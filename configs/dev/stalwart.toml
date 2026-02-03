@@ -1,0 +1,12 @@
+# Minimal Stalwart config placeholder for local development.
+# Replace with a working config from Stalwart documentation.
+# Required settings:
+# - Enable JMAP on 0.0.0.0:8080
+# - Local domain: local.neuralmail
+# - User: dev@local.neuralmail / devpass
+# - SMTP on :25 (container internal)
+# - IMAP/JMAP enabled
+
+[server]
+local_name = "local.neuralmail"
+

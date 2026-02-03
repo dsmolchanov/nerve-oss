@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Support Extraction v1",
+  "type": "object",
+  "properties": {
+    "account_id": {"type": "string"},
+    "plan": {"type": "string"},
+    "error_code": {"type": "string"},
+    "urgency": {"type": "string", "enum": ["low", "medium", "high"]}
+  },
+  "required": ["account_id", "urgency"]
+}

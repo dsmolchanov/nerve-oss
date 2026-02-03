@@ -1,0 +1,10 @@
+{
+  "name": "support_default",
+  "intents": [
+    {"id": "incident", "label": "Incident"},
+    {"id": "billing", "label": "Billing"},
+    {"id": "refund_request", "label": "Refund"},
+    {"id": "general", "label": "General"}
+  ],
+  "routes": ["support", "billing", "engineering"]
+}

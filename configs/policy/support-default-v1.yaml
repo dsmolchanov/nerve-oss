@@ -1,0 +1,26 @@
+id: support-default-v1
+name: Support Reply Policy v1
+version: 1
+allowed_tones:
+  - neutral
+  - friendly
+  - professional
+forbidden_phrases:
+  - guarantee
+  - 100% refund
+  - we promise
+required_disclosures:
+  - "This email was generated with AI assistance."
+redactions:
+  patterns:
+    - "\\b\\d{3}-\\d{2}-\\d{4}\\b"
+  replacement: "[REDACTED]"
+outbound_domain_allowlist:
+  - local.neuralmail
+max_reply_length_chars: 4000
+approval:
+  required_when:
+    - low_confidence
+    - contains_refund
+    - mentions_legal
+  confidence_threshold: 0.7
