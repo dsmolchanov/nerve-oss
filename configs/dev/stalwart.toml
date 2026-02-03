@@ -27,7 +27,7 @@ directory = "memory"
 
 [store."rocksdb"]
 type = "rocksdb"
-path = "/var/lib/stalwart/data"
+path = "/opt/stalwart/data"
 compression = "lz4"
 
 [directory."memory"]
