@@ -7,18 +7,18 @@ import (
 
 type OpenAI struct {
 	APIKey string
-	Model  string
+	ModelName  string
 }
 
 func NewOpenAI(apiKey string, model string) *OpenAI {
 	if model == "" {
 		model = "gpt-4o-mini"
 	}
-	return &OpenAI{APIKey: apiKey, Model: model}
+	return &OpenAI{APIKey: apiKey, ModelName: model}
 }
 
 func (o *OpenAI) Name() string { return "openai" }
-func (o *OpenAI) Model() string { return o.Model }
+func (o *OpenAI) Model() string { return o.ModelName }
 
 func (o *OpenAI) Classify(_ context.Context, _ string, _ map[string]any) (Classification, error) {
 	return Classification{}, errors.New("openai provider not implemented")
