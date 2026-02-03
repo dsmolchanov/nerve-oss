@@ -1,12 +1,58 @@
-# Minimal Stalwart config placeholder for local development.
-# Replace with a working config from Stalwart documentation.
-# Required settings:
-# - Enable JMAP on 0.0.0.0:8080
-# - Local domain: local.neuralmail
-# - User: dev@local.neuralmail / devpass
-# - SMTP on :25 (container internal)
-# - IMAP/JMAP enabled
+# Stalwart dev config (local only).
+# Based on Stalwart minimal config + JMAP HTTP listener.
+# See: https://stalw.art/docs/configuration/overview and https://stalw.art/docs/http/jmap/overview/
 
 [server]
-local_name = "local.neuralmail"
+hostname = "local.neuralmail"
 
+[server.listener."smtp"]
+bind = ["[::]:25"]
+protocol = "smtp"
+
+[server.listener."imap"]
+bind = ["[::]:143"]
+protocol = "imap"
+
+[server.listener."jmap"]
+bind = ["[::]:8080"]
+protocol = "http"
+tls.implicit = false
+
+[storage]
+data = "rocksdb"
+fts = "rocksdb"
+blob = "rocksdb"
+lookup = "rocksdb"
+directory = "memory"
+
+[store."rocksdb"]
+type = "rocksdb"
+path = "/var/lib/stalwart/data"
+compression = "lz4"
+
+[directory."memory"]
+type = "memory"
+
+[[directory."memory".principals]]
+name = "admin"
+class = "admin"
+description = "Admin"
+secret = "adminpass"
+email = ["admin@local.neuralmail"]
+
+[[directory."memory".principals]]
+name = "dev"
+class = "individual"
+description = "Dev User"
+secret = "devpass"
+email = ["dev@local.neuralmail"]
+
+[tracer."stdout"]
+type = "stdout"
+level = "info"
+ansi = false
+enable = true
+
+[authentication.fallback-admin]
+user = "admin"
+secret = "adminpass"

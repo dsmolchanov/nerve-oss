@@ -67,6 +67,7 @@ type Message struct {
 	HTML              string
 	CreatedAt         time.Time
 	ProviderMessageID string
+	ProviderThreadID  string
 	InternetMessageID string
 	From              Participant
 	To                []Participant
@@ -217,16 +218,22 @@ func (s *Store) InsertMessage(ctx context.Context, msg Message) (string, error) 
 	if msg.ID == "" {
 		msg.ID = uuid.NewString()
 	}
+	if msg.ProviderMessageID == "" {
+		msg.ProviderMessageID = msg.ID
+	}
 	fromJSON, _ := json.Marshal(msg.From)
 	toJSON, _ := json.Marshal(msg.To)
 	ccJSON, _ := json.Marshal(msg.CC)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO messages (id, inbox_id, thread_id, direction, subject, text, html, created_at, provider_message_id, internet_message_id, from_json, to_json, cc_json)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+	row := s.db.QueryRowContext(ctx, `INSERT INTO messages (id, inbox_id, thread_id, direction, subject, text, html, created_at, provider_message_id, internet_message_id, from_json, to_json, cc_json)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+		ON CONFLICT (inbox_id, provider_message_id) DO UPDATE SET thread_id = EXCLUDED.thread_id
+		RETURNING id`,
 		msg.ID, msg.InboxID, msg.ThreadID, msg.Direction, msg.Subject, msg.Text, msg.HTML, msg.CreatedAt, msg.ProviderMessageID, msg.InternetMessageID, fromJSON, toJSON, ccJSON)
-	if err != nil {
+	var id string
+	if err := row.Scan(&id); err != nil {
 		return "", err
 	}
-	return msg.ID, nil
+	return id, nil
 }
 
 func (s *Store) RecordToolCall(ctx context.Context, toolName string, idempotencyKey string, modelName string, promptVersion string, latencyMS int) (string, error) {
@@ -388,16 +395,34 @@ func (s *Store) EnsureDefaultInbox(ctx context.Context, address string) (string,
 	return id, nil
 }
 
-func (s *Store) UpsertThreadForMessage(ctx context.Context, inboxID string, subject string, participants []Participant) (string, error) {
-	thread := Thread{
-		ID:         uuid.NewString(),
-		InboxID:    inboxID,
-		Subject:    subject,
-		Status:     "open",
-		UpdatedAt:  time.Now().UTC(),
-		Participants: participants,
+func (s *Store) EnsureThread(ctx context.Context, inboxID string, providerThreadID string, subject string, participants []Participant) (string, error) {
+	if providerThreadID != "" {
+		row := s.db.QueryRowContext(ctx, `SELECT id FROM threads WHERE inbox_id = $1 AND provider_thread_id = $2`, inboxID, providerThreadID)
+		var id string
+		if err := row.Scan(&id); err == nil {
+			return id, nil
+		}
 	}
-	return s.UpsertThread(ctx, thread)
+	thread := Thread{
+		ID:               uuid.NewString(),
+		InboxID:          inboxID,
+		Subject:          subject,
+		Status:           "open",
+		UpdatedAt:        time.Now().UTC(),
+		Participants:     participants,
+		ProviderThreadID: providerThreadID,
+	}
+	participantsJSON, _ := json.Marshal(thread.Participants)
+	row := s.db.QueryRowContext(ctx, `INSERT INTO threads (id, inbox_id, subject, status, participants, updated_at, provider_thread_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)
+		ON CONFLICT (inbox_id, provider_thread_id) DO UPDATE SET subject = EXCLUDED.subject, updated_at = EXCLUDED.updated_at
+		RETURNING id`,
+		thread.ID, thread.InboxID, thread.Subject, thread.Status, participantsJSON, thread.UpdatedAt, thread.ProviderThreadID)
+	var id string
+	if err := row.Scan(&id); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 func (s *Store) UpdateThreadSignals(ctx context.Context, threadID string, sentiment *float64, priority string) error {
@@ -405,8 +430,8 @@ func (s *Store) UpdateThreadSignals(ctx context.Context, threadID string, sentim
 	return err
 }
 
-func (s *Store) InsertMessageWithThread(ctx context.Context, inboxID string, msg Message) (string, string, error) {
-	threadID, err := s.UpsertThreadForMessage(ctx, inboxID, msg.Subject, append([]Participant{msg.From}, msg.To...))
+func (s *Store) InsertMessageWithThread(ctx context.Context, inboxID string, providerThreadID string, msg Message) (string, string, error) {
+	threadID, err := s.EnsureThread(ctx, inboxID, providerThreadID, msg.Subject, append([]Participant{msg.From}, msg.To...))
 	if err != nil {
 		return "", "", err
 	}

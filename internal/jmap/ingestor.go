@@ -49,11 +49,12 @@ func Ingest(ctx context.Context, client Client, store *store.Store, inboxID stri
 			HTML:              email.HTML,
 			CreatedAt:         email.ReceivedAt,
 			ProviderMessageID: email.ID,
+			ProviderThreadID:  email.ThreadID,
 			InternetMessageID: email.InternetMsg,
 			From:              email.From,
 			To:                email.To,
 		}
-		_, msgID, err := store.InsertMessageWithThread(ctx, inboxID, msg)
+		_, msgID, err := store.InsertMessageWithThread(ctx, inboxID, email.ThreadID, msg)
 		if err != nil {
 			return sinceState, ids, err
 		}
