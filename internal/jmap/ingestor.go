@@ -35,7 +35,7 @@ func (n NoopClient) Name() string { return "noop" }
 
 var ErrNotConfigured = errors.New("jmap client not configured")
 
-func Ingest(ctx context.Context, client Client, store *store.Store, inboxID string, sinceState string) (string, []string, error) {
+func Ingest(ctx context.Context, client Client, st *store.Store, inboxID string, sinceState string) (string, []string, error) {
 	emails, newState, err := client.FetchChanges(ctx, sinceState)
 	if err != nil {
 		return sinceState, nil, err
@@ -54,7 +54,7 @@ func Ingest(ctx context.Context, client Client, store *store.Store, inboxID stri
 			From:              email.From,
 			To:                email.To,
 		}
-		_, msgID, err := store.InsertMessageWithThread(ctx, inboxID, email.ThreadID, msg)
+		_, msgID, err := st.InsertMessageWithThread(ctx, inboxID, email.ThreadID, msg)
 		if err != nil {
 			return sinceState, ids, err
 		}

@@ -117,7 +117,7 @@ func mcpTest(cfg config.Config) {
 	resp, session := callMCP(url, initReq, "")
 	fmt.Printf("initialize: %s\n", resp)
 	listReq := map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": map[string]any{}}
-	resp = callMCP(url, listReq, session)
+	resp, _ = callMCP(url, listReq, session)
 	fmt.Printf("tools/list: %s\n", resp)
 }
 
