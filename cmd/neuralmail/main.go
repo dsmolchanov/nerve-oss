@@ -94,7 +94,7 @@ func doctor(cfg config.Config) {
 		{"redis", func() error { return pingTCP(cfg.Redis.URL) }},
 		{"qdrant", func() error { return pingHTTP(cfg.Qdrant.URL) }},
 		{"jmap", func() error { return pingHTTP(cfg.JMAP.URL) }},
-		{"mcp", func() error { return pingHTTP("http://localhost:8088/healthz") }},
+		{"mcp", func() error { return pingHTTP(fmt.Sprintf("%s/healthz", localHTTPBase(cfg))) }},
 	}
 	for _, check := range checks {
 		if err := check.Fn(); err != nil {
@@ -112,7 +112,7 @@ func sendTest(cfg config.Config) {
 }
 
 func mcpTest(cfg config.Config) {
-	url := "http://localhost:8088/mcp"
+	url := fmt.Sprintf("%s/mcp", localHTTPBase(cfg))
 	initReq := map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{}}
 	resp, session := callMCP(url, initReq, "")
 	fmt.Printf("initialize: %s\n", resp)
@@ -157,10 +157,92 @@ func sendSMTP(cfg config.Config, subject, body string) {
 		body,
 	}, "\r\n")
 
-	auth := smtp.PlainAuth("", cfg.SMTP.Username, cfg.SMTP.Password, host)
-	if err := smtp.SendMail(addr, auth, from, []string{to}, []byte(msg)); err != nil {
+	helo := smtpHeloDomain(from)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
 		log.Printf("smtp send failed: %v", err)
+		return
 	}
+	defer conn.Close()
+	client, err := smtp.NewClient(conn, host)
+	if err != nil {
+		log.Printf("smtp send failed: %v", err)
+		return
+	}
+	defer client.Quit()
+	if err := client.Hello(helo); err != nil {
+		log.Printf("smtp send failed: %v", err)
+		return
+	}
+	if (cfg.SMTP.Username != "" || cfg.SMTP.Password != "") && supportsAuth(client) {
+		auth := smtp.PlainAuth("", cfg.SMTP.Username, cfg.SMTP.Password, host)
+		if err := client.Auth(auth); err != nil {
+			log.Printf("smtp send failed: %v", err)
+			return
+		}
+	}
+	if err := client.Mail(from); err != nil {
+		log.Printf("smtp send failed: %v", err)
+		return
+	}
+	if err := client.Rcpt(to); err != nil {
+		log.Printf("smtp send failed: %v", err)
+		return
+	}
+	writer, err := client.Data()
+	if err != nil {
+		log.Printf("smtp send failed: %v", err)
+		return
+	}
+	if _, err := writer.Write([]byte(msg)); err != nil {
+		_ = writer.Close()
+		log.Printf("smtp send failed: %v", err)
+		return
+	}
+	if err := writer.Close(); err != nil {
+		log.Printf("smtp send failed: %v", err)
+		return
+	}
+	_ = client.Quit()
+}
+
+func smtpHeloDomain(addr string) string {
+	parts := strings.Split(addr, "@")
+	if len(parts) == 2 && parts[1] != "" {
+		return parts[1]
+	}
+	return "local.neuralmail"
+}
+
+func supportsAuth(client *smtp.Client) bool {
+	ok, _ := client.Extension("AUTH")
+	return ok
+}
+
+func localHTTPBase(cfg config.Config) string {
+	addr := cfg.HTTP.Addr
+	if addr == "" {
+		addr = ":8088"
+	}
+	host := "127.0.0.1"
+	port := ""
+	if strings.HasPrefix(addr, ":") {
+		port = strings.TrimPrefix(addr, ":")
+	} else if strings.Contains(addr, ":") {
+		parts := strings.Split(addr, ":")
+		if parts[0] != "" {
+			host = parts[0]
+		}
+		if len(parts) > 1 {
+			port = parts[len(parts)-1]
+		}
+	} else {
+		port = addr
+	}
+	if port == "" {
+		port = "8088"
+	}
+	return fmt.Sprintf("http://%s:%s", host, port)
 }
 
 func pingSMTP(cfg config.Config) error {

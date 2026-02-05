@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/smtp"
 	"os"
 	"strings"
@@ -257,8 +258,57 @@ func (s *Service) sendSMTP(from, to, subject, body string) error {
 		"",
 		body,
 	}, "\r\n")
-	auth := smtp.PlainAuth("", s.Config.SMTP.Username, s.Config.SMTP.Password, host)
-	return smtp.SendMail(addr, auth, from, []string{to}, []byte(msg))
+	helo := smtpHeloDomain(from)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	client, err := smtp.NewClient(conn, host)
+	if err != nil {
+		return err
+	}
+	defer client.Quit()
+	if err := client.Hello(helo); err != nil {
+		return err
+	}
+	if (s.Config.SMTP.Username != "" || s.Config.SMTP.Password != "") && supportsAuth(client) {
+		auth := smtp.PlainAuth("", s.Config.SMTP.Username, s.Config.SMTP.Password, host)
+		if err := client.Auth(auth); err != nil {
+			return err
+		}
+	}
+	if err := client.Mail(from); err != nil {
+		return err
+	}
+	if err := client.Rcpt(to); err != nil {
+		return err
+	}
+	writer, err := client.Data()
+	if err != nil {
+		return err
+	}
+	if _, err := writer.Write([]byte(msg)); err != nil {
+		_ = writer.Close()
+		return err
+	}
+	if err := writer.Close(); err != nil {
+		return err
+	}
+	return client.Quit()
+}
+
+func smtpHeloDomain(addr string) string {
+	parts := strings.Split(addr, "@")
+	if len(parts) == 2 && parts[1] != "" {
+		return parts[1]
+	}
+	return "local.neuralmail"
+}
+
+func supportsAuth(client *smtp.Client) bool {
+	ok, _ := client.Extension("AUTH")
+	return ok
 }
 
 func LoadSchema(schemaID string) (map[string]any, error) {
