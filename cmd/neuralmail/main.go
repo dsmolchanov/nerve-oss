@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -116,10 +117,54 @@ func mcpTest(cfg config.Config) {
 	url := fmt.Sprintf("%s/mcp", localHTTPBase(cfg))
 	initReq := map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{}}
 	resp, session := callMCP(url, initReq, "")
+	_, err := parseMCPResponse(resp)
+	if err != nil {
+		log.Fatalf("initialize failed: %v", err)
+	}
 	fmt.Printf("initialize: %s\n", resp)
+
 	listReq := map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": map[string]any{}}
 	resp, _ = callMCP(url, listReq, session)
+	if _, err := parseMCPResponse(resp); err != nil {
+		log.Fatalf("tools/list failed: %v", err)
+	}
 	fmt.Printf("tools/list: %s\n", resp)
+
+	inboxesReq := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      3,
+		"method":  "resources/read",
+		"params": map[string]any{
+			"uri": "email://inboxes",
+		},
+	}
+	resp, _ = callMCP(url, inboxesReq, session)
+	inboxesParsed, err := parseMCPResponse(resp)
+	if err != nil {
+		log.Fatalf("resources/read inboxes failed: %v", err)
+	}
+	inboxID, err := firstInboxID(inboxesParsed.Result)
+	if err != nil {
+		log.Fatalf("no inbox available for list_threads: %v", err)
+	}
+
+	callReq := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      4,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "list_threads",
+			"arguments": map[string]any{
+				"inbox_id": inboxID,
+				"limit":    10,
+			},
+		},
+	}
+	resp, _ = callMCP(url, callReq, session)
+	if _, err := parseMCPResponse(resp); err != nil {
+		log.Fatalf("tools/call list_threads failed: %v", err)
+	}
+	fmt.Printf("tools/call list_threads: %s\n", resp)
 }
 
 func callMCP(url string, payload map[string]any, session string) (string, string) {
@@ -332,4 +377,38 @@ func pingTCP(rawURL string) error {
 
 func usage() {
 	fmt.Println("Usage: neuralmail <up|down|seed|doctor|send-test|mcp-test>")
+}
+
+type mcpResponse struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      any             `json:"id"`
+	Result  json.RawMessage `json:"result"`
+	Error   *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+func parseMCPResponse(raw string) (mcpResponse, error) {
+	var parsed mcpResponse
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return parsed, err
+	}
+	if parsed.Error != nil {
+		return parsed, fmt.Errorf("rpc error %d: %s", parsed.Error.Code, parsed.Error.Message)
+	}
+	return parsed, nil
+}
+
+func firstInboxID(result json.RawMessage) (string, error) {
+	var payload struct {
+		InboxIDs []string `json:"inbox_ids"`
+	}
+	if err := json.Unmarshal(result, &payload); err != nil {
+		return "", err
+	}
+	if len(payload.InboxIDs) == 0 {
+		return "", errors.New("empty inbox_ids")
+	}
+	return payload.InboxIDs[0], nil
 }
