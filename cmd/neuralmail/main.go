@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/smtp"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -93,7 +94,7 @@ func doctor(cfg config.Config) {
 		{"database", func() error { return pingDatabase(ctx, cfg.Database.DSN) }},
 		{"redis", func() error { return pingTCP(cfg.Redis.URL) }},
 		{"qdrant", func() error { return pingHTTP(cfg.Qdrant.URL) }},
-		{"jmap", func() error { return pingHTTP(cfg.JMAP.URL) }},
+		{"jmap", func() error { return pingJMAP(cfg) }},
 		{"mcp", func() error { return pingHTTP(fmt.Sprintf("%s/healthz", localHTTPBase(cfg))) }},
 	}
 	for _, check := range checks {
@@ -256,6 +257,33 @@ func pingSMTP(cfg config.Config) error {
 		return err
 	}
 	return conn.Close()
+}
+
+func pingJMAP(cfg config.Config) error {
+	sessionURL := cfg.JMAP.SessionURL
+	if sessionURL == "" {
+		parsed, err := url.Parse(cfg.JMAP.URL)
+		if err != nil {
+			return err
+		}
+		sessionURL = fmt.Sprintf("%s://%s/.well-known/jmap", parsed.Scheme, parsed.Host)
+	}
+	req, err := http.NewRequest(http.MethodGet, sessionURL, nil)
+	if err != nil {
+		return err
+	}
+	if cfg.JMAP.Username != "" || cfg.JMAP.Password != "" {
+		req.SetBasicAuth(cfg.JMAP.Username, cfg.JMAP.Password)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func pingHTTP(url string) error {

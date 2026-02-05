@@ -8,7 +8,7 @@ jmap:
   url: "http://127.0.0.1:8080/jmap"
   session_url: "http://127.0.0.1:8080/.well-known/jmap"
   account_id: ""
-  username: "dev@local.neuralmail"
+  username: "dev"
   password: "devpass"
   push_secret: "devsecret"
   poll_interval: 30s
