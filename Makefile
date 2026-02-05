@@ -1,5 +1,11 @@
 .PHONY: up down logs seed mcp-test doctor
 
+CONFIG ?= configs/dev/host.yaml
+GOCACHE ?= /tmp/go-build
+GOPATH ?= /tmp/go
+GOMODCACHE ?= /tmp/go/pkg/mod
+GOENV = GOCACHE=$(GOCACHE) GOPATH=$(GOPATH) GOMODCACHE=$(GOMODCACHE)
+
 up:
 	docker compose up -d
 
@@ -10,10 +16,10 @@ logs:
 	docker compose logs -f cortex
 
 seed:
-	go run ./cmd/neuralmail seed
+	NM_CONFIG=$(CONFIG) $(GOENV) go run ./cmd/neuralmail seed
 
 mcp-test:
-	go run ./cmd/neuralmail mcp-test
+	NM_CONFIG=$(CONFIG) $(GOENV) go run ./cmd/neuralmail mcp-test
 
 doctor:
-	go run ./cmd/neuralmail doctor
+	NM_CONFIG=$(CONFIG) $(GOENV) go run ./cmd/neuralmail doctor

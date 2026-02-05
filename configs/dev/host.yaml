@@ -1,0 +1,65 @@
+http:
+  addr: ":8088"
+
+dev:
+  mode: true
+
+jmap:
+  url: "http://127.0.0.1:8080/jmap"
+  session_url: "http://127.0.0.1:8080/.well-known/jmap"
+  account_id: ""
+  username: "dev@local.neuralmail"
+  password: "devpass"
+  push_secret: "devsecret"
+  poll_interval: 30s
+
+smtp:
+  host: "127.0.0.1"
+  port: 2525
+  username: "dev@local.neuralmail"
+  password: "devpass"
+  from: "dev@local.neuralmail"
+
+database:
+  dsn: "postgres://neuralmail:neuralmail@127.0.0.1:54320/neuralmail?sslmode=disable"
+
+qdrant:
+  url: "http://127.0.0.1:6333"
+  collection: "messages_v1536"
+  embed_dim: 1536
+
+redis:
+  url: "redis://127.0.0.1:63790/0"
+
+object_store:
+  url: "http://127.0.0.1:9000"
+  bucket: "neuralmail"
+  access_key: "minio"
+  secret_key: "minio123"
+
+embedding:
+  provider: "noop"
+  model: "text-embedding-3-small"
+  dim: 1536
+
+llm:
+  provider: "noop"
+  model: "gpt-4o-mini"
+  prompt_path: "configs/prompts/v1"
+
+policy:
+  default_path: "configs/policy/support-default-v1.yaml"
+
+mcp:
+  protocol_version: "2025-11-25"
+  allow_origins:
+    - "http://localhost:8088"
+
+security:
+  allow_outbound: false
+  allow_send_with_warnings: false
+  outbound_domain_allowlist:
+    - "local.neuralmail"
+
+log:
+  level: "info"
