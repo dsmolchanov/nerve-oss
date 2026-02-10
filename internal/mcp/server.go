@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -13,20 +14,29 @@ import (
 
 	"github.com/google/uuid"
 
+	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
+	"neuralmail/internal/entitlements"
 	"neuralmail/internal/observability"
 	"neuralmail/internal/tools"
 )
 
-type Server struct {
-	Config   config.Config
-	Tools    *tools.Service
-	mu       sync.Mutex
-	sessions map[string]time.Time
+type EntitlementGate interface {
+	PreAuthorizeTool(ctx context.Context, principal auth.Principal, toolName string, replayID string) (*entitlements.Reservation, error)
+	FinalizeToolExecution(ctx context.Context, reservation entitlements.Reservation, toolName string, replayID string, auditID string, status string) error
 }
 
-func NewServer(cfg config.Config, toolsSvc *tools.Service) *Server {
-	return &Server{Config: cfg, Tools: toolsSvc, sessions: make(map[string]time.Time)}
+type Server struct {
+	Config       config.Config
+	Auth         *auth.Service
+	Entitlements EntitlementGate
+	Tools        *tools.Service
+	mu           sync.Mutex
+	sessions     map[string]time.Time
+}
+
+func NewServer(cfg config.Config, toolsSvc *tools.Service, authSvc *auth.Service, entitlementSvc EntitlementGate) *Server {
+	return &Server{Config: cfg, Auth: authSvc, Entitlements: entitlementSvc, Tools: toolsSvc, sessions: make(map[string]time.Time)}
 }
 
 func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
@@ -38,10 +48,37 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
+	log.Printf("mcp request protocol_version=%q", strings.TrimSpace(r.Header.Get("MCP-Protocol-Version")))
+
+	ctx := r.Context()
+	var principal auth.Principal
+	if s.Config.Cloud.Mode {
+		if s.Auth == nil {
+			http.Error(w, "cloud auth not configured", http.StatusInternalServerError)
+			return
+		}
+		authenticated, err := s.Auth.AuthenticateRequest(r)
+		if err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		principal = authenticated
+		ctx = auth.WithPrincipal(ctx, authenticated)
+	}
+
 	var req Request
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
+	}
+	if s.Config.Cloud.Mode {
+		requiredScope := s.requiredScope(req)
+		if requiredScope != "" {
+			if err := s.Auth.ValidateScopes(principal, requiredScope); err != nil {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+		}
 	}
 	sessionID := r.Header.Get("MCP-Session-Id")
 	if req.Method != "initialize" {
@@ -50,9 +87,9 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	result, err := s.dispatch(r.Context(), req)
+	result, err := s.dispatch(ctx, req)
 	if err != nil {
-		writeError(w, req.ID, -32000, err.Error())
+		s.writeDispatchError(w, req.ID, err)
 		return
 	}
 	if req.Method == "initialize" {
@@ -79,7 +116,7 @@ func (s *Server) dispatch(ctx context.Context, req Request) (any, error) {
 		return map[string]any{
 			"protocolVersion": s.Config.MCP.ProtocolVersion,
 			"serverInfo": map[string]any{
-				"name": "neuralmaild",
+				"name":    "neuralmaild",
 				"version": "0.1.0",
 			},
 			"capabilities": map[string]any{
@@ -109,6 +146,43 @@ func (s *Server) callTool(ctx context.Context, req Request) (any, error) {
 	inputsHash := hashJSON(params.Arguments)
 	replayID := observability.NewReplayID()
 
+	var reservation *entitlements.Reservation
+	if s.Config.Cloud.Mode && s.Entitlements != nil {
+		principal, ok := auth.PrincipalFromContext(ctx)
+		if !ok {
+			return nil, errors.New("missing cloud principal")
+		}
+		reserved, err := s.Entitlements.PreAuthorizeTool(ctx, principal, params.Name, replayID)
+		if err != nil {
+			return nil, err
+		}
+		reservation = reserved
+	}
+
+	exec, err := s.toolExecutor(params)
+	if err != nil {
+		return nil, err
+	}
+
+	result, callErr := exec(ctx)
+	result = attachReplayID(result, replayID)
+	auditID := s.recordToolCall(ctx, params.Name, inputsHash, result, start, replayID)
+	result = attachAuditID(result, auditID)
+
+	if reservation != nil && s.Entitlements != nil {
+		status := "success"
+		if callErr != nil {
+			status = "failed"
+		}
+		if err := s.Entitlements.FinalizeToolExecution(ctx, *reservation, params.Name, replayID, auditID, status); err != nil {
+			return result, err
+		}
+	}
+
+	return result, callErr
+}
+
+func (s *Server) toolExecutor(params ToolCallParams) (func(context.Context) (any, error), error) {
 	switch params.Name {
 	case "list_threads":
 		var input struct {
@@ -119,10 +193,9 @@ func (s *Server) callTool(ctx context.Context, req Request) (any, error) {
 		if err := json.Unmarshal(params.Arguments, &input); err != nil {
 			return nil, err
 		}
-		result, err := s.Tools.ListThreads(ctx, input.InboxID, input.Status, input.Limit)
-		result = attachReplayID(result, replayID)
-		result = attachAuditID(result, s.recordToolCall(ctx, params.Name, inputsHash, result, start, replayID))
-		return result, err
+		return func(ctx context.Context) (any, error) {
+			return s.Tools.ListThreads(ctx, input.InboxID, input.Status, input.Limit)
+		}, nil
 	case "get_thread":
 		var input struct {
 			ThreadID string `json:"thread_id"`
@@ -130,10 +203,9 @@ func (s *Server) callTool(ctx context.Context, req Request) (any, error) {
 		if err := json.Unmarshal(params.Arguments, &input); err != nil {
 			return nil, err
 		}
-		result, err := s.Tools.GetThread(ctx, input.ThreadID)
-		result = attachReplayID(result, replayID)
-		result = attachAuditID(result, s.recordToolCall(ctx, params.Name, inputsHash, result, start, replayID))
-		return result, err
+		return func(ctx context.Context) (any, error) {
+			return s.Tools.GetThread(ctx, input.ThreadID)
+		}, nil
 	case "search_inbox":
 		var input struct {
 			InboxID string `json:"inbox_id"`
@@ -143,22 +215,19 @@ func (s *Server) callTool(ctx context.Context, req Request) (any, error) {
 		if err := json.Unmarshal(params.Arguments, &input); err != nil {
 			return nil, err
 		}
-		result, err := s.Tools.SearchInbox(ctx, input.InboxID, input.Query, input.TopK)
-		result = attachReplayID(result, replayID)
-		result = attachAuditID(result, s.recordToolCall(ctx, params.Name, inputsHash, result, start, replayID))
-		return result, err
+		return func(ctx context.Context) (any, error) {
+			return s.Tools.SearchInbox(ctx, input.InboxID, input.Query, input.TopK)
+		}, nil
 	case "triage_message":
 		var input struct {
-			MessageID  string `json:"message_id"`
-			TaxonomyID string `json:"taxonomy_id"`
+			MessageID string `json:"message_id"`
 		}
 		if err := json.Unmarshal(params.Arguments, &input); err != nil {
 			return nil, err
 		}
-		result, err := s.Tools.TriageMessage(ctx, input.MessageID)
-		result = attachReplayID(result, replayID)
-		result = attachAuditID(result, s.recordToolCall(ctx, params.Name, inputsHash, result, start, replayID))
-		return result, err
+		return func(ctx context.Context) (any, error) {
+			return s.Tools.TriageMessage(ctx, input.MessageID)
+		}, nil
 	case "extract_to_schema":
 		var input struct {
 			MessageID string `json:"message_id"`
@@ -167,10 +236,9 @@ func (s *Server) callTool(ctx context.Context, req Request) (any, error) {
 		if err := json.Unmarshal(params.Arguments, &input); err != nil {
 			return nil, err
 		}
-		result, err := s.Tools.ExtractToSchema(ctx, input.MessageID, input.SchemaID)
-		result = attachReplayID(result, replayID)
-		result = attachAuditID(result, s.recordToolCall(ctx, params.Name, inputsHash, result, start, replayID))
-		return result, err
+		return func(ctx context.Context) (any, error) {
+			return s.Tools.ExtractToSchema(ctx, input.MessageID, input.SchemaID)
+		}, nil
 	case "draft_reply_with_policy":
 		var input struct {
 			ThreadID string `json:"thread_id"`
@@ -179,24 +247,21 @@ func (s *Server) callTool(ctx context.Context, req Request) (any, error) {
 		if err := json.Unmarshal(params.Arguments, &input); err != nil {
 			return nil, err
 		}
-		result, err := s.Tools.DraftReply(ctx, input.ThreadID, input.Goal)
-		result = attachReplayID(result, replayID)
-		result = attachAuditID(result, s.recordToolCall(ctx, params.Name, inputsHash, result, start, replayID))
-		return result, err
+		return func(ctx context.Context) (any, error) {
+			return s.Tools.DraftReply(ctx, input.ThreadID, input.Goal)
+		}, nil
 	case "send_reply":
 		var input struct {
-			ThreadID       string `json:"thread_id"`
-			Body           string `json:"body_or_draft_id"`
-			NeedsApproval  bool   `json:"needs_human_approval"`
-			IdempotencyKey string `json:"idempotency_key"`
+			ThreadID      string `json:"thread_id"`
+			Body          string `json:"body_or_draft_id"`
+			NeedsApproval bool   `json:"needs_human_approval"`
 		}
 		if err := json.Unmarshal(params.Arguments, &input); err != nil {
 			return nil, err
 		}
-		result, err := s.Tools.SendReply(ctx, input.ThreadID, input.Body, input.NeedsApproval)
-		result = attachReplayID(result, replayID)
-		result = attachAuditID(result, s.recordToolCall(ctx, params.Name, inputsHash, result, start, replayID))
-		return result, err
+		return func(ctx context.Context) (any, error) {
+			return s.Tools.SendReply(ctx, input.ThreadID, input.Body, input.NeedsApproval)
+		}, nil
 	default:
 		return nil, fmt.Errorf("unknown tool: %s", params.Name)
 	}
@@ -257,9 +322,18 @@ func (s *Server) readResource(ctx context.Context, req Request) (any, error) {
 	if err := decodeParams(req.Params, &params); err != nil {
 		return nil, err
 	}
+	principal, hasPrincipal := auth.PrincipalFromContext(ctx)
 	switch {
 	case params.URI == "email://inboxes":
-		ids, err := s.Tools.Store.ListInboxes(ctx)
+		var (
+			ids []string
+			err error
+		)
+		if hasPrincipal {
+			ids, err = s.Tools.Store.ListInboxesByOrg(ctx, principal.OrgID)
+		} else {
+			ids, err = s.Tools.Store.ListInboxes(ctx)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -269,6 +343,11 @@ func (s *Server) readResource(ctx context.Context, req Request) (any, error) {
 		return s.Tools.GetThread(ctx, threadID)
 	case strings.HasPrefix(params.URI, "email://messages/"):
 		messageID := strings.TrimPrefix(params.URI, "email://messages/")
+		if hasPrincipal {
+			if err := s.Tools.Store.EnsureMessageBelongsToOrg(ctx, messageID, principal.OrgID); err != nil {
+				return nil, err
+			}
+		}
 		msg, err := s.Tools.Store.GetMessage(ctx, messageID)
 		if err != nil {
 			return nil, err
@@ -304,6 +383,49 @@ func (s *Server) validateOrigin(r *http.Request) error {
 	return errors.New("origin not allowed")
 }
 
+func (s *Server) requiredScope(req Request) string {
+	switch req.Method {
+	case "initialize", "tools/list", "resources/list", "resources/read":
+		return "nerve:email.read"
+	case "tools/call":
+		var params ToolCallParams
+		if err := decodeParams(req.Params, &params); err != nil {
+			return "nerve:email.read"
+		}
+		switch params.Name {
+		case "list_threads", "get_thread":
+			return "nerve:email.read"
+		case "search_inbox":
+			return "nerve:email.search"
+		case "triage_message", "extract_to_schema", "draft_reply_with_policy":
+			return "nerve:email.draft"
+		case "send_reply":
+			return "nerve:email.send"
+		default:
+			return "nerve:email.read"
+		}
+	default:
+		return "nerve:email.read"
+	}
+}
+
+func (s *Server) writeDispatchError(w http.ResponseWriter, id any, err error) {
+	var rateErr *entitlements.RateLimitError
+	switch {
+	case errors.Is(err, entitlements.ErrQuotaExceeded):
+		writeErrorWithData(w, id, -32040, "quota_exceeded", map[string]any{"retryable": false})
+	case errors.Is(err, entitlements.ErrSubscriptionInactive):
+		writeErrorWithData(w, id, -32041, "subscription_inactive", map[string]any{"retryable": false})
+	case errors.As(err, &rateErr):
+		writeErrorWithData(w, id, -32042, "rate_limited", map[string]any{
+			"retryable":           true,
+			"retry_after_seconds": rateErr.RetryAfterSeconds,
+		})
+	default:
+		writeError(w, id, -32000, err.Error())
+	}
+}
+
 func (s *Server) newSession() string {
 	sessionID := uuid.NewString()
 	s.mu.Lock()
@@ -333,11 +455,15 @@ func decodeParams(raw json.RawMessage, out any) error {
 }
 
 func writeError(w http.ResponseWriter, id any, code int, message string) {
+	writeErrorWithData(w, id, code, message, nil)
+}
+
+func writeErrorWithData(w http.ResponseWriter, id any, code int, message string, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	resp := Response{
 		JSONRPC: "2.0",
 		ID:      id,
-		Error: &ResponseError{Code: code, Message: message},
+		Error:   &ResponseError{Code: code, Message: message, Data: data},
 	}
 	_ = json.NewEncoder(w).Encode(resp)
 }

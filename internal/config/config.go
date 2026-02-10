@@ -17,6 +17,24 @@ type Config struct {
 	Dev struct {
 		Mode bool `yaml:"mode"`
 	} `yaml:"dev"`
+	Cloud struct {
+		Mode          bool   `yaml:"mode"`
+		PublicBaseURL string `yaml:"public_base_url"`
+	} `yaml:"cloud"`
+	Auth struct {
+		Issuer   string `yaml:"issuer"`
+		Audience string `yaml:"audience"`
+		JWKSURL  string `yaml:"jwks_url"`
+	} `yaml:"auth"`
+	Billing struct {
+		Provider            string `yaml:"provider"`
+		StripeSecretKey     string `yaml:"stripe_secret_key"`
+		StripeWebhookSecret string `yaml:"stripe_webhook_secret"`
+	} `yaml:"billing"`
+	Metering struct {
+		ToolCostPath     string `yaml:"tool_cost_path"`
+		PastDueGraceDays int    `yaml:"past_due_grace_days"`
+	} `yaml:"metering"`
 	JMAP struct {
 		URL          string        `yaml:"url"`
 		SessionURL   string        `yaml:"session_url"`
@@ -70,9 +88,9 @@ type Config struct {
 		AllowOrigins    []string `yaml:"allow_origins"`
 	} `yaml:"mcp"`
 	Security struct {
-		APIKey                  string `yaml:"api_key"`
-		AllowOutbound           bool   `yaml:"allow_outbound"`
-		AllowSendWithWarnings   bool   `yaml:"allow_send_with_warnings"`
+		APIKey                  string   `yaml:"api_key"`
+		AllowOutbound           bool     `yaml:"allow_outbound"`
+		AllowSendWithWarnings   bool     `yaml:"allow_send_with_warnings"`
 		OutboundDomainAllowlist []string `yaml:"outbound_domain_allowlist"`
 	} `yaml:"security"`
 	Log struct {
@@ -84,6 +102,7 @@ func Default() Config {
 	var cfg Config
 	cfg.HTTP.Addr = ":8088"
 	cfg.Dev.Mode = true
+	cfg.Billing.Provider = "stripe"
 	cfg.JMAP.PollInterval = 30 * time.Second
 	cfg.SMTP.Host = "localhost"
 	cfg.SMTP.Port = 2525
@@ -95,6 +114,8 @@ func Default() Config {
 	cfg.LLM.Provider = "noop"
 	cfg.LLM.PromptPath = "configs/prompts/v1"
 	cfg.Policy.DefaultPath = "configs/policy/support-default-v1.yaml"
+	cfg.Metering.ToolCostPath = "configs/meters/tool_costs.yaml"
+	cfg.Metering.PastDueGraceDays = 7
 	cfg.MCP.ProtocolVersion = "2025-11-25"
 	cfg.Log.Level = "info"
 	return cfg
@@ -130,6 +151,38 @@ func applyEnv(cfg *Config) {
 	}
 	if v := os.Getenv("NM_DEV_MODE"); v != "" {
 		cfg.Dev.Mode = parseBool(v, cfg.Dev.Mode)
+	}
+	if v := os.Getenv("NM_CLOUD_MODE"); v != "" {
+		cfg.Cloud.Mode = parseBool(v, cfg.Cloud.Mode)
+	}
+	if v := os.Getenv("NM_CLOUD_PUBLIC_BASE_URL"); v != "" {
+		cfg.Cloud.PublicBaseURL = v
+	}
+	if v := os.Getenv("NM_AUTH_ISSUER"); v != "" {
+		cfg.Auth.Issuer = v
+	}
+	if v := os.Getenv("NM_AUTH_AUDIENCE"); v != "" {
+		cfg.Auth.Audience = v
+	}
+	if v := os.Getenv("NM_AUTH_JWKS_URL"); v != "" {
+		cfg.Auth.JWKSURL = v
+	}
+	if v := os.Getenv("NM_BILLING_PROVIDER"); v != "" {
+		cfg.Billing.Provider = v
+	}
+	if v := os.Getenv("NM_STRIPE_SECRET_KEY"); v != "" {
+		cfg.Billing.StripeSecretKey = v
+	}
+	if v := os.Getenv("NM_STRIPE_WEBHOOK_SECRET"); v != "" {
+		cfg.Billing.StripeWebhookSecret = v
+	}
+	if v := os.Getenv("NM_METER_TOOL_COST_PATH"); v != "" {
+		cfg.Metering.ToolCostPath = v
+	}
+	if v := os.Getenv("NM_METER_PAST_DUE_GRACE_DAYS"); v != "" {
+		if days, err := strconv.Atoi(v); err == nil {
+			cfg.Metering.PastDueGraceDays = days
+		}
 	}
 	if v := os.Getenv("NM_JMAP_URL"); v != "" {
 		cfg.JMAP.URL = v

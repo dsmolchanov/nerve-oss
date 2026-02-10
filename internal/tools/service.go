@@ -14,6 +14,7 @@ import (
 
 	"github.com/santhosh-tekuri/jsonschema/v5"
 
+	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
 	"neuralmail/internal/embed"
 	"neuralmail/internal/llm"
@@ -41,31 +42,102 @@ func NewService(cfg config.Config, store *store.Store, llmProvider llm.Provider,
 	return &Service{Config: cfg, Store: store, LLM: llmProvider, Vector: vectorStore, Policy: policyObj, Embedder: embedder}
 }
 
-func (s *Service) ListThreads(ctx context.Context, inboxID string, status string, limit int) (any, error) {
-	threads, err := s.Store.ListThreads(ctx, inboxID, status, limit)
+func (s *Service) withScopedStore(ctx context.Context, fn func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error)) (any, error) {
+	if !s.Config.Cloud.Mode {
+		return fn(ctx, s.Store, auth.Principal{})
+	}
+	principal, ok := auth.PrincipalFromContext(ctx)
+	if !ok {
+		return nil, errors.New("missing cloud principal")
+	}
+	var out any
+	err := s.Store.RunAsOrg(ctx, principal.OrgID, func(scoped *store.Store) error {
+		result, callErr := fn(ctx, scoped, principal)
+		out = result
+		return callErr
+	})
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"threads": threads}, nil
+	return out, nil
+}
+
+func (s *Service) ensureInboxBelongsToOrg(ctx context.Context, st *store.Store, orgID string, inboxID string) error {
+	if err := st.EnsureInboxBelongsToOrg(ctx, inboxID, orgID); err != nil {
+		if errors.Is(err, store.ErrOwnershipMismatch) {
+			return errors.New("inbox does not belong to org")
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Service) ensureThreadBelongsToOrg(ctx context.Context, st *store.Store, orgID string, threadID string) error {
+	if err := st.EnsureThreadBelongsToOrg(ctx, threadID, orgID); err != nil {
+		if errors.Is(err, store.ErrOwnershipMismatch) {
+			return errors.New("thread does not belong to org")
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Service) ensureMessageBelongsToOrg(ctx context.Context, st *store.Store, orgID string, messageID string) error {
+	if err := st.EnsureMessageBelongsToOrg(ctx, messageID, orgID); err != nil {
+		if errors.Is(err, store.ErrOwnershipMismatch) {
+			return errors.New("message does not belong to org")
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Service) ListThreads(ctx context.Context, inboxID string, status string, limit int) (any, error) {
+	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
+		if principal.OrgID != "" {
+			if err := s.ensureInboxBelongsToOrg(scopedCtx, st, principal.OrgID, inboxID); err != nil {
+				return nil, err
+			}
+		}
+		threads, err := st.ListThreads(scopedCtx, inboxID, status, limit)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"threads": threads}, nil
+	})
 }
 
 func (s *Service) GetThread(ctx context.Context, threadID string) (any, error) {
-	thread, messages, err := s.Store.GetThread(ctx, threadID)
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{"thread": thread, "messages": messages}, nil
+	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
+		if principal.OrgID != "" {
+			if err := s.ensureThreadBelongsToOrg(scopedCtx, st, principal.OrgID, threadID); err != nil {
+				return nil, err
+			}
+		}
+		thread, messages, err := st.GetThread(scopedCtx, threadID)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"thread": thread, "messages": messages}, nil
+	})
 }
 
 func (s *Service) SearchInbox(ctx context.Context, inboxID string, query string, topK int) (any, error) {
-	if s.Vector != nil && s.Embedder != nil {
-		return s.searchVector(ctx, inboxID, query, topK)
-	}
-	results, err := s.Store.SearchInboxFTS(ctx, inboxID, query, topK)
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{"results": results}, nil
+	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
+		if principal.OrgID != "" {
+			if err := s.ensureInboxBelongsToOrg(scopedCtx, st, principal.OrgID, inboxID); err != nil {
+				return nil, err
+			}
+		}
+		if s.Vector != nil && s.Embedder != nil {
+			return s.searchVector(scopedCtx, inboxID, query, topK)
+		}
+		results, err := st.SearchInboxFTS(scopedCtx, inboxID, query, topK)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"results": results}, nil
+	})
 }
 
 func (s *Service) searchVector(ctx context.Context, inboxID, query string, topK int) (any, error) {
@@ -99,136 +171,164 @@ func (s *Service) searchVector(ctx context.Context, inboxID, query string, topK 
 }
 
 func (s *Service) TriageMessage(ctx context.Context, messageID string) (any, error) {
-	msg, err := s.Store.GetMessage(ctx, messageID)
-	if err != nil {
-		return nil, err
-	}
-	classification, err := s.LLM.Classify(ctx, msg.Text, nil)
-	if err != nil {
-		return nil, err
-	}
-	_ = s.Store.UpdateThreadSignals(ctx, msg.ThreadID, ptrFloat(classificationConfidenceToSentiment(classification.Sentiment)), classification.Urgency)
-	return map[string]any{
-		"intent":          classification.Intent,
-		"urgency":         classification.Urgency,
-		"sentiment":       classification.Sentiment,
-		"confidence":      classification.Confidence,
-		"suggested_route": "support",
-	}, nil
+	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
+		if principal.OrgID != "" {
+			if err := s.ensureMessageBelongsToOrg(scopedCtx, st, principal.OrgID, messageID); err != nil {
+				return nil, err
+			}
+		}
+		msg, err := st.GetMessage(scopedCtx, messageID)
+		if err != nil {
+			return nil, err
+		}
+		classification, err := s.LLM.Classify(scopedCtx, msg.Text, nil)
+		if err != nil {
+			return nil, err
+		}
+		_ = st.UpdateThreadSignals(scopedCtx, msg.ThreadID, ptrFloat(classificationConfidenceToSentiment(classification.Sentiment)), classification.Urgency)
+		return map[string]any{
+			"intent":          classification.Intent,
+			"urgency":         classification.Urgency,
+			"sentiment":       classification.Sentiment,
+			"confidence":      classification.Confidence,
+			"suggested_route": "support",
+		}, nil
+	})
 }
 
 func (s *Service) ExtractToSchema(ctx context.Context, messageID string, schemaID string) (any, error) {
-	msg, err := s.Store.GetMessage(ctx, messageID)
-	if err != nil {
-		return nil, err
-	}
-	schema, err := LoadSchema(schemaID)
-	if err != nil {
-		return nil, err
-	}
-	result, err := s.LLM.Extract(ctx, msg.Text, schema, nil)
-	if err != nil {
-		return nil, err
-	}
-	validated, validationErrors := validateJSON(schema, result.Data)
-	if !validated {
-		result.ValidationErrors = validationErrors
-		// One repair attempt
-		repair, err := s.LLM.Extract(ctx, msg.Text, schema, nil)
-		if err == nil {
-			result = repair
-			validated, validationErrors = validateJSON(schema, result.Data)
-			if !validated {
-				result.ValidationErrors = validationErrors
-				result.Confidence = 0
+	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
+		if principal.OrgID != "" {
+			if err := s.ensureMessageBelongsToOrg(scopedCtx, st, principal.OrgID, messageID); err != nil {
+				return nil, err
 			}
 		}
-	}
-	return map[string]any{
-		"data":              result.Data,
-		"confidence":        result.Confidence,
-		"missing_fields":    result.MissingFields,
-		"validation_errors": result.ValidationErrors,
-	}, nil
+		msg, err := st.GetMessage(scopedCtx, messageID)
+		if err != nil {
+			return nil, err
+		}
+		schema, err := LoadSchema(schemaID)
+		if err != nil {
+			return nil, err
+		}
+		result, err := s.LLM.Extract(scopedCtx, msg.Text, schema, nil)
+		if err != nil {
+			return nil, err
+		}
+		validated, validationErrors := validateJSON(schema, result.Data)
+		if !validated {
+			result.ValidationErrors = validationErrors
+			// One repair attempt
+			repair, err := s.LLM.Extract(scopedCtx, msg.Text, schema, nil)
+			if err == nil {
+				result = repair
+				validated, validationErrors = validateJSON(schema, result.Data)
+				if !validated {
+					result.ValidationErrors = validationErrors
+					result.Confidence = 0
+				}
+			}
+		}
+		return map[string]any{
+			"data":              result.Data,
+			"confidence":        result.Confidence,
+			"missing_fields":    result.MissingFields,
+			"validation_errors": result.ValidationErrors,
+		}, nil
+	})
 }
 
 func (s *Service) DraftReply(ctx context.Context, threadID string, goal string) (any, error) {
-	thread, messages, err := s.Store.GetThread(ctx, threadID)
-	if err != nil {
-		return nil, err
-	}
-	contextText := buildThreadContext(thread, messages)
-	draft, err := s.LLM.Draft(ctx, contextText, nil, goal)
-	if err != nil {
-		return nil, err
-	}
-	adjusted, eval := policy.Evaluate(draft.Text, s.Policy)
-	if !eval.Allowed && eval.ViolationLevel == "critical" {
+	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
+		if principal.OrgID != "" {
+			if err := s.ensureThreadBelongsToOrg(scopedCtx, st, principal.OrgID, threadID); err != nil {
+				return nil, err
+			}
+		}
+		thread, messages, err := st.GetThread(scopedCtx, threadID)
+		if err != nil {
+			return nil, err
+		}
+		contextText := buildThreadContext(thread, messages)
+		draft, err := s.LLM.Draft(scopedCtx, contextText, nil, goal)
+		if err != nil {
+			return nil, err
+		}
+		adjusted, eval := policy.Evaluate(draft.Text, s.Policy)
+		if !eval.Allowed && eval.ViolationLevel == "critical" {
+			return map[string]any{
+				"draft":                "",
+				"risk_flags":           eval.RiskFlags,
+				"cited_message_ids":    nil,
+				"needs_human_approval": true,
+				"policy_blocked":       true,
+				"reason":               eval.Reason,
+			}, nil
+		}
 		return map[string]any{
-			"draft":                "",
+			"draft":                adjusted,
 			"risk_flags":           eval.RiskFlags,
-			"cited_message_ids":    nil,
-			"needs_human_approval": true,
-			"policy_blocked":       true,
-			"reason":               eval.Reason,
+			"cited_message_ids":    []string{lastMessageID(messages)},
+			"needs_human_approval": eval.NeedsApproval || draft.NeedsApproval,
 		}, nil
-	}
-	return map[string]any{
-		"draft":                adjusted,
-		"risk_flags":           eval.RiskFlags,
-		"cited_message_ids":    []string{lastMessageID(messages)},
-		"needs_human_approval": eval.NeedsApproval || draft.NeedsApproval,
-	}, nil
+	})
 }
 
 func (s *Service) SendReply(ctx context.Context, threadID string, body string, needsApproval bool) (any, error) {
 	if needsApproval && !s.Config.Security.AllowSendWithWarnings {
 		return nil, errors.New("send blocked: needs human approval")
 	}
-	thread, messages, err := s.Store.GetThread(ctx, threadID)
-	if err != nil {
-		return nil, err
-	}
-	inboxID, _ := s.Store.GetThreadInboxID(ctx, threadID)
-	if len(messages) == 0 {
-		return nil, errors.New("no messages in thread")
-	}
-	from := s.Config.SMTP.From
-	if from == "" {
-		from = "dev@local.neuralmail"
-	}
-	to := messages[len(messages)-1].From.Email
-	if to == "" {
-		return nil, errors.New("missing recipient")
-	}
-	if !s.Config.Security.AllowOutbound && !strings.HasSuffix(to, "@local.neuralmail") {
-		return nil, errors.New("outbound disabled for non-local domains")
-	}
-	if len(s.Config.Security.OutboundDomainAllowlist) > 0 && !domainAllowed(to, s.Config.Security.OutboundDomainAllowlist) {
-		return nil, errors.New("recipient domain not allowlisted")
-	}
-	subject := "Re: " + thread.Subject
-	if subject == "Re: " {
-		subject = "Reply"
-	}
-	msg := store.Message{
-		InboxID:   inboxID,
-		Direction: "outbound",
-		Subject:   subject,
-		Text:      body,
-		CreatedAt: time.Now().UTC(),
-		From:      store.Participant{Email: from},
-		To:        []store.Participant{{Email: to}},
-	}
-	msg.ThreadID = thread.ID
-	msgID, err := s.Store.InsertMessage(ctx, msg)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.sendSMTP(from, to, subject, body); err != nil {
-		return nil, err
-	}
-	return map[string]any{"message_id": msgID, "status": "queued"}, nil
+	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
+		if principal.OrgID != "" {
+			if err := s.ensureThreadBelongsToOrg(scopedCtx, st, principal.OrgID, threadID); err != nil {
+				return nil, err
+			}
+		}
+		thread, messages, err := st.GetThread(scopedCtx, threadID)
+		if err != nil {
+			return nil, err
+		}
+		inboxID, _ := st.GetThreadInboxID(scopedCtx, threadID)
+		if len(messages) == 0 {
+			return nil, errors.New("no messages in thread")
+		}
+		from := s.Config.SMTP.From
+		if from == "" {
+			from = "dev@local.neuralmail"
+		}
+		to := messages[len(messages)-1].From.Email
+		if to == "" {
+			return nil, errors.New("missing recipient")
+		}
+		if !s.Config.Security.AllowOutbound && !strings.HasSuffix(to, "@local.neuralmail") {
+			return nil, errors.New("outbound disabled for non-local domains")
+		}
+		if len(s.Config.Security.OutboundDomainAllowlist) > 0 && !domainAllowed(to, s.Config.Security.OutboundDomainAllowlist) {
+			return nil, errors.New("recipient domain not allowlisted")
+		}
+		subject := "Re: " + thread.Subject
+		if subject == "Re: " {
+			subject = "Reply"
+		}
+		msg := store.Message{
+			InboxID:   inboxID,
+			Direction: "outbound",
+			Subject:   subject,
+			Text:      body,
+			CreatedAt: time.Now().UTC(),
+			From:      store.Participant{Email: from},
+			To:        []store.Participant{{Email: to}},
+		}
+		msg.ThreadID = thread.ID
+		msgID, err := st.InsertMessage(scopedCtx, msg)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.sendSMTP(from, to, subject, body); err != nil {
+			return nil, err
+		}
+		return map[string]any{"message_id": msgID, "status": "queued"}, nil
+	})
 }
 
 func domainAllowed(addr string, allowlist []string) bool {

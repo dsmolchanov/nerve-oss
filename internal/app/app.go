@@ -4,14 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 
+	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
 	"neuralmail/internal/embed"
+	"neuralmail/internal/entitlements"
 	"neuralmail/internal/jmap"
 	"neuralmail/internal/llm"
 	"neuralmail/internal/mcp"
+	"neuralmail/internal/observability"
 	"neuralmail/internal/policy"
 	"neuralmail/internal/queue"
 	"neuralmail/internal/store"
@@ -63,7 +67,10 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	}
 
 	toolSvc := tools.NewService(cfg, st, llmProvider, vectorStore, pol, embedder)
-	mcpServer := mcp.NewServer(cfg, toolSvc)
+	authSvc := auth.NewService(cfg, st)
+	entitlementObserver := observability.NewEntitlementObserver(log.Default())
+	entitlementSvc := entitlements.NewService(cfg, st, entitlementObserver)
+	mcpServer := mcp.NewServer(cfg, toolSvc, authSvc, entitlementSvc)
 
 	return &App{
 		Config:   cfg,

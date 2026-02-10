@@ -1,0 +1,9 @@
+default_unit_cost: 1
+tools:
+  list_threads: 1
+  get_thread: 1
+  search_inbox: 1
+  triage_message: 1
+  extract_to_schema: 1
+  draft_reply_with_policy: 1
+  send_reply: 1
