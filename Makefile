@@ -1,4 +1,4 @@
-.PHONY: up down logs seed mcp-test doctor
+.PHONY: up down logs seed mcp-test doctor cloud-e2e-test
 
 CONFIG ?= configs/dev/host.yaml
 GOCACHE ?= /tmp/go-build
@@ -23,3 +23,6 @@ mcp-test:
 
 doctor:
 	NM_CONFIG=$(CONFIG) $(GOENV) go run ./cmd/neuralmail doctor
+
+cloud-e2e-test:
+	$(GOENV) go test ./internal/cloudapi -run TestCloudE2EMatrix -count=1

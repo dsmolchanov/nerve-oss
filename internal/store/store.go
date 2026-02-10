@@ -30,6 +30,15 @@ type CloudAPIKey struct {
 	RevokedAt sql.NullTime
 }
 
+type ServiceToken struct {
+	ID        string
+	OrgID     string
+	Actor     string
+	Scopes    []string
+	ExpiresAt time.Time
+	RevokedAt sql.NullTime
+}
+
 type OrgEntitlement struct {
 	OrgID              string
 	PlanCode           string
@@ -1027,4 +1036,20 @@ func (s *Store) RevokeActiveServiceTokens(ctx context.Context, orgID string) err
 		  AND expires_at > now()
 	`, orgID)
 	return err
+}
+
+func (s *Store) GetServiceToken(ctx context.Context, tokenID string) (ServiceToken, error) {
+	var token ServiceToken
+	if tokenID == "" {
+		return token, sql.ErrNoRows
+	}
+	row := s.q.QueryRowContext(ctx, `
+		SELECT id, org_id, actor, scopes, expires_at, revoked_at
+		FROM service_tokens
+		WHERE id = $1
+	`, tokenID)
+	if err := row.Scan(&token.ID, &token.OrgID, &token.Actor, &token.Scopes, &token.ExpiresAt, &token.RevokedAt); err != nil {
+		return token, err
+	}
+	return token, nil
 }

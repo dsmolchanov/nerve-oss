@@ -22,12 +22,14 @@ var (
 )
 
 type CloudKeyLookupFunc func(ctx context.Context, keyHash string) (store.CloudAPIKey, error)
+type ServiceTokenLookupFunc func(ctx context.Context, tokenID string) (store.ServiceToken, error)
 
 type Service struct {
-	Config         config.Config
-	Store          *store.Store
-	Now            func() time.Time
-	LookupCloudKey CloudKeyLookupFunc
+	Config             config.Config
+	Store              *store.Store
+	Now                func() time.Time
+	LookupCloudKey     CloudKeyLookupFunc
+	LookupServiceToken ServiceTokenLookupFunc
 }
 
 func NewService(cfg config.Config, st *store.Store) *Service {
@@ -38,6 +40,7 @@ func NewService(cfg config.Config, st *store.Store) *Service {
 	}
 	if st != nil {
 		svc.LookupCloudKey = st.LookupCloudAPIKey
+		svc.LookupServiceToken = st.GetServiceToken
 	}
 	return svc
 }
@@ -45,7 +48,7 @@ func NewService(cfg config.Config, st *store.Store) *Service {
 func (s *Service) AuthenticateRequest(r *http.Request) (Principal, error) {
 	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
 	if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
-		return s.VerifyJWT(authHeader)
+		return s.VerifyJWT(r.Context(), authHeader)
 	}
 	if key := strings.TrimSpace(r.Header.Get("X-Nerve-Cloud-Key")); key != "" {
 		return s.VerifyCloudAPIKey(r.Context(), key)
@@ -53,7 +56,7 @@ func (s *Service) AuthenticateRequest(r *http.Request) (Principal, error) {
 	return Principal{}, ErrUnauthorized
 }
 
-func (s *Service) VerifyJWT(authHeader string) (Principal, error) {
+func (s *Service) VerifyJWT(ctx context.Context, authHeader string) (Principal, error) {
 	headerParts := strings.Fields(authHeader)
 	if len(headerParts) != 2 || !strings.EqualFold(headerParts[0], "Bearer") {
 		return Principal{}, ErrUnauthorized
@@ -81,14 +84,44 @@ func (s *Service) VerifyJWT(authHeader string) (Principal, error) {
 	if orgID == "" {
 		return Principal{}, ErrUnauthorized
 	}
+	tokenID := claimString(claims["jti"])
+	if servicePrincipal, ok, err := s.resolveServiceTokenPrincipal(ctx, tokenID); err != nil {
+		return Principal{}, err
+	} else if ok {
+		return servicePrincipal, nil
+	}
 
 	return Principal{
 		OrgID:      orgID,
 		ActorID:    claimString(claims["sub"]),
-		TokenID:    claimString(claims["jti"]),
+		TokenID:    tokenID,
 		Scopes:     extractScopes(claims["scope"]),
 		AuthMethod: "jwt",
 	}, nil
+}
+
+func (s *Service) resolveServiceTokenPrincipal(ctx context.Context, tokenID string) (Principal, bool, error) {
+	if tokenID == "" || s.LookupServiceToken == nil {
+		return Principal{}, false, nil
+	}
+	token, err := s.LookupServiceToken(ctx, tokenID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Principal{}, false, nil
+		}
+		return Principal{}, false, err
+	}
+	now := s.Now()
+	if token.RevokedAt.Valid || !token.ExpiresAt.After(now) {
+		return Principal{}, true, ErrUnauthorized
+	}
+	return Principal{
+		OrgID:      token.OrgID,
+		ActorID:    token.Actor,
+		TokenID:    token.ID,
+		Scopes:     token.Scopes,
+		AuthMethod: "jwt",
+	}, true, nil
 }
 
 func (s *Service) VerifyCloudAPIKey(ctx context.Context, key string) (Principal, error) {

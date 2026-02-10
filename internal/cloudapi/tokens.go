@@ -62,12 +62,13 @@ func (s *TokenService) IssueServiceToken(ctx context.Context, orgID string, acto
 	expiresAt := now.Add(ttl)
 	tokenID := uuid.NewString()
 	claims := map[string]any{
-		"org_id": orgID,
-		"sub":    actor,
-		"jti":    tokenID,
-		"scope":  scopes,
-		"iat":    now.Unix(),
-		"exp":    expiresAt.Unix(),
+		"org_id":    orgID,
+		"sub":       actor,
+		"jti":       tokenID,
+		"scope":     scopes,
+		"iat":       now.Unix(),
+		"exp":       expiresAt.Unix(),
+		"token_use": "service",
 	}
 	token, err := unsignedJWT(claims)
 	if err != nil {
