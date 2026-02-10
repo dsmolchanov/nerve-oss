@@ -2,21 +2,25 @@ package mcp
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	jwtlib "github.com/golang-jwt/jwt/v5"
+
 	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
 )
+
+const testSigningKey = "mcp-test-signing-key"
 
 func TestHandleHTTPCloudModeRequiresCredentials(t *testing.T) {
 	cfg := config.Default()
 	cfg.Dev.Mode = true
 	cfg.Cloud.Mode = true
+	cfg.Security.TokenSigningKey = testSigningKey
 
 	server := NewServer(cfg, nil, &auth.Service{
 		Config: cfg,
@@ -36,13 +40,14 @@ func TestHandleHTTPCloudModeRejectsInsufficientScope(t *testing.T) {
 	cfg := config.Default()
 	cfg.Dev.Mode = true
 	cfg.Cloud.Mode = true
+	cfg.Security.TokenSigningKey = testSigningKey
 
 	server := NewServer(cfg, nil, &auth.Service{
 		Config: cfg,
 		Now:    time.Now,
 	}, nil)
 
-	token := unsignedJWT(t, map[string]any{
+	token := signedJWT(t, jwtlib.MapClaims{
 		"org_id": "org-1",
 		"sub":    "user-1",
 		"jti":    "token-1",
@@ -98,15 +103,12 @@ func newInitializeRequest(t *testing.T, authorization string) *http.Request {
 	return req
 }
 
-func unsignedJWT(t *testing.T, claims map[string]any) string {
+func signedJWT(t *testing.T, claims jwtlib.MapClaims) string {
 	t.Helper()
-	headerBytes, err := json.Marshal(map[string]string{"alg": "none", "typ": "JWT"})
+	tok := jwtlib.NewWithClaims(jwtlib.SigningMethodHS256, claims)
+	signed, err := tok.SignedString([]byte(testSigningKey))
 	if err != nil {
-		t.Fatalf("marshal header: %v", err)
+		t.Fatalf("sign jwt: %v", err)
 	}
-	claimsBytes, err := json.Marshal(claims)
-	if err != nil {
-		t.Fatalf("marshal claims: %v", err)
-	}
-	return base64.RawURLEncoding.EncodeToString(headerBytes) + "." + base64.RawURLEncoding.EncodeToString(claimsBytes) + "."
+	return signed
 }

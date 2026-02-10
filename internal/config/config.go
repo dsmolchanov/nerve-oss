@@ -89,6 +89,7 @@ type Config struct {
 	} `yaml:"mcp"`
 	Security struct {
 		APIKey                  string   `yaml:"api_key"`
+		TokenSigningKey         string   `yaml:"token_signing_key"`
 		AllowOutbound           bool     `yaml:"allow_outbound"`
 		AllowSendWithWarnings   bool     `yaml:"allow_send_with_warnings"`
 		OutboundDomainAllowlist []string `yaml:"outbound_domain_allowlist"`
@@ -286,6 +287,9 @@ func applyEnv(cfg *Config) {
 	}
 	if v := os.Getenv("NM_API_KEY"); v != "" {
 		cfg.Security.APIKey = v
+	}
+	if v := os.Getenv("NERVE_TOKEN_SIGNING_KEY"); v != "" {
+		cfg.Security.TokenSigningKey = v
 	}
 	if v := os.Getenv("NM_ALLOW_OUTBOUND"); v != "" {
 		cfg.Security.AllowOutbound = parseBool(v, cfg.Security.AllowOutbound)

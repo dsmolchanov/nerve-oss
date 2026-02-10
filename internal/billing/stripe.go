@@ -259,7 +259,7 @@ func (s *StripeService) resolveOrgID(ctx context.Context, directOrgID, customerI
 func (s *StripeService) verifySignature(payload []byte, signatureHeader string) error {
 	secret := strings.TrimSpace(s.Config.Billing.StripeWebhookSecret)
 	if secret == "" {
-		return nil
+		return errors.New("stripe webhook secret not configured")
 	}
 
 	timestamp, signature, err := parseStripeSignatureHeader(signatureHeader)

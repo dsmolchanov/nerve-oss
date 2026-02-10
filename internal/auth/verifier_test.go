@@ -3,28 +3,31 @@ package auth
 import (
 	"context"
 	"database/sql"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
+
 	"neuralmail/internal/config"
 	"neuralmail/internal/store"
 )
+
+const testSigningKey = "test-signing-key-for-unit-tests"
 
 func TestAuthenticateRequestJWT(t *testing.T) {
 	cfg := config.Default()
 	cfg.Auth.Issuer = "https://auth.nerve.email"
 	cfg.Auth.Audience = "nerve-runtime"
+	cfg.Security.TokenSigningKey = testSigningKey
 
 	svc := &Service{
 		Config: cfg,
 		Now:    func() time.Time { return time.Unix(1000, 0) },
 	}
 
-	token := unsignedJWT(t, map[string]any{
+	token := signedJWT(t, jwt.MapClaims{
 		"iss":    "https://auth.nerve.email",
 		"aud":    "nerve-runtime",
 		"exp":    2000,
@@ -58,12 +61,13 @@ func TestAuthenticateRequestJWT(t *testing.T) {
 
 func TestAuthenticateRequestJWTRequiresOrgID(t *testing.T) {
 	cfg := config.Default()
+	cfg.Security.TokenSigningKey = testSigningKey
 	svc := &Service{
 		Config: cfg,
 		Now:    func() time.Time { return time.Unix(1000, 0) },
 	}
 
-	token := unsignedJWT(t, map[string]any{
+	token := signedJWT(t, jwt.MapClaims{
 		"exp": 2000,
 		"sub": "user-1",
 	})
@@ -115,6 +119,7 @@ func TestAuthenticateRequestCloudAPIKey(t *testing.T) {
 
 func TestAuthenticateRequestServiceJWTUsesStoreRecord(t *testing.T) {
 	cfg := config.Default()
+	cfg.Security.TokenSigningKey = testSigningKey
 	svc := &Service{
 		Config: cfg,
 		Now:    func() time.Time { return time.Unix(1000, 0) },
@@ -132,7 +137,7 @@ func TestAuthenticateRequestServiceJWTUsesStoreRecord(t *testing.T) {
 		},
 	}
 
-	token := unsignedJWT(t, map[string]any{
+	token := signedJWT(t, jwt.MapClaims{
 		"exp":    2000,
 		"org_id": "forged-org",
 		"sub":    "forged-subject",
@@ -160,6 +165,7 @@ func TestAuthenticateRequestServiceJWTUsesStoreRecord(t *testing.T) {
 
 func TestAuthenticateRequestServiceJWTRejectsRevokedToken(t *testing.T) {
 	cfg := config.Default()
+	cfg.Security.TokenSigningKey = testSigningKey
 	svc := &Service{
 		Config: cfg,
 		Now:    func() time.Time { return time.Unix(1000, 0) },
@@ -178,7 +184,7 @@ func TestAuthenticateRequestServiceJWTRejectsRevokedToken(t *testing.T) {
 		},
 	}
 
-	token := unsignedJWT(t, map[string]any{
+	token := signedJWT(t, jwt.MapClaims{
 		"exp":    2000,
 		"org_id": "org-1",
 		"sub":    "svc-actor",
@@ -208,15 +214,12 @@ func TestValidateScopes(t *testing.T) {
 	}
 }
 
-func unsignedJWT(t *testing.T, claims map[string]any) string {
+func signedJWT(t *testing.T, claims jwt.MapClaims) string {
 	t.Helper()
-	headerBytes, err := json.Marshal(map[string]string{"alg": "none", "typ": "JWT"})
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := tok.SignedString([]byte(testSigningKey))
 	if err != nil {
-		t.Fatalf("marshal header: %v", err)
+		t.Fatalf("sign jwt: %v", err)
 	}
-	claimsBytes, err := json.Marshal(claims)
-	if err != nil {
-		t.Fatalf("marshal claims: %v", err)
-	}
-	return base64.RawURLEncoding.EncodeToString(headerBytes) + "." + base64.RawURLEncoding.EncodeToString(claimsBytes) + "."
+	return signed
 }

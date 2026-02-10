@@ -3,12 +3,13 @@ package mcp
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	jwtlib "github.com/golang-jwt/jwt/v5"
 
 	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
@@ -69,13 +70,14 @@ func callToolWithEntitlementError(t *testing.T, entitlementErr error) Response {
 	cfg := config.Default()
 	cfg.Dev.Mode = true
 	cfg.Cloud.Mode = true
+	cfg.Security.TokenSigningKey = testSigningKey
 
 	server := NewServer(cfg, nil, &auth.Service{
 		Config: cfg,
 		Now:    time.Now,
 	}, &fakeEntitlementGate{preAuthErr: entitlementErr})
 
-	token := unsignedJWTClaims(t, map[string]any{
+	token := signedJWT(t, jwtlib.MapClaims{
 		"org_id": "org-1",
 		"sub":    "user-1",
 		"jti":    "tok-1",
@@ -140,17 +142,4 @@ func rpcRequest(t *testing.T, payload map[string]any, sessionID, token string) *
 		req.Header.Set("MCP-Session-Id", sessionID)
 	}
 	return req
-}
-
-func unsignedJWTClaims(t *testing.T, claims map[string]any) string {
-	t.Helper()
-	headerBytes, err := json.Marshal(map[string]string{"alg": "none", "typ": "JWT"})
-	if err != nil {
-		t.Fatalf("marshal header: %v", err)
-	}
-	claimsBytes, err := json.Marshal(claims)
-	if err != nil {
-		t.Fatalf("marshal claims: %v", err)
-	}
-	return base64.RawURLEncoding.EncodeToString(headerBytes) + "." + base64.RawURLEncoding.EncodeToString(claimsBytes) + "."
 }

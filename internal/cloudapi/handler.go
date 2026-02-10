@@ -154,14 +154,15 @@ func (h *Handler) handleCurrentSubscription(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	orgID := strings.TrimSpace(r.URL.Query().Get("org_id"))
-	if orgID == "" {
-		principal, err := h.authenticatePrincipal(r)
-		if err != nil {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		orgID = principal.OrgID
+	principal, err := h.authenticatePrincipal(r)
+	if err != nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	orgID := principal.OrgID
+	if qp := strings.TrimSpace(r.URL.Query().Get("org_id")); qp != "" && principal.AuthMethod == "bootstrap_key" {
+		orgID = qp
 	}
 	if orgID == "" {
 		http.Error(w, "missing org_id", http.StatusBadRequest)

@@ -3,12 +3,12 @@ package cloudapi
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 
 	"neuralmail/internal/store"
@@ -26,14 +26,16 @@ type ServiceTokenIssuer interface {
 }
 
 type TokenService struct {
-	Store *store.Store
-	Now   func() time.Time
+	Store      *store.Store
+	SigningKey []byte
+	Now        func() time.Time
 }
 
-func NewTokenService(st *store.Store) *TokenService {
+func NewTokenService(st *store.Store, signingKey string) *TokenService {
 	return &TokenService{
-		Store: st,
-		Now:   func() time.Time { return time.Now().UTC() },
+		Store:      st,
+		SigningKey: []byte(signingKey),
+		Now:        func() time.Time { return time.Now().UTC() },
 	}
 }
 
@@ -58,10 +60,14 @@ func (s *TokenService) IssueServiceToken(ctx context.Context, orgID string, acto
 		actor = "system"
 	}
 
+	if len(s.SigningKey) == 0 {
+		return issued, errors.New("token signing key not configured")
+	}
+
 	now := s.Now()
 	expiresAt := now.Add(ttl)
 	tokenID := uuid.NewString()
-	claims := map[string]any{
+	jwtClaims := jwt.MapClaims{
 		"org_id":    orgID,
 		"sub":       actor,
 		"jti":       tokenID,
@@ -70,7 +76,8 @@ func (s *TokenService) IssueServiceToken(ctx context.Context, orgID string, acto
 		"exp":       expiresAt.Unix(),
 		"token_use": "service",
 	}
-	token, err := unsignedJWT(claims)
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwtClaims)
+	token, err := tok.SignedString(s.SigningKey)
 	if err != nil {
 		return issued, err
 	}
@@ -108,18 +115,6 @@ func (s *TokenService) IssueServiceToken(ctx context.Context, orgID string, acto
 		Scopes:    scopes,
 	}
 	return issued, nil
-}
-
-func unsignedJWT(claims map[string]any) (string, error) {
-	headerBytes, err := json.Marshal(map[string]string{"alg": "none", "typ": "JWT"})
-	if err != nil {
-		return "", err
-	}
-	claimsBytes, err := json.Marshal(claims)
-	if err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(headerBytes) + "." + base64.RawURLEncoding.EncodeToString(claimsBytes) + ".", nil
 }
 
 func hashAny(value any) string {

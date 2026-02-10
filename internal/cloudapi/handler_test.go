@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -17,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	jwtlib "github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
@@ -25,6 +25,8 @@ import (
 	"neuralmail/internal/config"
 	"neuralmail/internal/store"
 )
+
+const testSigningKey = "test-signing-key-for-handler-tests"
 
 type stubBilling struct{}
 
@@ -53,6 +55,7 @@ func TestControlPlaneAuthPermissionModel(t *testing.T) {
 		cfg := config.Default()
 		cfg.Cloud.Mode = true
 		cfg.Security.APIKey = "bootstrap-admin"
+		cfg.Security.TokenSigningKey = testSigningKey
 		authSvc := &auth.Service{Config: cfg, Now: time.Now}
 		tokenStub := &stubTokenIssuer{}
 		handler := NewHandler(cfg, st, authSvc, &stubBilling{}, tokenStub)
@@ -60,7 +63,7 @@ func TestControlPlaneAuthPermissionModel(t *testing.T) {
 		mux := http.NewServeMux()
 		handler.RegisterRoutes(mux)
 
-		readonlyToken := unsignedJWTForTest(t, map[string]any{
+		readonlyToken := signedJWTForTest(t, jwtlib.MapClaims{
 			"org_id": "org-x",
 			"sub":    "user-x",
 			"jti":    "tok-x",
@@ -195,17 +198,14 @@ func jsonRequest(t *testing.T, method, target string, body any) *http.Request {
 	return req
 }
 
-func unsignedJWTForTest(t *testing.T, claims map[string]any) string {
+func signedJWTForTest(t *testing.T, claims jwtlib.MapClaims) string {
 	t.Helper()
-	headerBytes, err := json.Marshal(map[string]string{"alg": "none", "typ": "JWT"})
+	tok := jwtlib.NewWithClaims(jwtlib.SigningMethodHS256, claims)
+	signed, err := tok.SignedString([]byte(testSigningKey))
 	if err != nil {
-		t.Fatalf("marshal header: %v", err)
+		t.Fatalf("sign jwt: %v", err)
 	}
-	claimsBytes, err := json.Marshal(claims)
-	if err != nil {
-		t.Fatalf("marshal claims: %v", err)
-	}
-	return base64.RawURLEncoding.EncodeToString(headerBytes) + "." + base64.RawURLEncoding.EncodeToString(claimsBytes) + "."
+	return signed
 }
 
 func withTempStore(t *testing.T, run func(ctx context.Context, st *store.Store)) {

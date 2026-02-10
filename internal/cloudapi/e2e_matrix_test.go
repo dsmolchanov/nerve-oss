@@ -3,8 +3,12 @@ package cloudapi
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -27,7 +31,11 @@ import (
 	"neuralmail/internal/tools"
 )
 
-const bootstrapAdminAPIKey = "bootstrap-admin"
+const (
+	bootstrapAdminAPIKey   = "bootstrap-admin"
+	e2eTokenSigningKey     = "e2e-test-signing-key"
+	e2eStripeWebhookSecret = "whsec_e2e_test_secret"
+)
 
 type cloudE2EHarness struct {
 	ctx          context.Context
@@ -466,11 +474,12 @@ func newCloudE2EHarness(t *testing.T, ctx context.Context, st *store.Store) *clo
 	cfg.Dev.Mode = true
 	cfg.Cloud.Mode = true
 	cfg.Security.APIKey = bootstrapAdminAPIKey
-	cfg.Billing.StripeWebhookSecret = ""
+	cfg.Security.TokenSigningKey = e2eTokenSigningKey
+	cfg.Billing.StripeWebhookSecret = e2eStripeWebhookSecret
 
 	authSvc := auth.NewService(cfg, st)
 	billingSvc := billing.NewStripeService(cfg, st)
-	tokenSvc := NewTokenService(st)
+	tokenSvc := NewTokenService(st, e2eTokenSigningKey)
 
 	controlHandler := NewHandler(cfg, st, authSvc, billingSvc, tokenSvc)
 	controlMux := http.NewServeMux()
@@ -628,9 +637,33 @@ func (h *cloudE2EHarness) issueServiceToken(t *testing.T, orgID string, scopes [
 
 func (h *cloudE2EHarness) postStripeSubscriptionEvent(t *testing.T, event map[string]any) {
 	t.Helper()
-	status, raw := h.doJSONRequest(t, http.MethodPost, h.controlPlane.URL+"/v1/billing/webhook/stripe", "", event, "")
-	if status != http.StatusOK {
-		t.Fatalf("stripe webhook failed status=%d body=%s", status, string(raw))
+	payload, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal stripe event: %v", err)
+	}
+	timestamp := time.Now().Unix()
+	mac := hmac.New(sha256.New, []byte(e2eStripeWebhookSecret))
+	mac.Write([]byte(fmt.Sprintf("%d.%s", timestamp, string(payload))))
+	signature := hex.EncodeToString(mac.Sum(nil))
+	sigHeader := fmt.Sprintf("t=%d,v1=%s", timestamp, signature)
+
+	req, err := http.NewRequest(http.MethodPost, h.controlPlane.URL+"/v1/billing/webhook/stripe", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("create stripe webhook request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Stripe-Signature", sigHeader)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("execute stripe webhook: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read stripe webhook response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stripe webhook failed status=%d body=%s", resp.StatusCode, string(raw))
 	}
 }
 
