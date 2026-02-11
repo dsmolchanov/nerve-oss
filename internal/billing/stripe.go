@@ -8,6 +8,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +17,10 @@ import (
 	"neuralmail/internal/config"
 	"neuralmail/internal/store"
 )
+
+// stripePriceID is the lookup_key-based price for the Pro plan.
+// Stripe resolves this via lookup_key when creating checkout sessions.
+const stripePriceID = "price_1SzW5LDPvkk7SvtZKJImtxzx"
 
 const stripeProvider = "stripe"
 
@@ -350,6 +356,112 @@ func graceUntilForStatus(status string, periodEnd time.Time, graceDays int) sql.
 		graceDays = 1
 	}
 	return sql.NullTime{Time: periodEnd.Add(time.Duration(graceDays) * 24 * time.Hour), Valid: true}
+}
+
+// ── Checkout & Billing Portal (Stripe REST API) ────────────────
+
+type CheckoutResult struct {
+	CheckoutURL       string `json:"checkout_url"`
+	ClientReferenceID string `json:"client_reference_id"`
+}
+
+func (s *StripeService) CreateCheckoutSession(ctx context.Context, orgID, successURL, cancelURL string) (*CheckoutResult, error) {
+	sk := strings.TrimSpace(s.Config.Billing.StripeSecretKey)
+	if sk == "" {
+		return nil, errors.New("stripe secret key not configured")
+	}
+
+	form := "mode=subscription" +
+		"&client_reference_id=" + orgID +
+		"&line_items[0][price]=" + stripePriceID + "&line_items[0][quantity]=1" +
+		"&metadata[org_id]=" + orgID +
+		"&subscription_data[metadata][org_id]=" + orgID
+
+	if successURL != "" {
+		form += "&success_url=" + successURL
+	} else {
+		form += "&success_url=https://nerve.email/?checkout=success"
+	}
+	if cancelURL != "" {
+		form += "&cancel_url=" + cancelURL
+	} else {
+		form += "&cancel_url=https://nerve.email/?checkout=cancel"
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.stripe.com/v1/checkout/sessions", strings.NewReader(form))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth(sk, "")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return nil, errors.New("stripe checkout error: " + string(body))
+	}
+
+	var session struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(body, &session); err != nil {
+		return nil, err
+	}
+	return &CheckoutResult{
+		CheckoutURL:       session.URL,
+		ClientReferenceID: orgID,
+	}, nil
+}
+
+type PortalResult struct {
+	URL string `json:"url"`
+}
+
+func (s *StripeService) CreateBillingPortalSession(ctx context.Context, orgID string) (*PortalResult, error) {
+	sk := strings.TrimSpace(s.Config.Billing.StripeSecretKey)
+	if sk == "" {
+		return nil, errors.New("stripe secret key not configured")
+	}
+
+	// Find the Stripe customer ID for this org
+	customerID, err := s.Store.FindStripeCustomerByOrg(ctx, orgID)
+	if err != nil {
+		return nil, errors.New("no billing account found for this organization")
+	}
+
+	form := "customer=" + customerID +
+		"&return_url=https://nerve.email/billing"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.stripe.com/v1/billing_portal/sessions", strings.NewReader(form))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth(sk, "")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return nil, errors.New("stripe portal error: " + string(body))
+	}
+
+	var session struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(body, &session); err != nil {
+		return nil, err
+	}
+	return &PortalResult{URL: session.URL}, nil
 }
 
 func sha256Hex(payload []byte) string {

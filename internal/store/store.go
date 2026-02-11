@@ -904,6 +904,21 @@ func (s *Store) FindOrgByExternalSubscriptionID(ctx context.Context, externalSub
 	return orgID, nil
 }
 
+func (s *Store) FindStripeCustomerByOrg(ctx context.Context, orgID string) (string, error) {
+	row := s.q.QueryRowContext(ctx, `
+		SELECT external_customer_id
+		FROM subscriptions
+		WHERE org_id = $1 AND external_customer_id != ''
+		ORDER BY updated_at DESC
+		LIMIT 1
+	`, orgID)
+	var customerID string
+	if err := row.Scan(&customerID); err != nil {
+		return "", err
+	}
+	return customerID, nil
+}
+
 func (s *Store) UpsertOrgEntitlement(ctx context.Context, ent OrgEntitlement) error {
 	var grace any
 	if ent.GraceUntil.Valid {

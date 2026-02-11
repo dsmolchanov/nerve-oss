@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"neuralmail/internal/auth"
+	"neuralmail/internal/billing"
 	"neuralmail/internal/config"
 	"neuralmail/internal/store"
 )
@@ -22,23 +23,37 @@ type BillingWebhookProcessor interface {
 	ProcessWebhook(ctx context.Context, payload []byte, signatureHeader string) error
 }
 
+type BillingCheckoutProvider interface {
+	CreateCheckoutSession(ctx context.Context, orgID, successURL, cancelURL string) (*billingCheckoutResult, error)
+	CreateBillingPortalSession(ctx context.Context, orgID string) (*billingPortalResult, error)
+}
+
+type billingCheckoutResult = billing.CheckoutResult
+type billingPortalResult = billing.PortalResult
+
 type Handler struct {
 	Config config.Config
 	Store  *store.Store
 	Auth   *auth.Service
 
-	Billing BillingWebhookProcessor
-	Tokens  ServiceTokenIssuer
+	Billing  BillingWebhookProcessor
+	Checkout BillingCheckoutProvider
+	Tokens   ServiceTokenIssuer
 }
 
 func NewHandler(cfg config.Config, st *store.Store, authSvc *auth.Service, billingSvc BillingWebhookProcessor, tokenSvc ServiceTokenIssuer) *Handler {
-	return &Handler{
+	h := &Handler{
 		Config:  cfg,
 		Store:   st,
 		Auth:    authSvc,
 		Billing: billingSvc,
 		Tokens:  tokenSvc,
 	}
+	// If the billing service also implements checkout/portal, wire it up.
+	if cp, ok := billingSvc.(BillingCheckoutProvider); ok {
+		h.Checkout = cp
+	}
+	return h
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
@@ -120,10 +135,24 @@ func (h *Handler) handleCheckout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	checkoutURL := fmt.Sprintf("https://checkout.stripe.com/pay/mock?client_reference_id=%s", req.OrgID)
+	if h.Checkout == nil {
+		// Fallback mock for tests
+		checkoutURL := fmt.Sprintf("https://checkout.stripe.com/pay/mock?client_reference_id=%s", req.OrgID)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"checkout_url":        checkoutURL,
+			"client_reference_id": req.OrgID,
+		})
+		return
+	}
+
+	result, err := h.Checkout.CreateCheckoutSession(r.Context(), req.OrgID, "", "")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"checkout_url":        checkoutURL,
-		"client_reference_id": req.OrgID,
+		"checkout_url":        result.CheckoutURL,
+		"client_reference_id": result.ClientReferenceID,
 	})
 }
 
@@ -260,8 +289,19 @@ func (h *Handler) handleBillingPortal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing org_id", http.StatusBadRequest)
 		return
 	}
-	portalURL := fmt.Sprintf("https://billing.stripe.com/p/session/mock?org_id=%s", req.OrgID)
-	writeJSON(w, http.StatusOK, map[string]any{"url": portalURL})
+	if h.Checkout == nil {
+		// Fallback mock for tests
+		portalURL := fmt.Sprintf("https://billing.stripe.com/p/session/mock?org_id=%s", req.OrgID)
+		writeJSON(w, http.StatusOK, map[string]any{"url": portalURL})
+		return
+	}
+
+	result, err := h.Checkout.CreateBillingPortalSession(r.Context(), req.OrgID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"url": result.URL})
 }
 
 func (h *Handler) requireBillingAdmin(r *http.Request) (auth.Principal, error) {
