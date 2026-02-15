@@ -163,7 +163,7 @@ type Thread struct {
 	Participants     []Participant
 	UpdatedAt        time.Time
 	SentimentScore   *float64
-	PriorityLevel    string
+	PriorityLevel    *string
 	ProviderThreadID string
 }
 

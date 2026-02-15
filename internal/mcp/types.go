@@ -41,6 +41,7 @@ func ListTools() map[string]any {
 			{"name": "extract_to_schema", "description": "Extract structured data"},
 			{"name": "draft_reply_with_policy", "description": "Draft a reply constrained by policy"},
 			{"name": "send_reply", "description": "Send a reply"},
+			{"name": "compose_email", "description": "Compose and send a new email (not a reply)"},
 		},
 	}
 }

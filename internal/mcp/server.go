@@ -262,6 +262,19 @@ func (s *Server) toolExecutor(params ToolCallParams) (func(context.Context) (any
 		return func(ctx context.Context) (any, error) {
 			return s.Tools.SendReply(ctx, input.ThreadID, input.Body, input.NeedsApproval)
 		}, nil
+	case "compose_email":
+		var input struct {
+			InboxID string `json:"inbox_id"`
+			To      string `json:"to"`
+			Subject string `json:"subject"`
+			Body    string `json:"body"`
+		}
+		if err := json.Unmarshal(params.Arguments, &input); err != nil {
+			return nil, err
+		}
+		return func(ctx context.Context) (any, error) {
+			return s.Tools.ComposeEmail(ctx, input.InboxID, input.To, input.Subject, input.Body)
+		}, nil
 	default:
 		return nil, fmt.Errorf("unknown tool: %s", params.Name)
 	}
@@ -399,7 +412,7 @@ func (s *Server) requiredScope(req Request) string {
 			return "nerve:email.search"
 		case "triage_message", "extract_to_schema", "draft_reply_with_policy":
 			return "nerve:email.draft"
-		case "send_reply":
+		case "send_reply", "compose_email":
 			return "nerve:email.send"
 		default:
 			return "nerve:email.read"

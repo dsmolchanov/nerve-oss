@@ -331,6 +331,69 @@ func (s *Service) SendReply(ctx context.Context, threadID string, body string, n
 	})
 }
 
+func (s *Service) ComposeEmail(ctx context.Context, inboxID, toAddress, subject, body string) (any, error) {
+	if subject == "" {
+		return nil, errors.New("missing subject")
+	}
+	if body == "" {
+		return nil, errors.New("missing body")
+	}
+	if toAddress == "" {
+		return nil, errors.New("missing recipient")
+	}
+	if inboxID == "" {
+		return nil, errors.New("missing inbox_id")
+	}
+
+	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
+		if principal.OrgID != "" {
+			if err := s.ensureInboxBelongsToOrg(scopedCtx, st, principal.OrgID, inboxID); err != nil {
+				return nil, err
+			}
+		}
+
+		from := s.Config.SMTP.From
+		if from == "" {
+			from = "dev@local.neuralmail"
+		}
+
+		if !s.Config.Security.AllowOutbound && !strings.HasSuffix(toAddress, "@local.neuralmail") {
+			return nil, errors.New("outbound disabled for non-local domains")
+		}
+		if len(s.Config.Security.OutboundDomainAllowlist) > 0 && !domainAllowed(toAddress, s.Config.Security.OutboundDomainAllowlist) {
+			return nil, errors.New("recipient domain not allowlisted")
+		}
+
+		msg := store.Message{
+			Direction: "outbound",
+			Subject:   subject,
+			Text:      body,
+			CreatedAt: time.Now().UTC(),
+			From:      store.Participant{Email: from},
+			To:        []store.Participant{{Email: toAddress}},
+		}
+
+		providerThreadID := fmt.Sprintf("compose-%d", time.Now().UnixNano())
+		threadID, msgID, err := st.InsertMessageWithThread(scopedCtx, inboxID, providerThreadID, msg)
+		if err != nil {
+			return nil, err
+		}
+
+		smtpErr := s.sendSMTP(from, toAddress, subject, body)
+		status := "sent"
+		result := map[string]any{
+			"thread_id":  threadID,
+			"message_id": msgID,
+		}
+		if smtpErr != nil {
+			status = "queued"
+			result["smtp_error"] = smtpErr.Error()
+		}
+		result["status"] = status
+		return result, nil
+	})
+}
+
 func domainAllowed(addr string, allowlist []string) bool {
 	parts := strings.Split(addr, "@")
 	if len(parts) != 2 {
