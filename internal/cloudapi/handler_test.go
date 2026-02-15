@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -25,6 +26,7 @@ import (
 
 	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
+	"neuralmail/internal/domains"
 	"neuralmail/internal/store"
 )
 
@@ -400,6 +402,143 @@ func TestOrgRuntimeConfigGetAndPut(t *testing.T) {
 		mux.ServeHTTP(rec, invalidReq)
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("expected invalid endpoint rejection, got %d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+type stubTXTResolver struct {
+	records map[string][]string
+}
+
+func (s stubTXTResolver) LookupTXT(_ context.Context, name string) ([]string, error) {
+	if s.records == nil {
+		s.records = map[string][]string{}
+	}
+	if recs, ok := s.records[name]; ok {
+		return recs, nil
+	}
+	return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+}
+
+func TestOrgDomainsCreateListDNSVerifyAndDelete(t *testing.T) {
+	withTempStore(t, func(ctx context.Context, st *store.Store) {
+		cfg := config.Default()
+		cfg.Security.APIKey = "bootstrap-admin"
+		handler := NewHandler(cfg, st, &auth.Service{Config: cfg, Now: time.Now}, &stubBilling{}, &stubTokenIssuer{})
+		mux := http.NewServeMux()
+		handler.RegisterRoutes(mux)
+
+		orgID, err := st.CreateOrg(ctx, "domains-org")
+		if err != nil {
+			t.Fatalf("create org: %v", err)
+		}
+
+		createReq := jsonRequest(t, http.MethodPost, "/v1/domains", map[string]any{
+			"org_id": orgID,
+			"domain": "acme.com",
+		})
+		createReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, createReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected domain create success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+		var created struct {
+			Domain struct {
+				ID                string `json:"id"`
+				Domain            string `json:"domain"`
+				Status            string `json:"status"`
+				VerificationToken string `json:"verification_token"`
+				DNSRecords        []struct {
+					Type  string `json:"type"`
+					Host  string `json:"host"`
+					Value string `json:"value"`
+				} `json:"dns_records"`
+			} `json:"domain"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+			t.Fatalf("decode domain create response: %v", err)
+		}
+		if created.Domain.ID == "" || created.Domain.Domain != "acme.com" {
+			t.Fatalf("unexpected created domain payload: %+v", created.Domain)
+		}
+		if created.Domain.Status != "pending" {
+			t.Fatalf("expected status 'pending', got %q", created.Domain.Status)
+		}
+		if created.Domain.VerificationToken == "" {
+			t.Fatalf("expected non-empty verification_token")
+		}
+		if len(created.Domain.DNSRecords) != 1 || created.Domain.DNSRecords[0].Host != domains.OwnershipTXTLabel {
+			t.Fatalf("expected one DNS record for ownership, got %+v", created.Domain.DNSRecords)
+		}
+		if created.Domain.DNSRecords[0].Value != created.Domain.VerificationToken {
+			t.Fatalf("expected dns record value to match verification token")
+		}
+
+		listReq, err := http.NewRequest(http.MethodGet, "/v1/domains?org_id="+url.QueryEscape(orgID), nil)
+		if err != nil {
+			t.Fatalf("build list request: %v", err)
+		}
+		listReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, listReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected domain list success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+
+		dnsReq, err := http.NewRequest(http.MethodGet, "/v1/domains/dns?org_id="+url.QueryEscape(orgID)+"&domain_id="+url.QueryEscape(created.Domain.ID), nil)
+		if err != nil {
+			t.Fatalf("build dns request: %v", err)
+		}
+		dnsReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, dnsReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected dns instructions success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+
+		// Verify: stub DNS resolver to return the token at _nerve-verify.acme.com.
+		txtName := domains.OwnershipTXTLabel + ".acme.com"
+		handler.Domains = domains.NewVerifier(stubTXTResolver{
+			records: map[string][]string{
+				txtName: {created.Domain.VerificationToken},
+			},
+		})
+		verifyReq := jsonRequest(t, http.MethodPost, "/v1/domains/verify", map[string]any{
+			"org_id":    orgID,
+			"domain_id": created.Domain.ID,
+		})
+		verifyReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, verifyReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected verify success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+		var verified struct {
+			Domain struct {
+				Status string `json:"status"`
+			} `json:"domain"`
+			Checks map[string]any `json:"checks"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &verified); err != nil {
+			t.Fatalf("decode verify response: %v", err)
+		}
+		if verified.Domain.Status != "active" {
+			t.Fatalf("expected status 'active', got %q", verified.Domain.Status)
+		}
+		if ok, _ := verified.Checks["ownership_verified"].(bool); !ok {
+			t.Fatalf("expected ownership_verified=true, got %+v", verified.Checks)
+		}
+
+		deleteReq, err := http.NewRequest(http.MethodDelete, "/v1/domains/"+created.Domain.ID+"?org_id="+url.QueryEscape(orgID), nil)
+		if err != nil {
+			t.Fatalf("build delete request: %v", err)
+		}
+		deleteReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, deleteReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected delete success, got %d body=%s", rec.Code, rec.Body.String())
 		}
 	})
 }

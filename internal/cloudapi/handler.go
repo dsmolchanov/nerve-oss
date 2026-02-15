@@ -15,13 +15,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"neuralmail/internal/auth"
 	"neuralmail/internal/billing"
 	"neuralmail/internal/config"
+	"neuralmail/internal/domains"
 	"neuralmail/internal/store"
 )
 
 var ErrMaxInboxesExceeded = errors.New("max inboxes exceeded")
+var ErrMaxDomainsExceeded = errors.New("max domains exceeded")
 
 type BillingWebhookProcessor interface {
 	ProcessWebhook(ctx context.Context, payload []byte, signatureHeader string) error
@@ -43,6 +47,7 @@ type Handler struct {
 	Billing  BillingWebhookProcessor
 	Checkout BillingCheckoutProvider
 	Tokens   ServiceTokenIssuer
+	Domains  *domains.Verifier
 }
 
 func NewHandler(cfg config.Config, st *store.Store, authSvc *auth.Service, billingSvc BillingWebhookProcessor, tokenSvc ServiceTokenIssuer) *Handler {
@@ -52,6 +57,7 @@ func NewHandler(cfg config.Config, st *store.Store, authSvc *auth.Service, billi
 		Auth:    authSvc,
 		Billing: billingSvc,
 		Tokens:  tokenSvc,
+		Domains: domains.NewVerifier(nil),
 	}
 	// If the billing service also implements checkout/portal, wire it up.
 	if cp, ok := billingSvc.(BillingCheckoutProvider); ok {
@@ -69,6 +75,10 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/tokens/service", h.handleIssueServiceToken)
 	mux.HandleFunc("/v1/keys", h.handleCloudAPIKeys)
 	mux.HandleFunc("/v1/keys/", h.handleCloudAPIKeyByID)
+	mux.HandleFunc("/v1/domains", h.handleDomains)
+	mux.HandleFunc("/v1/domains/", h.handleDomainByID)
+	mux.HandleFunc("/v1/domains/verify", h.handleVerifyDomain)
+	mux.HandleFunc("/v1/domains/dns", h.handleDomainDNS)
 	mux.HandleFunc("/v1/billing/portal", h.handleBillingPortal)
 }
 
@@ -369,6 +379,31 @@ type cloudAPIKeyResponse struct {
 	RevokedAt *time.Time `json:"revoked_at,omitempty"`
 }
 
+type orgDomainResponse struct {
+	ID                string            `json:"id"`
+	Domain            string            `json:"domain"`
+	Status            string            `json:"status"`
+	VerificationToken string            `json:"verification_token,omitempty"`
+	DNSRecords        []domains.DNSRecord `json:"dns_records,omitempty"`
+	MXVerified        bool              `json:"mx_verified"`
+	SPFVerified       bool              `json:"spf_verified"`
+	DKIMVerified      bool              `json:"dkim_verified"`
+	DMARCVerified     bool              `json:"dmarc_verified"`
+	InboundEnabled    bool              `json:"inbound_enabled"`
+	DKIMSelector      string            `json:"dkim_selector"`
+	DKIMMethod        string            `json:"dkim_method"`
+	LastCheckAt       *time.Time        `json:"last_check_at,omitempty"`
+	VerifiedAt        *time.Time        `json:"verified_at,omitempty"`
+	ExpiresAt         *time.Time        `json:"expires_at,omitempty"`
+	CreatedAt         time.Time         `json:"created_at"`
+	UpdatedAt         time.Time         `json:"updated_at"`
+}
+
+type domainVerifyResponse struct {
+	Domain orgDomainResponse `json:"domain"`
+	Checks map[string]any    `json:"checks"`
+}
+
 func (h *Handler) handleCloudAPIKeys(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
@@ -516,6 +551,379 @@ func (h *Handler) handleListCloudAPIKeys(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]any{"keys": response})
 }
 
+func (h *Handler) EnforceDomainLimit(ctx context.Context, orgID string) error {
+	if h == nil || h.Store == nil || orgID == "" {
+		return nil
+	}
+	ent, err := h.Store.GetOrgEntitlement(ctx, orgID)
+	if err != nil {
+		return err
+	}
+	if ent.MaxDomains <= 0 {
+		return nil
+	}
+	count, err := h.Store.CountDomainsByOrg(ctx, orgID)
+	if err != nil {
+		return err
+	}
+	if count >= ent.MaxDomains {
+		return ErrMaxDomainsExceeded
+	}
+	return nil
+}
+
+func (h *Handler) handleDomains(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		h.handleCreateDomain(w, r)
+	case http.MethodGet:
+		h.handleListDomains(w, r)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) handleDomainByID(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	principal, err := h.requireBillingAdmin(r)
+	if err != nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	domainID := strings.TrimPrefix(r.URL.Path, "/v1/domains/")
+	if domainID == "" || strings.Contains(domainID, "/") {
+		http.Error(w, "missing domain id", http.StatusBadRequest)
+		return
+	}
+
+	orgID, err := resolveOrgIDForPrincipal(principal, strings.TrimSpace(r.URL.Query().Get("org_id")))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	deleted, err := h.Store.DeleteOrgDomainForOrg(r.Context(), orgID, domainID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !deleted {
+		http.Error(w, "domain not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted"})
+}
+
+func (h *Handler) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
+	principal, err := h.requireBillingAdmin(r)
+	if err != nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	var req struct {
+		OrgID      string `json:"org_id"`
+		Domain     string `json:"domain"`
+		DKIMMethod string `json:"dkim_method,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	orgID, err := resolveOrgIDForPrincipal(principal, strings.TrimSpace(req.OrgID))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	canonical, err := domains.CanonicalizeDomain(req.Domain)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := h.EnforceDomainLimit(r.Context(), orgID); err != nil {
+		if errors.Is(err, ErrMaxDomainsExceeded) {
+			http.Error(w, "max domains exceeded", http.StatusForbidden)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	_, _ = h.Store.ExpirePendingDomains(r.Context())
+
+	verificationToken, err := generateDomainVerificationToken()
+	if err != nil {
+		http.Error(w, "failed to generate verification token", http.StatusInternalServerError)
+		return
+	}
+
+	dkimMethod := strings.TrimSpace(req.DKIMMethod)
+	if dkimMethod == "" {
+		dkimMethod = "cname"
+	}
+	if dkimMethod != "cname" && dkimMethod != "txt" {
+		http.Error(w, "invalid dkim_method", http.StatusBadRequest)
+		return
+	}
+
+	domainID, err := h.Store.CreateOrgDomain(
+		r.Context(),
+		orgID,
+		canonical,
+		verificationToken,
+		"nerve",
+		"",
+		"",
+		dkimMethod,
+	)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	created, err := h.Store.GetOrgDomainByIDForOrg(r.Context(), orgID, domainID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp := orgDomainResponse{
+		ID:                created.ID,
+		Domain:            created.Domain,
+		Status:            created.Status,
+		VerificationToken: created.VerificationToken,
+		DNSRecords:        domains.DNSInstructions(created.VerificationToken),
+		MXVerified:        created.MXVerified,
+		SPFVerified:       created.SPFVerified,
+		DKIMVerified:      created.DKIMVerified,
+		DMARCVerified:     created.DMARCVerified,
+		InboundEnabled:    created.InboundEnabled,
+		DKIMSelector:      created.DKIMSelector,
+		DKIMMethod:        created.DKIMMethod,
+		CreatedAt:         created.CreatedAt,
+		UpdatedAt:         created.UpdatedAt,
+	}
+	if created.LastCheckAt.Valid {
+		tm := created.LastCheckAt.Time
+		resp.LastCheckAt = &tm
+	}
+	if created.VerifiedAt.Valid {
+		tm := created.VerifiedAt.Time
+		resp.VerifiedAt = &tm
+	}
+	if created.ExpiresAt.Valid {
+		tm := created.ExpiresAt.Time
+		resp.ExpiresAt = &tm
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"domain": resp})
+}
+
+func (h *Handler) handleListDomains(w http.ResponseWriter, r *http.Request) {
+	principal, err := h.requireBillingAdmin(r)
+	if err != nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	orgID, err := resolveOrgIDForPrincipal(principal, strings.TrimSpace(r.URL.Query().Get("org_id")))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	items, err := h.Store.ListOrgDomains(r.Context(), orgID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp := make([]orgDomainResponse, 0, len(items))
+	for _, item := range items {
+		out := orgDomainResponse{
+			ID:             item.ID,
+			Domain:         item.Domain,
+			Status:         item.Status,
+			MXVerified:     item.MXVerified,
+			SPFVerified:    item.SPFVerified,
+			DKIMVerified:   item.DKIMVerified,
+			DMARCVerified:  item.DMARCVerified,
+			InboundEnabled: item.InboundEnabled,
+			DKIMSelector:   item.DKIMSelector,
+			DKIMMethod:     item.DKIMMethod,
+			CreatedAt:      item.CreatedAt,
+			UpdatedAt:      item.UpdatedAt,
+		}
+		if item.LastCheckAt.Valid {
+			tm := item.LastCheckAt.Time
+			out.LastCheckAt = &tm
+		}
+		if item.VerifiedAt.Valid {
+			tm := item.VerifiedAt.Time
+			out.VerifiedAt = &tm
+		}
+		if item.ExpiresAt.Valid {
+			tm := item.ExpiresAt.Time
+			out.ExpiresAt = &tm
+		}
+		resp = append(resp, out)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"domains": resp})
+}
+
+func (h *Handler) handleDomainDNS(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	principal, err := h.requireBillingAdmin(r)
+	if err != nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	orgID, err := resolveOrgIDForPrincipal(principal, strings.TrimSpace(r.URL.Query().Get("org_id")))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	domainID := strings.TrimSpace(r.URL.Query().Get("domain_id"))
+	if domainID == "" {
+		http.Error(w, "missing domain_id", http.StatusBadRequest)
+		return
+	}
+
+	d, err := h.Store.GetOrgDomainByIDForOrg(r.Context(), orgID, domainID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "domain not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"domain_id":   d.ID,
+		"domain":      d.Domain,
+		"dns_records": domains.DNSInstructions(d.VerificationToken),
+	})
+}
+
+func (h *Handler) handleVerifyDomain(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	principal, err := h.requireBillingAdmin(r)
+	if err != nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	var req struct {
+		OrgID    string `json:"org_id"`
+		DomainID string `json:"domain_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	orgID, err := resolveOrgIDForPrincipal(principal, strings.TrimSpace(req.OrgID))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	domainID := strings.TrimSpace(req.DomainID)
+	if domainID == "" {
+		http.Error(w, "missing domain_id", http.StatusBadRequest)
+		return
+	}
+
+	d, err := h.Store.GetOrgDomainByIDForOrg(r.Context(), orgID, domainID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "domain not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if h.Domains == nil {
+		h.Domains = domains.NewVerifier(nil)
+	}
+
+	result := h.Domains.VerifyOwnership(r.Context(), d.Domain, d.VerificationToken)
+	status := d.Status
+	if result.Verified {
+		status = "active"
+	}
+
+	if err := h.Store.UpdateOrgDomainVerification(r.Context(), d.ID, false, false, false, false, status); err != nil {
+		if isUniqueViolation(err) {
+			http.Error(w, "domain already verified by another org", http.StatusConflict)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	updated, err := h.Store.GetOrgDomainByIDForOrg(r.Context(), orgID, d.ID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	out := orgDomainResponse{
+		ID:             updated.ID,
+		Domain:         updated.Domain,
+		Status:         updated.Status,
+		MXVerified:     updated.MXVerified,
+		SPFVerified:    updated.SPFVerified,
+		DKIMVerified:   updated.DKIMVerified,
+		DMARCVerified:  updated.DMARCVerified,
+		InboundEnabled: updated.InboundEnabled,
+		DKIMSelector:   updated.DKIMSelector,
+		DKIMMethod:     updated.DKIMMethod,
+		CreatedAt:      updated.CreatedAt,
+		UpdatedAt:      updated.UpdatedAt,
+	}
+	if updated.LastCheckAt.Valid {
+		tm := updated.LastCheckAt.Time
+		out.LastCheckAt = &tm
+	}
+	if updated.VerifiedAt.Valid {
+		tm := updated.VerifiedAt.Time
+		out.VerifiedAt = &tm
+	}
+	if updated.ExpiresAt.Valid {
+		tm := updated.ExpiresAt.Time
+		out.ExpiresAt = &tm
+	}
+
+	writeJSON(w, http.StatusOK, domainVerifyResponse{
+		Domain: out,
+		Checks: map[string]any{
+			"ownership_verified": result.Verified,
+			"details":            result.Details,
+		},
+	})
+}
+
 func (h *Handler) handleBillingPortal(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -652,6 +1060,22 @@ func normalizeMCPEndpoint(raw string) (string, error) {
 	parsed.RawPath = ""
 
 	return parsed.String(), nil
+}
+
+func generateDomainVerificationToken() (string, error) {
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return "", err
+	}
+	return "nerve-verification=" + hex.EncodeToString(random), nil
+}
+
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "23505"
+	}
+	return false
 }
 
 func ioReadAll(r *http.Request) ([]byte, error) {

@@ -82,6 +82,23 @@ func (s *Store) GetOrgDomainByID(ctx context.Context, id string) (OrgDomain, err
 	return d, nil
 }
 
+// GetOrgDomainByIDForOrg retrieves a domain by UUID, scoped to an org.
+func (s *Store) GetOrgDomainByIDForOrg(ctx context.Context, orgID, id string) (OrgDomain, error) {
+	var d OrgDomain
+	row := s.q.QueryRowContext(ctx, `
+		SELECT id, org_id, domain, status, verification_token,
+		       mx_verified, spf_verified, dkim_verified, dmarc_verified,
+		       inbound_enabled, dkim_selector, dkim_private_key_enc, dkim_public_key,
+		       dkim_method, last_check_at, verified_at, expires_at, created_at, updated_at
+		FROM org_domains
+		WHERE id = $1 AND org_id = $2
+	`, id, orgID)
+	if err := scanOrgDomain(row, &d); err != nil {
+		return d, err
+	}
+	return d, nil
+}
+
 // ListOrgDomains returns all domains for an org.
 func (s *Store) ListOrgDomains(ctx context.Context, orgID string) ([]OrgDomain, error) {
 	rows, err := s.q.QueryContext(ctx, `
@@ -119,7 +136,9 @@ func (s *Store) UpdateOrgDomainVerification(ctx context.Context, id string, mx, 
 	_, err := s.q.ExecContext(ctx, `
 		UPDATE org_domains
 		SET mx_verified = $2, spf_verified = $3, dkim_verified = $4, dmarc_verified = $5,
-		    status = $6, last_check_at = now(), updated_at = now()
+		    status = $6, last_check_at = now(),
+		    verified_at = CASE WHEN $6 IN ('verified_dns', 'active') THEN now() ELSE verified_at END,
+		    updated_at = now()
 		WHERE id = $1
 	`, id, mx, spf, dkim, dmarc, status)
 	return err
@@ -139,6 +158,20 @@ func (s *Store) UpdateOrgDomainStatus(ctx context.Context, id string, status str
 func (s *Store) DeleteOrgDomain(ctx context.Context, id string) error {
 	_, err := s.q.ExecContext(ctx, `DELETE FROM org_domains WHERE id = $1`, id)
 	return err
+}
+
+// DeleteOrgDomainForOrg removes a domain registration, scoped to an org.
+// Returns true if a row was deleted.
+func (s *Store) DeleteOrgDomainForOrg(ctx context.Context, orgID, id string) (bool, error) {
+	result, err := s.q.ExecContext(ctx, `DELETE FROM org_domains WHERE id = $1 AND org_id = $2`, id, orgID)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // GetOrgDomainForSending retrieves the active domain + encrypted DKIM key for a given email address domain.
