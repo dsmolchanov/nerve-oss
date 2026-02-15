@@ -21,6 +21,7 @@ import (
 	"neuralmail/internal/billing"
 	"neuralmail/internal/config"
 	"neuralmail/internal/domains"
+	"neuralmail/internal/emailaddr"
 	"neuralmail/internal/store"
 )
 
@@ -79,6 +80,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/domains/", h.handleDomainByID)
 	mux.HandleFunc("/v1/domains/verify", h.handleVerifyDomain)
 	mux.HandleFunc("/v1/domains/dns", h.handleDomainDNS)
+	mux.HandleFunc("/v1/inboxes", h.handleInboxes)
 	mux.HandleFunc("/v1/billing/portal", h.handleBillingPortal)
 }
 
@@ -402,6 +404,14 @@ type orgDomainResponse struct {
 type domainVerifyResponse struct {
 	Domain orgDomainResponse `json:"domain"`
 	Checks map[string]any    `json:"checks"`
+}
+
+type inboxResponse struct {
+	ID          string    `json:"id"`
+	Address     string    `json:"address"`
+	Status      string    `json:"status"`
+	OrgDomainID *string   `json:"org_domain_id,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 func (h *Handler) handleCloudAPIKeys(w http.ResponseWriter, r *http.Request) {
@@ -924,6 +934,142 @@ func (h *Handler) handleVerifyDomain(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) handleInboxes(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		h.handleCreateInbox(w, r)
+	case http.MethodGet:
+		h.handleListInboxes(w, r)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) handleCreateInbox(w http.ResponseWriter, r *http.Request) {
+	principal, err := h.requireBillingAdmin(r)
+	if err != nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	var req struct {
+		OrgID   string `json:"org_id"`
+		Address string `json:"address"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	orgID, err := resolveOrgIDForPrincipal(principal, strings.TrimSpace(req.OrgID))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	canonical, _, domainPart, err := emailaddr.Canonicalize(req.Address)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := h.EnforceInboxLimit(r.Context(), orgID); err != nil {
+		if errors.Is(err, ErrMaxInboxesExceeded) {
+			http.Error(w, "max inboxes exceeded", http.StatusForbidden)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if existing, err := h.Store.GetInboxByAddress(r.Context(), canonical); err == nil && existing.ID != "" {
+		http.Error(w, "inbox already exists", http.StatusConflict)
+		return
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	orgDomainID := ""
+	if h.Config.Cloud.Mode {
+		d, err := h.Store.GetOrgDomainForSending(r.Context(), domainPart)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				http.Error(w, "domain not verified", http.StatusBadRequest)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if d.OrgID != orgID {
+			// Don't leak domain ownership information.
+			http.Error(w, "domain not verified", http.StatusBadRequest)
+			return
+		}
+		orgDomainID = d.ID
+	}
+
+	created, err := h.Store.CreateInboxForOrg(r.Context(), orgID, canonical, orgDomainID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	var domainID *string
+	if created.OrgDomainID.Valid {
+		v := created.OrgDomainID.String
+		domainID = &v
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"inbox": inboxResponse{
+			ID:          created.ID,
+			Address:     created.Address,
+			Status:      created.Status,
+			OrgDomainID: domainID,
+			CreatedAt:   created.CreatedAt,
+		},
+	})
+}
+
+func (h *Handler) handleListInboxes(w http.ResponseWriter, r *http.Request) {
+	principal, err := h.requireBillingAdmin(r)
+	if err != nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	orgID, err := resolveOrgIDForPrincipal(principal, strings.TrimSpace(r.URL.Query().Get("org_id")))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	items, err := h.Store.ListInboxRecordsByOrg(r.Context(), orgID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp := make([]inboxResponse, 0, len(items))
+	for _, item := range items {
+		var domainID *string
+		if item.OrgDomainID.Valid {
+			v := item.OrgDomainID.String
+			domainID = &v
+		}
+		resp = append(resp, inboxResponse{
+			ID:          item.ID,
+			Address:     item.Address,
+			Status:      item.Status,
+			OrgDomainID: domainID,
+			CreatedAt:   item.CreatedAt,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"inboxes": resp})
+}
+
 func (h *Handler) handleBillingPortal(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1008,7 +1154,7 @@ func resolveOrgIDForPrincipal(principal auth.Principal, orgIDCandidate string) (
 
 func allowedCloudKeyScope(scope string) bool {
 	switch scope {
-	case "nerve:email.read", "nerve:email.search", "nerve:email.draft", "nerve:email.send":
+	case "nerve:email.read", "nerve:email.search", "nerve:email.draft", "nerve:email.send", "nerve:email.inbox.create":
 		return true
 	default:
 		return false

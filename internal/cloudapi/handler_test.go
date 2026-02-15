@@ -424,6 +424,7 @@ func TestOrgDomainsCreateListDNSVerifyAndDelete(t *testing.T) {
 	withTempStore(t, func(ctx context.Context, st *store.Store) {
 		cfg := config.Default()
 		cfg.Security.APIKey = "bootstrap-admin"
+		cfg.Cloud.Mode = true
 		handler := NewHandler(cfg, st, &auth.Service{Config: cfg, Now: time.Now}, &stubBilling{}, &stubTokenIssuer{})
 		mux := http.NewServeMux()
 		handler.RegisterRoutes(mux)
@@ -539,6 +540,125 @@ func TestOrgDomainsCreateListDNSVerifyAndDelete(t *testing.T) {
 		mux.ServeHTTP(rec, deleteReq)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("expected delete success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+func TestInboxesCreateAndList(t *testing.T) {
+	withTempStore(t, func(ctx context.Context, st *store.Store) {
+		cfg := config.Default()
+		cfg.Security.APIKey = "bootstrap-admin"
+		cfg.Cloud.Mode = true
+		handler := NewHandler(cfg, st, &auth.Service{Config: cfg, Now: time.Now}, &stubBilling{}, &stubTokenIssuer{})
+		mux := http.NewServeMux()
+		handler.RegisterRoutes(mux)
+
+		orgID, err := st.CreateOrg(ctx, "inboxes-org")
+		if err != nil {
+			t.Fatalf("create org: %v", err)
+		}
+
+		// Create domain (pending)
+		createDomainReq := jsonRequest(t, http.MethodPost, "/v1/domains", map[string]any{
+			"org_id": orgID,
+			"domain": "acme.com",
+		})
+		createDomainReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, createDomainReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected domain create success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+		var createdDomain struct {
+			Domain struct {
+				ID                string `json:"id"`
+				VerificationToken string `json:"verification_token"`
+			} `json:"domain"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &createdDomain); err != nil {
+			t.Fatalf("decode domain create response: %v", err)
+		}
+
+		// Creating an inbox before verification should fail.
+		createInboxReq := jsonRequest(t, http.MethodPost, "/v1/inboxes", map[string]any{
+			"org_id":  orgID,
+			"address": "support@acme.com",
+		})
+		createInboxReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, createInboxReq)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected domain verification requirement, got %d body=%s", rec.Code, rec.Body.String())
+		}
+
+		// Verify domain.
+		txtName := domains.OwnershipTXTLabel + ".acme.com"
+		handler.Domains = domains.NewVerifier(stubTXTResolver{
+			records: map[string][]string{
+				txtName: {createdDomain.Domain.VerificationToken},
+			},
+		})
+		verifyReq := jsonRequest(t, http.MethodPost, "/v1/domains/verify", map[string]any{
+			"org_id":    orgID,
+			"domain_id": createdDomain.Domain.ID,
+		})
+		verifyReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, verifyReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected verify success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+
+		// Create inbox on the verified domain.
+		createInboxReq = jsonRequest(t, http.MethodPost, "/v1/inboxes", map[string]any{
+			"org_id":  orgID,
+			"address": "support@acme.com",
+		})
+		createInboxReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, createInboxReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected inbox create success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+		var createdInbox struct {
+			Inbox struct {
+				ID          string  `json:"id"`
+				Address     string  `json:"address"`
+				OrgDomainID *string `json:"org_domain_id"`
+			} `json:"inbox"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &createdInbox); err != nil {
+			t.Fatalf("decode inbox create response: %v", err)
+		}
+		if createdInbox.Inbox.ID == "" || createdInbox.Inbox.Address != "support@acme.com" {
+			t.Fatalf("unexpected inbox payload: %+v", createdInbox.Inbox)
+		}
+		if createdInbox.Inbox.OrgDomainID == nil || *createdInbox.Inbox.OrgDomainID != createdDomain.Domain.ID {
+			t.Fatalf("expected org_domain_id=%q got %+v", createdDomain.Domain.ID, createdInbox.Inbox.OrgDomainID)
+		}
+
+		// List inboxes
+		listReq, err := http.NewRequest(http.MethodGet, "/v1/inboxes?org_id="+url.QueryEscape(orgID), nil)
+		if err != nil {
+			t.Fatalf("build list request: %v", err)
+		}
+		listReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, listReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected inbox list success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+		var listed struct {
+			Inboxes []struct {
+				ID      string `json:"id"`
+				Address string `json:"address"`
+			} `json:"inboxes"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
+			t.Fatalf("decode inbox list response: %v", err)
+		}
+		if len(listed.Inboxes) != 1 || listed.Inboxes[0].ID != createdInbox.Inbox.ID {
+			t.Fatalf("expected one listed inbox, got %+v", listed.Inboxes)
 		}
 	})
 }
