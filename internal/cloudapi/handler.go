@@ -81,6 +81,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/domains/verify", h.handleVerifyDomain)
 	mux.HandleFunc("/v1/domains/dns", h.handleDomainDNS)
 	mux.HandleFunc("/v1/inboxes", h.handleInboxes)
+	mux.HandleFunc("/v1/inboxes/", h.handleInboxByID)
 	mux.HandleFunc("/v1/billing/portal", h.handleBillingPortal)
 }
 
@@ -946,15 +947,16 @@ func (h *Handler) handleInboxes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleCreateInbox(w http.ResponseWriter, r *http.Request) {
-	principal, err := h.requireBillingAdmin(r)
+	principal, err := h.requireAnyScope(r, "nerve:admin.billing", "nerve:email.inbox.create")
 	if err != nil {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
 	var req struct {
-		OrgID   string `json:"org_id"`
-		Address string `json:"address"`
+		OrgID     string `json:"org_id"`
+		Address   string `json:"address"`
+		DomainID  string `json:"domain_id,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
@@ -992,21 +994,43 @@ func (h *Handler) handleCreateInbox(w http.ResponseWriter, r *http.Request) {
 
 	orgDomainID := ""
 	if h.Config.Cloud.Mode {
-		d, err := h.Store.GetOrgDomainForSending(r.Context(), domainPart)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
+		domainIDCandidate := strings.TrimSpace(req.DomainID)
+		if domainIDCandidate != "" {
+			d, err := h.Store.GetOrgDomainByIDForOrg(r.Context(), orgID, domainIDCandidate)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					http.Error(w, "domain not verified", http.StatusBadRequest)
+					return
+				}
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if d.Status != "active" {
 				http.Error(w, "domain not verified", http.StatusBadRequest)
 				return
 			}
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+			if !strings.EqualFold(d.Domain, domainPart) {
+				http.Error(w, "address domain mismatch", http.StatusBadRequest)
+				return
+			}
+			orgDomainID = d.ID
+		} else {
+			d, err := h.Store.GetOrgDomainForSending(r.Context(), domainPart)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					http.Error(w, "domain not verified", http.StatusBadRequest)
+					return
+				}
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if d.OrgID != orgID {
+				// Don't leak domain ownership information.
+				http.Error(w, "domain not verified", http.StatusBadRequest)
+				return
+			}
+			orgDomainID = d.ID
 		}
-		if d.OrgID != orgID {
-			// Don't leak domain ownership information.
-			http.Error(w, "domain not verified", http.StatusBadRequest)
-			return
-		}
-		orgDomainID = d.ID
 	}
 
 	created, err := h.Store.CreateInboxForOrg(r.Context(), orgID, canonical, orgDomainID)
@@ -1033,7 +1057,7 @@ func (h *Handler) handleCreateInbox(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleListInboxes(w http.ResponseWriter, r *http.Request) {
-	principal, err := h.requireBillingAdmin(r)
+	principal, err := h.requireAnyScope(r, "nerve:admin.billing", "nerve:email.read", "nerve:email.inbox.create")
 	if err != nil {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
@@ -1068,6 +1092,43 @@ func (h *Handler) handleListInboxes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"inboxes": resp})
+}
+
+func (h *Handler) handleInboxByID(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	principal, err := h.requireAnyScope(r, "nerve:admin.billing", "nerve:email.inbox.create")
+	if err != nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	inboxID := strings.TrimPrefix(r.URL.Path, "/v1/inboxes/")
+	if inboxID == "" || strings.Contains(inboxID, "/") {
+		http.Error(w, "missing inbox id", http.StatusBadRequest)
+		return
+	}
+
+	orgID, err := resolveOrgIDForPrincipal(principal, strings.TrimSpace(r.URL.Query().Get("org_id")))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	disabled, err := h.Store.DisableInboxForOrg(r.Context(), orgID, inboxID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !disabled {
+		http.Error(w, "inbox not found", http.StatusNotFound)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"status": "disabled"})
 }
 
 func (h *Handler) handleBillingPortal(w http.ResponseWriter, r *http.Request) {
@@ -1118,6 +1179,25 @@ func (h *Handler) requireBillingAdmin(r *http.Request) (auth.Principal, error) {
 		return auth.Principal{}, err
 	}
 	return principal, nil
+}
+
+func (h *Handler) requireAnyScope(r *http.Request, allowedScopes ...string) (auth.Principal, error) {
+	principal, err := h.authenticatePrincipal(r)
+	if err != nil {
+		return auth.Principal{}, err
+	}
+	if h.Auth == nil {
+		return auth.Principal{}, errors.New("auth service not configured")
+	}
+	for _, scope := range allowedScopes {
+		if scope == "" {
+			continue
+		}
+		if err := h.Auth.ValidateScopes(principal, scope); err == nil {
+			return principal, nil
+		}
+	}
+	return auth.Principal{}, auth.ErrForbidden
 }
 
 func (h *Handler) authenticatePrincipal(r *http.Request) (auth.Principal, error) {

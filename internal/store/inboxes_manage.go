@@ -17,6 +17,19 @@ type InboxRecord struct {
 	CreatedAt   time.Time
 }
 
+func (s *Store) GetInboxRecordByIDForOrg(ctx context.Context, orgID string, inboxID string) (InboxRecord, error) {
+	var rec InboxRecord
+	row := s.q.QueryRowContext(ctx, `
+		SELECT id, org_id, org_domain_id::text, address, status, created_at
+		FROM inboxes
+		WHERE id = $1 AND org_id = $2
+	`, inboxID, orgID)
+	if err := row.Scan(&rec.ID, &rec.OrgID, &rec.OrgDomainID, &rec.Address, &rec.Status, &rec.CreatedAt); err != nil {
+		return rec, err
+	}
+	return rec, nil
+}
+
 func (s *Store) ListInboxRecordsByOrg(ctx context.Context, orgID string) ([]InboxRecord, error) {
 	rows, err := s.q.QueryContext(ctx, `
 		SELECT id, org_id, org_domain_id::text, address, status, created_at
@@ -82,3 +95,18 @@ func (s *Store) CreateInboxForOrg(ctx context.Context, orgID string, address str
 	return rec, nil
 }
 
+func (s *Store) DisableInboxForOrg(ctx context.Context, orgID string, inboxID string) (bool, error) {
+	result, err := s.q.ExecContext(ctx, `
+		UPDATE inboxes
+		SET status = 'disabled'
+		WHERE id = $1 AND org_id = $2
+	`, inboxID, orgID)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
