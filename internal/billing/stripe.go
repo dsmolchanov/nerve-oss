@@ -202,6 +202,7 @@ func (s *StripeService) applySubscriptionSnapshot(ctx context.Context, sub strip
 		MCPRPM:             plan.MCPRPM,
 		MonthlyUnits:       plan.MonthlyUnits,
 		MaxInboxes:         plan.MaxInboxes,
+		MaxDomains:         plan.MaxDomains,
 		UsagePeriodStart:   periodStart,
 		UsagePeriodEnd:     periodEnd,
 		GraceUntil:         graceUntilForStatus(status, periodEnd, s.Config.Metering.PastDueGraceDays),

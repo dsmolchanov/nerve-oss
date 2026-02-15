@@ -195,6 +195,279 @@ func TestTenantRLSBlocksCrossOrgReadsWithScopedSession(t *testing.T) {
 	})
 }
 
+func TestOrgDomainsMigrationAppliesCleanly(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+
+		assertTableExists(t, db, "org_domains")
+
+		// Verify new columns on inboxes
+		assertColumnExists(t, db, "inboxes", "org_domain_id")
+
+		// Verify new columns on entitlements
+		assertColumnExists(t, db, "plan_entitlements", "max_domains")
+		assertColumnExists(t, db, "org_entitlements", "max_domains")
+	})
+}
+
+func TestOrgDomainsCanonicalCheckConstraint(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+
+		orgID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'acme')`, orgID); err != nil {
+			t.Fatalf("insert org: %v", err)
+		}
+
+		// Valid lowercase domain should succeed
+		_, err := db.ExecContext(ctx, `
+			INSERT INTO org_domains (org_id, domain, verification_token, dkim_selector, dkim_method)
+			VALUES ($1, 'acme.com', 'tok-1', 'nerve', 'cname')
+		`, orgID)
+		if err != nil {
+			t.Fatalf("insert valid domain: %v", err)
+		}
+
+		// Uppercase domain should fail check constraint
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO org_domains (org_id, domain, verification_token, dkim_selector, dkim_method)
+			VALUES ($1, 'ACME.COM', 'tok-2', 'nerve', 'cname')
+		`, orgID)
+		if err == nil {
+			t.Fatal("expected CHECK constraint to reject uppercase domain")
+		}
+
+		// Trailing dot should fail check constraint
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO org_domains (org_id, domain, verification_token, dkim_selector, dkim_method)
+			VALUES ($1, 'acme.com.', 'tok-3', 'nerve', 'cname')
+		`, orgID)
+		if err == nil {
+			t.Fatal("expected CHECK constraint to reject trailing dot domain")
+		}
+	})
+}
+
+func TestOrgDomainsPartialUniqueIndex(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+
+		orgA := uuid.NewString()
+		orgB := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'org-a'), ($2, 'org-b')`, orgA, orgB); err != nil {
+			t.Fatalf("insert orgs: %v", err)
+		}
+
+		// Multiple pending claims for the same domain should be allowed
+		_, err := db.ExecContext(ctx, `
+			INSERT INTO org_domains (org_id, domain, verification_token, dkim_selector, dkim_method)
+			VALUES ($1, 'shared.com', 'tok-a', 'nerve', 'cname')
+		`, orgA)
+		if err != nil {
+			t.Fatalf("insert pending domain A: %v", err)
+		}
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO org_domains (org_id, domain, verification_token, dkim_selector, dkim_method)
+			VALUES ($1, 'shared.com', 'tok-b', 'nerve', 'cname')
+		`, orgB)
+		if err != nil {
+			t.Fatalf("insert pending domain B: %v", err)
+		}
+
+		// But verified domains should enforce uniqueness
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO org_domains (org_id, domain, verification_token, dkim_selector, dkim_method, status)
+			VALUES ($1, 'unique.com', 'tok-1', 'nerve', 'cname', 'active')
+		`, orgA)
+		if err != nil {
+			t.Fatalf("insert active domain A: %v", err)
+		}
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO org_domains (org_id, domain, verification_token, dkim_selector, dkim_method, status)
+			VALUES ($1, 'unique.com', 'tok-2', 'nerve', 'cname', 'active')
+		`, orgB)
+		if err == nil {
+			t.Fatal("expected partial unique index to reject duplicate active domain")
+		}
+	})
+}
+
+func TestOrgDomainsPendingExpiry(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+
+		orgID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'acme')`, orgID); err != nil {
+			t.Fatalf("insert org: %v", err)
+		}
+
+		// Insert a domain with expired expires_at
+		_, err := db.ExecContext(ctx, `
+			INSERT INTO org_domains (org_id, domain, verification_token, dkim_selector, dkim_method, expires_at)
+			VALUES ($1, 'expired.com', 'tok-exp', 'nerve', 'cname', now() - interval '1 day')
+		`, orgID)
+		if err != nil {
+			t.Fatalf("insert expired domain: %v", err)
+		}
+
+		// Insert a domain with future expires_at
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO org_domains (org_id, domain, verification_token, dkim_selector, dkim_method, expires_at)
+			VALUES ($1, 'fresh.com', 'tok-fresh', 'nerve', 'cname', now() + interval '6 days')
+		`, orgID)
+		if err != nil {
+			t.Fatalf("insert fresh domain: %v", err)
+		}
+
+		// ExpirePendingDomains should delete the expired one
+		result, err := db.ExecContext(ctx, `DELETE FROM org_domains WHERE status = 'pending' AND expires_at < now()`)
+		if err != nil {
+			t.Fatalf("expire pending domains: %v", err)
+		}
+		n, _ := result.RowsAffected()
+		if n != 1 {
+			t.Fatalf("expected 1 expired domain deleted, got %d", n)
+		}
+
+		// The fresh domain should still exist
+		var count int
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM org_domains WHERE org_id = $1`, orgID).Scan(&count); err != nil {
+			t.Fatalf("count remaining: %v", err)
+		}
+		if count != 1 {
+			t.Fatalf("expected 1 remaining domain, got %d", count)
+		}
+	})
+}
+
+func TestOrgDomainsStoreCreateAndGet(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+
+		orgID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'acme')`, orgID); err != nil {
+			t.Fatalf("insert org: %v", err)
+		}
+
+		st := &Store{db: db, q: db}
+
+		id, err := st.CreateOrgDomain(ctx, orgID, "acme.com", "nerve-verification=abc123", "nerve2026a", "encrypted-key", "public-key", "cname")
+		if err != nil {
+			t.Fatalf("create domain: %v", err)
+		}
+		if id == "" {
+			t.Fatal("expected non-empty domain ID")
+		}
+
+		// Get by ID
+		d, err := st.GetOrgDomainByID(ctx, id)
+		if err != nil {
+			t.Fatalf("get domain by ID: %v", err)
+		}
+		if d.Domain != "acme.com" {
+			t.Fatalf("expected domain 'acme.com', got %q", d.Domain)
+		}
+		if d.Status != "pending" {
+			t.Fatalf("expected status 'pending', got %q", d.Status)
+		}
+		if d.VerificationToken != "nerve-verification=abc123" {
+			t.Fatalf("expected token 'nerve-verification=abc123', got %q", d.VerificationToken)
+		}
+		if d.DKIMSelector != "nerve2026a" {
+			t.Fatalf("expected selector 'nerve2026a', got %q", d.DKIMSelector)
+		}
+		if d.DKIMMethod != "cname" {
+			t.Fatalf("expected method 'cname', got %q", d.DKIMMethod)
+		}
+		if !d.ExpiresAt.Valid {
+			t.Fatal("expected expires_at to be set for pending domain")
+		}
+
+		// Get by domain name
+		d2, err := st.GetOrgDomain(ctx, "acme.com")
+		if err != nil {
+			t.Fatalf("get domain by name: %v", err)
+		}
+		if d2.ID != id {
+			t.Fatalf("expected ID %q, got %q", id, d2.ID)
+		}
+
+		// List
+		domains, err := st.ListOrgDomains(ctx, orgID)
+		if err != nil {
+			t.Fatalf("list domains: %v", err)
+		}
+		if len(domains) != 1 {
+			t.Fatalf("expected 1 domain, got %d", len(domains))
+		}
+
+		// Update verification
+		if err := st.UpdateOrgDomainVerification(ctx, id, false, true, true, true, "verified_dns"); err != nil {
+			t.Fatalf("update verification: %v", err)
+		}
+		d3, _ := st.GetOrgDomainByID(ctx, id)
+		if d3.Status != "verified_dns" {
+			t.Fatalf("expected status 'verified_dns', got %q", d3.Status)
+		}
+		if !d3.SPFVerified || !d3.DKIMVerified || !d3.DMARCVerified {
+			t.Fatal("expected SPF, DKIM, DMARC all verified")
+		}
+		if d3.MXVerified {
+			t.Fatal("expected MX not verified")
+		}
+
+		// Update status
+		if err := st.UpdateOrgDomainStatus(ctx, id, "active"); err != nil {
+			t.Fatalf("update status: %v", err)
+		}
+		d4, _ := st.GetOrgDomainByID(ctx, id)
+		if d4.Status != "active" {
+			t.Fatalf("expected status 'active', got %q", d4.Status)
+		}
+
+		// GetOrgDomainForSending
+		d5, err := st.GetOrgDomainForSending(ctx, "acme.com")
+		if err != nil {
+			t.Fatalf("get domain for sending: %v", err)
+		}
+		if d5.ID != id {
+			t.Fatalf("expected ID %q, got %q", id, d5.ID)
+		}
+
+		// Count
+		count, err := st.CountDomainsByOrg(ctx, orgID)
+		if err != nil {
+			t.Fatalf("count domains: %v", err)
+		}
+		if count != 1 {
+			t.Fatalf("expected count 1, got %d", count)
+		}
+
+		// Delete
+		if err := st.DeleteOrgDomain(ctx, id); err != nil {
+			t.Fatalf("delete domain: %v", err)
+		}
+		domains2, _ := st.ListOrgDomains(ctx, orgID)
+		if len(domains2) != 0 {
+			t.Fatalf("expected 0 domains after delete, got %d", len(domains2))
+		}
+	})
+}
+
+func assertColumnExists(t *testing.T, db *sql.DB, table, column string) {
+	t.Helper()
+	var colName string
+	if err := db.QueryRow(`
+		SELECT column_name
+		FROM information_schema.columns
+		WHERE table_schema = 'public'
+		  AND table_name = $1
+		  AND column_name = $2
+	`, table, column).Scan(&colName); err != nil {
+		t.Fatalf("expected column %s.%s to exist: %v", table, column, err)
+	}
+}
+
 func migrateToLatest(t *testing.T, ctx context.Context, db *sql.DB) {
 	t.Helper()
 	goose.SetDialect("postgres")

@@ -46,6 +46,7 @@ type OrgEntitlement struct {
 	MCPRPM             int
 	MonthlyUnits       int64
 	MaxInboxes         int
+	MaxDomains         int
 	UsagePeriodStart   time.Time
 	UsagePeriodEnd     time.Time
 	GraceUntil         sql.NullTime
@@ -57,6 +58,7 @@ type PlanEntitlement struct {
 	MCPRPM       int
 	MonthlyUnits int64
 	MaxInboxes   int
+	MaxDomains   int
 }
 
 type SubscriptionRecord struct {
@@ -644,7 +646,7 @@ func (s *Store) CountInboxesByOrg(ctx context.Context, orgID string) (int, error
 func (s *Store) GetOrgEntitlement(ctx context.Context, orgID string) (OrgEntitlement, error) {
 	var ent OrgEntitlement
 	row := s.q.QueryRowContext(ctx, `
-		SELECT org_id, plan_code, subscription_status, mcp_rpm, monthly_units, max_inboxes,
+		SELECT org_id, plan_code, subscription_status, mcp_rpm, monthly_units, max_inboxes, max_domains,
 		       usage_period_start, usage_period_end, grace_until, updated_at
 		FROM org_entitlements
 		WHERE org_id = $1
@@ -656,6 +658,7 @@ func (s *Store) GetOrgEntitlement(ctx context.Context, orgID string) (OrgEntitle
 		&ent.MCPRPM,
 		&ent.MonthlyUnits,
 		&ent.MaxInboxes,
+		&ent.MaxDomains,
 		&ent.UsagePeriodStart,
 		&ent.UsagePeriodEnd,
 		&ent.GraceUntil,
@@ -780,7 +783,7 @@ func (s *Store) SetOrgUsageCounterUsed(ctx context.Context, orgID string, meterN
 
 func (s *Store) ListExpiredOrgEntitlements(ctx context.Context, now time.Time) ([]OrgEntitlement, error) {
 	rows, err := s.q.QueryContext(ctx, `
-		SELECT org_id, plan_code, subscription_status, mcp_rpm, monthly_units, max_inboxes,
+		SELECT org_id, plan_code, subscription_status, mcp_rpm, monthly_units, max_inboxes, max_domains,
 		       usage_period_start, usage_period_end, grace_until, updated_at
 		FROM org_entitlements
 		WHERE usage_period_end < $1
@@ -800,6 +803,7 @@ func (s *Store) ListExpiredOrgEntitlements(ctx context.Context, now time.Time) (
 			&ent.MCPRPM,
 			&ent.MonthlyUnits,
 			&ent.MaxInboxes,
+			&ent.MaxDomains,
 			&ent.UsagePeriodStart,
 			&ent.UsagePeriodEnd,
 			&ent.GraceUntil,
@@ -827,11 +831,11 @@ func (s *Store) RecordUsageEvent(ctx context.Context, orgID string, meterName st
 func (s *Store) GetPlanEntitlement(ctx context.Context, planCode string) (PlanEntitlement, error) {
 	var plan PlanEntitlement
 	row := s.q.QueryRowContext(ctx, `
-		SELECT plan_code, mcp_rpm, monthly_units, max_inboxes
+		SELECT plan_code, mcp_rpm, monthly_units, max_inboxes, max_domains
 		FROM plan_entitlements
 		WHERE plan_code = $1
 	`, planCode)
-	if err := row.Scan(&plan.PlanCode, &plan.MCPRPM, &plan.MonthlyUnits, &plan.MaxInboxes); err != nil {
+	if err := row.Scan(&plan.PlanCode, &plan.MCPRPM, &plan.MonthlyUnits, &plan.MaxInboxes, &plan.MaxDomains); err != nil {
 		return plan, err
 	}
 	return plan, nil
@@ -926,20 +930,21 @@ func (s *Store) UpsertOrgEntitlement(ctx context.Context, ent OrgEntitlement) er
 	}
 	_, err := s.q.ExecContext(ctx, `
 		INSERT INTO org_entitlements (
-			org_id, plan_code, subscription_status, mcp_rpm, monthly_units, max_inboxes,
+			org_id, plan_code, subscription_status, mcp_rpm, monthly_units, max_inboxes, max_domains,
 			usage_period_start, usage_period_end, grace_until
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (org_id) DO UPDATE SET
 			plan_code = EXCLUDED.plan_code,
 			subscription_status = EXCLUDED.subscription_status,
 			mcp_rpm = EXCLUDED.mcp_rpm,
 			monthly_units = EXCLUDED.monthly_units,
 			max_inboxes = EXCLUDED.max_inboxes,
+			max_domains = EXCLUDED.max_domains,
 			usage_period_start = EXCLUDED.usage_period_start,
 			usage_period_end = EXCLUDED.usage_period_end,
 			grace_until = EXCLUDED.grace_until,
 			updated_at = now()
-	`, ent.OrgID, ent.PlanCode, ent.SubscriptionStatus, ent.MCPRPM, ent.MonthlyUnits, ent.MaxInboxes, ent.UsagePeriodStart, ent.UsagePeriodEnd, grace)
+	`, ent.OrgID, ent.PlanCode, ent.SubscriptionStatus, ent.MCPRPM, ent.MonthlyUnits, ent.MaxInboxes, ent.MaxDomains, ent.UsagePeriodStart, ent.UsagePeriodEnd, grace)
 	return err
 }
 
