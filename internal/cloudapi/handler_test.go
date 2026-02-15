@@ -3,7 +3,9 @@ package cloudapi
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -180,6 +182,224 @@ func TestTokenIssuanceValidatesScopeAndTTL(t *testing.T) {
 		}
 		if payload["token"] == "" || payload["token_id"] == "" {
 			t.Fatalf("expected token issuance payload with token and token_id")
+		}
+	})
+}
+
+func TestCloudAPIKeysCreateListAndRevoke(t *testing.T) {
+	withTempStore(t, func(ctx context.Context, st *store.Store) {
+		cfg := config.Default()
+		cfg.Security.APIKey = "bootstrap-admin"
+		handler := NewHandler(cfg, st, &auth.Service{Config: cfg, Now: time.Now}, &stubBilling{}, &stubTokenIssuer{})
+		mux := http.NewServeMux()
+		handler.RegisterRoutes(mux)
+
+		orgID, err := st.CreateOrg(ctx, "keys-org")
+		if err != nil {
+			t.Fatalf("create org: %v", err)
+		}
+
+		req := jsonRequest(t, http.MethodPost, "/v1/keys", map[string]any{
+			"org_id": orgID,
+			"scopes": []string{"nerve:admin.billing"},
+		})
+		req.Header.Set("X-API-Key", "bootstrap-admin")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected invalid cloud key scope rejection, got %d body=%s", rec.Code, rec.Body.String())
+		}
+
+		req = jsonRequest(t, http.MethodPost, "/v1/keys", map[string]any{
+			"org_id": orgID,
+			"label":  "Primary integration",
+			"scopes": []string{"nerve:email.read", "nerve:email.search"},
+		})
+		req.Header.Set("X-API-Key", "bootstrap-admin")
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected cloud key creation success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+
+		var created struct {
+			ID        string    `json:"id"`
+			Key       string    `json:"key"`
+			KeyPrefix string    `json:"key_prefix"`
+			Label     string    `json:"label"`
+			Scopes    []string  `json:"scopes"`
+			CreatedAt time.Time `json:"created_at"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+			t.Fatalf("decode create key response: %v", err)
+		}
+		if created.ID == "" || created.Key == "" {
+			t.Fatalf("expected created key id and raw key, got %+v", created)
+		}
+		if !strings.HasPrefix(created.Key, "nrv_live_") || !strings.HasPrefix(created.KeyPrefix, "nrv_live_") {
+			t.Fatalf("expected key/key_prefix to include nrv_live_ prefix, got key=%q key_prefix=%q", created.Key, created.KeyPrefix)
+		}
+		if created.Label != "Primary integration" {
+			t.Fatalf("expected key label to round-trip, got %q", created.Label)
+		}
+
+		keySum := sha256.Sum256([]byte(created.Key))
+		stored, err := st.LookupCloudAPIKey(ctx, hex.EncodeToString(keySum[:]))
+		if err != nil {
+			t.Fatalf("lookup cloud key by hash: %v", err)
+		}
+		if stored.ID != created.ID || stored.OrgID != orgID {
+			t.Fatalf("unexpected stored cloud key record: %+v", stored)
+		}
+		if stored.RevokedAt.Valid {
+			t.Fatalf("expected fresh cloud key to be active")
+		}
+
+		listReq, err := http.NewRequest(http.MethodGet, "/v1/keys?org_id="+url.QueryEscape(orgID), nil)
+		if err != nil {
+			t.Fatalf("build list request: %v", err)
+		}
+		listReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, listReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected key list success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+
+		var listed struct {
+			Keys []struct {
+				ID        string     `json:"id"`
+				KeyPrefix string     `json:"key_prefix"`
+				RevokedAt *time.Time `json:"revoked_at"`
+			} `json:"keys"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
+			t.Fatalf("decode key list response: %v", err)
+		}
+		if len(listed.Keys) != 1 || listed.Keys[0].ID != created.ID {
+			t.Fatalf("expected one listed key with created id, got %+v", listed.Keys)
+		}
+		if listed.Keys[0].KeyPrefix == "" || listed.Keys[0].RevokedAt != nil {
+			t.Fatalf("expected active key metadata in list, got %+v", listed.Keys[0])
+		}
+
+		revokeReq, err := http.NewRequest(http.MethodDelete, "/v1/keys/"+created.ID+"?org_id="+url.QueryEscape(orgID), nil)
+		if err != nil {
+			t.Fatalf("build revoke request: %v", err)
+		}
+		revokeReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, revokeReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected revoke success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+
+		stored, err = st.LookupCloudAPIKey(ctx, hex.EncodeToString(keySum[:]))
+		if err != nil {
+			t.Fatalf("lookup cloud key after revoke: %v", err)
+		}
+		if !stored.RevokedAt.Valid {
+			t.Fatalf("expected cloud key to be revoked after delete")
+		}
+	})
+}
+
+func TestOrgRuntimeConfigGetAndPut(t *testing.T) {
+	withTempStore(t, func(ctx context.Context, st *store.Store) {
+		cfg := config.Default()
+		cfg.Security.APIKey = "bootstrap-admin"
+		handler := NewHandler(cfg, st, &auth.Service{Config: cfg, Now: time.Now}, &stubBilling{}, &stubTokenIssuer{})
+		mux := http.NewServeMux()
+		handler.RegisterRoutes(mux)
+
+		orgID, err := st.CreateOrg(ctx, "runtime-org")
+		if err != nil {
+			t.Fatalf("create org: %v", err)
+		}
+
+		getReq, err := http.NewRequest(http.MethodGet, "/v1/orgs/runtime?org_id="+url.QueryEscape(orgID), nil)
+		if err != nil {
+			t.Fatalf("build get runtime request: %v", err)
+		}
+		getReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, getReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected runtime config read success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+		var initial struct {
+			OrgID       string `json:"org_id"`
+			MCPEndpoint string `json:"mcp_endpoint"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &initial); err != nil {
+			t.Fatalf("decode initial runtime payload: %v", err)
+		}
+		if initial.OrgID != orgID || initial.MCPEndpoint != "" {
+			t.Fatalf("unexpected initial runtime payload: %+v", initial)
+		}
+
+		putReq := jsonRequest(t, http.MethodPut, "/v1/orgs/runtime", map[string]any{
+			"org_id":       orgID,
+			"mcp_endpoint": "https://nerve-runtime.fly.dev/mcp/",
+		})
+		putReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, putReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected runtime config update success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+		var updated struct {
+			OrgID       string `json:"org_id"`
+			MCPEndpoint string `json:"mcp_endpoint"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &updated); err != nil {
+			t.Fatalf("decode updated runtime payload: %v", err)
+		}
+		if updated.MCPEndpoint != "https://nerve-runtime.fly.dev/mcp" {
+			t.Fatalf("expected normalized mcp endpoint, got %q", updated.MCPEndpoint)
+		}
+
+		getReq, err = http.NewRequest(http.MethodGet, "/v1/orgs/runtime?org_id="+url.QueryEscape(orgID), nil)
+		if err != nil {
+			t.Fatalf("build second get runtime request: %v", err)
+		}
+		getReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, getReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected runtime config read success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+		var fetched struct {
+			OrgID       string `json:"org_id"`
+			MCPEndpoint string `json:"mcp_endpoint"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &fetched); err != nil {
+			t.Fatalf("decode fetched runtime payload: %v", err)
+		}
+		if fetched.MCPEndpoint != "https://nerve-runtime.fly.dev/mcp" {
+			t.Fatalf("expected persisted mcp endpoint, got %q", fetched.MCPEndpoint)
+		}
+
+		clearReq := jsonRequest(t, http.MethodPut, "/v1/orgs/runtime", map[string]any{
+			"org_id":       orgID,
+			"mcp_endpoint": "",
+		})
+		clearReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, clearReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected runtime config clear success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+
+		invalidReq := jsonRequest(t, http.MethodPut, "/v1/orgs/runtime", map[string]any{
+			"org_id":       orgID,
+			"mcp_endpoint": "ftp://bad-endpoint",
+		})
+		invalidReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, invalidReq)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected invalid endpoint rejection, got %d body=%s", rec.Code, rec.Body.String())
 		}
 	})
 }

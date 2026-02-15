@@ -34,6 +34,7 @@ func TestCloudControlPlaneMigrationFromEmptyDatabase(t *testing.T) {
 
 		assertColumnNotNull(t, db, "threads", "org_id")
 		assertColumnNotNull(t, db, "messages", "org_id")
+		assertColumnExists(t, db, "orgs", "mcp_endpoint")
 	})
 }
 
