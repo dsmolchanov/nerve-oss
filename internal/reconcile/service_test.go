@@ -6,15 +6,12 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/pressly/goose/v3"
 
 	"neuralmail/internal/store"
 )
@@ -153,9 +150,7 @@ func withTempStore(t *testing.T, run func(ctx context.Context, st *store.Store))
 	}
 	defer st.Close()
 
-	goose.SetDialect("postgres")
-	goose.SetTableName("schema_migrations")
-	if err := goose.UpContext(context.Background(), st.DB(), migrationDir(t)); err != nil {
+	if err := store.MigrateAll(context.Background(), st.DB()); err != nil {
 		t.Fatalf("apply migrations: %v", err)
 	}
 
@@ -174,13 +169,4 @@ func dsnWithDatabase(rawDSN, dbName string) (string, error) {
 	}
 	parsed.Path = "/" + dbName
 	return parsed.String(), nil
-}
-
-func migrationDir(t *testing.T) string {
-	t.Helper()
-	_, currentFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatalf("resolve migration dir: missing caller")
-	}
-	return filepath.Join(filepath.Dir(currentFile), "..", "store", "migrations")
 }

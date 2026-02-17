@@ -35,7 +35,7 @@ func NewOutboundAdapter(cfg Config) *OutboundAdapter {
 		cfg.Port = 25
 	}
 	if strings.TrimSpace(cfg.HeloDomain) == "" {
-		cfg.HeloDomain = "local.neuralmail"
+		cfg.HeloDomain = "local.nerve.email"
 	}
 	return &OutboundAdapter{cfg: cfg}
 }

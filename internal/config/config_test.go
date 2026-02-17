@@ -1,7 +1,10 @@
 package config
 
 import (
+	"bytes"
+	"log"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -65,4 +68,69 @@ func TestLoadEnvOverrides(t *testing.T) {
 	}
 
 	_ = os.Unsetenv("NM_JMAP_URL")
+}
+
+func TestLoadEnvOverridesPrefersNERVEPrefix(t *testing.T) {
+	t.Setenv("NM_HTTP_ADDR", ":9000")
+	t.Setenv("NERVE_HTTP_ADDR", ":9100")
+	t.Setenv("NM_SMTP_FROM", "legacy@local.neuralmail")
+	t.Setenv("NERVE_SMTP_FROM", "modern@local.nerve.email")
+	t.Setenv("NM_CLOUD_MODE", "false")
+	t.Setenv("NERVE_CLOUD_MODE", "true")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.HTTP.Addr != ":9100" {
+		t.Fatalf("expected NERVE_HTTP_ADDR to override NM_HTTP_ADDR, got %q", cfg.HTTP.Addr)
+	}
+	if cfg.SMTP.From != "modern@local.nerve.email" {
+		t.Fatalf("expected NERVE_SMTP_FROM to override NM_SMTP_FROM, got %q", cfg.SMTP.From)
+	}
+	if !cfg.Cloud.Mode {
+		t.Fatalf("expected NERVE_CLOUD_MODE to override NM_CLOUD_MODE")
+	}
+}
+
+func TestConfigPathFromEnvPrefersNERVE(t *testing.T) {
+	t.Setenv("NM_CONFIG", "configs/dev/host.yaml")
+	t.Setenv("NERVE_CONFIG", "configs/dev/cortex.yaml")
+	path := ConfigPathFromEnv()
+	if path != "configs/dev/cortex.yaml" {
+		t.Fatalf("expected NERVE_CONFIG precedence, got %q", path)
+	}
+}
+
+func TestDefaultUsesModernLocalDomain(t *testing.T) {
+	cfg := Default()
+	if cfg.SMTP.From != "dev@local.nerve.email" {
+		t.Fatalf("expected modern SMTP default, got %q", cfg.SMTP.From)
+	}
+	if cfg.SMTP.HeloDomain != "local.nerve.email" {
+		t.Fatalf("expected modern HELO default, got %q", cfg.SMTP.HeloDomain)
+	}
+}
+
+func TestLoadWarnsOnLegacyEnvUsage(t *testing.T) {
+	t.Setenv("NM_SMTP_HOST", "legacy-host")
+	t.Setenv("NERVE_SMTP_HOST", "")
+
+	var logs bytes.Buffer
+	origWriter := log.Writer()
+	origFlags := log.Flags()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(origWriter)
+		log.SetFlags(origFlags)
+	})
+
+	if _, err := Load(""); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if !strings.Contains(logs.String(), "NM_SMTP_HOST") {
+		t.Fatalf("expected deprecation warning to mention NM_SMTP_HOST, got: %s", logs.String())
+	}
 }

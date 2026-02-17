@@ -107,4 +107,3 @@ func TestResendDomainsClientCRUDPathsAndAuth(t *testing.T) {
 		}
 	}
 }
-

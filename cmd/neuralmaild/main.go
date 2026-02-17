@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
@@ -19,6 +20,7 @@ import (
 	"neuralmail/internal/embed"
 	"neuralmail/internal/mcp"
 	"neuralmail/internal/queue"
+	"neuralmail/internal/release"
 	"neuralmail/internal/store"
 	"neuralmail/internal/vector"
 )
@@ -29,11 +31,12 @@ func main() {
 		return
 	}
 	cmd := os.Args[1]
-	cfgPath := os.Getenv("NM_CONFIG")
+	cfgPath := config.ConfigPathFromEnv()
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		log.Fatalf("config error: %v", err)
 	}
+	release.LogRuntimeBanner(log.Default(), cfg.Cloud.Mode)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -45,6 +48,12 @@ func main() {
 		runWorker(ctx, cfg)
 	case "mcp-stdio":
 		runStdio(ctx, cfg)
+	case "migrate-core":
+		runMigrations(ctx, cfg, store.MigrateCore)
+	case "migrate-cloud":
+		runMigrations(ctx, cfg, store.MigrateCloud)
+	case "migrate-all":
+		runMigrations(ctx, cfg, store.MigrateAll)
 	default:
 		usage()
 	}
@@ -59,7 +68,7 @@ func runServe(ctx context.Context, cfg config.Config) {
 
 	inboxAddr := cfg.SMTP.From
 	if inboxAddr == "" {
-		inboxAddr = "dev@local.neuralmail"
+		inboxAddr = "dev@local.nerve.email"
 	}
 	inboxID, _ := appInstance.Store.EnsureDefaults(ctx, inboxAddr)
 	go func() {
@@ -68,7 +77,7 @@ func runServe(ctx context.Context, cfg config.Config) {
 		}
 	}()
 
-	log.Printf("neuralmaild serving on %s", cfg.HTTP.Addr)
+	log.Printf("nerve-runtime serving on %s", cfg.HTTP.Addr)
 	if err := appInstance.Serve(ctx); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
@@ -118,7 +127,7 @@ func runWorker(ctx context.Context, cfg config.Config) {
 			BaseURL: cfg.Resend.BaseURL,
 		}))
 	}
-	outboxWorker := emailtransport.NewOutboxWorker(storeInstance, transportRegistry, "neuralmaild-worker")
+	outboxWorker := emailtransport.NewOutboxWorker(storeInstance, transportRegistry, "nerve-runtime-worker")
 	go func() {
 		if err := outboxWorker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("outbox worker stopped: %v", err)
@@ -180,8 +189,20 @@ func runStdio(ctx context.Context, cfg config.Config) {
 	}
 }
 
+func runMigrations(ctx context.Context, cfg config.Config, migrateFn func(context.Context, *sql.DB) error) {
+	storeInstance, err := store.Open(cfg.Database.DSN)
+	if err != nil {
+		log.Fatalf("store error: %v", err)
+	}
+	defer storeInstance.Close()
+	if err := migrateFn(ctx, storeInstance.DB()); err != nil {
+		log.Fatalf("migration error: %v", err)
+	}
+	log.Println("migrations complete")
+}
+
 func usage() {
-	fmt.Println("Usage: neuralmaild <serve|worker|mcp-stdio>")
+	fmt.Println("Usage: nerve-runtime (alias: neuralmaild) <serve|worker|mcp-stdio|migrate-core|migrate-cloud|migrate-all>")
 }
 
 func snippet(text string) string {

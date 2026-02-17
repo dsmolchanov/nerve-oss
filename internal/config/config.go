@@ -1,7 +1,9 @@
 package config
 
 import (
+	"log"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -112,8 +114,8 @@ func Default() Config {
 	cfg.JMAP.PollInterval = 30 * time.Second
 	cfg.SMTP.Host = "localhost"
 	cfg.SMTP.Port = 2525
-	cfg.SMTP.From = "dev@local.neuralmail"
-	cfg.SMTP.HeloDomain = "local.neuralmail"
+	cfg.SMTP.From = "dev@local.nerve.email"
+	cfg.SMTP.HeloDomain = "local.nerve.email"
 	cfg.Resend.BaseURL = "https://api.resend.com"
 	cfg.Qdrant.Collection = "messages_v1536"
 	cfg.Qdrant.EmbedDim = 1536
@@ -144,9 +146,104 @@ func Load(path string) (Config, error) {
 		}
 	}
 
+	legacyOnly := applyPreferredEnvAliases()
 	applyEnv(&cfg)
+	if len(legacyOnly) > 0 {
+		log.Printf("config warning: legacy NM_* env vars are deprecated; prefer NERVE_* (using: %s)", strings.Join(legacyOnly, ", "))
+	}
 
 	return cfg, nil
+}
+
+// ConfigPathFromEnv resolves the config file path with modern-key precedence.
+// NERVE_CONFIG takes precedence over NM_CONFIG.
+func ConfigPathFromEnv() string {
+	if v := strings.TrimSpace(os.Getenv("NERVE_CONFIG")); v != "" {
+		return v
+	}
+	return strings.TrimSpace(os.Getenv("NM_CONFIG"))
+}
+
+func applyPreferredEnvAliases() []string {
+	var legacyOnly []string
+	legacyVars := []string{
+		"NM_HTTP_ADDR",
+		"NM_DEV_MODE",
+		"NM_CLOUD_MODE",
+		"NM_CLOUD_PUBLIC_BASE_URL",
+		"NM_AUTH_ISSUER",
+		"NM_AUTH_AUDIENCE",
+		"NM_AUTH_JWKS_URL",
+		"NM_BILLING_PROVIDER",
+		"NM_STRIPE_SECRET_KEY",
+		"NM_STRIPE_WEBHOOK_SECRET",
+		"NM_METER_TOOL_COST_PATH",
+		"NM_METER_PAST_DUE_GRACE_DAYS",
+		"NM_JMAP_URL",
+		"NM_JMAP_SESSION_URL",
+		"NM_JMAP_ACCOUNT_ID",
+		"NM_JMAP_USERNAME",
+		"NM_JMAP_PASSWORD",
+		"NM_JMAP_PUSH_SECRET",
+		"NM_JMAP_POLL_INTERVAL",
+		"NM_SMTP_HOST",
+		"NM_SMTP_PORT",
+		"NM_SMTP_USERNAME",
+		"NM_SMTP_PASSWORD",
+		"NM_SMTP_FROM",
+		"NM_SMTP_REQUIRE_STARTTLS",
+		"NM_SMTP_HELO_DOMAIN",
+		"NM_RESEND_API_KEY",
+		"NM_RESEND_BASE_URL",
+		"NM_DB_DSN",
+		"NM_QDRANT_URL",
+		"NM_QDRANT_COLLECTION",
+		"NM_EMBED_DIM",
+		"NM_REDIS_URL",
+		"NM_OBJECT_STORE_URL",
+		"NM_OBJECT_STORE_BUCKET",
+		"NM_OBJECT_STORE_ACCESS_KEY",
+		"NM_OBJECT_STORE_SECRET_KEY",
+		"NM_EMBED_PROVIDER",
+		"NM_EMBED_MODEL",
+		"NM_LLM_PROVIDER",
+		"NM_LLM_MODEL",
+		"NM_OPENAI_API_KEY",
+		"NM_OLLAMA_URL",
+		"NM_LLM_PROMPT_PATH",
+		"NM_POLICY_PATH",
+		"NM_MCP_PROTOCOL_VERSION",
+		"NM_MCP_ALLOW_ORIGINS",
+		"NM_API_KEY",
+		"NM_ALLOW_OUTBOUND",
+		"NM_ALLOW_SEND_WITH_WARNINGS",
+		"NM_OUTBOUND_DOMAIN_ALLOWLIST",
+		"NM_LOG_LEVEL",
+	}
+
+	for _, legacy := range legacyVars {
+		modern := "NERVE_" + strings.TrimPrefix(legacy, "NM_")
+		modernVal := strings.TrimSpace(os.Getenv(modern))
+		legacyVal := strings.TrimSpace(os.Getenv(legacy))
+		if modernVal != "" {
+			_ = os.Setenv(legacy, modernVal)
+			continue
+		}
+		if legacyVal != "" {
+			legacyOnly = append(legacyOnly, legacy)
+		}
+	}
+
+	// Keep compatibility for legacy token signing env name.
+	if modernVal := strings.TrimSpace(os.Getenv("NERVE_TOKEN_SIGNING_KEY")); modernVal != "" {
+		_ = os.Setenv("NERVE_TOKEN_SIGNING_KEY", modernVal)
+	} else if legacyVal := strings.TrimSpace(os.Getenv("NM_TOKEN_SIGNING_KEY")); legacyVal != "" {
+		_ = os.Setenv("NERVE_TOKEN_SIGNING_KEY", legacyVal)
+		legacyOnly = append(legacyOnly, "NM_TOKEN_SIGNING_KEY")
+	}
+
+	sort.Strings(legacyOnly)
+	return legacyOnly
 }
 
 func applyEnv(cfg *Config) {

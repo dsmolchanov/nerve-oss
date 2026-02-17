@@ -116,7 +116,7 @@ func (s *Server) dispatch(ctx context.Context, req Request) (any, error) {
 		return map[string]any{
 			"protocolVersion": s.Config.MCP.ProtocolVersion,
 			"serverInfo": map[string]any{
-				"name":    "neuralmaild",
+				"name":    "nerve-runtime",
 				"version": "0.1.0",
 			},
 			"capabilities": map[string]any{

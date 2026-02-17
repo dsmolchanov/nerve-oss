@@ -21,6 +21,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"neuralmail/internal/config"
+	"neuralmail/internal/store"
 )
 
 func main() {
@@ -29,7 +30,7 @@ func main() {
 		return
 	}
 	cmd := os.Args[1]
-	cfg, err := config.Load(os.Getenv("NM_CONFIG"))
+	cfg, err := config.Load(config.ConfigPathFromEnv())
 	if err != nil {
 		log.Fatalf("config error: %v", err)
 	}
@@ -39,6 +40,12 @@ func main() {
 		runCompose("up", "-d")
 	case "down":
 		runCompose("down")
+	case "migrate-core":
+		runMigrations(cfg, store.MigrateCore)
+	case "migrate-cloud":
+		runMigrations(cfg, store.MigrateCloud)
+	case "migrate-all":
+		runMigrations(cfg, store.MigrateAll)
 	case "seed":
 		seed(cfg)
 	case "doctor":
@@ -59,6 +66,18 @@ func runCompose(args ...string) {
 	if err := cmd.Run(); err != nil {
 		log.Fatalf("docker compose failed: %v", err)
 	}
+}
+
+func runMigrations(cfg config.Config, migrate func(context.Context, *sql.DB) error) {
+	db, err := sql.Open("pgx", cfg.Database.DSN)
+	if err != nil {
+		log.Fatalf("open database: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(context.Background(), db); err != nil {
+		log.Fatalf("migration failed: %v", err)
+	}
+	fmt.Println("migrations complete")
 }
 
 func seed(cfg config.Config) {
@@ -110,7 +129,7 @@ func doctor(cfg config.Config) {
 }
 
 func sendTest(cfg config.Config) {
-	sendSMTP(cfg, "Nerve test", "This is a test email from neuralmail CLI.")
+	sendSMTP(cfg, "Nerve test", "This is a test email from nerve CLI.")
 	fmt.Println("sent test email")
 }
 
@@ -193,9 +212,9 @@ func sendSMTP(cfg config.Config, subject, body string) {
 	addr := net.JoinHostPort(host, strconv.Itoa(cfg.SMTP.Port))
 	from := cfg.SMTP.From
 	if from == "" {
-		from = "dev@local.neuralmail"
+		from = "dev@local.nerve.email"
 	}
-	to := "dev@local.neuralmail"
+	to := "dev@local.nerve.email"
 	msg := strings.Join([]string{
 		"From: " + from,
 		"To: " + to,
@@ -258,7 +277,7 @@ func smtpHeloDomain(addr string) string {
 	if len(parts) == 2 && parts[1] != "" {
 		return parts[1]
 	}
-	return "local.neuralmail"
+	return "local.nerve.email"
 }
 
 func supportsAuth(client *smtp.Client) bool {
@@ -377,7 +396,7 @@ func pingTCP(rawURL string) error {
 }
 
 func usage() {
-	fmt.Println("Usage: neuralmail <up|down|seed|doctor|send-test|mcp-test>")
+	fmt.Println("Usage: neuralmail <up|down|migrate-core|migrate-cloud|migrate-all|seed|doctor|send-test|mcp-test>")
 }
 
 type mcpResponse struct {

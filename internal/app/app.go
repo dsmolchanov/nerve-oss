@@ -51,7 +51,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	}
 	inboxAddr := cfg.SMTP.From
 	if inboxAddr == "" {
-		inboxAddr = "dev@local.neuralmail"
+		inboxAddr = "dev@local.nerve.email"
 	}
 	_, _ = st.EnsureDefaults(ctx, inboxAddr)
 

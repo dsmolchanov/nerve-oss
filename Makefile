@@ -16,13 +16,13 @@ logs:
 	docker compose logs -f cortex
 
 seed:
-	NM_CONFIG=$(CONFIG) $(GOENV) go run ./cmd/neuralmail seed
+	NERVE_CONFIG=$(CONFIG) $(GOENV) go run ./cmd/neuralmail seed
 
 mcp-test:
-	NM_CONFIG=$(CONFIG) $(GOENV) go run ./cmd/neuralmail mcp-test
+	NERVE_CONFIG=$(CONFIG) $(GOENV) go run ./cmd/neuralmail mcp-test
 
 doctor:
-	NM_CONFIG=$(CONFIG) $(GOENV) go run ./cmd/neuralmail doctor
+	NERVE_CONFIG=$(CONFIG) $(GOENV) go run ./cmd/neuralmail doctor
 
 cloud-e2e-test:
 	$(GOENV) go test ./internal/cloudapi -run TestCloudE2EMatrix -count=1

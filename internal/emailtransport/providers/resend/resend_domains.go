@@ -23,11 +23,11 @@ type DomainRecord struct {
 }
 
 type Domain struct {
-	ID     string         `json:"id"`
-	Name   string         `json:"name"`
-	Status string         `json:"status"`
+	ID      string         `json:"id"`
+	Name    string         `json:"name"`
+	Status  string         `json:"status"`
 	Records []DomainRecord `json:"records,omitempty"`
-	Region string         `json:"region,omitempty"`
+	Region  string         `json:"region,omitempty"`
 }
 
 type DomainsClient struct {

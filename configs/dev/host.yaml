@@ -16,9 +16,9 @@ jmap:
 smtp:
   host: "127.0.0.1"
   port: 2525
-  username: "dev@local.neuralmail"
+  username: "dev@local.nerve.email"
   password: "devpass"
-  from: "dev@local.neuralmail"
+  from: "dev@local.nerve.email"
 
 database:
   dsn: "postgres://neuralmail:neuralmail@127.0.0.1:54320/neuralmail?sslmode=disable"
@@ -59,7 +59,7 @@ security:
   allow_outbound: false
   allow_send_with_warnings: false
   outbound_domain_allowlist:
-    - "local.neuralmail"
+    - "local.nerve.email"
 
 log:
   level: "info"

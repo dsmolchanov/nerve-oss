@@ -3,7 +3,7 @@
 # See: https://stalw.art/docs/configuration/overview and https://stalw.art/docs/http/jmap/overview/
 
 [server]
-hostname = "local.neuralmail"
+hostname = "local.nerve.email"
 
 [server.listener."smtp"]
 bind = ["[::]:25"]
@@ -38,14 +38,14 @@ name = "admin"
 class = "admin"
 description = "Admin"
 secret = "adminpass"
-email = ["admin@local.neuralmail"]
+email = ["admin@local.nerve.email"]
 
 [[directory."memory".principals]]
 name = "dev"
 class = "individual"
 description = "Dev User"
 secret = "devpass"
-email = ["dev@local.neuralmail"]
+email = ["dev@local.nerve.email"]
 
 [tracer."stdout"]
 type = "stdout"

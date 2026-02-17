@@ -33,6 +33,7 @@ Then open:
 - `extract_to_schema`
 - `draft_reply_with_policy`
 - `send_reply`
+- `compose_email`
 
 See `docs/MCP_Contract.md` for schemas.
 
@@ -45,7 +46,15 @@ See `docs/MCP_Contract.md` for schemas.
 ## Configuration
 Defaults live in `configs/dev/cortex.yaml`. Environment variables override config.
 
-Key env vars:
+Key env vars (preferred):
+- `NERVE_JMAP_URL`
+- `NERVE_DB_DSN`
+- `NERVE_QDRANT_URL`
+- `NERVE_REDIS_URL`
+- `NERVE_SMTP_HOST`
+- `NERVE_POLICY_PATH`
+
+Legacy aliases are still supported during migration:
 - `NM_JMAP_URL`
 - `NM_DB_DSN`
 - `NM_QDRANT_URL`
@@ -53,9 +62,14 @@ Key env vars:
 - `NM_SMTP_HOST`
 - `NM_POLICY_PATH`
 
+## Repo Split Transition
+- Runtime pin for cloud deploys: `deploy/cloud/runtime.lock`
+- Cloud deploy order (core migrations -> cloud migrations -> deploys): `scripts/deploy/cloud_deploy.sh`
+- Local two-repo loop guide: `docs/TWO_REPO_DEV_LOOP.md`
+
 ## License
 - NeuralMail code: Apache-2.0
 - Stalwart Mail Server: AGPLv3 (separate container dependency)
 
 ## Branding
-The OSS engine is `neuralmaild`; the product is **Nerve** (`nerve.email`).
+The OSS runtime service is `nerve-runtime` (legacy binary alias: `neuralmaild`); the product is **Nerve** (`nerve.email`).

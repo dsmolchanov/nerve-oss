@@ -319,7 +319,7 @@ func (s *Service) SendReply(ctx context.Context, threadID string, body string, b
 		if from == "" {
 			from = strings.TrimSpace(s.Config.SMTP.From)
 			if from == "" {
-				from = "dev@local.neuralmail"
+				from = "dev@local.nerve.email"
 			}
 		}
 
@@ -327,7 +327,7 @@ func (s *Service) SendReply(ctx context.Context, threadID string, body string, b
 			return nil, errors.New("missing idempotency_key")
 		}
 
-		if !s.Config.Security.AllowOutbound && !strings.HasSuffix(to, "@local.neuralmail") {
+		if !s.Config.Security.AllowOutbound && !isLocalDevRecipient(to) {
 			return nil, errors.New("outbound disabled for non-local domains")
 		}
 		if len(s.Config.Security.OutboundDomainAllowlist) > 0 && !domainAllowed(to, s.Config.Security.OutboundDomainAllowlist) {
@@ -420,7 +420,7 @@ func (s *Service) ComposeEmail(ctx context.Context, inboxID, toAddress, subject,
 		if from == "" {
 			from = strings.TrimSpace(s.Config.SMTP.From)
 			if from == "" {
-				from = "dev@local.neuralmail"
+				from = "dev@local.nerve.email"
 			}
 		}
 
@@ -428,7 +428,7 @@ func (s *Service) ComposeEmail(ctx context.Context, inboxID, toAddress, subject,
 			return nil, errors.New("missing idempotency_key")
 		}
 
-		if !s.Config.Security.AllowOutbound && !strings.HasSuffix(toAddress, "@local.neuralmail") {
+		if !s.Config.Security.AllowOutbound && !isLocalDevRecipient(toAddress) {
 			return nil, errors.New("outbound disabled for non-local domains")
 		}
 		if len(s.Config.Security.OutboundDomainAllowlist) > 0 && !domainAllowed(toAddress, s.Config.Security.OutboundDomainAllowlist) {
@@ -507,6 +507,11 @@ func domainAllowed(addr string, allowlist []string) bool {
 		}
 	}
 	return false
+}
+
+func isLocalDevRecipient(addr string) bool {
+	lower := strings.ToLower(strings.TrimSpace(addr))
+	return strings.HasSuffix(lower, "@local.nerve.email") || strings.HasSuffix(lower, "@local.neuralmail")
 }
 
 func (s *Service) activeInboxRecord(ctx context.Context, st *store.Store, principal auth.Principal, inboxID string) (store.InboxRecord, error) {

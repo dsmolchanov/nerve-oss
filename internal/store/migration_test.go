@@ -20,6 +20,9 @@ func TestCloudControlPlaneMigrationFromEmptyDatabase(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToLatest(t, ctx, db)
 
+		assertTableExists(t, db, "schema_migrations_core")
+		assertTableExists(t, db, "schema_migrations_cloud")
+
 		for _, table := range []string{
 			"plan_entitlements",
 			"subscriptions",
@@ -471,19 +474,17 @@ func assertColumnExists(t *testing.T, db *sql.DB, table, column string) {
 
 func migrateToLatest(t *testing.T, ctx context.Context, db *sql.DB) {
 	t.Helper()
-	goose.SetDialect("postgres")
-	goose.SetTableName("schema_migrations")
-	if err := goose.UpContext(ctx, db, migrationDir(t)); err != nil {
-		t.Fatalf("apply latest migrations: %v", err)
+	if err := MigrateAll(ctx, db); err != nil {
+		t.Fatalf("apply latest core/cloud migrations: %v", err)
 	}
 }
 
 func migrateToVersion(t *testing.T, ctx context.Context, db *sql.DB, version int64) {
 	t.Helper()
 	goose.SetDialect("postgres")
-	goose.SetTableName("schema_migrations")
-	if err := goose.UpToContext(ctx, db, migrationDir(t), version); err != nil {
-		t.Fatalf("apply migrations to version %d: %v", version, err)
+	goose.SetTableName(migrationTableCore)
+	if err := goose.UpToContext(ctx, db, coreMigrationDir(t), version); err != nil {
+		t.Fatalf("apply core migrations to version %d: %v", version, err)
 	}
 }
 
@@ -580,11 +581,11 @@ func dsnWithCredentials(rawDSN, user, password string) (string, error) {
 	return parsed.String(), nil
 }
 
-func migrationDir(t *testing.T) string {
+func coreMigrationDir(t *testing.T) string {
 	t.Helper()
 	_, currentFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatalf("resolve migration directory: missing caller info")
 	}
-	return filepath.Join(filepath.Dir(currentFile), "migrations")
+	return filepath.Join(filepath.Dir(currentFile), "migrations", "core")
 }
