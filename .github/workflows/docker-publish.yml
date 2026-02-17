@@ -51,6 +51,12 @@ jobs:
             CORE_SCHEMA_HASH=${{ steps.manifest.outputs.core_schema_hash }}
             BUILD_COMMIT=${{ github.sha }}
             BUILD_TIME=${{ steps.manifest.outputs.build_time }}
+      - name: Ensure GHCR packages are public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X PATCH /user/packages/container/nerve-runtime/visibility -f visibility=public
+          gh api -X PATCH /user/packages/container/neuralmaild/visibility -f visibility=public
       - name: Generate runtime release artifacts
         run: |
           mkdir -p dist/runtime
