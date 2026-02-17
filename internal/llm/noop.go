@@ -11,7 +11,7 @@ func NewNoop() *Noop {
 	return &Noop{}
 }
 
-func (n *Noop) Name() string { return "noop" }
+func (n *Noop) Name() string  { return "noop" }
 func (n *Noop) Model() string { return "noop" }
 
 func (n *Noop) Classify(_ context.Context, text string, _ map[string]any) (Classification, error) {

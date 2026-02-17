@@ -22,8 +22,7 @@ func TestValidateSubscriptionAccess(t *testing.T) {
 		{name: "active allowed", status: "active", wantErr: false},
 		{name: "past_due in grace allowed", status: "past_due", grace: sql.NullTime{Time: now.Add(24 * time.Hour), Valid: true}, wantErr: false},
 		{name: "past_due out of grace denied", status: "past_due", grace: sql.NullTime{Time: now.Add(-24 * time.Hour), Valid: true}, wantErr: true},
-		{name: "canceled before period end allowed", status: "canceled", periodEnd: now.Add(24 * time.Hour), wantErr: false},
-		{name: "canceled after period end denied", status: "canceled", periodEnd: now.Add(-24 * time.Hour), wantErr: true},
+		{name: "canceled denied", status: "canceled", periodEnd: now.Add(24 * time.Hour), wantErr: true},
 		{name: "unpaid denied", status: "unpaid", wantErr: true},
 		{name: "unknown denied", status: "unknown", wantErr: true},
 	}

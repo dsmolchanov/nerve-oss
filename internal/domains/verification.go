@@ -82,4 +82,3 @@ func (v *Verifier) VerifyOwnership(ctx context.Context, domain string, verificat
 
 	return OwnershipVerification{Verified: false, Details: "DNS lookup failed"}
 }
-

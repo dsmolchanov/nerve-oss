@@ -3,11 +3,10 @@ package tools
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
-	"net/smtp"
 	"os"
 	"strings"
 	"time"
@@ -16,7 +15,9 @@ import (
 
 	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
+	"neuralmail/internal/emailtransport"
 	"neuralmail/internal/embed"
+	"neuralmail/internal/entitlements"
 	"neuralmail/internal/llm"
 	"neuralmail/internal/observability"
 	"neuralmail/internal/policy"
@@ -25,12 +26,13 @@ import (
 )
 
 type Service struct {
-	Config   config.Config
-	Store    *store.Store
-	LLM      llm.Provider
-	Vector   vector.Store
-	Policy   policy.Policy
-	Embedder embed.Provider
+	Config    config.Config
+	Store     *store.Store
+	LLM       llm.Provider
+	Vector    vector.Store
+	Policy    policy.Policy
+	Embedder  embed.Provider
+	Transport *emailtransport.Registry
 }
 
 type ToolContext struct {
@@ -38,8 +40,8 @@ type ToolContext struct {
 	ReplayID string
 }
 
-func NewService(cfg config.Config, store *store.Store, llmProvider llm.Provider, vectorStore vector.Store, policyObj policy.Policy, embedder embed.Provider) *Service {
-	return &Service{Config: cfg, Store: store, LLM: llmProvider, Vector: vectorStore, Policy: policyObj, Embedder: embedder}
+func NewService(cfg config.Config, store *store.Store, llmProvider llm.Provider, vectorStore vector.Store, policyObj policy.Policy, embedder embed.Provider, transport *emailtransport.Registry) *Service {
+	return &Service{Config: cfg, Store: store, LLM: llmProvider, Vector: vectorStore, Policy: policyObj, Embedder: embedder, Transport: transport}
 }
 
 func (s *Service) withScopedStore(ctx context.Context, fn func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error)) (any, error) {
@@ -274,9 +276,21 @@ func (s *Service) DraftReply(ctx context.Context, threadID string, goal string) 
 	})
 }
 
-func (s *Service) SendReply(ctx context.Context, threadID string, body string, needsApproval bool) (any, error) {
-	if needsApproval && !s.Config.Security.AllowSendWithWarnings {
-		return nil, errors.New("send blocked: needs human approval")
+func (s *Service) SendReply(ctx context.Context, threadID string, body string, bodyHTML string, needsApproval bool, idempotencyKey string) (any, error) {
+	if needsApproval {
+		if !s.Config.Cloud.Mode {
+			if !s.Config.Security.AllowSendWithWarnings {
+				return nil, errors.New("send blocked: needs human approval")
+			}
+		} else {
+			reservation, ok := entitlements.ReservationFromContext(ctx)
+			if !ok {
+				return nil, errors.New("missing entitlement context")
+			}
+			if !entitlements.FeatureBool(reservation.Features, "email_autopilot_send_override", false) {
+				return nil, errors.New("send blocked: needs human approval")
+			}
+		}
 	}
 	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
 		if principal.OrgID != "" {
@@ -292,29 +306,78 @@ func (s *Service) SendReply(ctx context.Context, threadID string, body string, n
 		if len(messages) == 0 {
 			return nil, errors.New("no messages in thread")
 		}
-		from := s.Config.SMTP.From
-		if from == "" {
-			from = "dev@local.neuralmail"
-		}
 		to := messages[len(messages)-1].From.Email
 		if to == "" {
 			return nil, errors.New("missing recipient")
 		}
+
+		inbox, err := s.activeInboxRecord(scopedCtx, st, principal, inboxID)
+		if err != nil {
+			return nil, err
+		}
+		from := strings.TrimSpace(inbox.Address)
+		if from == "" {
+			from = strings.TrimSpace(s.Config.SMTP.From)
+			if from == "" {
+				from = "dev@local.neuralmail"
+			}
+		}
+
+		if idempotencyKey == "" {
+			return nil, errors.New("missing idempotency_key")
+		}
+
 		if !s.Config.Security.AllowOutbound && !strings.HasSuffix(to, "@local.neuralmail") {
 			return nil, errors.New("outbound disabled for non-local domains")
 		}
 		if len(s.Config.Security.OutboundDomainAllowlist) > 0 && !domainAllowed(to, s.Config.Security.OutboundDomainAllowlist) {
 			return nil, errors.New("recipient domain not allowlisted")
 		}
+
+		provider := strings.TrimSpace(inbox.OutboundProvider)
+		if provider == "" {
+			provider = "smtp"
+		}
+		if s.Transport == nil {
+			return nil, errors.New("missing transport registry")
+		}
+		if _, ok := s.Transport.Outbound(provider); !ok {
+			return nil, fmt.Errorf("unknown outbound provider: %s", provider)
+		}
+
 		subject := "Re: " + thread.Subject
 		if subject == "Re: " {
 			subject = "Reply"
 		}
+
+		outboxID, err := st.EnqueueOutboxMessage(scopedCtx, store.OutboxMessage{
+			OrgID:          inbox.OrgID,
+			InboxID:        inboxID,
+			Provider:       provider,
+			IdempotencyKey: idempotencyKey,
+			To:             to,
+			From:           from,
+			Subject:        subject,
+			TextBody:       body,
+			HTMLBody:       bodyHTML,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		if _, err := st.GetMessage(scopedCtx, outboxID); err == nil {
+			return map[string]any{"message_id": outboxID, "status": "queued"}, nil
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+
 		msg := store.Message{
+			ID:        outboxID,
 			InboxID:   inboxID,
 			Direction: "outbound",
 			Subject:   subject,
 			Text:      body,
+			HTML:      bodyHTML,
 			CreatedAt: time.Now().UTC(),
 			From:      store.Participant{Email: from},
 			To:        []store.Participant{{Email: to}},
@@ -324,18 +387,15 @@ func (s *Service) SendReply(ctx context.Context, threadID string, body string, n
 		if err != nil {
 			return nil, err
 		}
-		if err := s.sendSMTP(from, to, subject, body); err != nil {
-			return nil, err
-		}
 		return map[string]any{"message_id": msgID, "status": "queued"}, nil
 	})
 }
 
-func (s *Service) ComposeEmail(ctx context.Context, inboxID, toAddress, subject, body string) (any, error) {
+func (s *Service) ComposeEmail(ctx context.Context, inboxID, toAddress, subject, body string, bodyHTML string, idempotencyKey string) (any, error) {
 	if subject == "" {
 		return nil, errors.New("missing subject")
 	}
-	if body == "" {
+	if body == "" && bodyHTML == "" {
 		return nil, errors.New("missing body")
 	}
 	if toAddress == "" {
@@ -352,9 +412,20 @@ func (s *Service) ComposeEmail(ctx context.Context, inboxID, toAddress, subject,
 			}
 		}
 
-		from := s.Config.SMTP.From
+		inbox, err := s.activeInboxRecord(scopedCtx, st, principal, inboxID)
+		if err != nil {
+			return nil, err
+		}
+		from := strings.TrimSpace(inbox.Address)
 		if from == "" {
-			from = "dev@local.neuralmail"
+			from = strings.TrimSpace(s.Config.SMTP.From)
+			if from == "" {
+				from = "dev@local.neuralmail"
+			}
+		}
+
+		if idempotencyKey == "" {
+			return nil, errors.New("missing idempotency_key")
 		}
 
 		if !s.Config.Security.AllowOutbound && !strings.HasSuffix(toAddress, "@local.neuralmail") {
@@ -364,33 +435,63 @@ func (s *Service) ComposeEmail(ctx context.Context, inboxID, toAddress, subject,
 			return nil, errors.New("recipient domain not allowlisted")
 		}
 
+		provider := strings.TrimSpace(inbox.OutboundProvider)
+		if provider == "" {
+			provider = "smtp"
+		}
+		if s.Transport == nil {
+			return nil, errors.New("missing transport registry")
+		}
+		if _, ok := s.Transport.Outbound(provider); !ok {
+			return nil, fmt.Errorf("unknown outbound provider: %s", provider)
+		}
+
+		outboxID, err := st.EnqueueOutboxMessage(scopedCtx, store.OutboxMessage{
+			OrgID:          inbox.OrgID,
+			InboxID:        inboxID,
+			Provider:       provider,
+			IdempotencyKey: idempotencyKey,
+			To:             toAddress,
+			From:           from,
+			Subject:        subject,
+			TextBody:       body,
+			HTMLBody:       bodyHTML,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		if existing, err := st.GetMessage(scopedCtx, outboxID); err == nil {
+			return map[string]any{
+				"thread_id":  existing.ThreadID,
+				"message_id": outboxID,
+				"status":     "queued",
+			}, nil
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+
 		msg := store.Message{
+			ID:        outboxID,
 			Direction: "outbound",
 			Subject:   subject,
 			Text:      body,
+			HTML:      bodyHTML,
 			CreatedAt: time.Now().UTC(),
 			From:      store.Participant{Email: from},
 			To:        []store.Participant{{Email: toAddress}},
 		}
 
-		providerThreadID := fmt.Sprintf("compose-%d", time.Now().UnixNano())
+		providerThreadID := "compose-" + outboxID
 		threadID, msgID, err := st.InsertMessageWithThread(scopedCtx, inboxID, providerThreadID, msg)
 		if err != nil {
 			return nil, err
 		}
-
-		smtpErr := s.sendSMTP(from, toAddress, subject, body)
-		status := "sent"
-		result := map[string]any{
+		return map[string]any{
 			"thread_id":  threadID,
 			"message_id": msgID,
-		}
-		if smtpErr != nil {
-			status = "queued"
-			result["smtp_error"] = smtpErr.Error()
-		}
-		result["status"] = status
-		return result, nil
+			"status":     "queued",
+		}, nil
 	})
 }
 
@@ -408,70 +509,29 @@ func domainAllowed(addr string, allowlist []string) bool {
 	return false
 }
 
-func (s *Service) sendSMTP(from, to, subject, body string) error {
-	host := s.Config.SMTP.Host
-	if host == "" {
-		host = "localhost"
+func (s *Service) activeInboxRecord(ctx context.Context, st *store.Store, principal auth.Principal, inboxID string) (store.InboxRecord, error) {
+	if st == nil || inboxID == "" {
+		return store.InboxRecord{}, errors.New("missing inbox")
 	}
-	addr := fmt.Sprintf("%s:%d", host, s.Config.SMTP.Port)
-	msg := strings.Join([]string{
-		"From: " + from,
-		"To: " + to,
-		"Subject: " + subject,
-		"",
-		body,
-	}, "\r\n")
-	helo := smtpHeloDomain(from)
-	conn, err := net.Dial("tcp", addr)
+	var (
+		inbox store.InboxRecord
+		err   error
+	)
+	if principal.OrgID != "" {
+		inbox, err = st.GetInboxRecordByIDForOrg(ctx, principal.OrgID, inboxID)
+	} else {
+		inbox, err = st.GetInboxRecordByID(ctx, inboxID)
+	}
 	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	client, err := smtp.NewClient(conn, host)
-	if err != nil {
-		return err
-	}
-	defer client.Quit()
-	if err := client.Hello(helo); err != nil {
-		return err
-	}
-	if (s.Config.SMTP.Username != "" || s.Config.SMTP.Password != "") && supportsAuth(client) {
-		auth := smtp.PlainAuth("", s.Config.SMTP.Username, s.Config.SMTP.Password, host)
-		if err := client.Auth(auth); err != nil {
-			return err
+		if principal.OrgID != "" && errors.Is(err, sql.ErrNoRows) {
+			return store.InboxRecord{}, errors.New("inbox not found")
 		}
+		return store.InboxRecord{}, err
 	}
-	if err := client.Mail(from); err != nil {
-		return err
+	if strings.ToLower(strings.TrimSpace(inbox.Status)) != "active" {
+		return store.InboxRecord{}, errors.New("inbox is not active")
 	}
-	if err := client.Rcpt(to); err != nil {
-		return err
-	}
-	writer, err := client.Data()
-	if err != nil {
-		return err
-	}
-	if _, err := writer.Write([]byte(msg)); err != nil {
-		_ = writer.Close()
-		return err
-	}
-	if err := writer.Close(); err != nil {
-		return err
-	}
-	return client.Quit()
-}
-
-func smtpHeloDomain(addr string) string {
-	parts := strings.Split(addr, "@")
-	if len(parts) == 2 && parts[1] != "" {
-		return parts[1]
-	}
-	return "local.neuralmail"
-}
-
-func supportsAuth(client *smtp.Client) bool {
-	ok, _ := client.Extension("AUTH")
-	return ok
+	return inbox, nil
 }
 
 func LoadSchema(schemaID string) (map[string]any, error) {

@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -189,7 +190,7 @@ func sendSMTP(cfg config.Config, subject, body string) {
 	if host == "" {
 		host = "localhost"
 	}
-	addr := fmt.Sprintf("%s:%d", host, cfg.SMTP.Port)
+	addr := net.JoinHostPort(host, strconv.Itoa(cfg.SMTP.Port))
 	from := cfg.SMTP.From
 	if from == "" {
 		from = "dev@local.neuralmail"
@@ -296,7 +297,7 @@ func pingSMTP(cfg config.Config) error {
 	if host == "" {
 		host = "localhost"
 	}
-	addr := fmt.Sprintf("%s:%d", host, cfg.SMTP.Port)
+	addr := net.JoinHostPort(host, strconv.Itoa(cfg.SMTP.Port))
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		return err

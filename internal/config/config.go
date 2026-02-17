@@ -1,7 +1,6 @@
 package config
 
 import (
-	"errors"
 	"os"
 	"strconv"
 	"strings"
@@ -45,12 +44,18 @@ type Config struct {
 		PollInterval time.Duration `yaml:"poll_interval"`
 	} `yaml:"jmap"`
 	SMTP struct {
-		Host     string `yaml:"host"`
-		Port     int    `yaml:"port"`
-		Username string `yaml:"username"`
-		Password string `yaml:"password"`
-		From     string `yaml:"from"`
+		Host            string `yaml:"host"`
+		Port            int    `yaml:"port"`
+		Username        string `yaml:"username"`
+		Password        string `yaml:"password"`
+		From            string `yaml:"from"`
+		RequireStartTLS bool   `yaml:"require_starttls"`
+		HeloDomain      string `yaml:"helo_domain"`
 	} `yaml:"smtp"`
+	Resend struct {
+		APIKey  string `yaml:"api_key"`
+		BaseURL string `yaml:"base_url"`
+	} `yaml:"resend"`
 	Database struct {
 		DSN string `yaml:"dsn"`
 	} `yaml:"database"`
@@ -108,6 +113,8 @@ func Default() Config {
 	cfg.SMTP.Host = "localhost"
 	cfg.SMTP.Port = 2525
 	cfg.SMTP.From = "dev@local.neuralmail"
+	cfg.SMTP.HeloDomain = "local.neuralmail"
+	cfg.Resend.BaseURL = "https://api.resend.com"
 	cfg.Qdrant.Collection = "messages_v1536"
 	cfg.Qdrant.EmbedDim = 1536
 	cfg.Embedding.Provider = "noop"
@@ -138,10 +145,6 @@ func Load(path string) (Config, error) {
 	}
 
 	applyEnv(&cfg)
-
-	if cfg.JMAP.URL == "" {
-		return cfg, errors.New("missing jmap.url (or NM_JMAP_URL)")
-	}
 
 	return cfg, nil
 }
@@ -224,6 +227,18 @@ func applyEnv(cfg *Config) {
 	}
 	if v := os.Getenv("NM_SMTP_FROM"); v != "" {
 		cfg.SMTP.From = v
+	}
+	if v := os.Getenv("NM_SMTP_REQUIRE_STARTTLS"); v != "" {
+		cfg.SMTP.RequireStartTLS = parseBool(v, cfg.SMTP.RequireStartTLS)
+	}
+	if v := os.Getenv("NM_SMTP_HELO_DOMAIN"); v != "" {
+		cfg.SMTP.HeloDomain = v
+	}
+	if v := os.Getenv("NM_RESEND_API_KEY"); v != "" {
+		cfg.Resend.APIKey = v
+	}
+	if v := os.Getenv("NM_RESEND_BASE_URL"); v != "" {
+		cfg.Resend.BaseURL = v
 	}
 	if v := os.Getenv("NM_DB_DSN"); v != "" {
 		cfg.Database.DSN = v

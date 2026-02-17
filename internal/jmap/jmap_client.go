@@ -18,10 +18,10 @@ import (
 const mailCapability = "urn:ietf:params:jmap:mail"
 
 type JMAPClient struct {
-	cfg           config.Config
-	httpClient    *http.Client
-	apiURL        string
-	accountID     string
+	cfg            config.Config
+	httpClient     *http.Client
+	apiURL         string
+	accountID      string
 	inboxMailboxID string
 }
 
@@ -121,7 +121,7 @@ func (c *JMAPClient) ensureInboxMailbox(ctx context.Context) error {
 		return nil
 	}
 	args := map[string]any{
-		"accountId": c.accountID,
+		"accountId":  c.accountID,
 		"properties": []string{"id", "name", "role"},
 	}
 	resp, err := c.call(ctx, "Mailbox/get", args)

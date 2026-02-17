@@ -45,7 +45,7 @@ func TestAtomicReserveNoOvershootUnderConcurrency(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				_, err := svc.PreAuthorizeTool(ctx, auth.Principal{OrgID: orgID}, "list_threads", "")
+				_, err := svc.PreAuthorizeTool(ctx, auth.Principal{OrgID: orgID}, "list_threads", "", "")
 				switch {
 				case err == nil:
 					successCount.Add(1)
@@ -96,7 +96,7 @@ func TestPreAuthorizeToolRollsUsagePeriodForward(t *testing.T) {
 		svc := NewService(config.Default(), st, nil)
 		svc.Now = func() time.Time { return now }
 
-		reservation, err := svc.PreAuthorizeTool(ctx, auth.Principal{OrgID: orgID}, "list_threads", "replay-1")
+		reservation, err := svc.PreAuthorizeTool(ctx, auth.Principal{OrgID: orgID}, "list_threads", "replay-1", "")
 		if err != nil {
 			t.Fatalf("pre-authorize tool: %v", err)
 		}
@@ -126,6 +126,75 @@ func TestPreAuthorizeToolRollsUsagePeriodForward(t *testing.T) {
 		}
 		if newUsed != 1 {
 			t.Fatalf("expected new period usage to be 1, got %d", newUsed)
+		}
+	})
+}
+
+func TestPreAuthorizeToolDeniesSendToolsWhenSendDisabled(t *testing.T) {
+	withTempStore(t, func(ctx context.Context, st *store.Store) {
+		orgID := uuid.NewString()
+		periodStart := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+		periodEnd := periodStart.Add(30 * 24 * time.Hour)
+
+		insertEntitlementFixture(t, ctx, st, orgID, periodStart, periodEnd, 100, 100000)
+		if _, err := st.DB().ExecContext(ctx, `
+			UPDATE org_entitlements
+			SET features = '{"email_send_enabled": false}'::jsonb
+			WHERE org_id = $1
+		`, orgID); err != nil {
+			t.Fatalf("disable send feature: %v", err)
+		}
+
+		svc := NewService(config.Default(), st, nil)
+		svc.Now = func() time.Time { return time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC) }
+
+		if _, err := svc.PreAuthorizeTool(ctx, auth.Principal{OrgID: orgID}, "compose_email", "replay-send", ""); err == nil {
+			t.Fatalf("expected compose_email to be denied when send is disabled")
+		}
+	})
+}
+
+func TestIdempotentReplayDoesNotDoubleChargeUnits(t *testing.T) {
+	withTempStore(t, func(ctx context.Context, st *store.Store) {
+		orgID := uuid.NewString()
+		periodStart := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+		periodEnd := periodStart.Add(30 * 24 * time.Hour)
+
+		insertEntitlementFixture(t, ctx, st, orgID, periodStart, periodEnd, 100, 100000)
+
+		svc := NewService(config.Default(), st, nil)
+		svc.Now = func() time.Time { return time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC) }
+
+		idempotencyKey := "idem-1"
+		res1, err := svc.PreAuthorizeTool(ctx, auth.Principal{OrgID: orgID}, "compose_email", "replay-1", idempotencyKey)
+		if err != nil {
+			t.Fatalf("pre-authorize first: %v", err)
+		}
+		if err := svc.FinalizeToolExecution(ctx, *res1, "compose_email", "replay-1", uuid.NewString(), "success", idempotencyKey, map[string]any{
+			"thread_id":  "thread-1",
+			"message_id": "msg-1",
+			"status":     "queued",
+		}); err != nil {
+			t.Fatalf("finalize first: %v", err)
+		}
+
+		used1, err := st.GetOrgUsageCounterUsed(ctx, orgID, meterMCPUnits, res1.PeriodStart)
+		if err != nil {
+			t.Fatalf("read used after first: %v", err)
+		}
+
+		_, err = svc.PreAuthorizeTool(ctx, auth.Principal{OrgID: orgID}, "compose_email", "replay-2", idempotencyKey)
+		var replayErr *IdempotencyReplayError
+		if !errors.As(err, &replayErr) {
+			t.Fatalf("expected replay error, got %v", err)
+		}
+
+		used2, err := st.GetOrgUsageCounterUsed(ctx, orgID, meterMCPUnits, res1.PeriodStart)
+		if err != nil {
+			t.Fatalf("read used after replay: %v", err)
+		}
+		if used2 != used1 {
+			t.Fatalf("expected used units to remain %d after replay, got %d", used1, used2)
 		}
 	})
 }

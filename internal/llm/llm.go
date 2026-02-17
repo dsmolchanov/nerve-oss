@@ -5,16 +5,16 @@ import (
 )
 
 type Classification struct {
-	Intent    string
-	Urgency   string
-	Sentiment string
+	Intent     string
+	Urgency    string
+	Sentiment  string
 	Confidence float64
 }
 
 type Extraction struct {
-	Data           map[string]any
-	Confidence     float64
-	MissingFields  []string
+	Data             map[string]any
+	Confidence       float64
+	MissingFields    []string
 	ValidationErrors []string
 }
 

@@ -22,6 +22,7 @@ import (
 	"neuralmail/internal/config"
 	"neuralmail/internal/domains"
 	"neuralmail/internal/emailaddr"
+	resendprovider "neuralmail/internal/emailtransport/providers/resend"
 	"neuralmail/internal/store"
 )
 
@@ -67,6 +68,73 @@ func NewHandler(cfg config.Config, st *store.Store, authSvc *auth.Service, billi
 	return h
 }
 
+func (h *Handler) resendDomainsClient() *resendprovider.DomainsClient {
+	return resendprovider.NewDomainsClient(resendprovider.Config{
+		APIKey:  h.Config.Resend.APIKey,
+		BaseURL: h.Config.Resend.BaseURL,
+	})
+}
+
+func resendRecordsToDNS(verificationToken string, records []resendprovider.DomainRecord) []domains.DNSRecord {
+	out := domains.DNSInstructions(verificationToken)
+	for _, r := range records {
+		host := strings.TrimSpace(r.Name)
+		if host == "" {
+			host = "@"
+		}
+		purpose := "Resend DNS record"
+		if strings.TrimSpace(r.Record) != "" {
+			purpose = "Resend " + strings.ToUpper(strings.TrimSpace(r.Record))
+		}
+		out = append(out, domains.DNSRecord{
+			Type:     strings.TrimSpace(r.Type),
+			Host:     host,
+			Value:    strings.TrimSpace(r.Value),
+			Priority: r.Priority,
+			Purpose:  purpose,
+			Required: true,
+		})
+	}
+	return out
+}
+
+func resendComputeVerification(records []resendprovider.DomainRecord) (mxVerified, spfVerified, dkimVerified bool) {
+	var (
+		foundMX, foundSPF, foundDKIM bool
+		allMX, allSPF, allDKIM       = true, true, true
+	)
+	for _, r := range records {
+		recType := strings.ToUpper(strings.TrimSpace(r.Type))
+		recGroup := strings.ToUpper(strings.TrimSpace(r.Record))
+		recStatus := strings.ToLower(strings.TrimSpace(r.Status))
+
+		isVerified := recStatus == "verified"
+		if recGroup == "SPF" {
+			foundSPF = true
+			allSPF = allSPF && isVerified
+			if recType == "MX" {
+				foundMX = true
+				allMX = allMX && isVerified
+			}
+		}
+		if recGroup == "DKIM" {
+			foundDKIM = true
+			allDKIM = allDKIM && isVerified
+		}
+	}
+
+	if foundMX {
+		mxVerified = allMX
+	}
+	if foundSPF {
+		spfVerified = allSPF
+	}
+	if foundDKIM {
+		dkimVerified = allDKIM
+	}
+	return mxVerified, spfVerified, dkimVerified
+}
+
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/orgs", h.handleCreateOrg)
 	mux.HandleFunc("/v1/orgs/runtime", h.handleOrgRuntime)
@@ -85,25 +153,41 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/billing/portal", h.handleBillingPortal)
 }
 
+func (h *Handler) withOrgStore(ctx context.Context, orgID string, fn func(scoped *store.Store) error) error {
+	if h == nil || h.Store == nil {
+		return errors.New("store not configured")
+	}
+	if h.Config.Cloud.Mode && orgID != "" {
+		return h.Store.RunAsOrg(ctx, orgID, fn)
+	}
+	return fn(h.Store)
+}
+
 func (h *Handler) EnforceInboxLimit(ctx context.Context, orgID string) error {
 	if h == nil || h.Store == nil || orgID == "" {
 		return nil
 	}
-	ent, err := h.Store.GetOrgEntitlement(ctx, orgID)
-	if err != nil {
-		return err
-	}
-	if ent.MaxInboxes <= 0 {
+	return h.withOrgStore(ctx, orgID, func(scoped *store.Store) error {
+		ent, err := scoped.GetOrgEntitlement(ctx, orgID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				// Allow provisioning flows to proceed before billing has produced an entitlement snapshot.
+				return nil
+			}
+			return err
+		}
+		if ent.MaxInboxes <= 0 {
+			return nil
+		}
+		count, err := scoped.CountInboxesByOrg(ctx, orgID)
+		if err != nil {
+			return err
+		}
+		if count >= ent.MaxInboxes {
+			return ErrMaxInboxesExceeded
+		}
 		return nil
-	}
-	count, err := h.Store.CountInboxesByOrg(ctx, orgID)
-	if err != nil {
-		return err
-	}
-	if count >= ent.MaxInboxes {
-		return ErrMaxInboxesExceeded
-	}
-	return nil
+	})
 }
 
 func (h *Handler) handleCreateOrg(w http.ResponseWriter, r *http.Request) {
@@ -383,23 +467,23 @@ type cloudAPIKeyResponse struct {
 }
 
 type orgDomainResponse struct {
-	ID                string            `json:"id"`
-	Domain            string            `json:"domain"`
-	Status            string            `json:"status"`
-	VerificationToken string            `json:"verification_token,omitempty"`
+	ID                string              `json:"id"`
+	Domain            string              `json:"domain"`
+	Status            string              `json:"status"`
+	VerificationToken string              `json:"verification_token,omitempty"`
 	DNSRecords        []domains.DNSRecord `json:"dns_records,omitempty"`
-	MXVerified        bool              `json:"mx_verified"`
-	SPFVerified       bool              `json:"spf_verified"`
-	DKIMVerified      bool              `json:"dkim_verified"`
-	DMARCVerified     bool              `json:"dmarc_verified"`
-	InboundEnabled    bool              `json:"inbound_enabled"`
-	DKIMSelector      string            `json:"dkim_selector"`
-	DKIMMethod        string            `json:"dkim_method"`
-	LastCheckAt       *time.Time        `json:"last_check_at,omitempty"`
-	VerifiedAt        *time.Time        `json:"verified_at,omitempty"`
-	ExpiresAt         *time.Time        `json:"expires_at,omitempty"`
-	CreatedAt         time.Time         `json:"created_at"`
-	UpdatedAt         time.Time         `json:"updated_at"`
+	MXVerified        bool                `json:"mx_verified"`
+	SPFVerified       bool                `json:"spf_verified"`
+	DKIMVerified      bool                `json:"dkim_verified"`
+	DMARCVerified     bool                `json:"dmarc_verified"`
+	InboundEnabled    bool                `json:"inbound_enabled"`
+	DKIMSelector      string              `json:"dkim_selector"`
+	DKIMMethod        string              `json:"dkim_method"`
+	LastCheckAt       *time.Time          `json:"last_check_at,omitempty"`
+	VerifiedAt        *time.Time          `json:"verified_at,omitempty"`
+	ExpiresAt         *time.Time          `json:"expires_at,omitempty"`
+	CreatedAt         time.Time           `json:"created_at"`
+	UpdatedAt         time.Time           `json:"updated_at"`
 }
 
 type domainVerifyResponse struct {
@@ -566,21 +650,27 @@ func (h *Handler) EnforceDomainLimit(ctx context.Context, orgID string) error {
 	if h == nil || h.Store == nil || orgID == "" {
 		return nil
 	}
-	ent, err := h.Store.GetOrgEntitlement(ctx, orgID)
-	if err != nil {
-		return err
-	}
-	if ent.MaxDomains <= 0 {
+	return h.withOrgStore(ctx, orgID, func(scoped *store.Store) error {
+		ent, err := scoped.GetOrgEntitlement(ctx, orgID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				// Allow provisioning flows to proceed before billing has produced an entitlement snapshot.
+				return nil
+			}
+			return err
+		}
+		if ent.MaxDomains <= 0 {
+			return nil
+		}
+		count, err := scoped.CountDomainsByOrg(ctx, orgID)
+		if err != nil {
+			return err
+		}
+		if count >= ent.MaxDomains {
+			return ErrMaxDomainsExceeded
+		}
 		return nil
-	}
-	count, err := h.Store.CountDomainsByOrg(ctx, orgID)
-	if err != nil {
-		return err
-	}
-	if count >= ent.MaxDomains {
-		return ErrMaxDomainsExceeded
-	}
-	return nil
+	})
 }
 
 func (h *Handler) handleDomains(w http.ResponseWriter, r *http.Request) {
@@ -618,7 +708,12 @@ func (h *Handler) handleDomainByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deleted, err := h.Store.DeleteOrgDomainForOrg(r.Context(), orgID, domainID)
+	var deleted bool
+	err = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+		var err error
+		deleted, err = scoped.DeleteOrgDomainForOrg(r.Context(), orgID, domainID)
+		return err
+	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -668,8 +763,6 @@ func (h *Handler) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, _ = h.Store.ExpirePendingDomains(r.Context())
-
 	verificationToken, err := generateDomainVerificationToken()
 	if err != nil {
 		http.Error(w, "failed to generate verification token", http.StatusInternalServerError)
@@ -685,25 +778,98 @@ func (h *Handler) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	domainID, err := h.Store.CreateOrgDomain(
-		r.Context(),
-		orgID,
-		canonical,
-		verificationToken,
-		"nerve",
-		"",
-		"",
-		dkimMethod,
-	)
+	var created store.OrgDomain
+	err = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+		_, _ = scoped.ExpirePendingDomains(r.Context())
+
+		domainID, err := scoped.CreateOrgDomain(
+			r.Context(),
+			orgID,
+			canonical,
+			verificationToken,
+			"nerve",
+			"",
+			"",
+			dkimMethod,
+		)
+		if err != nil {
+			return err
+		}
+
+		createdDomain, err := scoped.GetOrgDomainByIDForOrg(r.Context(), orgID, domainID)
+		if err != nil {
+			return err
+		}
+		created = createdDomain
+		return nil
+	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	created, err := h.Store.GetOrgDomainByIDForOrg(r.Context(), orgID, domainID)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	var resendDomain resendprovider.Domain
+	if strings.TrimSpace(h.Config.Resend.APIKey) != "" {
+		client := h.resendDomainsClient()
+
+		// Prefer create, fall back to lookup by name if already present.
+		rd, rerr := client.CreateDomain(r.Context(), canonical)
+		if rerr != nil {
+			items, lerr := client.ListDomains(r.Context())
+			if lerr != nil {
+				_ = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+					_, _ = scoped.DeleteOrgDomainForOrg(r.Context(), orgID, created.ID)
+					return nil
+				})
+				http.Error(w, rerr.Error(), http.StatusBadGateway)
+				return
+			}
+			var existingID string
+			for _, item := range items {
+				if strings.EqualFold(strings.TrimSpace(item.Name), canonical) {
+					existingID = item.ID
+					break
+				}
+			}
+			if existingID == "" {
+				_ = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+					_, _ = scoped.DeleteOrgDomainForOrg(r.Context(), orgID, created.ID)
+					return nil
+				})
+				http.Error(w, rerr.Error(), http.StatusBadGateway)
+				return
+			}
+			rd, rerr = client.GetDomain(r.Context(), existingID)
+			if rerr != nil {
+				_ = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+					_, _ = scoped.DeleteOrgDomainForOrg(r.Context(), orgID, created.ID)
+					return nil
+				})
+				http.Error(w, rerr.Error(), http.StatusBadGateway)
+				return
+			}
+		}
+		resendDomain = rd
+
+		rawRecords, merr := json.Marshal(resendDomain.Records)
+		if merr != nil {
+			_ = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+				_, _ = scoped.DeleteOrgDomainForOrg(r.Context(), orgID, created.ID)
+				return nil
+			})
+			http.Error(w, "failed to store provider dns records", http.StatusInternalServerError)
+			return
+		}
+		if uerr := h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+			return scoped.UpdateOrgDomainResend(r.Context(), created.ID, resendDomain.ID, resendDomain.Status, rawRecords)
+		}); uerr != nil {
+			_ = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+				_, _ = scoped.DeleteOrgDomainForOrg(r.Context(), orgID, created.ID)
+				return nil
+			})
+			http.Error(w, uerr.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	resp := orgDomainResponse{
@@ -711,7 +877,7 @@ func (h *Handler) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		Domain:            created.Domain,
 		Status:            created.Status,
 		VerificationToken: created.VerificationToken,
-		DNSRecords:        domains.DNSInstructions(created.VerificationToken),
+		DNSRecords:        resendRecordsToDNS(created.VerificationToken, resendDomain.Records),
 		MXVerified:        created.MXVerified,
 		SPFVerified:       created.SPFVerified,
 		DKIMVerified:      created.DKIMVerified,
@@ -751,7 +917,12 @@ func (h *Handler) handleListDomains(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	items, err := h.Store.ListOrgDomains(r.Context(), orgID)
+	var items []store.OrgDomain
+	err = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+		var err error
+		items, err = scoped.ListOrgDomains(r.Context(), orgID)
+		return err
+	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -815,7 +986,12 @@ func (h *Handler) handleDomainDNS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	d, err := h.Store.GetOrgDomainByIDForOrg(r.Context(), orgID, domainID)
+	var d store.OrgDomain
+	err = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+		var err error
+		d, err = scoped.GetOrgDomainByIDForOrg(r.Context(), orgID, domainID)
+		return err
+	})
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			http.Error(w, "domain not found", http.StatusNotFound)
@@ -825,10 +1001,26 @@ func (h *Handler) handleDomainDNS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var resendRecords []resendprovider.DomainRecord
+	if len(d.ResendDNSRecords) > 0 {
+		_ = json.Unmarshal(d.ResendDNSRecords, &resendRecords)
+	} else if strings.TrimSpace(h.Config.Resend.APIKey) != "" && d.ResendDomainID.Valid {
+		client := h.resendDomainsClient()
+		rd, err := client.GetDomain(r.Context(), d.ResendDomainID.String)
+		if err == nil {
+			resendRecords = rd.Records
+			if raw, merr := json.Marshal(resendRecords); merr == nil {
+				_ = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+					return scoped.UpdateOrgDomainResend(r.Context(), d.ID, rd.ID, rd.Status, raw)
+				})
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"domain_id":   d.ID,
 		"domain":      d.Domain,
-		"dns_records": domains.DNSInstructions(d.VerificationToken),
+		"dns_records": resendRecordsToDNS(d.VerificationToken, resendRecords),
 	})
 }
 
@@ -864,37 +1056,111 @@ func (h *Handler) handleVerifyDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	d, err := h.Store.GetOrgDomainByIDForOrg(r.Context(), orgID, domainID)
+	if h.Domains == nil {
+		h.Domains = domains.NewVerifier(nil)
+	}
+
+	var (
+		d       store.OrgDomain
+		updated store.OrgDomain
+		result  domains.OwnershipVerification
+		resend  *resendprovider.Domain
+	)
+	err = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+		var err error
+		d, err = scoped.GetOrgDomainByIDForOrg(r.Context(), orgID, domainID)
+		if err != nil {
+			return err
+		}
+
+		result = h.Domains.VerifyOwnership(r.Context(), d.Domain, d.VerificationToken)
+
+		status := d.Status
+		mx := d.MXVerified
+		spf := d.SPFVerified
+		dkim := d.DKIMVerified
+		dmarc := d.DMARCVerified
+
+		if result.Verified {
+			if strings.TrimSpace(h.Config.Resend.APIKey) == "" {
+				// Legacy/self-host mode: ownership verification is sufficient to activate the domain.
+				status = "active"
+			} else {
+				status = "verified_dns"
+			}
+		}
+
+		if strings.TrimSpace(h.Config.Resend.APIKey) != "" && result.Verified {
+			client := h.resendDomainsClient()
+
+			resendID := ""
+			if d.ResendDomainID.Valid {
+				resendID = d.ResendDomainID.String
+			} else {
+				rd, err := client.CreateDomain(r.Context(), d.Domain)
+				if err != nil {
+					items, lerr := client.ListDomains(r.Context())
+					if lerr == nil {
+						for _, item := range items {
+							if strings.EqualFold(strings.TrimSpace(item.Name), d.Domain) {
+								resendID = item.ID
+								break
+							}
+						}
+					}
+					if resendID == "" {
+						// Keep the domain in verified_dns state but return details.
+						resend = nil
+						goto persist
+					}
+				} else {
+					resendID = rd.ID
+				}
+			}
+
+			if resendID != "" {
+				_, _ = client.VerifyDomain(r.Context(), resendID)
+				rd, err := client.GetDomain(r.Context(), resendID)
+				if err == nil {
+					resend = &rd
+					raw, _ := json.Marshal(rd.Records)
+					_ = scoped.UpdateOrgDomainResend(r.Context(), d.ID, rd.ID, rd.Status, raw)
+
+					mx2, spf2, dkim2 := resendComputeVerification(rd.Records)
+					// SPF includes MX+TXT in Resend's view; keep both flags for UI/debug.
+					if mx2 {
+						mx = true
+					}
+					if spf2 {
+						spf = true
+					}
+					if dkim2 {
+						dkim = true
+					}
+					if spf && dkim {
+						status = "active"
+					}
+				}
+			}
+		}
+
+	persist:
+		if err := scoped.UpdateOrgDomainVerification(r.Context(), d.ID, mx, spf, dkim, dmarc, status); err != nil {
+			return err
+		}
+
+		updated, err = scoped.GetOrgDomainByIDForOrg(r.Context(), orgID, d.ID)
+		return err
+	})
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			http.Error(w, "domain not found", http.StatusNotFound)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if h.Domains == nil {
-		h.Domains = domains.NewVerifier(nil)
-	}
-
-	result := h.Domains.VerifyOwnership(r.Context(), d.Domain, d.VerificationToken)
-	status := d.Status
-	if result.Verified {
-		status = "active"
-	}
-
-	if err := h.Store.UpdateOrgDomainVerification(r.Context(), d.ID, false, false, false, false, status); err != nil {
 		if isUniqueViolation(err) {
 			http.Error(w, "domain already verified by another org", http.StatusConflict)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	updated, err := h.Store.GetOrgDomainByIDForOrg(r.Context(), orgID, d.ID)
-	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -926,12 +1192,24 @@ func (h *Handler) handleVerifyDomain(w http.ResponseWriter, r *http.Request) {
 		out.ExpiresAt = &tm
 	}
 
+	details := result.Details
+	checks := map[string]any{
+		"ownership_verified": result.Verified,
+	}
+	if resend != nil {
+		checks["resend_status"] = resend.Status
+		checks["resend_verified"] = updated.SPFVerified && updated.DKIMVerified
+		if strings.TrimSpace(resend.Status) != "" {
+			details = strings.TrimSpace(details + "; Resend: " + resend.Status)
+		}
+	} else if strings.TrimSpace(h.Config.Resend.APIKey) != "" && result.Verified {
+		details = strings.TrimSpace(details + "; Resend: verification pending")
+	}
+	checks["details"] = details
+
 	writeJSON(w, http.StatusOK, domainVerifyResponse{
 		Domain: out,
-		Checks: map[string]any{
-			"ownership_verified": result.Verified,
-			"details":            result.Details,
-		},
+		Checks: checks,
 	})
 }
 
@@ -954,9 +1232,9 @@ func (h *Handler) handleCreateInbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		OrgID     string `json:"org_id"`
-		Address   string `json:"address"`
-		DomainID  string `json:"domain_id,omitempty"`
+		OrgID    string `json:"org_id"`
+		Address  string `json:"address"`
+		DomainID string `json:"domain_id,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
@@ -984,11 +1262,17 @@ func (h *Handler) handleCreateInbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if existing, err := h.Store.GetInboxByAddress(r.Context(), canonical); err == nil && existing.ID != "" {
+	var existing store.InboxRecord
+	existingErr := h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+		var err error
+		existing, err = scoped.GetInboxByAddress(r.Context(), canonical)
+		return err
+	})
+	if existingErr == nil && existing.ID != "" {
 		http.Error(w, "inbox already exists", http.StatusConflict)
 		return
-	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	} else if existingErr != nil && !errors.Is(existingErr, sql.ErrNoRows) {
+		http.Error(w, existingErr.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -996,7 +1280,12 @@ func (h *Handler) handleCreateInbox(w http.ResponseWriter, r *http.Request) {
 	if h.Config.Cloud.Mode {
 		domainIDCandidate := strings.TrimSpace(req.DomainID)
 		if domainIDCandidate != "" {
-			d, err := h.Store.GetOrgDomainByIDForOrg(r.Context(), orgID, domainIDCandidate)
+			var d store.OrgDomain
+			err := h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+				var err error
+				d, err = scoped.GetOrgDomainByIDForOrg(r.Context(), orgID, domainIDCandidate)
+				return err
+			})
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					http.Error(w, "domain not verified", http.StatusBadRequest)
@@ -1015,7 +1304,12 @@ func (h *Handler) handleCreateInbox(w http.ResponseWriter, r *http.Request) {
 			}
 			orgDomainID = d.ID
 		} else {
-			d, err := h.Store.GetOrgDomainForSending(r.Context(), domainPart)
+			var d store.OrgDomain
+			err := h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+				var err error
+				d, err = scoped.GetOrgDomainForSending(r.Context(), domainPart)
+				return err
+			})
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					http.Error(w, "domain not verified", http.StatusBadRequest)
@@ -1033,7 +1327,12 @@ func (h *Handler) handleCreateInbox(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	created, err := h.Store.CreateInboxForOrg(r.Context(), orgID, canonical, orgDomainID)
+	var created store.InboxRecord
+	err = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+		var err error
+		created, err = scoped.CreateInboxForOrg(r.Context(), orgID, canonical, orgDomainID)
+		return err
+	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1069,7 +1368,12 @@ func (h *Handler) handleListInboxes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	items, err := h.Store.ListInboxRecordsByOrg(r.Context(), orgID)
+	var items []store.InboxRecord
+	err = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+		var err error
+		items, err = scoped.ListInboxRecordsByOrg(r.Context(), orgID)
+		return err
+	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1118,7 +1422,12 @@ func (h *Handler) handleInboxByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	disabled, err := h.Store.DisableInboxForOrg(r.Context(), orgID, inboxID)
+	var disabled bool
+	err = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+		var err error
+		disabled, err = scoped.DisableInboxForOrg(r.Context(), orgID, inboxID)
+		return err
+	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

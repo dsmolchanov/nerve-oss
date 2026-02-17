@@ -18,8 +18,8 @@ type Store interface {
 }
 
 type Point struct {
-	ID     string         `json:"id"`
-	Vector []float32      `json:"vector"`
+	ID      string         `json:"id"`
+	Vector  []float32      `json:"vector"`
 	Payload map[string]any `json:"payload"`
 }
 
@@ -131,9 +131,9 @@ func (q *Qdrant) Search(ctx context.Context, vector []float32, limit int, filter
 	}
 	var decoded struct {
 		Result []struct {
-			ID      any             `json:"id"`
-			Score   float64         `json:"score"`
-			Payload map[string]any  `json:"payload"`
+			ID      any            `json:"id"`
+			Score   float64        `json:"score"`
+			Payload map[string]any `json:"payload"`
 		} `json:"result"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {

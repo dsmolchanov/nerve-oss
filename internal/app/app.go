@@ -6,10 +6,15 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
+	"neuralmail/internal/emailtransport"
+	jmaptransport "neuralmail/internal/emailtransport/providers/jmap"
+	resendtransport "neuralmail/internal/emailtransport/providers/resend"
+	smtptransport "neuralmail/internal/emailtransport/providers/smtp"
 	"neuralmail/internal/embed"
 	"neuralmail/internal/entitlements"
 	"neuralmail/internal/jmap"
@@ -32,6 +37,8 @@ type App struct {
 	LLM      llm.Provider
 	Policy   policy.Policy
 	MCP      *mcp.Server
+
+	EmailTransport *emailtransport.Registry
 }
 
 func New(ctx context.Context, cfg config.Config) (*App, error) {
@@ -66,7 +73,32 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		vectorStore = vector.NewQdrant(cfg.Qdrant.URL, cfg.Qdrant.Collection)
 	}
 
-	toolSvc := tools.NewService(cfg, st, llmProvider, vectorStore, pol, embedder)
+	transportRegistry := emailtransport.NewRegistry()
+
+	outboundAdapter := smtptransport.NewOutboundAdapter(smtptransport.Config{
+		Host:            cfg.SMTP.Host,
+		Port:            cfg.SMTP.Port,
+		Username:        cfg.SMTP.Username,
+		Password:        cfg.SMTP.Password,
+		RequireStartTLS: cfg.SMTP.RequireStartTLS,
+		HeloDomain:      cfg.SMTP.HeloDomain,
+	})
+	_ = transportRegistry.RegisterOutbound(outboundAdapter)
+
+	if strings.TrimSpace(cfg.Resend.APIKey) != "" {
+		_ = transportRegistry.RegisterOutbound(resendtransport.NewOutboundAdapter(resendtransport.Config{
+			APIKey:  cfg.Resend.APIKey,
+			BaseURL: cfg.Resend.BaseURL,
+		}))
+	}
+
+	jmapClient, err := jmap.NewClient(cfg)
+	if err != nil {
+		jmapClient = jmap.NoopClient{}
+	}
+	_ = transportRegistry.RegisterInbound(jmaptransport.NewInboundAdapter(jmapClient))
+
+	toolSvc := tools.NewService(cfg, st, llmProvider, vectorStore, pol, embedder, transportRegistry)
 	authSvc := auth.NewService(cfg, st)
 	entitlementObserver := observability.NewEntitlementObserver(log.Default())
 	entitlementSvc := entitlements.NewService(cfg, st, entitlementObserver)
@@ -81,6 +113,8 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		LLM:      llmProvider,
 		Policy:   pol,
 		MCP:      mcpServer,
+
+		EmailTransport: transportRegistry,
 	}, nil
 }
 
@@ -167,19 +201,32 @@ func (a *App) handleDebug(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "</ul></body></html>")
 }
 
-func (a *App) PollLoop(ctx context.Context, client jmap.Client, inboxID string) error {
-	if client == nil {
-		return errors.New("missing jmap client")
+func (a *App) PollLoop(ctx context.Context, inboxID string) error {
+	if a.EmailTransport == nil {
+		return errors.New("missing email transport registry")
 	}
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(a.Config.JMAP.PollInterval):
-			state, _ := a.Store.GetCheckpoint(ctx, inboxID, client.Name())
-			newState, messageIDs, err := jmap.Ingest(ctx, client, a.Store, inboxID, state)
+			inbox, err := a.Store.GetInboxRecordByID(ctx, inboxID)
+			if err != nil {
+				return err
+			}
+			provider := strings.TrimSpace(inbox.InboundProvider)
+			if provider == "" {
+				provider = "jmap"
+			}
+			adapter, ok := a.EmailTransport.Inbound(provider)
+			if !ok {
+				return fmt.Errorf("unknown inbound provider: %s", provider)
+			}
+
+			state, _ := a.Store.GetCheckpoint(ctx, inboxID, adapter.Name())
+			newState, messageIDs, err := adapter.Ingest(ctx, a.Store, inboxID, state)
 			if err == nil && newState != "" {
-				_ = a.Store.UpdateCheckpoint(ctx, inboxID, client.Name(), newState)
+				_ = a.Store.UpdateCheckpoint(ctx, inboxID, adapter.Name(), newState)
 			}
 			for _, id := range messageIDs {
 				_ = a.Queue.PushEmbeddingJob(ctx, id)

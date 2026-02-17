@@ -20,9 +20,6 @@ func ValidateSubscriptionAccess(now time.Time, ent store.OrgEntitlement) error {
 		}
 		return ErrSubscriptionInactive
 	case "canceled":
-		if !now.After(ent.UsagePeriodEnd) {
-			return nil
-		}
 		return ErrSubscriptionInactive
 	case "unpaid":
 		return ErrSubscriptionInactive

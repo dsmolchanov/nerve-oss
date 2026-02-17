@@ -20,11 +20,11 @@ type fakeEntitlementGate struct {
 	preAuthErr error
 }
 
-func (f *fakeEntitlementGate) PreAuthorizeTool(_ context.Context, _ auth.Principal, _ string, _ string) (*entitlements.Reservation, error) {
+func (f *fakeEntitlementGate) PreAuthorizeTool(_ context.Context, _ auth.Principal, _ string, _ string, _ string) (*entitlements.Reservation, error) {
 	return nil, f.preAuthErr
 }
 
-func (f *fakeEntitlementGate) FinalizeToolExecution(_ context.Context, _ entitlements.Reservation, _ string, _ string, _ string, _ string) error {
+func (f *fakeEntitlementGate) FinalizeToolExecution(_ context.Context, _ entitlements.Reservation, _ string, _ string, _ string, _ string, _ string, _ any) error {
 	return nil
 }
 

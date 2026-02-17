@@ -15,16 +15,60 @@ type InboxRecord struct {
 	Address     string
 	Status      string
 	CreatedAt   time.Time
+
+	InboundProvider           string
+	OutboundProvider          string
+	InboundProviderConfigRef  sql.NullString
+	OutboundProviderConfigRef sql.NullString
+}
+
+func (s *Store) GetInboxRecordByID(ctx context.Context, inboxID string) (InboxRecord, error) {
+	var rec InboxRecord
+	row := s.q.QueryRowContext(ctx, `
+		SELECT id, org_id, org_domain_id::text, address, status, created_at,
+		       inbound_provider, outbound_provider,
+		       inbound_provider_config_ref, outbound_provider_config_ref
+		FROM inboxes
+		WHERE id = $1
+	`, inboxID)
+	if err := row.Scan(
+		&rec.ID,
+		&rec.OrgID,
+		&rec.OrgDomainID,
+		&rec.Address,
+		&rec.Status,
+		&rec.CreatedAt,
+		&rec.InboundProvider,
+		&rec.OutboundProvider,
+		&rec.InboundProviderConfigRef,
+		&rec.OutboundProviderConfigRef,
+	); err != nil {
+		return rec, err
+	}
+	return rec, nil
 }
 
 func (s *Store) GetInboxRecordByIDForOrg(ctx context.Context, orgID string, inboxID string) (InboxRecord, error) {
 	var rec InboxRecord
 	row := s.q.QueryRowContext(ctx, `
-		SELECT id, org_id, org_domain_id::text, address, status, created_at
+		SELECT id, org_id, org_domain_id::text, address, status, created_at,
+		       inbound_provider, outbound_provider,
+		       inbound_provider_config_ref, outbound_provider_config_ref
 		FROM inboxes
 		WHERE id = $1 AND org_id = $2
 	`, inboxID, orgID)
-	if err := row.Scan(&rec.ID, &rec.OrgID, &rec.OrgDomainID, &rec.Address, &rec.Status, &rec.CreatedAt); err != nil {
+	if err := row.Scan(
+		&rec.ID,
+		&rec.OrgID,
+		&rec.OrgDomainID,
+		&rec.Address,
+		&rec.Status,
+		&rec.CreatedAt,
+		&rec.InboundProvider,
+		&rec.OutboundProvider,
+		&rec.InboundProviderConfigRef,
+		&rec.OutboundProviderConfigRef,
+	); err != nil {
 		return rec, err
 	}
 	return rec, nil
@@ -32,7 +76,9 @@ func (s *Store) GetInboxRecordByIDForOrg(ctx context.Context, orgID string, inbo
 
 func (s *Store) ListInboxRecordsByOrg(ctx context.Context, orgID string) ([]InboxRecord, error) {
 	rows, err := s.q.QueryContext(ctx, `
-		SELECT id, org_id, org_domain_id::text, address, status, created_at
+		SELECT id, org_id, org_domain_id::text, address, status, created_at,
+		       inbound_provider, outbound_provider,
+		       inbound_provider_config_ref, outbound_provider_config_ref
 		FROM inboxes
 		WHERE org_id = $1
 		ORDER BY created_at DESC
@@ -45,7 +91,18 @@ func (s *Store) ListInboxRecordsByOrg(ctx context.Context, orgID string) ([]Inbo
 	var out []InboxRecord
 	for rows.Next() {
 		var rec InboxRecord
-		if err := rows.Scan(&rec.ID, &rec.OrgID, &rec.OrgDomainID, &rec.Address, &rec.Status, &rec.CreatedAt); err != nil {
+		if err := rows.Scan(
+			&rec.ID,
+			&rec.OrgID,
+			&rec.OrgDomainID,
+			&rec.Address,
+			&rec.Status,
+			&rec.CreatedAt,
+			&rec.InboundProvider,
+			&rec.OutboundProvider,
+			&rec.InboundProviderConfigRef,
+			&rec.OutboundProviderConfigRef,
+		); err != nil {
 			return nil, err
 		}
 		out = append(out, rec)
@@ -56,13 +113,26 @@ func (s *Store) ListInboxRecordsByOrg(ctx context.Context, orgID string) ([]Inbo
 func (s *Store) GetInboxByAddress(ctx context.Context, address string) (InboxRecord, error) {
 	var rec InboxRecord
 	row := s.q.QueryRowContext(ctx, `
-		SELECT id, org_id, org_domain_id::text, address, status, created_at
+		SELECT id, org_id, org_domain_id::text, address, status, created_at,
+		       inbound_provider, outbound_provider,
+		       inbound_provider_config_ref, outbound_provider_config_ref
 		FROM inboxes
 		WHERE lower(address) = lower($1)
 		ORDER BY created_at DESC
 		LIMIT 1
 	`, address)
-	if err := row.Scan(&rec.ID, &rec.OrgID, &rec.OrgDomainID, &rec.Address, &rec.Status, &rec.CreatedAt); err != nil {
+	if err := row.Scan(
+		&rec.ID,
+		&rec.OrgID,
+		&rec.OrgDomainID,
+		&rec.Address,
+		&rec.Status,
+		&rec.CreatedAt,
+		&rec.InboundProvider,
+		&rec.OutboundProvider,
+		&rec.InboundProviderConfigRef,
+		&rec.OutboundProviderConfigRef,
+	); err != nil {
 		return rec, err
 	}
 	return rec, nil
@@ -74,6 +144,9 @@ func (s *Store) CreateInboxForOrg(ctx context.Context, orgID string, address str
 		OrgID:   orgID,
 		Address: address,
 		Status:  "active",
+
+		InboundProvider:  "jmap",
+		OutboundProvider: "smtp",
 	}
 
 	var domainRef any

@@ -6,8 +6,8 @@ import (
 )
 
 type Ollama struct {
-	BaseURL string
-	ModelName   string
+	BaseURL   string
+	ModelName string
 }
 
 func NewOllama(baseURL string, model string) *Ollama {
@@ -17,7 +17,7 @@ func NewOllama(baseURL string, model string) *Ollama {
 	return &Ollama{BaseURL: baseURL, ModelName: model}
 }
 
-func (o *Ollama) Name() string { return "ollama" }
+func (o *Ollama) Name() string  { return "ollama" }
 func (o *Ollama) Model() string { return o.ModelName }
 
 func (o *Ollama) Classify(_ context.Context, _ string, _ map[string]any) (Classification, error) {

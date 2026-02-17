@@ -22,8 +22,8 @@ import (
 )
 
 type EntitlementGate interface {
-	PreAuthorizeTool(ctx context.Context, principal auth.Principal, toolName string, replayID string) (*entitlements.Reservation, error)
-	FinalizeToolExecution(ctx context.Context, reservation entitlements.Reservation, toolName string, replayID string, auditID string, status string) error
+	PreAuthorizeTool(ctx context.Context, principal auth.Principal, toolName string, replayID string, idempotencyKey string) (*entitlements.Reservation, error)
+	FinalizeToolExecution(ctx context.Context, reservation entitlements.Reservation, toolName string, replayID string, auditID string, status string, idempotencyKey string, result any) error
 }
 
 type Server struct {
@@ -146,27 +146,53 @@ func (s *Server) callTool(ctx context.Context, req Request) (any, error) {
 	inputsHash := hashJSON(params.Arguments)
 	replayID := observability.NewReplayID()
 
+	principal, hasPrincipal := auth.PrincipalFromContext(ctx)
+
+	idempotencyKey := ""
+	if params.Name == "send_reply" || params.Name == "compose_email" {
+		idempotencyKey = extractIdempotencyKey(params.Arguments)
+		if idempotencyKey == "" {
+			orgSeed := ""
+			if hasPrincipal {
+				orgSeed = principal.OrgID
+			}
+			idempotencyKey = deriveIdempotencyKey(orgSeed, params.Name, inputsHash)
+		}
+	}
+
 	var reservation *entitlements.Reservation
 	if s.Config.Cloud.Mode && s.Entitlements != nil {
-		principal, ok := auth.PrincipalFromContext(ctx)
-		if !ok {
+		if !hasPrincipal {
 			return nil, errors.New("missing cloud principal")
 		}
-		reserved, err := s.Entitlements.PreAuthorizeTool(ctx, principal, params.Name, replayID)
+		reserved, err := s.Entitlements.PreAuthorizeTool(ctx, principal, params.Name, replayID, idempotencyKey)
 		if err != nil {
+			var replayErr *entitlements.IdempotencyReplayError
+			if errors.As(err, &replayErr) {
+				return attachReplayID(replayErr.Response, replayID), nil
+			}
 			return nil, err
 		}
 		reservation = reserved
 	}
 
-	exec, err := s.toolExecutor(params)
+	if reservation != nil {
+		ctx = entitlements.WithReservation(ctx, *reservation)
+	}
+
+	exec, err := s.toolExecutor(params, idempotencyKey)
 	if err != nil {
+		if reservation != nil && s.Entitlements != nil {
+			if finalizeErr := s.Entitlements.FinalizeToolExecution(ctx, *reservation, params.Name, replayID, "", "failed", idempotencyKey, nil); finalizeErr != nil {
+				return nil, finalizeErr
+			}
+		}
 		return nil, err
 	}
 
 	result, callErr := exec(ctx)
 	result = attachReplayID(result, replayID)
-	auditID := s.recordToolCall(ctx, params.Name, inputsHash, result, start, replayID)
+	auditID := s.recordToolCall(ctx, params.Name, idempotencyKey, inputsHash, result, start, replayID)
 	result = attachAuditID(result, auditID)
 
 	if reservation != nil && s.Entitlements != nil {
@@ -174,7 +200,7 @@ func (s *Server) callTool(ctx context.Context, req Request) (any, error) {
 		if callErr != nil {
 			status = "failed"
 		}
-		if err := s.Entitlements.FinalizeToolExecution(ctx, *reservation, params.Name, replayID, auditID, status); err != nil {
+		if err := s.Entitlements.FinalizeToolExecution(ctx, *reservation, params.Name, replayID, auditID, status, idempotencyKey, result); err != nil {
 			return result, err
 		}
 	}
@@ -182,7 +208,7 @@ func (s *Server) callTool(ctx context.Context, req Request) (any, error) {
 	return result, callErr
 }
 
-func (s *Server) toolExecutor(params ToolCallParams) (func(context.Context) (any, error), error) {
+func (s *Server) toolExecutor(params ToolCallParams, defaultIdempotencyKey string) (func(context.Context) (any, error), error) {
 	switch params.Name {
 	case "list_threads":
 		var input struct {
@@ -252,35 +278,47 @@ func (s *Server) toolExecutor(params ToolCallParams) (func(context.Context) (any
 		}, nil
 	case "send_reply":
 		var input struct {
-			ThreadID      string `json:"thread_id"`
-			Body          string `json:"body_or_draft_id"`
-			NeedsApproval bool   `json:"needs_human_approval"`
+			ThreadID       string `json:"thread_id"`
+			Body           string `json:"body_or_draft_id"`
+			HTML           string `json:"html,omitempty"`
+			IdempotencyKey string `json:"idempotency_key,omitempty"`
+			NeedsApproval  bool   `json:"needs_human_approval"`
 		}
 		if err := json.Unmarshal(params.Arguments, &input); err != nil {
 			return nil, err
 		}
 		return func(ctx context.Context) (any, error) {
-			return s.Tools.SendReply(ctx, input.ThreadID, input.Body, input.NeedsApproval)
+			key := strings.TrimSpace(input.IdempotencyKey)
+			if key == "" {
+				key = defaultIdempotencyKey
+			}
+			return s.Tools.SendReply(ctx, input.ThreadID, input.Body, input.HTML, input.NeedsApproval, key)
 		}, nil
 	case "compose_email":
 		var input struct {
-			InboxID string `json:"inbox_id"`
-			To      string `json:"to"`
-			Subject string `json:"subject"`
-			Body    string `json:"body"`
+			InboxID        string `json:"inbox_id"`
+			To             string `json:"to"`
+			Subject        string `json:"subject"`
+			Body           string `json:"body"`
+			HTML           string `json:"html,omitempty"`
+			IdempotencyKey string `json:"idempotency_key,omitempty"`
 		}
 		if err := json.Unmarshal(params.Arguments, &input); err != nil {
 			return nil, err
 		}
 		return func(ctx context.Context) (any, error) {
-			return s.Tools.ComposeEmail(ctx, input.InboxID, input.To, input.Subject, input.Body)
+			key := strings.TrimSpace(input.IdempotencyKey)
+			if key == "" {
+				key = defaultIdempotencyKey
+			}
+			return s.Tools.ComposeEmail(ctx, input.InboxID, input.To, input.Subject, input.Body, input.HTML, key)
 		}, nil
 	default:
 		return nil, fmt.Errorf("unknown tool: %s", params.Name)
 	}
 }
 
-func (s *Server) recordToolCall(ctx context.Context, toolName string, inputsHash string, result any, start time.Time, replayID string) string {
+func (s *Server) recordToolCall(ctx context.Context, toolName string, idempotencyKey string, inputsHash string, result any, start time.Time, replayID string) string {
 	if s.Tools == nil || s.Tools.Store == nil {
 		return ""
 	}
@@ -291,7 +329,7 @@ func (s *Server) recordToolCall(ctx context.Context, toolName string, inputsHash
 	if s.Tools.LLM != nil {
 		modelName = s.Tools.LLM.Name()
 	}
-	toolCallID, err := s.Tools.Store.RecordToolCall(ctx, toolName, "", modelName, promptVersion, latency)
+	toolCallID, err := s.Tools.Store.RecordToolCall(ctx, toolName, idempotencyKey, modelName, promptVersion, latency)
 	if err != nil {
 		return ""
 	}
@@ -305,6 +343,22 @@ func hashJSON(value any) string {
 		return ""
 	}
 	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func extractIdempotencyKey(args json.RawMessage) string {
+	var input struct {
+		IdempotencyKey string `json:"idempotency_key"`
+	}
+	if err := json.Unmarshal(args, &input); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(input.IdempotencyKey)
+}
+
+func deriveIdempotencyKey(orgSeed string, toolName string, inputsHash string) string {
+	seed := orgSeed + ":" + toolName + ":" + inputsHash
+	sum := sha256.Sum256([]byte(seed))
 	return fmt.Sprintf("%x", sum[:])
 }
 
@@ -424,6 +478,7 @@ func (s *Server) requiredScope(req Request) string {
 
 func (s *Server) writeDispatchError(w http.ResponseWriter, id any, err error) {
 	var rateErr *entitlements.RateLimitError
+	var inProgressErr *entitlements.IdempotencyInProgressError
 	switch {
 	case errors.Is(err, entitlements.ErrQuotaExceeded):
 		writeErrorWithData(w, id, -32040, "quota_exceeded", map[string]any{"retryable": false})
@@ -433,6 +488,11 @@ func (s *Server) writeDispatchError(w http.ResponseWriter, id any, err error) {
 		writeErrorWithData(w, id, -32042, "rate_limited", map[string]any{
 			"retryable":           true,
 			"retry_after_seconds": rateErr.RetryAfterSeconds,
+		})
+	case errors.As(err, &inProgressErr):
+		writeErrorWithData(w, id, -32043, "idempotency_in_progress", map[string]any{
+			"retryable":           true,
+			"retry_after_seconds": inProgressErr.RetryAfterSeconds,
 		})
 	default:
 		writeError(w, id, -32000, err.Error())

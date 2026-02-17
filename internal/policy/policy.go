@@ -23,19 +23,19 @@ type Policy struct {
 		Replacement string   `yaml:"replacement"`
 	} `yaml:"redactions"`
 	Approval struct {
-		RequiredWhen       []string `yaml:"required_when"`
+		RequiredWhen        []string `yaml:"required_when"`
 		ConfidenceThreshold float64  `yaml:"confidence_threshold"`
 	} `yaml:"approval"`
 }
 
 type Result struct {
-	Allowed             bool
-	ViolationLevel      string
-	Reason              string
-	SuggestedRedaction  string
-	RiskFlags           []string
-	NeedsApproval       bool
-	RedactionsApplied   []string
+	Allowed            bool
+	ViolationLevel     string
+	Reason             string
+	SuggestedRedaction string
+	RiskFlags          []string
+	NeedsApproval      bool
+	RedactionsApplied  []string
 }
 
 func Load(path string) (Policy, error) {

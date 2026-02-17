@@ -2,17 +2,21 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"neuralmail/internal/app"
 	"neuralmail/internal/config"
+	"neuralmail/internal/emailtransport"
+	resendtransport "neuralmail/internal/emailtransport/providers/resend"
+	smtptransport "neuralmail/internal/emailtransport/providers/smtp"
 	"neuralmail/internal/embed"
-	"neuralmail/internal/jmap"
 	"neuralmail/internal/mcp"
 	"neuralmail/internal/queue"
 	"neuralmail/internal/store"
@@ -58,10 +62,11 @@ func runServe(ctx context.Context, cfg config.Config) {
 		inboxAddr = "dev@local.neuralmail"
 	}
 	inboxID, _ := appInstance.Store.EnsureDefaults(ctx, inboxAddr)
-	client, err := jmap.NewClient(cfg)
-	if err == nil {
-		go appInstance.PollLoop(ctx, client, inboxID)
-	}
+	go func() {
+		if err := appInstance.PollLoop(ctx, inboxID); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("poll loop stopped: %v", err)
+		}
+	}()
 
 	log.Printf("neuralmaild serving on %s", cfg.HTTP.Addr)
 	if err := appInstance.Serve(ctx); err != nil {
@@ -97,6 +102,28 @@ func runWorker(ctx context.Context, cfg config.Config) {
 	if err := vecStore.EnsureCollection(ctx, cfg.Embedding.Dim); err != nil {
 		log.Printf("qdrant ensure collection failed: %v", err)
 	}
+
+	transportRegistry := emailtransport.NewRegistry()
+	_ = transportRegistry.RegisterOutbound(smtptransport.NewOutboundAdapter(smtptransport.Config{
+		Host:            cfg.SMTP.Host,
+		Port:            cfg.SMTP.Port,
+		Username:        cfg.SMTP.Username,
+		Password:        cfg.SMTP.Password,
+		RequireStartTLS: cfg.SMTP.RequireStartTLS,
+		HeloDomain:      cfg.SMTP.HeloDomain,
+	}))
+	if strings.TrimSpace(cfg.Resend.APIKey) != "" {
+		_ = transportRegistry.RegisterOutbound(resendtransport.NewOutboundAdapter(resendtransport.Config{
+			APIKey:  cfg.Resend.APIKey,
+			BaseURL: cfg.Resend.BaseURL,
+		}))
+	}
+	outboxWorker := emailtransport.NewOutboxWorker(storeInstance, transportRegistry, "neuralmaild-worker")
+	go func() {
+		if err := outboxWorker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("outbox worker stopped: %v", err)
+		}
+	}()
 
 	log.Println("worker started")
 	for {

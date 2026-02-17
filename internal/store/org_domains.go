@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -27,6 +28,9 @@ type OrgDomain struct {
 	LastCheckAt       sql.NullTime
 	VerifiedAt        sql.NullTime
 	ExpiresAt         sql.NullTime
+	ResendDomainID    sql.NullString
+	ResendStatus      sql.NullString
+	ResendDNSRecords  json.RawMessage
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 }
@@ -53,7 +57,9 @@ func (s *Store) GetOrgDomain(ctx context.Context, domain string) (OrgDomain, err
 		SELECT id, org_id, domain, status, verification_token,
 		       mx_verified, spf_verified, dkim_verified, dmarc_verified,
 		       inbound_enabled, dkim_selector, dkim_private_key_enc, dkim_public_key,
-		       dkim_method, last_check_at, verified_at, expires_at, created_at, updated_at
+		       dkim_method, last_check_at, verified_at, expires_at,
+		       resend_domain_id, resend_domain_status, resend_dns_records,
+		       created_at, updated_at
 		FROM org_domains
 		WHERE lower(domain) = lower($1)
 		ORDER BY created_at DESC
@@ -72,7 +78,9 @@ func (s *Store) GetOrgDomainByID(ctx context.Context, id string) (OrgDomain, err
 		SELECT id, org_id, domain, status, verification_token,
 		       mx_verified, spf_verified, dkim_verified, dmarc_verified,
 		       inbound_enabled, dkim_selector, dkim_private_key_enc, dkim_public_key,
-		       dkim_method, last_check_at, verified_at, expires_at, created_at, updated_at
+		       dkim_method, last_check_at, verified_at, expires_at,
+		       resend_domain_id, resend_domain_status, resend_dns_records,
+		       created_at, updated_at
 		FROM org_domains
 		WHERE id = $1
 	`, id)
@@ -89,7 +97,9 @@ func (s *Store) GetOrgDomainByIDForOrg(ctx context.Context, orgID, id string) (O
 		SELECT id, org_id, domain, status, verification_token,
 		       mx_verified, spf_verified, dkim_verified, dmarc_verified,
 		       inbound_enabled, dkim_selector, dkim_private_key_enc, dkim_public_key,
-		       dkim_method, last_check_at, verified_at, expires_at, created_at, updated_at
+		       dkim_method, last_check_at, verified_at, expires_at,
+		       resend_domain_id, resend_domain_status, resend_dns_records,
+		       created_at, updated_at
 		FROM org_domains
 		WHERE id = $1 AND org_id = $2
 	`, id, orgID)
@@ -105,7 +115,9 @@ func (s *Store) ListOrgDomains(ctx context.Context, orgID string) ([]OrgDomain, 
 		SELECT id, org_id, domain, status, verification_token,
 		       mx_verified, spf_verified, dkim_verified, dmarc_verified,
 		       inbound_enabled, dkim_selector, dkim_private_key_enc, dkim_public_key,
-		       dkim_method, last_check_at, verified_at, expires_at, created_at, updated_at
+		       dkim_method, last_check_at, verified_at, expires_at,
+		       resend_domain_id, resend_domain_status, resend_dns_records,
+		       created_at, updated_at
 		FROM org_domains
 		WHERE org_id = $1
 		ORDER BY created_at DESC
@@ -122,7 +134,9 @@ func (s *Store) ListOrgDomains(ctx context.Context, orgID string) ([]OrgDomain, 
 			&d.ID, &d.OrgID, &d.Domain, &d.Status, &d.VerificationToken,
 			&d.MXVerified, &d.SPFVerified, &d.DKIMVerified, &d.DMARCVerified,
 			&d.InboundEnabled, &d.DKIMSelector, &d.DKIMPrivateKeyEnc, &d.DKIMPublicKey,
-			&d.DKIMMethod, &d.LastCheckAt, &d.VerifiedAt, &d.ExpiresAt, &d.CreatedAt, &d.UpdatedAt,
+			&d.DKIMMethod, &d.LastCheckAt, &d.VerifiedAt, &d.ExpiresAt,
+			&d.ResendDomainID, &d.ResendStatus, &d.ResendDNSRecords,
+			&d.CreatedAt, &d.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -182,7 +196,9 @@ func (s *Store) GetOrgDomainForSending(ctx context.Context, domain string) (OrgD
 		SELECT id, org_id, domain, status, verification_token,
 		       mx_verified, spf_verified, dkim_verified, dmarc_verified,
 		       inbound_enabled, dkim_selector, dkim_private_key_enc, dkim_public_key,
-		       dkim_method, last_check_at, verified_at, expires_at, created_at, updated_at
+		       dkim_method, last_check_at, verified_at, expires_at,
+		       resend_domain_id, resend_domain_status, resend_dns_records,
+		       created_at, updated_at
 		FROM org_domains
 		WHERE lower(domain) = lower($1) AND status = 'active'
 		LIMIT 1
@@ -227,7 +243,9 @@ func scanOrgDomain(row *sql.Row, d *OrgDomain) error {
 		&d.ID, &d.OrgID, &d.Domain, &d.Status, &d.VerificationToken,
 		&d.MXVerified, &d.SPFVerified, &d.DKIMVerified, &d.DMARCVerified,
 		&d.InboundEnabled, &d.DKIMSelector, &d.DKIMPrivateKeyEnc, &d.DKIMPublicKey,
-		&d.DKIMMethod, &d.LastCheckAt, &d.VerifiedAt, &d.ExpiresAt, &d.CreatedAt, &d.UpdatedAt,
+		&d.DKIMMethod, &d.LastCheckAt, &d.VerifiedAt, &d.ExpiresAt,
+		&d.ResendDomainID, &d.ResendStatus, &d.ResendDNSRecords,
+		&d.CreatedAt, &d.UpdatedAt,
 	)
 }
 
@@ -236,4 +254,16 @@ func nullIfEmpty(s string) sql.NullString {
 		return sql.NullString{}
 	}
 	return sql.NullString{String: s, Valid: true}
+}
+
+func (s *Store) UpdateOrgDomainResend(ctx context.Context, id, resendDomainID, resendStatus string, dnsRecords json.RawMessage) error {
+	_, err := s.q.ExecContext(ctx, `
+		UPDATE org_domains
+		SET resend_domain_id = nullif($2, ''),
+		    resend_domain_status = nullif($3, ''),
+		    resend_dns_records = CASE WHEN $4 IS NULL THEN resend_dns_records ELSE $4::jsonb END,
+		    updated_at = now()
+		WHERE id = $1
+	`, id, resendDomainID, resendStatus, dnsRecords)
+	return err
 }

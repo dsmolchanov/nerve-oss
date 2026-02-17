@@ -6,8 +6,8 @@ import (
 )
 
 type OpenAI struct {
-	APIKey string
-	ModelName  string
+	APIKey    string
+	ModelName string
 }
 
 func NewOpenAI(apiKey string, model string) *OpenAI {
@@ -17,7 +17,7 @@ func NewOpenAI(apiKey string, model string) *OpenAI {
 	return &OpenAI{APIKey: apiKey, ModelName: model}
 }
 
-func (o *OpenAI) Name() string { return "openai" }
+func (o *OpenAI) Name() string  { return "openai" }
 func (o *OpenAI) Model() string { return o.ModelName }
 
 func (o *OpenAI) Classify(_ context.Context, _ string, _ map[string]any) (Classification, error) {

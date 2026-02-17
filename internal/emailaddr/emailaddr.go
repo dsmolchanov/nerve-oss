@@ -47,4 +47,3 @@ func Canonicalize(address string) (canonical string, localPart string, domain st
 
 	return localPart + "@" + domain, localPart, domain, nil
 }
-

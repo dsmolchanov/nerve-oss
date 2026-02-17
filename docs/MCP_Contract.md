@@ -363,9 +363,11 @@ Input schema:
   "properties": {
     "thread_id": {"$ref": "neuralmail/types.json#/definitions/id"},
     "body_or_draft_id": {"type": "string"},
-    "idempotency_key": {"type": "string"}
+    "idempotency_key": {"type": "string"},
+    "html": {"type": "string"},
+    "needs_human_approval": {"type": "boolean", "default": false}
   },
-  "required": ["thread_id", "body_or_draft_id", "idempotency_key"]
+  "required": ["thread_id", "body_or_draft_id"]
 }
 ```
 
@@ -381,6 +383,49 @@ Output schema:
     "status": {"type": "string", "enum": ["queued", "sent"]}
   },
   "required": ["message_id", "status"]
+}
+```
+
+### 8) compose_email
+Compose and send a new email (not a reply).
+
+Input schema:
+```json
+{
+  "$id": "neuralmail/tools/compose_email.input.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "inbox_id": {"$ref": "neuralmail/types.json#/definitions/id"},
+    "to": {"type": "string", "format": "email"},
+    "subject": {"type": "string"},
+    "idempotency_key": {"type": "string"},
+    "body": {"type": "string"},
+    "html": {"type": "string"}
+  },
+  "required": ["inbox_id", "to", "subject"],
+  "anyOf": [
+    {"required": ["body"]},
+    {"required": ["html"]}
+  ]
+}
+```
+
+Output schema:
+```json
+{
+  "$id": "neuralmail/tools/compose_email.output.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "thread_id": {"$ref": "neuralmail/types.json#/definitions/id"},
+    "message_id": {"$ref": "neuralmail/types.json#/definitions/id"},
+    "status": {"type": "string", "enum": ["queued", "sent"]},
+    "smtp_error": {"type": "string"}
+  },
+  "required": ["thread_id", "message_id", "status"]
 }
 ```
 

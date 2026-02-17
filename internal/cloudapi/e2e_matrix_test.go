@@ -22,6 +22,7 @@ import (
 	"neuralmail/internal/auth"
 	"neuralmail/internal/billing"
 	"neuralmail/internal/config"
+	"neuralmail/internal/emailtransport"
 	"neuralmail/internal/entitlements"
 	"neuralmail/internal/llm"
 	"neuralmail/internal/mcp"
@@ -79,6 +80,18 @@ func (f *fixedDraftLLM) Draft(_ context.Context, _ string, _ map[string]any, _ s
 
 func (f *fixedDraftLLM) Name() string  { return "fixed-draft-llm" }
 func (f *fixedDraftLLM) Model() string { return "fixed-draft-llm" }
+
+type noopOutboundAdapter struct{}
+
+func (n noopOutboundAdapter) Name() string { return "smtp" }
+
+func (n noopOutboundAdapter) SendMessage(context.Context, emailtransport.OutboundMessage, string) (string, error) {
+	return "", nil
+}
+
+func (n noopOutboundAdapter) GetDeliveryStatus(context.Context, string) (emailtransport.DeliveryStatus, error) {
+	return emailtransport.DeliveryStatusUnknown, emailtransport.ErrNotSupported
+}
 
 func TestCloudE2EMatrix(t *testing.T) {
 	withTempStore(t, func(ctx context.Context, st *store.Store) {
@@ -491,7 +504,9 @@ func newCloudE2EHarness(t *testing.T, ctx context.Context, st *store.Store) *clo
 	pol := policy.Policy{
 		ForbiddenPhrases: []string{"processed your refund of $500 immediately"},
 	}
-	toolSvc := tools.NewService(cfg, st, &fixedDraftLLM{draftText: "I have processed your refund of $500 immediately."}, nil, pol, nil)
+	transport := emailtransport.NewRegistry()
+	_ = transport.RegisterOutbound(noopOutboundAdapter{})
+	toolSvc := tools.NewService(cfg, st, &fixedDraftLLM{draftText: "I have processed your refund of $500 immediately."}, nil, pol, nil, transport)
 	mcpServer := mcp.NewServer(cfg, toolSvc, authSvc, entitlementSvc)
 	mcpMux := http.NewServeMux()
 	mcpMux.HandleFunc("/mcp", mcpServer.HandleHTTP)

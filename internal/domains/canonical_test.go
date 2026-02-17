@@ -24,12 +24,12 @@ func TestCanonicalizeDomain(t *testing.T) {
 		{input: "https://acme.com", wantErr: true},
 		{input: "acme.com/path", wantErr: true},
 		{input: "not a domain", wantErr: true},
-		{input: "localhost", wantErr: true},          // no TLD
-		{input: "-invalid.com", wantErr: true},       // starts with dash
-		{input: "invalid-.com", wantErr: true},       // ends with dash
-		{input: "inv alid.com", wantErr: true},       // spaces
-		{input: "acme.c", wantErr: true},             // TLD too short
-		{input: ".acme.com", wantErr: true},          // starts with dot
+		{input: "localhost", wantErr: true},    // no TLD
+		{input: "-invalid.com", wantErr: true}, // starts with dash
+		{input: "invalid-.com", wantErr: true}, // ends with dash
+		{input: "inv alid.com", wantErr: true}, // spaces
+		{input: "acme.c", wantErr: true},       // TLD too short
+		{input: ".acme.com", wantErr: true},    // starts with dot
 	}
 
 	for _, tc := range tests {

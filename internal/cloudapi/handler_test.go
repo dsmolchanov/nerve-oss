@@ -544,6 +544,132 @@ func TestOrgDomainsCreateListDNSVerifyAndDelete(t *testing.T) {
 	})
 }
 
+func TestOrgDomainsResendProvisioningAndVerification(t *testing.T) {
+	withTempStore(t, func(ctx context.Context, st *store.Store) {
+		var createdName string
+
+		resendSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") != "Bearer re_test_key" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"message":"unauthorized"}`))
+				return
+			}
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/domains":
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatalf("decode resend create body: %v", err)
+				}
+				createdName, _ = body["name"].(string)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"data":{"id":"d_abc","name":"acme.com","status":"not_started","records":[{"record":"SPF","name":"send","type":"MX","value":"feedback-smtp.us-east-1.amazonses.com","ttl":"Auto","status":"not_started","priority":10},{"record":"SPF","name":"send","type":"TXT","value":"v=spf1 include:amazonses.com ~all","ttl":"Auto","status":"not_started"},{"record":"DKIM","name":"dkim._domainkey","type":"CNAME","value":"dkim.resend.com","ttl":"Auto","status":"not_started"}]}}`))
+				return
+			case r.Method == http.MethodPost && r.URL.Path == "/domains/d_abc/verify":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"data":{"id":"d_abc","name":"acme.com","status":"pending","records":[]}}`))
+				return
+			case r.Method == http.MethodGet && r.URL.Path == "/domains/d_abc":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"data":{"id":"d_abc","name":"acme.com","status":"verified","records":[{"record":"SPF","name":"send","type":"MX","value":"feedback-smtp.us-east-1.amazonses.com","ttl":"Auto","status":"verified","priority":10},{"record":"SPF","name":"send","type":"TXT","value":"v=spf1 include:amazonses.com ~all","ttl":"Auto","status":"verified"},{"record":"DKIM","name":"dkim._domainkey","type":"CNAME","value":"dkim.resend.com","ttl":"Auto","status":"verified"}]}}`))
+				return
+			default:
+				t.Fatalf("unexpected resend request: %s %s", r.Method, r.URL.Path)
+			}
+		}))
+		defer resendSrv.Close()
+
+		cfg := config.Default()
+		cfg.Security.APIKey = "bootstrap-admin"
+		cfg.Cloud.Mode = true
+		cfg.Resend.APIKey = "re_test_key"
+		cfg.Resend.BaseURL = resendSrv.URL
+
+		handler := NewHandler(cfg, st, &auth.Service{Config: cfg, Now: time.Now}, &stubBilling{}, &stubTokenIssuer{})
+		mux := http.NewServeMux()
+		handler.RegisterRoutes(mux)
+
+		orgID, err := st.CreateOrg(ctx, "domains-org")
+		if err != nil {
+			t.Fatalf("create org: %v", err)
+		}
+
+		createReq := jsonRequest(t, http.MethodPost, "/v1/domains", map[string]any{
+			"org_id": orgID,
+			"domain": "acme.com",
+		})
+		createReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, createReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected domain create success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+		if createdName != "acme.com" {
+			t.Fatalf("expected resend create name=acme.com, got %q", createdName)
+		}
+
+		var created struct {
+			Domain struct {
+				ID                string              `json:"id"`
+				Domain            string              `json:"domain"`
+				Status            string              `json:"status"`
+				VerificationToken string              `json:"verification_token"`
+				DNSRecords        []domains.DNSRecord `json:"dns_records"`
+			} `json:"domain"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+			t.Fatalf("decode domain create response: %v", err)
+		}
+		if created.Domain.ID == "" || created.Domain.Domain != "acme.com" {
+			t.Fatalf("unexpected created domain payload: %+v", created.Domain)
+		}
+		if len(created.Domain.DNSRecords) < 2 {
+			t.Fatalf("expected combined DNS records (nerve + resend), got %+v", created.Domain.DNSRecords)
+		}
+
+		// Verify ownership via stub DNS resolver to return the token at _nerve-verify.acme.com.
+		txtName := domains.OwnershipTXTLabel + ".acme.com"
+		handler.Domains = domains.NewVerifier(stubTXTResolver{
+			records: map[string][]string{
+				txtName: {created.Domain.VerificationToken},
+			},
+		})
+		verifyReq := jsonRequest(t, http.MethodPost, "/v1/domains/verify", map[string]any{
+			"org_id":    orgID,
+			"domain_id": created.Domain.ID,
+		})
+		verifyReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, verifyReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected verify success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+		var verified struct {
+			Domain struct {
+				Status      string `json:"status"`
+				MXVerified  bool   `json:"mx_verified"`
+				SPFVerified bool   `json:"spf_verified"`
+				DKIMVerified bool  `json:"dkim_verified"`
+			} `json:"domain"`
+			Checks map[string]any `json:"checks"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &verified); err != nil {
+			t.Fatalf("decode verify response: %v", err)
+		}
+		if verified.Domain.Status != "active" {
+			t.Fatalf("expected status 'active', got %q", verified.Domain.Status)
+		}
+		if !verified.Domain.MXVerified || !verified.Domain.SPFVerified || !verified.Domain.DKIMVerified {
+			t.Fatalf("expected resend verification flags true, got %+v", verified.Domain)
+		}
+		if ok, _ := verified.Checks["ownership_verified"].(bool); !ok {
+			t.Fatalf("expected ownership_verified=true, got %+v", verified.Checks)
+		}
+		if ok, _ := verified.Checks["resend_verified"].(bool); !ok {
+			t.Fatalf("expected resend_verified=true, got %+v", verified.Checks)
+		}
+	})
+}
+
 func TestInboxesCreateAndList(t *testing.T) {
 	withTempStore(t, func(ctx context.Context, st *store.Store) {
 		cfg := config.Default()

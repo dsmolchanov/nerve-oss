@@ -3,6 +3,7 @@ package entitlements
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
 	"time"
@@ -36,6 +37,7 @@ type Reservation struct {
 	MonthlyUnits int64
 	UsedAfter    int64
 	Subscription string
+	Features     json.RawMessage
 }
 
 type Service struct {
@@ -63,7 +65,7 @@ func NewService(cfg config.Config, st *store.Store, observer *observability.Enti
 	}
 }
 
-func (s *Service) PreAuthorizeTool(ctx context.Context, principal auth.Principal, toolName string, replayID string) (*Reservation, error) {
+func (s *Service) PreAuthorizeTool(ctx context.Context, principal auth.Principal, toolName string, replayID string, idempotencyKey string) (*Reservation, error) {
 	if s == nil || s.Store == nil {
 		return nil, ErrSubscriptionInactive
 	}
@@ -99,21 +101,62 @@ func (s *Service) PreAuthorizeTool(ctx context.Context, principal auth.Principal
 			return err
 		}
 
+		if toolName == "send_reply" || toolName == "compose_email" {
+			// Default allow to preserve existing behavior until plans are explicitly feature-scoped.
+			if !FeatureBool(ent.Features, "email_send_enabled", true) {
+				s.Observer.RecordDeny(principal.OrgID, "send_disabled")
+				return errors.New("send disabled by plan")
+			}
+
+			if idempotencyKey != "" {
+				acquire, err := scoped.AcquireToolIdempotency(ctx, principal.OrgID, toolName, idempotencyKey, now, 15*time.Minute)
+				if err != nil {
+					return err
+				}
+				switch acquire.State {
+				case store.ToolIdempotencyReplay:
+					var cached any
+					if err := json.Unmarshal(acquire.CachedResponse, &cached); err != nil {
+						return err
+					}
+					return &IdempotencyReplayError{Response: cached}
+				case store.ToolIdempotencyInProgress:
+					return &IdempotencyInProgressError{RetryAfterSeconds: 2}
+				case store.ToolIdempotencyAcquired:
+					// proceed
+				default:
+					return &IdempotencyInProgressError{RetryAfterSeconds: 2}
+				}
+			}
+		}
+
 		allowed, retryAfter := s.RateLimiter.Allow(principal.OrgID, ent.MCPRPM)
 		if !allowed {
 			s.Observer.RecordDeny(principal.OrgID, "rate_limited")
+			if idempotencyKey != "" && (toolName == "send_reply" || toolName == "compose_email") {
+				_ = scoped.MarkToolIdempotencyFailed(ctx, principal.OrgID, toolName, idempotencyKey, now)
+			}
 			return &RateLimitError{RetryAfterSeconds: retryAfter}
 		}
 
 		if err := scoped.EnsureOrgUsageCounter(ctx, principal.OrgID, meterMCPUnits, ent.UsagePeriodStart, ent.UsagePeriodEnd); err != nil {
+			if idempotencyKey != "" && (toolName == "send_reply" || toolName == "compose_email") {
+				_ = scoped.MarkToolIdempotencyFailed(ctx, principal.OrgID, toolName, idempotencyKey, now)
+			}
 			return err
 		}
 		reserved, usedAfter, err := scoped.ReserveOrgUsageUnits(ctx, principal.OrgID, meterMCPUnits, ent.UsagePeriodStart, cost, ent.MonthlyUnits)
 		if err != nil {
+			if idempotencyKey != "" && (toolName == "send_reply" || toolName == "compose_email") {
+				_ = scoped.MarkToolIdempotencyFailed(ctx, principal.OrgID, toolName, idempotencyKey, now)
+			}
 			return err
 		}
 		if !reserved {
 			s.Observer.RecordDeny(principal.OrgID, "quota_exceeded")
+			if idempotencyKey != "" && (toolName == "send_reply" || toolName == "compose_email") {
+				_ = scoped.MarkToolIdempotencyFailed(ctx, principal.OrgID, toolName, idempotencyKey, now)
+			}
 			return ErrQuotaExceeded
 		}
 
@@ -127,6 +170,7 @@ func (s *Service) PreAuthorizeTool(ctx context.Context, principal auth.Principal
 			MonthlyUnits: ent.MonthlyUnits,
 			UsedAfter:    usedAfter,
 			Subscription: ent.SubscriptionStatus,
+			Features:     ent.Features,
 		}
 		return nil
 	})
@@ -136,7 +180,28 @@ func (s *Service) PreAuthorizeTool(ctx context.Context, principal auth.Principal
 	return reservation, nil
 }
 
-func (s *Service) FinalizeToolExecution(ctx context.Context, reservation Reservation, toolName string, replayID string, auditID string, status string) error {
+// FeatureBool extracts a boolean feature flag from a JSON entitlement blob.
+// If the key is absent or the blob is invalid, defaultValue is returned.
+func FeatureBool(raw json.RawMessage, key string, defaultValue bool) bool {
+	if len(raw) == 0 {
+		return defaultValue
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return defaultValue
+	}
+	v, ok := m[key]
+	if !ok {
+		return defaultValue
+	}
+	b, ok := v.(bool)
+	if ok {
+		return b
+	}
+	return defaultValue
+}
+
+func (s *Service) FinalizeToolExecution(ctx context.Context, reservation Reservation, toolName string, replayID string, auditID string, status string, idempotencyKey string, result any) error {
 	if s == nil || s.Store == nil {
 		return nil
 	}
@@ -150,11 +215,38 @@ func (s *Service) FinalizeToolExecution(ctx context.Context, reservation Reserva
 	}
 
 	return s.Store.RunAsOrg(ctx, reservation.OrgID, func(scoped *store.Store) error {
+		now := s.Now()
 		if normalizedStatus != "success" {
 			if err := scoped.ReleaseOrgUsageUnits(ctx, reservation.OrgID, reservation.MeterName, reservation.PeriodStart, reservation.Quantity); err != nil {
 				return err
 			}
 			s.Observer.RecordDeny(reservation.OrgID, "tool_execution_failed")
+		}
+
+		if idempotencyKey != "" && (toolName == "send_reply" || toolName == "compose_email") {
+			if normalizedStatus == "success" {
+				cached := result
+				if m, ok := result.(map[string]any); ok {
+					copyMap := make(map[string]any, len(m))
+					for k, v := range m {
+						copyMap[k] = v
+					}
+					delete(copyMap, "replay_id")
+					delete(copyMap, "audit_id")
+					cached = copyMap
+				}
+				cachedBytes, err := json.Marshal(cached)
+				if err != nil {
+					return err
+				}
+				if err := scoped.MarkToolIdempotencySucceeded(ctx, reservation.OrgID, toolName, idempotencyKey, cachedBytes, now); err != nil {
+					return err
+				}
+			} else {
+				if err := scoped.MarkToolIdempotencyFailed(ctx, reservation.OrgID, toolName, idempotencyKey, now); err != nil {
+					return err
+				}
+			}
 		}
 		return scoped.RecordUsageEvent(ctx, reservation.OrgID, reservation.MeterName, reservation.Quantity, toolName, replayID, auditID, normalizedStatus)
 	})
