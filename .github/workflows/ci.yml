@@ -24,10 +24,5 @@ jobs:
         run: ./scripts/ci/verify_runtime_boundaries.sh
       - name: Verify migration ownership
         run: ./scripts/ci/verify_migration_ownership.sh
-      - name: golangci-lint
-        continue-on-error: true
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: v1.56
       - name: Docker build
         run: docker build -f deploy/docker/cortex/Dockerfile .

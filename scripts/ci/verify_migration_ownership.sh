@@ -12,9 +12,14 @@ check_absent() {
 
   local pattern
   for pattern in "$@"; do
-    if rg -n -S "$pattern" "$dir" >/dev/null; then
+    if command -v rg >/dev/null 2>&1; then
+      matcher='rg -n -S'
+    else
+      matcher='grep -R -n -E'
+    fi
+    if $matcher "$pattern" "$dir" >/dev/null; then
       echo "migration ownership violation: $label contains forbidden token '$pattern'" >&2
-      rg -n -S "$pattern" "$dir" >&2
+      $matcher "$pattern" "$dir" >&2
       exit 1
     fi
   done
