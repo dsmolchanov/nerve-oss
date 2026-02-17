@@ -1,0 +1,72 @@
+name: Docker Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate runtime manifest
+        id: manifest
+        run: |
+          mkdir -p dist/runtime
+          VERSION="${GITHUB_REF_NAME}"
+          ./scripts/release/generate_runtime_manifest.sh "$VERSION" "dist/runtime/runtime-manifest.json"
+          MCP_HASH="$(sed -n 's/.*\"mcp_contract_hash\": \"\\([^\"]*\\)\".*/\\1/p' dist/runtime/runtime-manifest.json)"
+          CORE_HASH="$(sed -n 's/.*\"core_schema_hash\": \"\\([^\"]*\\)\".*/\\1/p' dist/runtime/runtime-manifest.json)"
+          BUILD_TIME="$(sed -n 's/.*\"build_time\": \"\\([^\"]*\\)\".*/\\1/p' dist/runtime/runtime-manifest.json)"
+          echo "runtime_version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "mcp_contract_hash=$MCP_HASH" >> "$GITHUB_OUTPUT"
+          echo "core_schema_hash=$CORE_HASH" >> "$GITHUB_OUTPUT"
+          echo "build_time=$BUILD_TIME" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: |
+            ghcr.io/${{ github.repository_owner }}/nerve-runtime
+            ghcr.io/${{ github.repository_owner }}/neuralmaild
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: deploy/docker/cortex/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            RUNTIME_VERSION=${{ steps.manifest.outputs.runtime_version }}
+            MCP_CONTRACT_HASH=${{ steps.manifest.outputs.mcp_contract_hash }}
+            CORE_SCHEMA_HASH=${{ steps.manifest.outputs.core_schema_hash }}
+            BUILD_COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ steps.manifest.outputs.build_time }}
+      - name: Generate runtime release artifacts
+        run: |
+          mkdir -p dist/runtime
+          cp docs/MCP_Contract.md dist/runtime/MCP_Contract.md
+          tar -czf dist/runtime/core-migrations.tar.gz -C internal/store/migrations core
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum dist/runtime/runtime-manifest.json | awk '{print $1}' > dist/runtime/runtime-manifest.sha256
+            sha256sum dist/runtime/MCP_Contract.md | awk '{print $1}' > dist/runtime/mcp-contract.sha256
+            sha256sum dist/runtime/core-migrations.tar.gz | awk '{print $1}' > dist/runtime/core-migrations.sha256
+          else
+            shasum -a 256 dist/runtime/runtime-manifest.json | awk '{print $1}' > dist/runtime/runtime-manifest.sha256
+            shasum -a 256 dist/runtime/MCP_Contract.md | awk '{print $1}' > dist/runtime/mcp-contract.sha256
+            shasum -a 256 dist/runtime/core-migrations.tar.gz | awk '{print $1}' > dist/runtime/core-migrations.sha256
+          fi
+      - name: Upload runtime release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-release-assets
+          path: dist/runtime/*

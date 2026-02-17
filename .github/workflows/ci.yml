@@ -1,0 +1,32 @@
+name: OSS CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: Go fmt
+        run: test -z "$(gofmt -l $(git ls-files '*.go'))"
+      - name: Go vet
+        run: go vet ./...
+      - name: Go test
+        run: go test ./...
+      - name: Verify runtime boundaries
+        run: ./scripts/ci/verify_runtime_boundaries.sh
+      - name: Verify migration ownership
+        run: ./scripts/ci/verify_migration_ownership.sh
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.56
+      - name: Docker build
+        run: docker build -f deploy/docker/cortex/Dockerfile .
