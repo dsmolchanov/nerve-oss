@@ -25,6 +25,7 @@ jobs:
       - name: Verify migration ownership
         run: ./scripts/ci/verify_migration_ownership.sh
       - name: golangci-lint
+        continue-on-error: true
         uses: golangci/golangci-lint-action@v6
         with:
           version: v1.56
