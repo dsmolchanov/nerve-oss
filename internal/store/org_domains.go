@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"strings"
 	"time"
 
@@ -30,7 +29,7 @@ type OrgDomain struct {
 	ExpiresAt         sql.NullTime
 	ResendDomainID    sql.NullString
 	ResendStatus      sql.NullString
-	ResendDNSRecords  json.RawMessage
+	ResendDNSRecords  []byte
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 }
@@ -256,12 +255,12 @@ func nullIfEmpty(s string) sql.NullString {
 	return sql.NullString{String: s, Valid: true}
 }
 
-func (s *Store) UpdateOrgDomainResend(ctx context.Context, id, resendDomainID, resendStatus string, dnsRecords json.RawMessage) error {
+func (s *Store) UpdateOrgDomainResend(ctx context.Context, id, resendDomainID, resendStatus string, dnsRecords []byte) error {
 	_, err := s.q.ExecContext(ctx, `
 		UPDATE org_domains
 		SET resend_domain_id = nullif($2, ''),
 		    resend_domain_status = nullif($3, ''),
-		    resend_dns_records = CASE WHEN $4 IS NULL THEN resend_dns_records ELSE $4::jsonb END,
+		    resend_dns_records = coalesce($4::jsonb, resend_dns_records),
 		    updated_at = now()
 		WHERE id = $1
 	`, id, resendDomainID, resendStatus, dnsRecords)

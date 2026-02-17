@@ -1004,12 +1004,35 @@ func (h *Handler) handleDomainDNS(w http.ResponseWriter, r *http.Request) {
 	var resendRecords []resendprovider.DomainRecord
 	if len(d.ResendDNSRecords) > 0 {
 		_ = json.Unmarshal(d.ResendDNSRecords, &resendRecords)
-	} else if strings.TrimSpace(h.Config.Resend.APIKey) != "" && d.ResendDomainID.Valid {
+	} else if strings.TrimSpace(h.Config.Resend.APIKey) != "" {
 		client := h.resendDomainsClient()
-		rd, err := client.GetDomain(r.Context(), d.ResendDomainID.String)
-		if err == nil {
+
+		var (
+			rd       resendprovider.Domain
+			fetchErr error
+		)
+
+		if d.ResendDomainID.Valid {
+			rd, fetchErr = client.GetDomain(r.Context(), d.ResendDomainID.String)
+		} else {
+			rd, fetchErr = client.CreateDomain(r.Context(), d.Domain)
+		}
+
+		if fetchErr != nil {
+			// Domain may already exist in the provider from an earlier run.
+			if items, lerr := client.ListDomains(r.Context()); lerr == nil {
+				for _, item := range items {
+					if strings.EqualFold(strings.TrimSpace(item.Name), d.Domain) {
+						rd, fetchErr = client.GetDomain(r.Context(), item.ID)
+						break
+					}
+				}
+			}
+		}
+
+		if fetchErr == nil {
 			resendRecords = rd.Records
-			if raw, merr := json.Marshal(resendRecords); merr == nil {
+			if raw, merr := json.Marshal(rd.Records); merr == nil {
 				_ = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
 					return scoped.UpdateOrgDomainResend(r.Context(), d.ID, rd.ID, rd.Status, raw)
 				})

@@ -670,6 +670,97 @@ func TestOrgDomainsResendProvisioningAndVerification(t *testing.T) {
 	})
 }
 
+func TestDomainDNSBackfillsResendRecordsForLegacyDomain(t *testing.T) {
+	withTempStore(t, func(ctx context.Context, st *store.Store) {
+		var createCalls int
+		resendSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") != "Bearer re_test_key" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"message":"unauthorized"}`))
+				return
+			}
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/domains":
+				createCalls++
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"data":{"id":"d_legacy","name":"legacy.com","status":"not_started","records":[{"record":"SPF","name":"send","type":"TXT","value":"v=spf1 include:amazonses.com ~all","status":"not_started"},{"record":"DKIM","name":"dkim._domainkey","type":"CNAME","value":"dkim.resend.com","status":"not_started"}]}}`))
+				return
+			case r.Method == http.MethodGet && r.URL.Path == "/domains":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"data":[]}`))
+				return
+			default:
+				t.Fatalf("unexpected resend request: %s %s", r.Method, r.URL.Path)
+			}
+		}))
+		defer resendSrv.Close()
+
+		cfg := config.Default()
+		cfg.Security.APIKey = "bootstrap-admin"
+		cfg.Cloud.Mode = true
+		cfg.Resend.APIKey = "re_test_key"
+		cfg.Resend.BaseURL = resendSrv.URL
+
+		handler := NewHandler(cfg, st, &auth.Service{Config: cfg, Now: time.Now}, &stubBilling{}, &stubTokenIssuer{})
+		mux := http.NewServeMux()
+		handler.RegisterRoutes(mux)
+
+		orgID, err := st.CreateOrg(ctx, "legacy-org")
+		if err != nil {
+			t.Fatalf("create org: %v", err)
+		}
+
+		legacyID, err := st.CreateOrgDomain(
+			ctx,
+			orgID,
+			"legacy.com",
+			"nerve-verification=legacytoken",
+			"nerve",
+			"",
+			"",
+			"cname",
+		)
+		if err != nil {
+			t.Fatalf("create legacy domain: %v", err)
+		}
+
+		dnsReq, err := http.NewRequest(http.MethodGet, "/v1/domains/dns?org_id="+url.QueryEscape(orgID)+"&domain_id="+url.QueryEscape(legacyID), nil)
+		if err != nil {
+			t.Fatalf("build dns request: %v", err)
+		}
+		dnsReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, dnsReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected dns instructions success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+
+		var payload struct {
+			DNSRecords []domains.DNSRecord `json:"dns_records"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode dns response: %v", err)
+		}
+		if len(payload.DNSRecords) < 2 {
+			t.Fatalf("expected combined DNS records, got %+v", payload.DNSRecords)
+		}
+		if createCalls == 0 {
+			t.Fatalf("expected resend create domain to be called for legacy backfill")
+		}
+
+		updated, err := st.GetOrgDomainByIDForOrg(ctx, orgID, legacyID)
+		if err != nil {
+			t.Fatalf("read updated domain: %v", err)
+		}
+		if !updated.ResendDomainID.Valid || updated.ResendDomainID.String == "" {
+			t.Fatalf("expected resend_domain_id to be stored after dns backfill")
+		}
+		if len(updated.ResendDNSRecords) == 0 {
+			t.Fatalf("expected resend_dns_records to be stored after dns backfill")
+		}
+	})
+}
+
 func TestInboxesCreateAndList(t *testing.T) {
 	withTempStore(t, func(ctx context.Context, st *store.Store) {
 		cfg := config.Default()
