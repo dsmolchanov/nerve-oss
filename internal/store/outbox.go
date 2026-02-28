@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,6 +23,7 @@ type OutboxMessage struct {
 	Subject           string
 	TextBody          string
 	HTMLBody          string
+	ContentHash       string
 
 	Status        string
 	AttemptCount  int
@@ -29,6 +32,16 @@ type OutboxMessage struct {
 	LastError     sql.NullString
 	LockedAt      sql.NullTime
 	LockedBy      sql.NullString
+}
+
+func contentHash(to, subject, textBody string) string {
+	h := sha256.New()
+	h.Write([]byte(to))
+	h.Write([]byte{0})
+	h.Write([]byte(subject))
+	h.Write([]byte{0})
+	h.Write([]byte(textBody))
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 func (s *Store) EnqueueOutboxMessage(ctx context.Context, msg OutboxMessage) (string, error) {
@@ -52,13 +65,25 @@ func (s *Store) EnqueueOutboxMessage(ctx context.Context, msg OutboxMessage) (st
 		id = uuid.NewString()
 	}
 
+	hash := contentHash(msg.To, msg.Subject, msg.TextBody)
+
 	row := s.q.QueryRowContext(ctx, `
-		INSERT INTO outbox_messages (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject, text_body, html_body)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, nullif($9, ''), nullif($10, ''))
+		WITH existing AS (
+			SELECT id FROM outbox_messages
+			WHERE org_id = $2 AND inbox_id = $3 AND content_hash = $11
+			  AND status IN ('queued', 'sending')
+			LIMIT 1
+		)
+		INSERT INTO outbox_messages (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject, text_body, html_body, content_hash)
+		SELECT $1, $2, $3, $4, $5, $6, $7, $8, nullif($9, ''), nullif($10, ''), $11
+		WHERE NOT EXISTS (SELECT 1 FROM existing)
 		ON CONFLICT (org_id, idempotency_key)
 		DO UPDATE SET idempotency_key = outbox_messages.idempotency_key
 		RETURNING id
-	`, id, msg.OrgID, msg.InboxID, msg.Provider, msg.IdempotencyKey, msg.To, msg.From, msg.Subject, msg.TextBody, msg.HTMLBody)
+		UNION ALL
+		SELECT id FROM existing
+		LIMIT 1
+	`, id, msg.OrgID, msg.InboxID, msg.Provider, msg.IdempotencyKey, msg.To, msg.From, msg.Subject, msg.TextBody, msg.HTMLBody, hash)
 	var outID string
 	if err := row.Scan(&outID); err != nil {
 		return "", err

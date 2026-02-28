@@ -58,6 +58,108 @@ func TestOutboxIdempotencyUniqueness(t *testing.T) {
 	})
 }
 
+func TestOutboxContentDedup(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+
+		st := &Store{db: db, q: db}
+		orgID := uuid.NewString()
+		inboxID := uuid.NewString()
+
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'acme')`, orgID); err != nil {
+			t.Fatalf("insert org: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO inboxes (id, org_id, address, status) VALUES ($1, $2, 'a@local.neuralmail', 'active')`, inboxID, orgID); err != nil {
+			t.Fatalf("insert inbox: %v", err)
+		}
+
+		// Two messages with same content but different idempotency keys
+		// should return the same outbox ID (content dedup)
+		id1, err := st.EnqueueOutboxMessage(ctx, OutboxMessage{
+			OrgID:          orgID,
+			InboxID:        inboxID,
+			Provider:       "smtp",
+			IdempotencyKey: "key-a",
+			To:             "to@local.neuralmail",
+			From:           "a@local.neuralmail",
+			Subject:        "hello",
+			TextBody:       "same body",
+		})
+		if err != nil {
+			t.Fatalf("enqueue #1: %v", err)
+		}
+		id2, err := st.EnqueueOutboxMessage(ctx, OutboxMessage{
+			OrgID:          orgID,
+			InboxID:        inboxID,
+			Provider:       "smtp",
+			IdempotencyKey: "key-b",
+			To:             "to@local.neuralmail",
+			From:           "a@local.neuralmail",
+			Subject:        "hello",
+			TextBody:       "same body",
+		})
+		if err != nil {
+			t.Fatalf("enqueue #2: %v", err)
+		}
+		if id1 != id2 {
+			t.Fatalf("expected same outbox id from content dedup, got %s vs %s", id1, id2)
+		}
+	})
+}
+
+func TestOutboxContentDedupAllowsResendAfterSent(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+
+		st := &Store{db: db, q: db}
+		orgID := uuid.NewString()
+		inboxID := uuid.NewString()
+
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'acme')`, orgID); err != nil {
+			t.Fatalf("insert org: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO inboxes (id, org_id, address, status) VALUES ($1, $2, 'a@local.neuralmail', 'active')`, inboxID, orgID); err != nil {
+			t.Fatalf("insert inbox: %v", err)
+		}
+
+		// Enqueue and mark as sent
+		id1, err := st.EnqueueOutboxMessage(ctx, OutboxMessage{
+			OrgID:          orgID,
+			InboxID:        inboxID,
+			Provider:       "smtp",
+			IdempotencyKey: "key-1",
+			To:             "to@local.neuralmail",
+			From:           "a@local.neuralmail",
+			Subject:        "hello",
+			TextBody:       "resend body",
+		})
+		if err != nil {
+			t.Fatalf("enqueue #1: %v", err)
+		}
+		if err := st.MarkOutboxMessageSent(ctx, id1, "provider-msg-1"); err != nil {
+			t.Fatalf("mark sent: %v", err)
+		}
+
+		// Same content should now be allowed (legitimate re-send)
+		id2, err := st.EnqueueOutboxMessage(ctx, OutboxMessage{
+			OrgID:          orgID,
+			InboxID:        inboxID,
+			Provider:       "smtp",
+			IdempotencyKey: "key-2",
+			To:             "to@local.neuralmail",
+			From:           "a@local.neuralmail",
+			Subject:        "hello",
+			TextBody:       "resend body",
+		})
+		if err != nil {
+			t.Fatalf("enqueue #2 after sent: %v", err)
+		}
+		if id1 == id2 {
+			t.Fatalf("expected different outbox id for re-send after original was sent, got same: %s", id1)
+		}
+	})
+}
+
 func TestOutboxClaimQueryIsConcurrencySafe(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToLatest(t, ctx, db)
