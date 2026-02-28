@@ -1,0 +1,113 @@
+name: Sync OSS → Cloud
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'internal/store/**'
+      - 'internal/emailtransport/**'
+      - 'internal/cloudapi/**'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout nerve-oss
+        uses: actions/checkout@v4
+        with:
+          path: oss
+          fetch-depth: 2
+
+      - name: Checkout nerve-cloud
+        uses: actions/checkout@v4
+        with:
+          repository: dsmolchanov/nerve-cloud
+          token: ${{ secrets.CLOUD_SYNC_PAT }}
+          path: cloud
+
+      - name: Detect changed shared files
+        id: changes
+        run: |
+          cd oss
+          # Get files changed in the push commit(s)
+          CHANGED=$(git diff --name-only HEAD~1 HEAD -- \
+            internal/store/migrations/core/ \
+            internal/store/outbox.go \
+            internal/store/outbox_test.go \
+            internal/store/tool_idempotency.go \
+            internal/store/migrate.go \
+            internal/store/migration_test.go \
+            internal/store/org_domains.go \
+            internal/emailtransport/ \
+            internal/cloudapi/ \
+          2>/dev/null || true)
+
+          if [ -z "$CHANGED" ]; then
+            echo "No shared files changed, skipping sync."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Changed shared files:"
+            echo "$CHANGED"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            # Save the list for the PR body
+            echo "$CHANGED" > /tmp/changed_files.txt
+          fi
+
+      - name: Sync shared files
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          # Files/dirs that are identical between oss and cloud (cloud may have
+          # additive methods in the same .go files, but migrations are always
+          # safe to copy since they are append-only numbered files).
+
+          # --- Migrations (always safe: append-only, numbered) ---
+          cp -r oss/internal/store/migrations/core/ cloud/internal/store/migrations/core/
+
+          # --- Go files: only sync if cloud doesn't have cloud-only edits ---
+          # For files where cloud adds extra methods/functions, we use a
+          # patch-based approach: generate the oss diff and apply it to cloud.
+          cd oss
+          OSS_DIFF=$(git diff HEAD~1 HEAD -- \
+            internal/store/outbox.go \
+            internal/store/outbox_test.go \
+            internal/store/tool_idempotency.go \
+            internal/store/migrate.go \
+            internal/store/migration_test.go \
+            internal/store/org_domains.go \
+            internal/emailtransport/ \
+            internal/cloudapi/ \
+          2>/dev/null || true)
+          cd ..
+
+          if [ -n "$OSS_DIFF" ]; then
+            cd cloud
+            echo "$OSS_DIFF" | git apply --3way --allow-empty 2>&1 || {
+              echo "::warning::Patch did not apply cleanly. Manual merge may be needed."
+              echo "$OSS_DIFF" | git apply --3way --allow-empty --reject 2>&1 || true
+            }
+            cd ..
+          fi
+
+      - name: Create Pull Request
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          path: cloud
+          token: ${{ secrets.CLOUD_SYNC_PAT }}
+          branch: sync/oss-${{ github.sha }}
+          delete-branch: true
+          title: "sync: port nerve-oss changes"
+          body: |
+            Automated sync from [nerve-oss@`${{ github.sha }}`](https://github.com/dsmolchanov/nerve-oss/commit/${{ github.sha }}).
+
+            **Commit message:** ${{ github.event.head_commit.message }}
+
+            **Changed shared files:**
+            ```
+            ${{ steps.changes.outputs.has_changes == 'true' && '(see below)' || 'none' }}
+            ```
+
+            > Review carefully — cloud-only additions (e.g. `MigrateOutboxProviderToResend`)
+            > should be preserved. If the patch didn't apply cleanly, `.rej` files will be
+            > present and the PR will need manual resolution.
+          labels: sync,automated
