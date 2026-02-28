@@ -11,6 +11,9 @@ import (
 	"github.com/google/uuid"
 )
 
+// MaxOutboxRetries is the maximum number of delivery attempts before giving up.
+const MaxOutboxRetries = 5
+
 type OutboxMessage struct {
 	ID                string
 	OrgID             string
