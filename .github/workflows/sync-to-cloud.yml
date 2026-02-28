@@ -61,7 +61,7 @@ jobs:
           # safe to copy since they are append-only numbered files).
 
           # --- Migrations (always safe: append-only, numbered) ---
-          cp -r oss/internal/store/migrations/core/ cloud/internal/store/migrations/core/
+          cp oss/internal/store/migrations/core/*.sql cloud/internal/store/migrations/core/
 
           # --- Go files: only sync if cloud doesn't have cloud-only edits ---
           # For files where cloud adds extra methods/functions, we use a
