@@ -185,7 +185,7 @@ func TestOutboxClaimQueryIsConcurrencySafe(t *testing.T) {
 				To:             "to@local.neuralmail",
 				From:           "a@local.neuralmail",
 				Subject:        "hello",
-				TextBody:       "test",
+				TextBody:       fmt.Sprintf("test-%d", i),
 			})
 			if err != nil {
 				t.Fatalf("enqueue %d: %v", i, err)

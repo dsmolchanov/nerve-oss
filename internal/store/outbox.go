@@ -76,13 +76,15 @@ func (s *Store) EnqueueOutboxMessage(ctx context.Context, msg OutboxMessage) (st
 			WHERE org_id = $2 AND inbox_id = $3 AND content_hash = $11
 			  AND status IN ('queued', 'sending')
 			LIMIT 1
+		), inserted AS (
+			INSERT INTO outbox_messages (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject, text_body, html_body, content_hash)
+			SELECT $1, $2, $3, $4, $5, $6, $7, $8, nullif($9, ''), nullif($10, ''), $11
+			WHERE NOT EXISTS (SELECT 1 FROM existing)
+			ON CONFLICT (org_id, idempotency_key)
+			DO UPDATE SET idempotency_key = outbox_messages.idempotency_key
+			RETURNING id
 		)
-		INSERT INTO outbox_messages (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject, text_body, html_body, content_hash)
-		SELECT $1, $2, $3, $4, $5, $6, $7, $8, nullif($9, ''), nullif($10, ''), $11
-		WHERE NOT EXISTS (SELECT 1 FROM existing)
-		ON CONFLICT (org_id, idempotency_key)
-		DO UPDATE SET idempotency_key = outbox_messages.idempotency_key
-		RETURNING id
+		SELECT id FROM inserted
 		UNION ALL
 		SELECT id FROM existing
 		LIMIT 1

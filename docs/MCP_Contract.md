@@ -400,6 +400,7 @@ Input schema:
     "inbox_id": {"$ref": "neuralmail/types.json#/definitions/id"},
     "to": {"type": "string", "format": "email"},
     "subject": {"type": "string"},
+    "from_name": {"type": "string", "description": "Optional display name for the sender; the sender address remains the selected inbox address"},
     "idempotency_key": {"type": "string"},
     "body": {"type": "string"},
     "html": {"type": "string"}

@@ -39,7 +39,7 @@ func TestResendOutboundAdapterSendsWithIdempotencyHeader(t *testing.T) {
 	})
 
 	id, err := adapter.SendMessage(context.Background(), emailtransport.OutboundMessage{
-		From:     "sender@example.com",
+		From:     "Agatha AI <sender@example.com>",
 		To:       []string{"to@example.com"},
 		Subject:  "Hello",
 		TextBody: "Plain",
@@ -58,7 +58,7 @@ func TestResendOutboundAdapterSendsWithIdempotencyHeader(t *testing.T) {
 		t.Fatalf("expected Idempotency-Key idem-1, got %q", gotIdem)
 	}
 
-	if gotBody["from"] != "sender@example.com" {
+	if gotBody["from"] != "Agatha AI <sender@example.com>" {
 		t.Fatalf("expected from in body, got %#v", gotBody["from"])
 	}
 	to, _ := gotBody["to"].([]any)
