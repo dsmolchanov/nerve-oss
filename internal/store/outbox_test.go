@@ -107,6 +107,80 @@ func TestOutboxContentDedup(t *testing.T) {
 	})
 }
 
+func TestOutboxContentDedupIsConcurrencySafe(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+
+		st := &Store{db: db, q: db}
+		orgID := uuid.NewString()
+		inboxID := uuid.NewString()
+
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'acme')`, orgID); err != nil {
+			t.Fatalf("insert org: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO inboxes (id, org_id, address, status) VALUES ($1, $2, 'a@local.neuralmail', 'active')`, inboxID, orgID); err != nil {
+			t.Fatalf("insert inbox: %v", err)
+		}
+
+		const requests = 16
+		type result struct {
+			id  string
+			err error
+		}
+		start := make(chan struct{})
+		results := make(chan result, requests)
+		var wg sync.WaitGroup
+
+		for i := 0; i < requests; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				id, err := st.EnqueueOutboxMessage(ctx, OutboxMessage{
+					OrgID:          orgID,
+					InboxID:        inboxID,
+					Provider:       "smtp",
+					IdempotencyKey: fmt.Sprintf("concurrent-%d", i),
+					To:             "to@local.neuralmail",
+					From:           "a@local.neuralmail",
+					Subject:        "hello",
+					TextBody:       "same concurrent body",
+				})
+				results <- result{id: id, err: err}
+			}(i)
+		}
+
+		close(start)
+		wg.Wait()
+		close(results)
+
+		var winnerID string
+		for result := range results {
+			if result.err != nil {
+				t.Fatalf("concurrent enqueue: %v", result.err)
+			}
+			if winnerID == "" {
+				winnerID = result.id
+			}
+			if result.id != winnerID {
+				t.Fatalf("expected winner %s, got %s", winnerID, result.id)
+			}
+		}
+
+		var count int
+		if err := db.QueryRowContext(ctx, `
+			SELECT count(*)
+			FROM outbox_messages
+			WHERE org_id = $1 AND inbox_id = $2 AND content_hash IS NOT NULL
+		`, orgID, inboxID).Scan(&count); err != nil {
+			t.Fatalf("count deduplicated rows: %v", err)
+		}
+		if count != 1 {
+			t.Fatalf("expected one deduplicated row, got %d", count)
+		}
+	})
+}
+
 func TestOutboxContentDedupAllowsResendAfterSent(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToLatest(t, ctx, db)
@@ -185,7 +259,7 @@ func TestOutboxClaimQueryIsConcurrencySafe(t *testing.T) {
 				To:             "to@local.neuralmail",
 				From:           "a@local.neuralmail",
 				Subject:        "hello",
-				TextBody:       "test",
+				TextBody:       fmt.Sprintf("test-%d", i),
 			})
 			if err != nil {
 				t.Fatalf("enqueue %d: %v", i, err)

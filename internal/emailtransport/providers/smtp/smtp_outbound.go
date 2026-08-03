@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/mail"
 	"net/smtp"
 	"strings"
 
@@ -54,6 +55,17 @@ func normalizeNewlines(input string) string {
 
 func containsNewline(value string) bool {
 	return strings.Contains(value, "\n") || strings.Contains(value, "\r")
+}
+
+func envelopeAddress(value string) (string, error) {
+	if containsNewline(value) {
+		return "", errors.New("invalid from")
+	}
+	parsed, err := mail.ParseAddress(strings.TrimSpace(value))
+	if err != nil || strings.TrimSpace(parsed.Address) == "" {
+		return "", errors.New("invalid from")
+	}
+	return strings.TrimSpace(parsed.Address), nil
 }
 
 func buildMIMEMessage(msg emailtransport.OutboundMessage) (string, error) {
@@ -136,6 +148,10 @@ func (a *OutboundAdapter) SendMessage(ctx context.Context, msg emailtransport.Ou
 	if err != nil {
 		return "", err
 	}
+	envelopeFrom, err := envelopeAddress(msg.From)
+	if err != nil {
+		return "", err
+	}
 
 	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -172,7 +188,7 @@ func (a *OutboundAdapter) SendMessage(ctx context.Context, msg emailtransport.Ou
 		}
 	}
 
-	if err := client.Mail(msg.From); err != nil {
+	if err := client.Mail(envelopeFrom); err != nil {
 		return "", err
 	}
 	for _, rcpt := range msg.To {

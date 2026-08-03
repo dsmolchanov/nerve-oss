@@ -208,6 +208,16 @@ func (s *Server) callTool(ctx context.Context, req Request) (any, error) {
 	return result, callErr
 }
 
+type composeEmailInput struct {
+	InboxID        string `json:"inbox_id"`
+	To             string `json:"to"`
+	Subject        string `json:"subject"`
+	Body           string `json:"body"`
+	HTML           string `json:"html,omitempty"`
+	FromName       string `json:"from_name,omitempty"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+}
+
 func (s *Server) toolExecutor(params ToolCallParams, defaultIdempotencyKey string) (func(context.Context) (any, error), error) {
 	switch params.Name {
 	case "list_threads":
@@ -295,14 +305,7 @@ func (s *Server) toolExecutor(params ToolCallParams, defaultIdempotencyKey strin
 			return s.Tools.SendReply(ctx, input.ThreadID, input.Body, input.HTML, input.NeedsApproval, key)
 		}, nil
 	case "compose_email":
-		var input struct {
-			InboxID        string `json:"inbox_id"`
-			To             string `json:"to"`
-			Subject        string `json:"subject"`
-			Body           string `json:"body"`
-			HTML           string `json:"html,omitempty"`
-			IdempotencyKey string `json:"idempotency_key,omitempty"`
-		}
+		var input composeEmailInput
 		if err := json.Unmarshal(params.Arguments, &input); err != nil {
 			return nil, err
 		}
@@ -311,7 +314,9 @@ func (s *Server) toolExecutor(params ToolCallParams, defaultIdempotencyKey strin
 			if key == "" {
 				key = defaultIdempotencyKey
 			}
-			return s.Tools.ComposeEmail(ctx, input.InboxID, input.To, input.Subject, input.Body, input.HTML, key)
+			return s.Tools.ComposeEmailWithOptions(ctx, input.InboxID, input.To, input.Subject, input.Body, input.HTML, key, tools.ComposeEmailOptions{
+				FromName: input.FromName,
+			})
 		}, nil
 	default:
 		return nil, fmt.Errorf("unknown tool: %s", params.Name)

@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/mail"
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/santhosh-tekuri/jsonschema/v5"
 
@@ -38,6 +40,10 @@ type Service struct {
 type ToolContext struct {
 	Actor    string
 	ReplayID string
+}
+
+type ComposeEmailOptions struct {
+	FromName string
 }
 
 func NewService(cfg config.Config, store *store.Store, llmProvider llm.Provider, vectorStore vector.Store, policyObj policy.Policy, embedder embed.Provider, transport *emailtransport.Registry) *Service {
@@ -392,6 +398,10 @@ func (s *Service) SendReply(ctx context.Context, threadID string, body string, b
 }
 
 func (s *Service) ComposeEmail(ctx context.Context, inboxID, toAddress, subject, body string, bodyHTML string, idempotencyKey string) (any, error) {
+	return s.ComposeEmailWithOptions(ctx, inboxID, toAddress, subject, body, bodyHTML, idempotencyKey, ComposeEmailOptions{})
+}
+
+func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddress, subject, body string, bodyHTML string, idempotencyKey string, options ComposeEmailOptions) (any, error) {
 	if subject == "" {
 		return nil, errors.New("missing subject")
 	}
@@ -403,6 +413,10 @@ func (s *Service) ComposeEmail(ctx context.Context, inboxID, toAddress, subject,
 	}
 	if inboxID == "" {
 		return nil, errors.New("missing inbox_id")
+	}
+	fromName, err := normalizeFromName(options.FromName)
+	if err != nil {
+		return nil, err
 	}
 
 	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
@@ -416,12 +430,16 @@ func (s *Service) ComposeEmail(ctx context.Context, inboxID, toAddress, subject,
 		if err != nil {
 			return nil, err
 		}
-		from := strings.TrimSpace(inbox.Address)
-		if from == "" {
-			from = strings.TrimSpace(s.Config.SMTP.From)
-			if from == "" {
-				from = "dev@local.nerve.email"
+		fromAddress := strings.TrimSpace(inbox.Address)
+		if fromAddress == "" {
+			fromAddress = strings.TrimSpace(s.Config.SMTP.From)
+			if fromAddress == "" {
+				fromAddress = "dev@local.nerve.email"
 			}
+		}
+		fromMailbox, senderAddress, err := formatSenderMailbox(fromAddress, fromName)
+		if err != nil {
+			return nil, err
 		}
 
 		if idempotencyKey == "" {
@@ -452,7 +470,7 @@ func (s *Service) ComposeEmail(ctx context.Context, inboxID, toAddress, subject,
 			Provider:       provider,
 			IdempotencyKey: idempotencyKey,
 			To:             toAddress,
-			From:           from,
+			From:           fromMailbox,
 			Subject:        subject,
 			TextBody:       body,
 			HTMLBody:       bodyHTML,
@@ -478,7 +496,7 @@ func (s *Service) ComposeEmail(ctx context.Context, inboxID, toAddress, subject,
 			Text:      body,
 			HTML:      bodyHTML,
 			CreatedAt: time.Now().UTC(),
-			From:      store.Participant{Email: from},
+			From:      store.Participant{Name: fromName, Email: senderAddress},
 			To:        []store.Participant{{Email: toAddress}},
 		}
 
@@ -493,6 +511,29 @@ func (s *Service) ComposeEmail(ctx context.Context, inboxID, toAddress, subject,
 			"status":     "queued",
 		}, nil
 	})
+}
+
+func normalizeFromName(value string) (string, error) {
+	name := strings.TrimSpace(value)
+	for _, r := range name {
+		if unicode.IsControl(r) {
+			return "", errors.New("invalid from_name")
+		}
+	}
+	return name, nil
+}
+
+func formatSenderMailbox(value string, fromName string) (string, string, error) {
+	mailbox := strings.TrimSpace(value)
+	parsed, err := mail.ParseAddress(mailbox)
+	if err != nil || strings.TrimSpace(parsed.Address) == "" {
+		return "", "", errors.New("invalid sender address")
+	}
+	address := strings.TrimSpace(parsed.Address)
+	if fromName == "" {
+		return mailbox, address, nil
+	}
+	return (&mail.Address{Name: fromName, Address: address}).String(), address, nil
 }
 
 func domainAllowed(addr string, allowlist []string) bool {

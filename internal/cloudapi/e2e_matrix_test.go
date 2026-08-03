@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/mail"
 	"strings"
 	"testing"
 	"time"
@@ -389,6 +390,54 @@ func TestCloudE2EMatrix(t *testing.T) {
 			})
 			if initStatus != http.StatusUnauthorized {
 				t.Fatalf("expected revoked v1 token to return 401, got status=%d body=%s", initStatus, string(body))
+			}
+		})
+
+		t.Run("ComposeEmailPreservesDisplayName", func(t *testing.T) {
+			orgID := h.createOrg(t, "compose-display-name-org")
+			h.upsertActiveEntitlement(t, orgID, 1000, 1000)
+			inboxID := h.createInbox(t, orgID, "support@local.nerve.email")
+
+			token := h.issueServiceToken(t, orgID, []string{"nerve:email.read", "nerve:email.send"}, false)
+			session := h.initializeSession(t, token)
+			status, resp := h.callTool(t, token, session, "compose_email", map[string]any{
+				"inbox_id":        inboxID,
+				"to":              "invitee@local.nerve.email",
+				"subject":         "Invitation",
+				"body":            "Open the invitation link",
+				"from_name":       "Агата AI",
+				"idempotency_key": "invitation-" + uuid.NewString(),
+			})
+			if status != http.StatusOK || resp.Error != nil {
+				t.Fatalf("expected compose_email success, status=%d err=%+v", status, resp.Error)
+			}
+
+			var result struct {
+				MessageID string `json:"message_id"`
+			}
+			decodeRawResult(t, resp.Result, &result)
+			if result.MessageID == "" {
+				t.Fatal("compose_email result missing message_id")
+			}
+
+			var outboxFrom string
+			if err := h.store.DB().QueryRowContext(h.ctx, `SELECT "from" FROM outbox_messages WHERE id = $1`, result.MessageID).Scan(&outboxFrom); err != nil {
+				t.Fatalf("read outbox sender: %v", err)
+			}
+			parsed, err := mail.ParseAddress(outboxFrom)
+			if err != nil {
+				t.Fatalf("parse outbox sender %q: %v", outboxFrom, err)
+			}
+			if parsed.Name != "Агата AI" || parsed.Address != "support@local.nerve.email" {
+				t.Fatalf("unexpected outbox sender: %#v", parsed)
+			}
+
+			message, err := h.store.GetMessage(h.ctx, result.MessageID)
+			if err != nil {
+				t.Fatalf("read outbound message: %v", err)
+			}
+			if message.From.Name != "Агата AI" || message.From.Email != "support@local.nerve.email" {
+				t.Fatalf("unexpected stored participant: %#v", message.From)
 			}
 		})
 
