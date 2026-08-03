@@ -41,6 +41,32 @@ func TestCloudControlPlaneMigrationFromEmptyDatabase(t *testing.T) {
 	})
 }
 
+func TestCoreMigrationUpgradeFrom15To17(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToVersion(t, ctx, db, 15)
+
+		if err := MigrateCore(ctx, db); err != nil {
+			t.Fatalf("upgrade core migrations from 15 to latest: %v", err)
+		}
+
+		var version int64
+		if err := db.QueryRowContext(ctx, `
+			SELECT coalesce(max(version_id), 0)
+			FROM schema_migrations_core
+			WHERE is_applied
+		`).Scan(&version); err != nil {
+			t.Fatalf("query core migration version: %v", err)
+		}
+		if version != 17 {
+			t.Fatalf("expected core migration version 17, got %d", version)
+		}
+
+		for _, table := range []string{"suppressions", "org_webhooks", "org_webhook_deliveries"} {
+			assertTableExists(t, db, table)
+		}
+	})
+}
+
 func TestCloudControlPlaneMigrationFromLegacyStateBackfillsOrgID(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToVersion(t, ctx, db, 1)
