@@ -71,25 +71,38 @@ func (s *Store) EnqueueOutboxMessage(ctx context.Context, msg OutboxMessage) (st
 	hash := contentHash(msg.To, msg.Subject, msg.TextBody)
 
 	row := s.q.QueryRowContext(ctx, `
-		WITH existing AS (
-			SELECT id FROM outbox_messages
-			WHERE org_id = $2 AND inbox_id = $3 AND content_hash = $11
-			  AND status IN ('queued', 'sending')
-			LIMIT 1
-		), inserted AS (
-			INSERT INTO outbox_messages (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject, text_body, html_body, content_hash)
-			SELECT $1, $2, $3, $4, $5, $6, $7, $8, nullif($9, ''), nullif($10, ''), $11
-			WHERE NOT EXISTS (SELECT 1 FROM existing)
-			ON CONFLICT (org_id, idempotency_key)
-			DO UPDATE SET idempotency_key = outbox_messages.idempotency_key
-			RETURNING id
-		)
-		SELECT id FROM inserted
-		UNION ALL
-		SELECT id FROM existing
-		LIMIT 1
+		INSERT INTO outbox_messages (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject, text_body, html_body, content_hash)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, nullif($9, ''), nullif($10, ''), $11)
+		ON CONFLICT DO NOTHING
+		RETURNING id
 	`, id, msg.OrgID, msg.InboxID, msg.Provider, msg.IdempotencyKey, msg.To, msg.From, msg.Subject, msg.TextBody, msg.HTMLBody, hash)
 	var outID string
+	if err := row.Scan(&outID); err == nil {
+		return outID, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+
+	// ON CONFLICT DO NOTHING can wait for a concurrent insert that was not
+	// visible in the INSERT statement's snapshot. Resolve the winner in a
+	// separate statement so READ COMMITTED takes a fresh snapshot after that
+	// transaction commits. This covers both idempotency-key and partial
+	// content-hash conflicts without surfacing a uniqueness error to callers.
+	row = s.q.QueryRowContext(ctx, `
+		SELECT id
+		FROM outbox_messages
+		WHERE org_id = $1
+		  AND (
+			idempotency_key = $2
+			OR (inbox_id = $3 AND content_hash = $4)
+		  )
+		ORDER BY
+		  CASE WHEN idempotency_key = $2 THEN 0 ELSE 1 END,
+		  CASE WHEN status IN ('queued', 'sending') THEN 0 ELSE 1 END,
+		  next_attempt_at DESC,
+		  id DESC
+		LIMIT 1
+	`, msg.OrgID, msg.IdempotencyKey, msg.InboxID, hash)
 	if err := row.Scan(&outID); err != nil {
 		return "", err
 	}
