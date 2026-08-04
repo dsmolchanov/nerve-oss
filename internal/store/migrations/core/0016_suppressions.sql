@@ -16,6 +16,49 @@ CREATE TABLE IF NOT EXISTS suppressions (
 CREATE INDEX IF NOT EXISTS idx_suppressions_org_created
   ON suppressions (org_id, created_at DESC);
 
+-- Repair tenant isolation for the org-owned tables introduced after the
+-- original RLS migration. This lives in 0016 (rather than rewriting already
+-- applied 0011/0013) so databases upgrading from the production v15 baseline
+-- receive the policies as well as fresh databases.
+ALTER TABLE outbox_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE outbox_events FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation_outbox_events ON outbox_events;
+CREATE POLICY tenant_isolation_outbox_events ON outbox_events
+  USING (
+    coalesce(current_setting('app.cloud_mode', true), 'false') <> 'true'
+    OR org_id = nullif(current_setting('app.current_org_id', true), '')::uuid
+  )
+  WITH CHECK (
+    coalesce(current_setting('app.cloud_mode', true), 'false') <> 'true'
+    OR org_id = nullif(current_setting('app.current_org_id', true), '')::uuid
+  );
+
+ALTER TABLE inbox_smtp_configs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE inbox_smtp_configs FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation_inbox_smtp_configs ON inbox_smtp_configs;
+CREATE POLICY tenant_isolation_inbox_smtp_configs ON inbox_smtp_configs
+  USING (
+    coalesce(current_setting('app.cloud_mode', true), 'false') <> 'true'
+    OR org_id = nullif(current_setting('app.current_org_id', true), '')::uuid
+  )
+  WITH CHECK (
+    coalesce(current_setting('app.cloud_mode', true), 'false') <> 'true'
+    OR org_id = nullif(current_setting('app.current_org_id', true), '')::uuid
+  );
+
+ALTER TABLE suppressions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE suppressions FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation_suppressions ON suppressions;
+CREATE POLICY tenant_isolation_suppressions ON suppressions
+  USING (
+    coalesce(current_setting('app.cloud_mode', true), 'false') <> 'true'
+    OR org_id = nullif(current_setting('app.current_org_id', true), '')::uuid
+  )
+  WITH CHECK (
+    coalesce(current_setting('app.cloud_mode', true), 'false') <> 'true'
+    OR org_id = nullif(current_setting('app.current_org_id', true), '')::uuid
+  );
+
 -- Pre-link outbox_events: relax provider_message_id NOT NULL so events can
 -- be appended for messages that never reached a provider (suppression at
 -- enqueue, future pre-flight rejection, etc.). The outbox_message_id column
@@ -52,5 +95,14 @@ $$;
 DROP INDEX IF EXISTS idx_outbox_events_outbox_msg;
 ALTER TABLE outbox_events
   ALTER COLUMN provider_message_id SET NOT NULL;
+
+DROP POLICY IF EXISTS tenant_isolation_suppressions ON suppressions;
+DROP POLICY IF EXISTS tenant_isolation_inbox_smtp_configs ON inbox_smtp_configs;
+ALTER TABLE inbox_smtp_configs NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE inbox_smtp_configs DISABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation_outbox_events ON outbox_events;
+ALTER TABLE outbox_events NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE outbox_events DISABLE ROW LEVEL SECURITY;
+
 DROP INDEX IF EXISTS idx_suppressions_org_created;
 DROP TABLE IF EXISTS suppressions;

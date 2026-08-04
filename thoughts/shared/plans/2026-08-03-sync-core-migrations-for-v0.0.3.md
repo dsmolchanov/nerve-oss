@@ -20,8 +20,11 @@ support from `v0.0.2`.
   an unapplied schema version. Correct `0016` OSS-first so its down migration
   refuses with a clear error when pre-provider audit events contain a NULL
   `provider_message_id`; deleting those events or fabricating an id is not an
-  acceptable rollback policy. Sync the corrected files back to `nerve-cloud`
-  before publishing the runtime so the core trees return to byte identity.
+  acceptable rollback policy. Because production is already at core `0015`,
+  `0016` also repairs the missing `ENABLE`/`FORCE ROW LEVEL SECURITY` policies
+  on `outbox_events` and `inbox_smtp_configs` while protecting the new
+  `suppressions` table. Sync the corrected files back to `nerve-cloud` before
+  publishing the runtime so the core trees return to byte identity.
 - Correct `0017` OSS-first so active webhook endpoint identity is unique on
   `(org_id, url)` while disabled historical rows remain allowed. Without that
   partial uniqueness, fan-out sends the same event more than once to a URL.
@@ -30,6 +33,9 @@ support from `v0.0.2`.
   not misclassify it as a billing table reference.
 - Do not change runtime logic, MCP behavior, providers, cloud-only migrations,
   or dependencies.
+- Keep the migration test databases disposable: close each test connection,
+  terminate/drop its database while the admin handle is still open, then close
+  the admin handle.
 - Publish the merged commit as immutable runtime tag `v0.0.3` only after CI
   and Codex review are green.
 
@@ -39,7 +45,7 @@ support from `v0.0.2`.
   `nerve-oss` and `nerve-cloud`.
 - The synchronized core-schema hash, including the corrected `0014` and
   guarded `0016` down paths, is
-  `0fffadb614f6b771557e43277b2acab85e9067620f001cdf92ae772d26cb353b`.
+  `fd453d13e1b8083e7ede7a3a42711383010dd146fdd14dfeb49c6ea8b876ab73`.
 - The MCP contract hash remains
   `1eb62111fc593ec9bc9a8ab7d5a9f52a1f3b4e661ee0dffafe4c60495f5b678b`.
 - Migrations `0011` through `0017` are additive on the production upgrade
@@ -55,6 +61,9 @@ support from `v0.0.2`.
 - [x] Migration `0016` down refuses before changing schema when NULL provider
   message ids exist, remains at version 16, and succeeds to version 15 after
   the blocking rows are explicitly resolved.
+- [x] Upgrade from version `15` enables and forces tenant RLS with the standard
+  policy on `outbox_events`, `inbox_smtp_configs`, and `suppressions`; rolling
+  `0016` back restores the prior RLS state on the surviving tables.
 - [x] Migration `0017` rejects a duplicate active `(org_id, url)` and permits a
   disabled historical duplicate.
 - [ ] The corrected `0014`, corrected `0016`, and normalized `0017` comment are
@@ -66,6 +75,7 @@ support from `v0.0.2`.
 - [x] `go test ./... -count=1` passes against PostgreSQL.
 - [x] `go vet ./...` passes.
 - [x] `git diff --check` passes.
+- [x] Migration tests leave zero `nerve_test_*` databases behind.
 - [ ] GitHub CI and Codex review pass.
 - [ ] Docker Publish creates the `v0.0.3` image and release artifacts.
 

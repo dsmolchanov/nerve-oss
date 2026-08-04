@@ -64,6 +64,9 @@ func TestCoreMigrationUpgradeFrom15To17(t *testing.T) {
 		for _, table := range []string{"suppressions", "org_webhooks", "org_webhook_deliveries"} {
 			assertTableExists(t, db, table)
 		}
+		for _, table := range []string{"outbox_events", "inbox_smtp_configs", "suppressions"} {
+			assertTenantRLSState(t, db, table, true)
+		}
 	})
 }
 
@@ -149,6 +152,8 @@ func TestCoreMigration16DownRefusesNullProviderMessageID(t *testing.T) {
 			t.Fatalf("expected core version 15 after one-step rollback, got %d", version)
 		}
 		assertColumnNotNull(t, db, "outbox_events", "provider_message_id")
+		assertTenantRLSState(t, db, "outbox_events", false)
+		assertTenantRLSState(t, db, "inbox_smtp_configs", false)
 	})
 }
 
@@ -325,6 +330,8 @@ func TestTenantRLSBlocksCrossOrgReadsWithScopedSession(t *testing.T) {
 		inboxB := uuid.NewString()
 		threadA := uuid.NewString()
 		threadB := uuid.NewString()
+		outboxA := uuid.NewString()
+		outboxB := uuid.NewString()
 
 		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'org-a'), ($2, 'org-b')`, orgA, orgB); err != nil {
 			t.Fatalf("insert orgs: %v", err)
@@ -341,6 +348,38 @@ func TestTenantRLSBlocksCrossOrgReadsWithScopedSession(t *testing.T) {
 		if _, err := db.ExecContext(ctx, `INSERT INTO threads (id, inbox_id, org_id, subject, status, participants, updated_at) VALUES ($1, $2, $3, 'thread-b', 'open', '[]'::jsonb, now())`, threadB, inboxB, orgB); err != nil {
 			t.Fatalf("insert org B thread: %v", err)
 		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO outbox_messages (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject)
+			VALUES
+			  ($1, $2, $3, 'resend', 'rls-outbox-a', 'to@example.com', 'a@local.neuralmail', 'org A'),
+			  ($4, $5, $6, 'resend', 'rls-outbox-b', 'to@example.com', 'b@local.neuralmail', 'org B')
+		`, outboxA, orgA, inboxA, outboxB, orgB, inboxB); err != nil {
+			t.Fatalf("insert outbox messages: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO outbox_events (org_id, outbox_message_id, provider_message_id, event_type, raw_payload)
+			VALUES
+			  ($1, $2, 'provider-a', 'delivered', '{}'::jsonb),
+			  ($3, $4, 'provider-b', 'delivered', '{}'::jsonb)
+		`, orgA, outboxA, orgB, outboxB); err != nil {
+			t.Fatalf("insert outbox events: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO inbox_smtp_configs (inbox_id, org_id, host, username, password_enc)
+			VALUES
+			  ($1, $2, 'smtp-a.example.com', 'user-a', 'cipher-a'),
+			  ($3, $4, 'smtp-b.example.com', 'user-b', 'cipher-b')
+		`, inboxA, orgA, inboxB, orgB); err != nil {
+			t.Fatalf("insert SMTP configs: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO suppressions (org_id, email_lower, reason, source)
+			VALUES
+			  ($1, 'blocked-a@example.com', 'rls test', 'manual'),
+			  ($2, 'blocked-b@example.com', 'rls test', 'manual')
+		`, orgA, orgB); err != nil {
+			t.Fatalf("insert suppressions: %v", err)
+		}
 
 		roleName := "rls_app_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 		if _, err := db.ExecContext(ctx, fmt.Sprintf(`CREATE ROLE %s LOGIN PASSWORD 'rls_app'`, roleName)); err != nil {
@@ -349,7 +388,7 @@ func TestTenantRLSBlocksCrossOrgReadsWithScopedSession(t *testing.T) {
 		if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO %s`, roleName)); err != nil {
 			t.Fatalf("grant schema usage: %v", err)
 		}
-		if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON inboxes, threads, messages TO %s`, roleName)); err != nil {
+		if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON inboxes, threads, messages, outbox_events, inbox_smtp_configs, suppressions TO %s`, roleName)); err != nil {
 			t.Fatalf("grant table permissions: %v", err)
 		}
 
@@ -394,6 +433,28 @@ func TestTenantRLSBlocksCrossOrgReadsWithScopedSession(t *testing.T) {
 		}
 		if crossOrgRows != 0 {
 			t.Fatalf("expected org A to see 0 rows for org B thread, got %d", crossOrgRows)
+		}
+
+		for _, table := range []string{"outbox_events", "inbox_smtp_configs", "suppressions"} {
+			var visibleRows int
+			if err := st.RunAsOrg(ctx, orgA, func(scoped *Store) error {
+				return scoped.q.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, table)).Scan(&visibleRows)
+			}); err != nil {
+				t.Fatalf("read %s as org A: %v", table, err)
+			}
+			if visibleRows != 1 {
+				t.Fatalf("expected org A to see 1 row in %s via RLS, got %d", table, visibleRows)
+			}
+		}
+
+		if err := st.RunAsOrg(ctx, orgA, func(scoped *Store) error {
+			_, err := scoped.q.ExecContext(ctx, `
+				INSERT INTO suppressions (org_id, email_lower, reason, source)
+				VALUES ($1, 'cross-org@example.com', 'must be rejected', 'manual')
+			`, orgB)
+			return err
+		}); err == nil {
+			t.Fatal("expected org A cross-org suppression insert to be rejected by RLS")
 		}
 	})
 }
@@ -715,6 +776,39 @@ func assertColumnNotNull(t *testing.T, db *sql.DB, table, column string) {
 	}
 }
 
+func assertTenantRLSState(t *testing.T, db *sql.DB, table string, enabled bool) {
+	t.Helper()
+	policy := "tenant_isolation_" + table
+	var rowSecurity, forceRowSecurity, policyExists bool
+	if err := db.QueryRow(`
+		SELECT c.relrowsecurity,
+		       c.relforcerowsecurity,
+		       EXISTS (
+		         SELECT 1
+		         FROM pg_policies p
+		         WHERE p.schemaname = n.nspname
+		           AND p.tablename = c.relname
+		           AND p.policyname = $2
+		       )
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'public'
+		  AND c.relname = $1
+	`, table, policy).Scan(&rowSecurity, &forceRowSecurity, &policyExists); err != nil {
+		t.Fatalf("inspect tenant RLS for %s: %v", table, err)
+	}
+	if rowSecurity != enabled || forceRowSecurity != enabled || policyExists != enabled {
+		t.Fatalf(
+			"tenant RLS for %s = enabled:%t forced:%t policy:%t; want all %t",
+			table,
+			rowSecurity,
+			forceRowSecurity,
+			policyExists,
+			enabled,
+		)
+	}
+}
+
 func withTempDatabase(t *testing.T, run func(ctx context.Context, db *sql.DB)) {
 	t.Helper()
 
@@ -731,7 +825,9 @@ func withTempDatabase(t *testing.T, run func(ctx context.Context, db *sql.DB)) {
 	if err != nil {
 		t.Fatalf("open admin database: %v", err)
 	}
-	defer adminDB.Close()
+	t.Cleanup(func() {
+		_ = adminDB.Close()
+	})
 
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer pingCancel()
@@ -743,6 +839,10 @@ func withTempDatabase(t *testing.T, run func(ctx context.Context, db *sql.DB)) {
 	if _, err := adminDB.ExecContext(context.Background(), fmt.Sprintf(`CREATE DATABASE %s`, dbName)); err != nil {
 		t.Fatalf("create temp database %s: %v", dbName, err)
 	}
+	t.Cleanup(func() {
+		_, _ = adminDB.ExecContext(context.Background(), `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1`, dbName)
+		_, _ = adminDB.ExecContext(context.Background(), fmt.Sprintf(`DROP DATABASE IF EXISTS %s`, dbName))
+	})
 
 	testDSN, err := dsnWithDatabase(baseDSN, dbName)
 	if err != nil {
@@ -752,11 +852,8 @@ func withTempDatabase(t *testing.T, run func(ctx context.Context, db *sql.DB)) {
 	if err != nil {
 		t.Fatalf("open temp database: %v", err)
 	}
-
 	t.Cleanup(func() {
 		_ = db.Close()
-		_, _ = adminDB.ExecContext(context.Background(), `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1`, dbName)
-		_, _ = adminDB.ExecContext(context.Background(), fmt.Sprintf(`DROP DATABASE IF EXISTS %s`, dbName))
 	})
 
 	run(context.Background(), db)
