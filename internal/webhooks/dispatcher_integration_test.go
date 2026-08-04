@@ -19,12 +19,11 @@ import (
 	"neuralmail/internal/store"
 )
 
-// TestDispatcher_EndToEnd exercises the full customer webhook flow:
+// TestDispatcher_EndToEnd exercises the sensitive inbound webhook flow:
 //  1. Spin up a real HTTP test server that verifies the HMAC signature.
-//  2. Seed an outbox row + outbox_event + org_webhook in real Postgres.
-//  3. Fan out the event to the subscription.
-//  4. Run one claim cycle of the dispatcher.
-//  5. Assert the delivery marked 'delivered' with status_code 200.
+//  2. Journal email.received + fan out in real Postgres.
+//  3. Return 503 once, then ACK the signed retry.
+//  4. Assert the delivery is deduplicated and marked delivered.
 func TestDispatcher_EndToEnd(t *testing.T) {
 	baseDSN := os.Getenv("NM_TEST_DB_DSN")
 	if baseDSN == "" {
@@ -69,65 +68,55 @@ func TestDispatcher_EndToEnd(t *testing.T) {
 	if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'acme')`, orgID); err != nil {
 		t.Fatalf("insert org: %v", err)
 	}
-	inboxID := uuid.NewString()
-	if _, err := db.ExecContext(ctx, `INSERT INTO inboxes (id, org_id, address, status) VALUES ($1, $2, 'a@local.neuralmail', 'active')`, inboxID, orgID); err != nil {
-		t.Fatalf("insert inbox: %v", err)
-	}
-
-	// Fake customer webhook server — captures one request and verifies
-	// the signature using SignPayload, then returns 200.
+	// Fake customer webhook server — first response is retryable, second ACKs.
 	var (
 		captured     http.Header
 		capturedBody []byte
-		gotOnce      sync.Once
-		done         = make(chan struct{})
+		captureMu    sync.Mutex
+		attempts     int
 	)
-	webhookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	webhookServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		gotOnce.Do(func() {
-			captured = r.Header.Clone()
-			capturedBody = body
-			close(done)
-		})
+		captureMu.Lock()
+		attempts++
+		captured = r.Header.Clone()
+		capturedBody = body
+		currentAttempt := attempts
+		captureMu.Unlock()
+		if currentAttempt == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer webhookServer.Close()
 
-	// Seed outbox + event + subscription.
-	outboxID, err := st.EnqueueOutboxMessage(ctx, store.OutboxMessage{
-		OrgID: orgID, InboxID: inboxID, Provider: "smtp", IdempotencyKey: "e2e-1",
-		To: "to@external.com", From: "a@local.neuralmail", Subject: "hi", TextBody: "body",
-	})
-	if err != nil {
-		t.Fatalf("enqueue outbox: %v", err)
-	}
-	eventPayload := json.RawMessage(`{"email_id":"res-1","event":"delivered"}`)
-	eventID, err := st.InsertOutboxEventReturningID(ctx, store.OutboxEvent{
-		OrgID: orgID, OutboxMessageID: outboxID, EventType: "email.delivered",
-		RawPayload: eventPayload,
-	})
-	if err != nil || eventID == "" {
-		t.Fatalf("insert event: id=%q err=%v", eventID, err)
-	}
-	wh, err := st.CreateOrgWebhook(ctx, orgID, webhookServer.URL, nil)
+	wh, err := st.CreateOrgWebhook(ctx, orgID, webhookServer.URL, []string{"email.received"})
 	if err != nil {
 		t.Fatalf("create webhook: %v", err)
 	}
-	if _, err := st.FanOutWebhookDeliveries(ctx, orgID, eventID, "email.delivered", eventPayload); err != nil {
-		t.Fatalf("fan out: %v", err)
+	messageID := uuid.NewString()
+	eventPayload := json.RawMessage(`{"event":"email.received","message_id":"` + messageID + `"}`)
+	eventID, deliveryCount, err := st.InsertOrgEventAndFanOut(ctx, orgID, "email.received", "message", messageID, eventPayload)
+	if err != nil || eventID == "" || deliveryCount != 1 {
+		t.Fatalf("insert inbound event: id=%q deliveries=%d err=%v", eventID, deliveryCount, err)
 	}
 
 	// Drive one cycle of the dispatcher directly (bypass Run so the
 	// test finishes in well under one poll interval).
 	dispatcher := NewDispatcher(st, "test-worker")
 	dispatcher.HTTPClient = webhookServer.Client()
+	dispatcher.BaseBackoff = time.Millisecond
 	dispatcher.claimAndDeliver(ctx)
-
-	// Wait for the fake server to see the request.
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("webhook was not delivered within 3s")
+	if _, err := db.ExecContext(ctx, `UPDATE org_webhook_deliveries SET next_attempt_at = now() - interval '1 second' WHERE webhook_id = $1`, wh.ID); err != nil {
+		t.Fatalf("make retry claimable: %v", err)
+	}
+	dispatcher.claimAndDeliver(ctx)
+	captureMu.Lock()
+	gotAttempts := attempts
+	captureMu.Unlock()
+	if gotAttempts != 2 {
+		t.Fatalf("webhook attempts = %d, want retry then ACK", gotAttempts)
 	}
 
 	// Assert the delivery row landed in 'delivered' state.
@@ -145,6 +134,13 @@ func TestDispatcher_EndToEnd(t *testing.T) {
 	}
 	if !statusCode.Valid || statusCode.Int32 != 200 {
 		t.Errorf("expected last_status_code=200, got %+v", statusCode)
+	}
+	var storedDeliveries int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM org_webhook_deliveries WHERE org_event_id = $1`, eventID).Scan(&storedDeliveries); err != nil {
+		t.Fatalf("count inbound deliveries: %v", err)
+	}
+	if storedDeliveries != 1 {
+		t.Fatalf("inbound delivery rows = %d, want 1", storedDeliveries)
 	}
 
 	// Assert the signature headers are present and valid.

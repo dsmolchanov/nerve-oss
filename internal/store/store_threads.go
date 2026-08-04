@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func (s *Store) ListThreads(ctx context.Context, inboxID string, status string, limit int) ([]Thread, error) {
@@ -52,25 +54,39 @@ func (s *Store) GetThread(ctx context.Context, threadID string) (Thread, []Messa
 	}
 	_ = json.Unmarshal(participantsJSON, &t.Participants)
 
-	rows, err := s.q.QueryContext(ctx, `SELECT message.id, message.inbox_id, message.thread_id, message.direction, coalesce(to_jsonb(message)->>'attachments_state', CASE WHEN message.direction = 'inbound' AND coalesce(message.received_email_id, '') <> '' THEN CASE WHEN message.created_at < now() - interval '30 days' THEN 'unknown_metadata_expired' ELSE 'pending_backfill' END ELSE 'known' END), coalesce(message.subject,''), coalesce(message.text,''), coalesce(message.html,''), message.created_at, coalesce(message.provider_message_id,''), coalesce(message.internet_message_id,''), coalesce(message.from_json,'{}'), coalesce(message.to_json,'[]'), coalesce(message.cc_json,'[]') FROM messages message WHERE message.thread_id = $1 ORDER BY message.created_at ASC`, threadID)
+	rows, err := s.q.QueryContext(ctx, `SELECT message.id, message.inbox_id, message.thread_id, message.direction, coalesce(to_jsonb(message)->>'attachments_state', CASE WHEN message.direction = 'inbound' AND coalesce(message.received_email_id, '') <> '' THEN CASE WHEN message.created_at < now() - interval '30 days' THEN 'unknown_metadata_expired' ELSE 'pending_backfill' END ELSE 'known' END), coalesce(message.subject,''), coalesce(message.text,''), coalesce(message.html,''), message.created_at, coalesce(message.provider_message_id,''), coalesce(message.internet_message_id,''), coalesce(message.from_json,'{}'), coalesce(message.to_json,'[]'), coalesce(message.cc_json,'[]'), message.org_id::text FROM messages message WHERE message.thread_id = $1 ORDER BY message.created_at ASC`, threadID)
 	if err != nil {
 		return t, nil, err
 	}
-	defer rows.Close()
-
 	var messages []Message
+	var messageOrgIDs []string
 	for rows.Next() {
 		var m Message
 		var fromJSON, toJSON, ccJSON []byte
-		if err := rows.Scan(&m.ID, &m.InboxID, &m.ThreadID, &m.Direction, &m.AttachmentsState, &m.Subject, &m.Text, &m.HTML, &m.CreatedAt, &m.ProviderMessageID, &m.InternetMessageID, &fromJSON, &toJSON, &ccJSON); err != nil {
+		var orgID string
+		if err := rows.Scan(&m.ID, &m.InboxID, &m.ThreadID, &m.Direction, &m.AttachmentsState, &m.Subject, &m.Text, &m.HTML, &m.CreatedAt, &m.ProviderMessageID, &m.InternetMessageID, &fromJSON, &toJSON, &ccJSON, &orgID); err != nil {
+			rows.Close()
 			return t, nil, err
 		}
 		_ = json.Unmarshal(fromJSON, &m.From)
 		_ = json.Unmarshal(toJSON, &m.To)
 		_ = json.Unmarshal(ccJSON, &m.CC)
 		messages = append(messages, m)
+		messageOrgIDs = append(messageOrgIDs, orgID)
 	}
-	return t, messages, rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return t, nil, err
+	}
+	rows.Close()
+	for i := range messages {
+		attachments, err := s.listMessageAttachmentsCompatible(ctx, messageOrgIDs[i], messages[i].ID)
+		if err != nil {
+			return t, nil, err
+		}
+		messages[i].Attachments = attachments
+	}
+	return t, messages, nil
 }
 
 func (s *Store) GetThreadInboxID(ctx context.Context, threadID string) (string, error) {
@@ -85,14 +101,32 @@ func (s *Store) GetThreadInboxID(ctx context.Context, threadID string) (string, 
 func (s *Store) GetMessage(ctx context.Context, messageID string) (Message, error) {
 	var m Message
 	var fromJSON, toJSON, ccJSON []byte
-	row := s.q.QueryRowContext(ctx, `SELECT message.id, message.inbox_id, message.thread_id, message.direction, coalesce(to_jsonb(message)->>'attachments_state', CASE WHEN message.direction = 'inbound' AND coalesce(message.received_email_id, '') <> '' THEN CASE WHEN message.created_at < now() - interval '30 days' THEN 'unknown_metadata_expired' ELSE 'pending_backfill' END ELSE 'known' END), message.subject, message.text, message.html, message.created_at, message.provider_message_id, message.internet_message_id, message.from_json, message.to_json, message.cc_json, coalesce(message.received_email_id, '') FROM messages message WHERE message.id = $1`, messageID)
-	if err := row.Scan(&m.ID, &m.InboxID, &m.ThreadID, &m.Direction, &m.AttachmentsState, &m.Subject, &m.Text, &m.HTML, &m.CreatedAt, &m.ProviderMessageID, &m.InternetMessageID, &fromJSON, &toJSON, &ccJSON, &m.ReceivedEmailID); err != nil {
+	row := s.q.QueryRowContext(ctx, `SELECT message.id, message.inbox_id, message.thread_id, message.direction, coalesce(to_jsonb(message)->>'attachments_state', CASE WHEN message.direction = 'inbound' AND coalesce(message.received_email_id, '') <> '' THEN CASE WHEN message.created_at < now() - interval '30 days' THEN 'unknown_metadata_expired' ELSE 'pending_backfill' END ELSE 'known' END), message.subject, message.text, message.html, message.created_at, message.provider_message_id, message.internet_message_id, message.from_json, message.to_json, message.cc_json, coalesce(message.received_email_id, ''), message.org_id::text FROM messages message WHERE message.id = $1`, messageID)
+	var orgID string
+	if err := row.Scan(&m.ID, &m.InboxID, &m.ThreadID, &m.Direction, &m.AttachmentsState, &m.Subject, &m.Text, &m.HTML, &m.CreatedAt, &m.ProviderMessageID, &m.InternetMessageID, &fromJSON, &toJSON, &ccJSON, &m.ReceivedEmailID, &orgID); err != nil {
 		return m, err
 	}
 	_ = json.Unmarshal(fromJSON, &m.From)
 	_ = json.Unmarshal(toJSON, &m.To)
 	_ = json.Unmarshal(ccJSON, &m.CC)
+	attachments, err := s.listMessageAttachmentsCompatible(ctx, orgID, m.ID)
+	if err != nil {
+		return Message{}, err
+	}
+	m.Attachments = attachments
 	return m, nil
+}
+
+func (s *Store) listMessageAttachmentsCompatible(ctx context.Context, orgID, messageID string) ([]MessageAttachment, error) {
+	attachments, err := s.ListMessageAttachments(ctx, orgID, messageID)
+	if err == nil {
+		return attachments, nil
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
+		return nil, nil
+	}
+	return nil, err
 }
 
 func (s *Store) SearchInboxFTS(ctx context.Context, inboxID string, query string, limit int) ([]SearchResult, error) {
@@ -209,14 +243,43 @@ func (s *Store) UpdateThreadSignals(ctx context.Context, threadID string, sentim
 }
 
 func (s *Store) InsertMessageWithThread(ctx context.Context, inboxID string, providerThreadID string, msg Message) (string, string, error) {
-	threadID, err := s.EnsureThread(ctx, inboxID, providerThreadID, msg.Subject, append([]Participant{msg.From}, msg.To...))
-	if err != nil {
-		return "", "", err
-	}
-	msg.ThreadID = threadID
-	msg.InboxID = inboxID
-	msgID, err := s.InsertMessage(ctx, msg)
-	return threadID, msgID, err
+	var threadID, messageID string
+	err := s.withTx(ctx, func(txStore *Store) error {
+		// Serialize concurrent deliveries of the same provider message. This is
+		// transaction-scoped, so a crash cannot strand a lock.
+		if msg.ProviderMessageID != "" {
+			if _, err := txStore.q.ExecContext(ctx, `
+				SELECT pg_advisory_xact_lock(hashtextextended($1, 0))
+			`, inboxID+":"+msg.ProviderMessageID); err != nil {
+				return err
+			}
+			// Inbound providers may retry after the first transaction committed
+			// but before the webhook was acknowledged. Resolve the replay before
+			// creating a thread, especially when providerThreadID is empty.
+			err := txStore.q.QueryRowContext(ctx, `
+				SELECT thread_id::text, id::text
+				FROM messages
+				WHERE inbox_id = $1 AND provider_message_id = $2
+			`, inboxID, msg.ProviderMessageID).Scan(&threadID, &messageID)
+			if err == nil {
+				return nil
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+		}
+
+		var err error
+		threadID, err = txStore.EnsureThread(ctx, inboxID, providerThreadID, msg.Subject, append([]Participant{msg.From}, msg.To...))
+		if err != nil {
+			return err
+		}
+		msg.ThreadID = threadID
+		msg.InboxID = inboxID
+		messageID, err = txStore.InsertMessage(ctx, msg)
+		return err
+	})
+	return threadID, messageID, err
 }
 
 func (s *Store) MessageCount(ctx context.Context) (int, error) {

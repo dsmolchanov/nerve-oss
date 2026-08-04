@@ -1,5 +1,16 @@
 # Nerve: Inbound Event Fan-out + Attachments (Both Directions)
 
+> **Revision 12 (2026-08-04)** — Abrolia Phase 2.1 household email tenancy
+> is an approved interleaved prerequisite and owns core migration `0024`
+> (Cloud reconciliation owns `cloud/0008`). It adds replay-safe organization,
+> root-domain grant, domain, inbox and webhook identities so multiple synthetic
+> or pilot households can receive through `abrolia.com` without weakening RLS
+> isolation. The already-planned but not-yet-implemented outbound attachment
+> migration moves from `0024` to `0025`; feature flags move from `0025` to
+> `0026`; the dual-reader compatibility ceiling moves from `0025` to `0026`.
+> No implemented `0020`–`0023` migration is renamed, and no outbound-attachment
+> scope changes beyond its migration number.
+>
 > **Revision 11 (2026-08-04)** — Phase 1 safety primitives are implemented
 > OSS-first and promoted as immutable runtime `v0.0.7` from merge commit
 > `8a3568e`: dial-time public-address enforcement, redirect refusal, bounded
@@ -506,12 +517,12 @@ Revision 4 named four steps but left migration as a single `up --scope all`, whi
 | Step | Migration | Artifact | Gate before proceeding |
 |---|---|---|---|
 | **1a. Expand** | `up --to 0020` — create `org_events`, `ADD COLUMN org_event_id`. `outbox_event_id` stays `NOT NULL` | unchanged | `status` shows `0021`+ pending |
-| **1b. Dual reader** | none | **pinned control-plane digest** with schema window `[0020,0025]` | **No pre-1b control-plane instance remains** — assert every control-plane Machine reports exactly the expected 1b digest via the Machines API. If a rolling release intentionally permits more than one digest, the release manifest must list each allowed digest with the same compatible window. This is the gate that makes 1c safe. |
+| **1b. Dual reader** | none | **pinned control-plane digest** with schema window `[0020,0026]` | **No pre-1b control-plane instance remains** — assert every control-plane Machine reports exactly the expected 1b digest via the Machines API. If a rolling release intentionally permits more than one digest, the release manifest must list each allowed digest with the same compatible window. This is the gate that makes 1c safe. |
 | **1c. Relax** | `up --to 0023` (see §4) | producer flag off | zero pending through `0023` |
 | **1d. Activate** | none | flag on via D8 | flag cache converged (Phase 7 §3) |
 
 The 1b binary supports the whole additive rollout window, `0020` through
-`0025`, so it remains healthy while `0021`–`0025` land. It starts in `verify`
+`0026`, so it remains healthy while `0021`–`0026` land. It starts in `verify`
 mode (Phase 0 §5), which **never applies migrations**; only the explicit
 `nerve-migrate up --to ...` jobs may advance schema. An artifact whose declared
 window excludes the current DB version refuses to start. That separates
@@ -585,8 +596,8 @@ Matching: `($2 = ANY(events)) OR (cardinality(events) = 0 AND NOT $3)`. `handleC
 ### Success Criteria
 
 #### Automated:
-- [ ] `up --to 0020` leaves `outbox_event_id NOT NULL` and `0021` pending; the 1b binary starts against `0020` and remains green through `0025` while applying nothing
-- [ ] Compatibility enforcement is independent of the dual reader: a test binary whose `maxSupported = 0020` refuses to start against `0021`, while the 1b artifact declares `[0020,0025]`
+- [ ] `up --to 0020` leaves `outbox_event_id NOT NULL` and `0021` pending; the 1b binary starts against `0020` and remains green through `0026` while applying nothing
+- [ ] Compatibility enforcement is independent of the dual reader: a test binary whose `maxSupported = 0020` refuses to start against `0021`, while the 1b artifact declares `[0020,0026]`
 - [ ] **N−1**: pre-1b binary against `0021` with a NULL row reproduces the claim-batch failure; 1b claims it alongside an outbound row
 - [ ] `nerve-migrate down` for `0021` is clean with no `org_event_id` rows and **refuses** when they exist
 - [ ] Transaction ownership: from `RunAsOrg`, a forced error rolls back the message insert *and* the event; bare, it commits independently
@@ -725,7 +736,7 @@ ALTER TABLE attachments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE attachments FORCE ROW LEVEL SECURITY;
 CREATE POLICY deny_all_legacy_attachments ON attachments USING (false) WITH CHECK (false);
 COMMENT ON TABLE attachments IS
-  'DEPRECATED 2026-08 — superseded by message_attachments. Deny-all RLS. Drop after 0024 has been live 30 days.';
+  'DEPRECATED 2026-08 — superseded by message_attachments. Deny-all RLS. Drop after 0023 has been live 30 days.';
 -- + RLS on message_attachments + the three refcount triggers from §2
 ```
 
@@ -745,7 +756,7 @@ Claim `availability='pending' AND next_attempt_at <= now()` plus lease-expired r
 
 ### 6. Dereference, retention and abandon (D7)
 
-**Release, never delete.** Migration `0024` (Phase 4) adds:
+**Release, never delete.** Migration `0025` (Phase 4) adds:
 
 ```sql
 ALTER TABLE outbox_messages
@@ -802,9 +813,85 @@ CREATE INDEX idx_outbox_release_owed ON outbox_messages (terminal_at)
 
 ---
 
+## Interleaved Phase 2.1: Abrolia household email tenancy foundation
+
+This approved prerequisite occupies `core/0024_email_tenancy.sql` before the
+still-unimplemented outbound attachment phase. Abrolia routes many household
+inboxes through one verified root domain, while each household remains its own
+organization and RLS tenant. A root-domain owner therefore grants a bounded
+right to create inboxes for one grantee org; ownership of the domain itself is
+never transferred.
+
+### 1. Schema and reconciliation identity
+
+- Add stable, nullable `external_ref` reconciliation keys to `orgs`,
+  `org_domains`, `inboxes` and `org_webhooks`; active resources use partial
+  uniqueness where tombstoned rows must remain addressable.
+- Add `orgs.deleted_at` for fail-closed tenant tombstoning.
+- Add `org_domain_grants(owner_org_id, org_domain_id, grantee_org_id,
+  external_ref, status, revoked_at)` with one active grant per
+  `(org_domain_id, grantee_org_id)` and immutable owner/domain/grantee identity
+  on replay.
+- Grant RLS exposes the row to its owner and grantee, but mutation remains an
+  owner operation. Inbox creation proves either domain ownership or an active
+  grant in the same transaction.
+- The down migration refuses while grants, external reconciliation identities,
+  or tenant tombstone state still exist; rollback may not silently discard
+  durable control-plane identity.
+
+### 2. Replay-safe store contract
+
+- `EnsureOrg`, `EnsureOrgDomain`, `EnsureOrgDomainGrant` and
+  `EnsureOrgWebhook` use conflict-safe insert/fetch paths and return the same
+  resource for a matching retry; a reused external ref with different immutable
+  fields returns a typed idempotency conflict.
+- Concurrent grant creation and org/domain deletion serialize on sorted
+  transaction advisory locks, so deletion cannot race a late grant into an
+  orphaned or tombstoned tenant.
+- Grant revocation performs its active-inbox guard through a narrowly scoped
+  RLS-bypass query so an owner cannot revoke access while grantee inboxes still
+  exist merely because owner-scoped RLS hid them.
+- Existing attachment metadata and durable byte sizes remain stable when an
+  envelope or reconciliation replay omits fields it no longer owns.
+
+### 3. Cloud-owned follow-through
+
+`cloud/0008_email_tenancy_and_idempotency.sql` adds stable external references
+to Cloud API keys. Cloud reconciliation ensures one org, grant, inbox, key and
+signed inbound webhook per household. Repeating the same provisioning request
+returns existing resources and never re-emits an existing key secret. Runtime
+startup pins core `[24,24]`; the control plane pins core `[24,24]` and cloud
+`[8,8]` before production activation.
+
+### Success Criteria
+
+#### Automated:
+
+- [x] Fresh migration and upgrade from the `0023` head both reach core `0024`;
+  the compiled runtime window is `[24,24]`.
+- [x] Matching external-ref retries return one org/domain/grant/webhook under
+  concurrent callers; mismatched immutable identity returns a conflict.
+- [x] A grantee can create and read its inbox on the granted root domain but
+  cannot read another grantee's inbox or tenant messages.
+- [x] Revocation is refused while an active grantee inbox exists, including
+  when invoked from an owner-scoped RLS transaction.
+- [x] Grant creation racing org deletion waits for the same advisory lock and
+  then fails closed rather than creating a grant for a deleted org.
+- [x] Down migration refuses durable tenancy/reconciliation state instead of
+  dropping it.
+
+#### Manual:
+
+- [ ] After the digest-pinned Cloud deployment, provision two clearly
+  synthetic household orgs under `abrolia.com`, each with its own inbox and
+  tenant key; send the same PDF to both; each key can read and download only
+  its own durable attachment bytes.
+
+---
+
 ## Phase 4: Outbound attachments (nerve-oss)
 
-### 1. Migration `core/0024_outbox_attachments.sql`
+### 1. Migration `core/0025_outbox_attachments.sql`
 
 ```sql
 ALTER TABLE outbox_messages ADD CONSTRAINT uq_outbox_messages_org_id UNIQUE (org_id, id);  -- if absent
@@ -907,7 +994,7 @@ Updated **here**, before the runtime build, so the published manifest's `MCP_CON
 
 ## Phase 5: Cloud integration
 
-1. **Accept the sync PR** for the repair `0018`, stable-created-time baseline `0019`, feature migrations `0020`–`0024`, and every exact-mirror path. `diff -r migrations/core` empty; the sync job has already built and tested cloud (Phase 0 §4).
+1. **Accept the sync PR** for the repair `0018`, stable-created-time baseline `0019`, feature migrations `0020`–`0025`, and every exact-mirror path. `diff -r migrations/core` empty; the sync job has already built and tested cloud (Phase 0 §4).
 2. **Wire the mirror worker** into `cmd/nerve-control-plane` with config and metrics.
 3. **Cloud-only handlers**: Phase 3 §7's read surface, scopes, 401/403, and the abandon endpoint — all in the cloud-only list (`handler_messages.go`, `handler_inboxes.go`, `handler_webhooks.go`, `handler_dlq.go`).
 4. **Reconcile additions** (Phase 2 §6, Phase 3 §6) plus metrics.
@@ -1027,7 +1114,7 @@ Every job takes **artifact digests as inputs** — nothing is rebuilt. `control-
 
 ### 3. D8 — the executable flag contract
 
-**Schema in `core`** (`0025_feature_flags.sql`), not cloud: the runtime is OSS and must find the table in a self-hosted core schema.
+**Schema in `core`** (`0026_feature_flags.sql`), not cloud: the runtime is OSS and must find the table in a self-hosted core schema.
 
 ```sql
 CREATE TABLE org_feature_flags (
@@ -1064,7 +1151,7 @@ Two partial unique indexes because a plain `UNIQUE (org_id, flag)` does not cons
 ### 4. Cutover
 
 0. `rehearse` replays the `0018` repair, the `0019` stable-created-time
-   baseline, and the `0020`, `0023`, and `0025`
+   baseline, and the `0020`, `0023`, `0024`, and `0026`
    feature targets plus a backfill dry-run against a restored production
    snapshot and must be green.
 1. `up --to 0019` applies the shared converged baseline. **Gate**: status
@@ -1076,7 +1163,7 @@ Two partial unique indexes because a plain `UNIQUE (org_id, flag)` does not cons
 2. `up --to 0020` (1a expand).
 3. 1b dual-reader digest deploys; **gate**: every control-plane Machine reports exactly the expected 1b digest (or a digest on the explicit compatible allowlist).
 4. `up --to 0023` (1c).
-5. With producer flags still off, `up --to 0025` lands the additive
+5. With producer flags still off, `up --to 0026` lands the additive tenancy,
    `outbox_attachments` and feature-flag schema required by the new binaries.
 6. Runtime deploys at its digest, flags off; `tools/list` omits `attachments`.
 7. Control plane + reconcile Machine deploy at the multi-binary digest.
@@ -1127,7 +1214,7 @@ Flag-off is not a general rollback, and revision 4 implied it was.
 
 #### Manual:
 - [ ] Canary org exists with a verified receiving subdomain, and inbound mail to it routes to that org
-- [ ] Full cutover run: rehearse → baseline `0019` gate → 1a (`0020`) → 1b → exact-digest gate → 1c (`0023`) → `0025` → runtime → control-plane → backfill → canary on → contract green → pilot on
+- [ ] Full cutover run: rehearse → baseline `0019` gate → 1a (`0020`) → 1b → exact-digest gate → 1c (`0023`) → tenancy (`0024`) → `0026` → runtime → control-plane → backfill → canary on → contract green → pilot on
 - [ ] Flags off mid-pilot leaves queued attachment sends deliverable (the worker stays attachment-aware regardless of the producer flag)
 
 ---
@@ -1136,7 +1223,7 @@ Flag-off is not a general rollback, and revision 4 implied it was.
 
 - hermes-cloud pins updated to the landed SHAs (`hermes-cloud/docs/source-pins.md`).
 - Runtime cold-start verified gone (first MCP call < 2s after idle).
-- Follow-ups filed: drop the legacy `attachments` table after `0024` has been live 30 days; sweep the remaining `401`/`403` call sites; re-evaluate `[[vm]] memory` against observed attachment traffic; backport or formally re-assign the cloud-only store files.
+- Follow-ups filed: drop the legacy `attachments` table after `0023` has been live 30 days; sweep the remaining `401`/`403` call sites; re-evaluate `[[vm]] memory` against observed attachment traffic; backport or formally re-assign the cloud-only store files.
 
 ---
 
@@ -1146,7 +1233,7 @@ Flag-off is not a general rollback, and revision 4 implied it was.
 - **Integration** against real Postgres (`NM_TEST_DB_DSN`, `NM_REQUIRE_DB=1`, zero skips): ingest with recorded Resend fixtures, `org_event` → dispatcher → HTTP delivery, mirror worker against a fake Resend, outbox worker against a fake provider, DLQ abandon/replay.
 - **Concurrency**: parallel same-SHA upload, parallel quota reservation, competing mirror claims, competing reconcile runs under the advisory lock, budget exhaustion.
 - **Compatibility**: the N−1 reader test, a synthetic out-of-window startup
-  refusal, the 1b `[0020,0025]` span, and the exact-digest Machine gate (Phase
+  refusal, the 1b `[0020,0026]` span, and the exact-digest Machine gate (Phase
   2 §1); the D9 API-surface diff; the sync job's post-apply cloud build and
   test.
 - **Fault injection**: fan-out failure mid-transaction, partial-recipient failure, mirror truncation, DNS rebinding at dial, quota exhaustion, crash between blob write and ref insert, interrupted backfill resume, slow-body budget hold.
@@ -1156,12 +1243,12 @@ Flag-off is not a general rollback, and revision 4 implied it was.
 ## Migration Notes
 
 - **`0018` is a forward repair, not the event expand step.** It repairs tenant RLS and active-webhook uniqueness for databases that had already recorded version `17`; duplicate active `(org_id, url)` rows must be explicitly resolved before it can apply. `0019_outbox_created_at.sql` is the next converged baseline migration and gives the retained outbox/DLQ history a stable creation timestamp. OSS runtime `v0.0.6` pins their shared core hash and `[19,19]` window.
-- **Rollout is expand → dual-read → relax → activate, with `--to` targets** (Phase 2 §1). `0020` expands with `outbox_event_id` still `NOT NULL`; the dual reader declares `[minRequired,maxSupported] = [0020,0025]` and runs in `verify` mode, so it remains compatible through the additive rollout but never applies a migration itself. Only after its exact digest is everywhere does `0021` relax.
+- **Rollout is expand → dual-read → relax → activate, with `--to` targets** (Phase 2 §1). `0020` expands with `outbox_event_id` still `NOT NULL`; the dual reader declares `[minRequired,maxSupported] = [0020,0026]` and runs in `verify` mode, so it remains compatible through the additive rollout but never applies a migration itself. Only after its exact digest is everywhere does `0021` relax.
 - **Step 1c applies through `0023`**, because ingest writes `message_attachments`.
 - **`0021` disables non-HTTPS webhooks carrying `email.received`** — deliberate and reversible, because `events` was never validated. Run the preflight and record the result before merging.
 - **`0023` leaves the rollout default at `pending_backfill`** and classifies existing rows (outbound and no-`received_email_id` → `known`; recoverable inbound → `pending_backfill`; past retention → `unknown_metadata_expired`). The new writer sets `known` explicitly, so a row created by an old writer during cutover stays visible to backfill. The activation gate is **zero `pending_backfill` in total**.
 - **D7: nothing is deleted.** `sent` rows release blob *bytes* 90 days (configurable) after `terminal_at`; `failed` rows retain bytes until explicit abandon via `POST /v1/admin/outbox/{id}/abandon`. Rows, timelines, webhook deliveries, attachment metadata + digests and idempotency tombstones are retained; `chk_outbox_status` is untouched. Pre-existing terminal rows get `terminal_at = now()` for a full grace window.
-- **Down-migrations**: `0018` down keeps the corrected version-17 security guarantees; `0019` down removes only the stable-created-time index/column; `0021` down is clean only with no `org_event_id` rows and refuses otherwise. `0022`–`0025` down remove only the new additive feature schema.
+- **Down-migrations**: `0018` down keeps the corrected version-17 security guarantees; `0019` down removes only the stable-created-time index/column; `0021` down is clean only with no `org_event_id` rows and refuses otherwise. `0022`–`0026` down remove only the new additive feature schema, and `0024` additionally refuses while tenancy reconciliation state exists.
 - **The `0011`–`0017` backport is a no-op for databases already at version `17`**, but `0018` is their required forward repair. The full tree through `0018` must be byte-identical for `CORE_SCHEMA_HASH` to converge — which requires D9 first.
 - **Legacy `attachments`** gets deny-all RLS in `0023`; the drop is a dated follow-up.
 

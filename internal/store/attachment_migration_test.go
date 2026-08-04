@@ -281,7 +281,9 @@ func TestMessageAttachmentCompositeForeignKeysRejectCrossTenantReferences(t *tes
 
 func TestMigration23DownRefusesAttachmentMetadata(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
-		migrateToLatest(t, ctx, db)
+		if err := MigrateUpToCore(ctx, db, 23); err != nil {
+			t.Fatal(err)
+		}
 		orgID, inboxID, threadID := seedAttachmentMessageParents(t, ctx, db, "down-refusal")
 		messageID := uuid.NewString()
 		if _, err := db.ExecContext(ctx, `

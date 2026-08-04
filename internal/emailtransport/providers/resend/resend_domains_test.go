@@ -56,6 +56,9 @@ func TestResendDomainsClientCRUDPathsAndAuth(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"id":"d_123","object":"domain"}`))
 			return
+		case r.Method == http.MethodDelete && r.URL.Path == "/domains/d_123":
+			w.WriteHeader(http.StatusNoContent)
+			return
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
@@ -106,6 +109,9 @@ func TestResendDomainsClientCRUDPathsAndAuth(t *testing.T) {
 	if err := client.EnableReceiving(context.Background(), "d_123"); err != nil {
 		t.Fatalf("EnableReceiving: %v", err)
 	}
+	if err := client.DeleteDomain(context.Background(), "d_123"); err != nil {
+		t.Fatalf("DeleteDomain: %v", err)
+	}
 
 	for i, auth := range gotAuth {
 		if auth != "Bearer re_test_key" {
@@ -118,6 +124,7 @@ func TestResendDomainsClientCRUDPathsAndAuth(t *testing.T) {
 		"POST /domains/d_123/verify",
 		"GET /domains",
 		"PATCH /domains/d_123",
+		"DELETE /domains/d_123",
 	}
 	if len(gotPaths) != len(expectedPaths) {
 		t.Fatalf("expected %d requests, got %d: %+v", len(expectedPaths), len(gotPaths), gotPaths)
@@ -126,6 +133,21 @@ func TestResendDomainsClientCRUDPathsAndAuth(t *testing.T) {
 		if gotPaths[i] != expectedPaths[i] {
 			t.Fatalf("request %d expected %q got %q", i, expectedPaths[i], gotPaths[i])
 		}
+	}
+}
+
+func TestResendDomainsDeleteTreatsNotFoundAsSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/domains/already-gone" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	client := NewDomainsClient(Config{APIKey: "re_test_key", BaseURL: srv.URL, HTTPClient: srv.Client()})
+	if err := client.DeleteDomain(context.Background(), "already-gone"); err != nil {
+		t.Fatalf("idempotent delete: %v", err)
 	}
 }
 

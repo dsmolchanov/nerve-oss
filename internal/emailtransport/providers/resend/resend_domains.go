@@ -132,6 +132,24 @@ func (c *DomainsClient) ListDomains(ctx context.Context) ([]Domain, error) {
 	return parseDomainList(respBody)
 }
 
+// DeleteDomain is idempotent: a provider 404 means the desired absent state is
+// already reached. Other non-2xx responses are returned so callers do not claim
+// local cleanup while provider state is unknown.
+func (c *DomainsClient) DeleteDomain(ctx context.Context, id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return errors.New("missing domain id")
+	}
+	status, respBody, err := c.doRequest(ctx, http.MethodDelete, "/domains/"+id, nil, "")
+	if err != nil {
+		return err
+	}
+	if status == http.StatusNotFound || (status >= 200 && status < 300) {
+		return nil
+	}
+	return fmt.Errorf("resend delete domain failed: status=%d body=%s", status, strings.TrimSpace(string(respBody)))
+}
+
 // EnableReceiving enables the receiving capability on a Resend domain.
 // Idempotent — safe to call multiple times. Per Resend's Update Domain API,
 // omitted capability fields keep their current values.

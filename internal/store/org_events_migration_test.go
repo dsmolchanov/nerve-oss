@@ -224,12 +224,12 @@ func TestDualReaderClaimsNullableAndOutboundDeliveriesTogether(t *testing.T) {
 		seenOutbox, seenOrg := false, false
 		for _, delivery := range claimed {
 			switch {
-			case delivery.OutboxEventID == outboxEventID && delivery.OrgEventID == "":
+			case delivery.OutboxEventID.Valid && delivery.OutboxEventID.String == outboxEventID && !delivery.OrgEventID.Valid:
 				seenOutbox = true
-			case delivery.OutboxEventID == "" && delivery.OrgEventID == orgEventID:
+			case !delivery.OutboxEventID.Valid && delivery.OrgEventID.Valid && delivery.OrgEventID.String == orgEventID:
 				seenOrg = true
 			default:
-				t.Fatalf("invalid claimed source pair: outbox=%q org=%q", delivery.OutboxEventID, delivery.OrgEventID)
+				t.Fatalf("invalid claimed source pair: outbox=%+v org=%+v", delivery.OutboxEventID, delivery.OrgEventID)
 			}
 		}
 		if !seenOutbox || !seenOrg {

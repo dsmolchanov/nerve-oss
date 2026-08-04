@@ -8,8 +8,8 @@ GIT_COMMIT="${GIT_COMMIT:-$(git rev-parse --short=12 HEAD 2>/dev/null || echo un
 BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 MCP_CONTRACT_PATH="${MCP_CONTRACT_PATH:-docs/MCP_Contract.md}"
 CORE_MIGRATIONS_PATH="${CORE_MIGRATIONS_PATH:-internal/store/migrations/core}"
-CORE_SCHEMA_MIN_REQUIRED="19"
-CORE_SCHEMA_MAX_SUPPORTED="23"
+CORE_SCHEMA_MIN_REQUIRED="24"
+CORE_SCHEMA_MAX_SUPPORTED="24"
 
 hash_file() {
   local path="$1"
