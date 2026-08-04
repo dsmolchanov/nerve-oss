@@ -56,6 +56,17 @@ func TestMessageAttachmentWorkerLeaseMirrorAndLoad(t *testing.T) {
 		if !bytes.Equal(loaded, content) {
 			t.Fatalf("loaded content=%q, want %q", loaded, content)
 		}
+		if err := st.PersistInboundAttachmentMetadata(ctx, orgID, messageID, []InboundAttachmentMetadata{{
+			ProviderAttachmentID: "provider-worker-flow",
+			Filename:             "flow.pdf",
+			ContentType:          "application/pdf",
+		}}); err != nil {
+			t.Fatal(err)
+		}
+		attachment, loaded, err = st.LoadMessageAttachmentContent(ctx, orgID, messageID, claimed[0].ID)
+		if err != nil || !attachment.SizeBytes.Valid || attachment.SizeBytes.Int64 != int64(len(content)) || !bytes.Equal(loaded, content) {
+			t.Fatalf("envelope replay changed durable result: attachment=%+v content=%q err=%v", attachment, loaded, err)
+		}
 		if err := st.MarkMessageAttachmentTerminal(ctx, claimed[0].ID, claimed[0].LockedBy.String, claimed[0].LockedAt.Time, "failed", "late worker"); !errors.Is(err, ErrAttachmentLeaseLost) {
 			t.Fatalf("late terminal update error=%v, want lease lost", err)
 		}

@@ -118,7 +118,7 @@ func (s *Store) SetMessageAttachmentsKnown(
 				  content_type = EXCLUDED.content_type,
 				  content_disposition = EXCLUDED.content_disposition,
 				  content_id = EXCLUDED.content_id,
-				  size_bytes = EXCLUDED.size_bytes
+				  size_bytes = COALESCE(message_attachments.size_bytes, EXCLUDED.size_bytes)
 			`,
 				orgID,
 				messageID,
