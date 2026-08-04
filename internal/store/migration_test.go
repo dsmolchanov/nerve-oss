@@ -719,13 +719,16 @@ func TestCurrentVersionDoesNotInitializeMigrationTables(t *testing.T) {
 
 func TestMigrationStatusOnFreshDatabaseIsReadOnly(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		coreVersions := migrationVersions(t, "core")
+		cloudVersions := migrationVersions(t, "cloud")
 		core, err := MigrationStatusCore(ctx, db)
 		core = requireMigrationStatus(t, core, err)
 		cloud, err := MigrationStatusCloud(ctx, db)
 		cloud = requireMigrationStatus(t, cloud, err)
 
-		assertMigrationStatus(t, core, 0, migrationVersions(t, "core"))
-		assertMigrationStatus(t, cloud, 0, []int64{1, 3})
+		assertMigrationStatus(t, core, 0, coreVersions)
+		assertMigrationStatus(t, cloud, 0, cloudVersions)
+		assertVersionAbsent(t, cloud.Pending, 2)
 		if tableExists(ctx, t, db, migrationTableCore) || tableExists(ctx, t, db, migrationTableCloud) {
 			t.Fatal("read-only migration status created a migration table")
 		}
@@ -762,9 +765,11 @@ func TestMigrationStatusCloudPreservesSparsePendingVersions(t *testing.T) {
 			t.Fatalf("migrate cloud to 1: %v", err)
 		}
 
+		versions := migrationVersions(t, "cloud")
 		status, err := MigrationStatusCloud(ctx, db)
 		status = requireMigrationStatus(t, status, err)
-		assertMigrationStatus(t, status, 1, []int64{3})
+		assertMigrationStatus(t, status, 1, versionsAfter(versions, 1))
+		assertVersionAbsent(t, status.Pending, 2)
 	})
 }
 
@@ -864,6 +869,15 @@ func versionsAfter(versions []int64, current int64) []int64 {
 		}
 	}
 	return pending
+}
+
+func assertVersionAbsent(t *testing.T, versions []int64, absent int64) {
+	t.Helper()
+	for _, version := range versions {
+		if version == absent {
+			t.Fatalf("migration versions = %v; synthetic gap version %d must be absent", versions, absent)
+		}
+	}
 }
 
 func TestWithGooseSerializesConfigurationAndOperation(t *testing.T) {
