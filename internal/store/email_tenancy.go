@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 
@@ -85,23 +86,34 @@ func (s *Store) GetOrgByID(ctx context.Context, orgID string) (OrgRecord, error)
 // resources must be reconciled first, after which the org row can be removed
 // without silently orphaning external state.
 func (s *Store) DeleteOrgIfEmpty(ctx context.Context, orgID string) (bool, error) {
-	result, err := s.q.ExecContext(ctx, `
-		UPDATE orgs o SET deleted_at = now()
-		WHERE o.id = $1
-		  AND o.deleted_at IS NULL
-		  AND NOT EXISTS (SELECT 1 FROM org_domains d WHERE d.org_id = o.id)
-		  AND NOT EXISTS (SELECT 1 FROM inboxes i WHERE i.org_id = o.id)
-		  AND NOT EXISTS (SELECT 1 FROM cloud_api_keys k WHERE k.org_id = o.id AND k.revoked_at IS NULL)
-		  AND NOT EXISTS (SELECT 1 FROM org_webhooks w WHERE w.org_id = o.id AND w.disabled_at IS NULL)
-		  AND NOT EXISTS (SELECT 1 FROM org_domain_grants g
-		                  WHERE (g.owner_org_id = o.id OR g.grantee_org_id = o.id)
-		                    AND g.status = 'active')
-	`, orgID)
-	if err != nil {
-		return false, err
-	}
-	n, err := result.RowsAffected()
-	return n > 0, err
+	deleted := false
+	err := s.withTx(ctx, func(scoped *Store) error {
+		if err := scoped.lockReconciliationResources(ctx, "org:"+orgID); err != nil {
+			return err
+		}
+		result, err := scoped.q.ExecContext(ctx, `
+			UPDATE orgs o SET deleted_at = now()
+			WHERE o.id = $1
+			  AND o.deleted_at IS NULL
+			  AND NOT EXISTS (SELECT 1 FROM org_domains d WHERE d.org_id = o.id)
+			  AND NOT EXISTS (SELECT 1 FROM inboxes i WHERE i.org_id = o.id)
+			  AND NOT EXISTS (SELECT 1 FROM cloud_api_keys k WHERE k.org_id = o.id AND k.revoked_at IS NULL)
+			  AND NOT EXISTS (SELECT 1 FROM org_webhooks w WHERE w.org_id = o.id AND w.disabled_at IS NULL)
+			  AND NOT EXISTS (SELECT 1 FROM org_domain_grants g
+			                  WHERE (g.owner_org_id = o.id OR g.grantee_org_id = o.id)
+			                    AND g.status = 'active')
+		`, orgID)
+		if err != nil {
+			return err
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		deleted = n > 0
+		return nil
+	})
+	return deleted, err
 }
 
 // LockOrgDomainForCleanup serializes the provider deletion with all inbox and
@@ -163,6 +175,24 @@ func (s *Store) EnsureOrgDomainGrant(ctx context.Context, ownerOrgID, domainID, 
 		return OrgDomainGrant{}, false, errors.New("owner and grantee must differ")
 	}
 
+	var rec OrgDomainGrant
+	created := false
+	err := s.withTx(ctx, func(scoped *Store) error {
+		if err := scoped.lockReconciliationResources(
+			ctx, "domain:"+domainID, "org:"+ownerOrgID, "org:"+granteeOrgID,
+		); err != nil {
+			return err
+		}
+		var innerErr error
+		rec, created, innerErr = scoped.ensureOrgDomainGrantLocked(
+			ctx, ownerOrgID, domainID, granteeOrgID, externalRef,
+		)
+		return innerErr
+	})
+	return rec, created, err
+}
+
+func (s *Store) ensureOrgDomainGrantLocked(ctx context.Context, ownerOrgID, domainID, granteeOrgID, externalRef string) (OrgDomainGrant, bool, error) {
 	var domainActive bool
 	if err := s.q.QueryRowContext(ctx, `
 		SELECT EXISTS(
@@ -213,6 +243,26 @@ func (s *Store) EnsureOrgDomainGrant(ctx context.Context, ownerOrgID, domainID, 
 		return OrgDomainGrant{}, false, ErrIdempotencyConflict
 	}
 	return rec, false, nil
+}
+
+// lockReconciliationResources serializes multi-resource admin operations before
+// their SQL statements take snapshots. Sorting gives every caller a stable lock
+// order and avoids deadlocks when owner and grantee roles are reversed.
+func (s *Store) lockReconciliationResources(ctx context.Context, resources ...string) error {
+	keys := append([]string(nil), resources...)
+	sort.Strings(keys)
+	previous := ""
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key == "" || key == previous {
+			continue
+		}
+		if _, err := s.q.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, key); err != nil {
+			return err
+		}
+		previous = key
+	}
+	return nil
 }
 
 func (s *Store) GetOrgDomainGrantByExternalRef(ctx context.Context, externalRef string) (OrgDomainGrant, error) {

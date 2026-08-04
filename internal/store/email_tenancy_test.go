@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestMigration24DownRefusesDomainGrants(t *testing.T) {
@@ -193,6 +194,63 @@ func TestEnsureOrgWebhookConcurrentReplay(t *testing.T) {
 		}
 		if createdCount != 1 {
 			t.Fatalf("created count = %d, want 1", createdCount)
+		}
+	})
+}
+
+func TestDomainGrantCreationSerializesWithOrgDeletion(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		ownerID, err := st.CreateOrg(ctx, "serialized-owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+		granteeID, err := st.CreateOrg(ctx, "serialized-grantee")
+		if err != nil {
+			t.Fatal(err)
+		}
+		domainID, err := st.CreateOrgDomain(ctx, ownerID, "abrolia.com", "verify", "selector", "private", "public", "cname")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.UpdateOrgDomainStatus(ctx, domainID, "active"); err != nil {
+			t.Fatal(err)
+		}
+
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "org:"+granteeID); err != nil {
+			t.Fatal(err)
+		}
+		grantResult := make(chan error, 1)
+		go func() {
+			_, _, ensureErr := st.EnsureOrgDomainGrant(ctx, ownerID, domainID, granteeID, "serialized:grant")
+			grantResult <- ensureErr
+		}()
+
+		select {
+		case err := <-grantResult:
+			t.Fatalf("grant creation did not wait for reconciliation lock: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE orgs SET deleted_at = now() WHERE id = $1`, granteeID); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-grantResult; !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("grant after serialized deletion error=%v, want no rows", err)
+		}
+		var grants int
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM org_domain_grants WHERE grantee_org_id = $1`, granteeID).Scan(&grants); err != nil {
+			t.Fatal(err)
+		}
+		if grants != 0 {
+			t.Fatalf("deleted grantee received %d active grants", grants)
 		}
 	})
 }
