@@ -144,11 +144,17 @@ func TestRunRepairsPendingOrgEventFanOut(t *testing.T) {
 
 func TestRunAtSchema19SkipsUnavailableOrgEventJournal(t *testing.T) {
 	withTempStore(t, func(ctx context.Context, st *store.Store) {
-		if err := store.MigrateDownCore(ctx, st.DB()); err != nil {
-			t.Fatalf("down from schema 21: %v", err)
-		}
-		if err := store.MigrateDownCore(ctx, st.DB()); err != nil {
-			t.Fatalf("down from schema 20: %v", err)
+		for {
+			version, err := store.CurrentVersionCore(ctx, st.DB())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if version <= 19 {
+				break
+			}
+			if err := store.MigrateDownCore(ctx, st.DB()); err != nil {
+				t.Fatalf("down from schema %d: %v", version, err)
+			}
 		}
 		version, err := store.CurrentVersionCore(ctx, st.DB())
 		if err != nil || version != 19 {
@@ -161,6 +167,46 @@ func TestRunAtSchema19SkipsUnavailableOrgEventJournal(t *testing.T) {
 		}
 		if report.OrgEventsFannedOut != 0 {
 			t.Fatalf("org events fanned out=%d, want 0 without journal schema", report.OrgEventsFannedOut)
+		}
+		if report.AttachmentUsageSeeded != 0 {
+			t.Fatalf("attachment usage seeded=%d, want 0 without attachment schema", report.AttachmentUsageSeeded)
+		}
+	})
+}
+
+func TestRunSeedsMissingAttachmentUsage(t *testing.T) {
+	withTempStore(t, func(ctx context.Context, st *store.Store) {
+		orgID := uuid.NewString()
+		if _, err := st.DB().ExecContext(ctx, `
+			INSERT INTO orgs (id, name) VALUES ($1, 'missing-attachment-usage')
+		`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.DB().ExecContext(ctx, `
+			INSERT INTO attachment_blobs
+			  (org_id, sha256, size_bytes, content_type, content)
+			VALUES ($1, 'preexisting', 3, 'application/octet-stream', '\x010203')
+		`, orgID); err != nil {
+			t.Fatal(err)
+		}
+
+		report, err := NewService(st).Run(ctx)
+		if err != nil {
+			t.Fatalf("run reconciliation: %v", err)
+		}
+		if report.AttachmentUsageSeeded != 1 {
+			t.Fatalf("attachment usage seeded=%d, want 1", report.AttachmentUsageSeeded)
+		}
+		var rows int
+		var bytesUsed int64
+		if err := st.DB().QueryRowContext(ctx, `
+			SELECT count(*), COALESCE(max(bytes_used), 0)
+			FROM org_attachment_usage WHERE org_id = $1
+		`, orgID).Scan(&rows, &bytesUsed); err != nil {
+			t.Fatal(err)
+		}
+		if rows != 1 || bytesUsed != 3 {
+			t.Fatalf("usage rows=%d bytes_used=%d, want 1/3", rows, bytesUsed)
 		}
 	})
 }

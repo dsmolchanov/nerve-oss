@@ -131,7 +131,9 @@ func TestMigration21RelaxesSourceAndDisablesCleartextInbound(t *testing.T) {
 
 func TestMigration21DownRefusesOrgEventDeliveries(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
-		migrateToLatest(t, ctx, db)
+		if err := MigrateUpToCore(ctx, db, 21); err != nil {
+			t.Fatal(err)
+		}
 		orgID := uuid.NewString()
 		webhookID := uuid.NewString()
 		eventID := uuid.NewString()

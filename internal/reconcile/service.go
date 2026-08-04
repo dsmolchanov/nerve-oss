@@ -13,9 +13,10 @@ type Service struct {
 }
 
 type Report struct {
-	CountersRepaired   int
-	PeriodsRolled      int
-	OrgEventsFannedOut int
+	CountersRepaired      int
+	PeriodsRolled         int
+	OrgEventsFannedOut    int
+	AttachmentUsageSeeded int
 }
 
 func NewService(st *store.Store) *Service {
@@ -85,6 +86,12 @@ func (s *Service) Run(ctx context.Context) (Report, error) {
 			}
 		}
 	}
+
+	seeded, err := s.Store.SeedMissingOrgAttachmentUsage(ctx)
+	if err != nil {
+		return report, err
+	}
+	report.AttachmentUsageSeeded = seeded
 
 	return report, nil
 }
