@@ -206,6 +206,40 @@ func TestCoreMigration14DownRemovesOutboxNotificationObjects(t *testing.T) {
 	})
 }
 
+func TestCoreMigration17PreventsDuplicateActiveWebhookURLs(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 17); err != nil {
+			t.Fatalf("migrate core to 17: %v", err)
+		}
+
+		orgID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'webhook-unique')`, orgID); err != nil {
+			t.Fatalf("insert webhook test org: %v", err)
+		}
+		insertWebhook := func(disabled bool) error {
+			var disabledAt any
+			if disabled {
+				disabledAt = time.Now().UTC()
+			}
+			_, err := db.ExecContext(ctx, `
+				INSERT INTO org_webhooks (org_id, url, secret, disabled_at)
+				VALUES ($1, 'https://example.com/events', 'secret', $2)
+			`, orgID, disabledAt)
+			return err
+		}
+
+		if err := insertWebhook(false); err != nil {
+			t.Fatalf("insert first active webhook: %v", err)
+		}
+		if err := insertWebhook(false); err == nil {
+			t.Fatal("expected duplicate active webhook URL to violate unique index")
+		}
+		if err := insertWebhook(true); err != nil {
+			t.Fatalf("insert disabled duplicate webhook: %v", err)
+		}
+	})
+}
+
 func TestCloudControlPlaneMigrationFromLegacyStateBackfillsOrgID(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToVersion(t, ctx, db, 1)

@@ -22,6 +22,9 @@ support from `v0.0.2`.
   `provider_message_id`; deleting those events or fabricating an id is not an
   acceptable rollback policy. Sync the corrected files back to `nerve-cloud`
   before publishing the runtime so the core trees return to byte identity.
+- Correct `0017` OSS-first so active webhook endpoint identity is unique on
+  `(org_id, url)` while disabled historical rows remain allowed. Without that
+  partial uniqueness, fan-out sends the same event more than once to a URL.
 - Normalize the non-executable `0017` subscription comment to `Webhook
   endpoints` in both repositories so the OSS migration-ownership gate does
   not misclassify it as a billing table reference.
@@ -36,7 +39,7 @@ support from `v0.0.2`.
   `nerve-oss` and `nerve-cloud`.
 - The synchronized core-schema hash, including the corrected `0014` and
   guarded `0016` down paths, is
-  `eb4af09838d1a25ee79999d86c9614175ac3fd8b6053a772b64cdfe0c9a69108`.
+  `0fffadb614f6b771557e43277b2acab85e9067620f001cdf92ae772d26cb353b`.
 - The MCP contract hash remains
   `1eb62111fc593ec9bc9a8ab7d5a9f52a1f3b4e661ee0dffafe4c60495f5b678b`.
 - Migrations `0011` through `0017` are additive on the production upgrade
@@ -52,6 +55,8 @@ support from `v0.0.2`.
 - [x] Migration `0016` down refuses before changing schema when NULL provider
   message ids exist, remains at version 16, and succeeds to version 15 after
   the blocking rows are explicitly resolved.
+- [x] Migration `0017` rejects a duplicate active `(org_id, url)` and permits a
+  disabled historical duplicate.
 - [ ] The corrected `0014`, corrected `0016`, and normalized `0017` comment are
   synced to `nerve-cloud`, restoring full core-tree byte identity before
   runtime publication.

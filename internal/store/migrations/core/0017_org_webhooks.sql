@@ -20,8 +20,8 @@ CREATE TABLE IF NOT EXISTS org_webhooks (
   CONSTRAINT chk_org_webhook_url CHECK (url ~* '^https?://')
 );
 
-CREATE INDEX IF NOT EXISTS idx_org_webhooks_org_active
-  ON org_webhooks (org_id)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_org_webhooks_org_active
+  ON org_webhooks (org_id, url)
   WHERE disabled_at IS NULL;
 
 -- RLS: same tenant isolation pattern as the rest of the schema.
