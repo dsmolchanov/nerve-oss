@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
 	"neuralmail/internal/entitlements"
+	"neuralmail/internal/memguard"
 	"neuralmail/internal/observability"
 	"neuralmail/internal/tools"
 )
@@ -31,12 +33,71 @@ type Server struct {
 	Auth         *auth.Service
 	Entitlements EntitlementGate
 	Tools        *tools.Service
+	MemoryBudget *memguard.Budget
 	mu           sync.Mutex
 	sessions     map[string]time.Time
 }
 
 func NewServer(cfg config.Config, toolsSvc *tools.Service, authSvc *auth.Service, entitlementSvc EntitlementGate) *Server {
-	return &Server{Config: cfg, Auth: authSvc, Entitlements: entitlementSvc, Tools: toolsSvc, sessions: make(map[string]time.Time)}
+	budget, err := memguard.New(cfg.Memory.BudgetBytes)
+	if err != nil {
+		budget, _ = memguard.New(64 << 20)
+	}
+	return &Server{Config: cfg, Auth: authSvc, Entitlements: entitlementSvc, Tools: toolsSvc, MemoryBudget: budget, sessions: make(map[string]time.Time)}
+}
+
+const maxMCPBodyBytes int64 = 16 << 20
+
+type budgetedReadCloser struct {
+	ctx              context.Context
+	reader           io.Reader
+	closer           io.Closer
+	budget           *memguard.Budget
+	prepaidRemaining int64
+	releases         []func()
+	closed           bool
+}
+
+func newBudgetedReadCloser(ctx context.Context, body io.ReadCloser, budget *memguard.Budget, prepaid int64) (*budgetedReadCloser, error) {
+	guarded := &budgetedReadCloser{ctx: ctx, reader: body, closer: body, budget: budget, prepaidRemaining: prepaid}
+	if prepaid > 0 {
+		release, err := budget.Acquire(ctx, prepaid)
+		if err != nil {
+			return nil, err
+		}
+		guarded.releases = append(guarded.releases, release)
+	}
+	return guarded, nil
+}
+
+func (r *budgetedReadCloser) Read(buffer []byte) (int, error) {
+	read, readErr := r.reader.Read(buffer)
+	charge := int64(read)
+	if charge <= r.prepaidRemaining {
+		r.prepaidRemaining -= charge
+		return read, readErr
+	}
+	charge -= r.prepaidRemaining
+	r.prepaidRemaining = 0
+	if charge > 0 {
+		release, err := r.budget.Acquire(r.ctx, charge)
+		if err != nil {
+			return 0, err
+		}
+		r.releases = append(r.releases, release)
+	}
+	return read, readErr
+}
+
+func (r *budgetedReadCloser) Close() error {
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	for index := len(r.releases) - 1; index >= 0; index-- {
+		r.releases[index]()
+	}
+	return r.closer.Close()
 }
 
 func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
@@ -49,6 +110,28 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("mcp request protocol_version=%q", strings.TrimSpace(r.Header.Get("MCP-Protocol-Version")))
+
+	readTimeout := s.Config.HTTP.ReadTimeout
+	if readTimeout <= 0 {
+		readTimeout = 30 * time.Second
+	}
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(readTimeout))
+	r.Body = http.MaxBytesReader(w, r.Body, maxMCPBodyBytes)
+	prepaid := r.ContentLength
+	if prepaid < 0 {
+		prepaid = 0
+	}
+	if prepaid > maxMCPBodyBytes {
+		prepaid = maxMCPBodyBytes
+	}
+	guardedBody, err := newBudgetedReadCloser(r.Context(), r.Body, s.MemoryBudget, prepaid)
+	if err != nil {
+		_ = r.Body.Close()
+		writeMemoryBudgetError(w)
+		return
+	}
+	r.Body = guardedBody
+	defer r.Body.Close()
 
 	ctx := r.Context()
 	var principal auth.Principal
@@ -68,6 +151,15 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var req Request
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		if errors.Is(err, memguard.ErrExhausted) {
+			writeMemoryBudgetError(w)
+			return
+		}
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
@@ -102,6 +194,11 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	resp := Response{JSONRPC: "2.0", ID: req.ID, Result: result}
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func writeMemoryBudgetError(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "1")
+	http.Error(w, "memory budget exhausted", http.StatusServiceUnavailable)
 }
 
 func (s *Server) HandleSSEStub(w http.ResponseWriter, r *http.Request) {

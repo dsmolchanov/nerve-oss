@@ -6,11 +6,14 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadEnvOverrides(t *testing.T) {
 	t.Setenv("NM_JMAP_URL", "http://example.com/jmap")
 	t.Setenv("NM_HTTP_ADDR", ":9000")
+	t.Setenv("NM_HTTP_READ_TIMEOUT", "12s")
+	t.Setenv("NM_MEMORY_BUDGET_BYTES", "123456")
 	t.Setenv("NM_DEV_MODE", "false")
 	t.Setenv("NM_CLOUD_MODE", "true")
 	t.Setenv("NM_CLOUD_PUBLIC_BASE_URL", "https://cloud.nerve.email")
@@ -32,6 +35,12 @@ func TestLoadEnvOverrides(t *testing.T) {
 	}
 	if cfg.HTTP.Addr != ":9000" {
 		t.Fatalf("expected http addr override")
+	}
+	if cfg.HTTP.ReadTimeout != 12*time.Second {
+		t.Fatalf("expected HTTP read timeout override, got %s", cfg.HTTP.ReadTimeout)
+	}
+	if cfg.Memory.BudgetBytes != 123456 {
+		t.Fatalf("expected memory budget override, got %d", cfg.Memory.BudgetBytes)
 	}
 	if cfg.Dev.Mode {
 		t.Fatalf("expected dev mode false")
@@ -104,6 +113,12 @@ func TestConfigPathFromEnvPrefersNERVE(t *testing.T) {
 
 func TestDefaultUsesModernLocalDomain(t *testing.T) {
 	cfg := Default()
+	if cfg.HTTP.ReadTimeout != 30*time.Second {
+		t.Fatalf("expected 30s HTTP read timeout, got %s", cfg.HTTP.ReadTimeout)
+	}
+	if cfg.Memory.BudgetBytes != 64<<20 {
+		t.Fatalf("expected 64 MiB memory budget, got %d", cfg.Memory.BudgetBytes)
+	}
 	if cfg.SMTP.From != "dev@local.nerve.email" {
 		t.Fatalf("expected modern SMTP default, got %q", cfg.SMTP.From)
 	}

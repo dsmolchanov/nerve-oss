@@ -13,8 +13,12 @@ import (
 
 type Config struct {
 	HTTP struct {
-		Addr string `yaml:"addr"`
+		Addr        string        `yaml:"addr"`
+		ReadTimeout time.Duration `yaml:"read_timeout"`
 	} `yaml:"http"`
+	Memory struct {
+		BudgetBytes int64 `yaml:"budget_bytes"`
+	} `yaml:"memory"`
 	Dev struct {
 		Mode bool `yaml:"mode"`
 	} `yaml:"dev"`
@@ -109,6 +113,8 @@ type Config struct {
 func Default() Config {
 	var cfg Config
 	cfg.HTTP.Addr = ":8088"
+	cfg.HTTP.ReadTimeout = 30 * time.Second
+	cfg.Memory.BudgetBytes = 64 << 20
 	cfg.Dev.Mode = true
 	cfg.Billing.Provider = "stripe"
 	cfg.JMAP.PollInterval = 30 * time.Second
@@ -168,6 +174,8 @@ func applyPreferredEnvAliases() []string {
 	var legacyOnly []string
 	legacyVars := []string{
 		"NM_HTTP_ADDR",
+		"NM_HTTP_READ_TIMEOUT",
+		"NM_MEMORY_BUDGET_BYTES",
 		"NM_DEV_MODE",
 		"NM_CLOUD_MODE",
 		"NM_CLOUD_PUBLIC_BASE_URL",
@@ -249,6 +257,16 @@ func applyPreferredEnvAliases() []string {
 func applyEnv(cfg *Config) {
 	if v := os.Getenv("NM_HTTP_ADDR"); v != "" {
 		cfg.HTTP.Addr = v
+	}
+	if v := os.Getenv("NM_HTTP_READ_TIMEOUT"); v != "" {
+		if duration, err := time.ParseDuration(v); err == nil && duration > 0 {
+			cfg.HTTP.ReadTimeout = duration
+		}
+	}
+	if v := os.Getenv("NM_MEMORY_BUDGET_BYTES"); v != "" {
+		if bytes, err := strconv.ParseInt(v, 10, 64); err == nil && bytes > 0 {
+			cfg.Memory.BudgetBytes = bytes
+		}
 	}
 	if v := os.Getenv("NM_DEV_MODE"); v != "" {
 		cfg.Dev.Mode = parseBool(v, cfg.Dev.Mode)

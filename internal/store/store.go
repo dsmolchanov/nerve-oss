@@ -12,8 +12,9 @@ import (
 )
 
 type Store struct {
-	db *sql.DB
-	q  queryer
+	db   *sql.DB
+	q    queryer
+	inTx bool
 }
 
 type queryer interface {
@@ -214,7 +215,31 @@ func (s *Store) RunAsOrg(ctx context.Context, orgID string, fn func(scoped *Stor
 		return err
 	}
 
-	scoped := &Store{db: s.db, q: tx}
+	scoped := &Store{db: s.db, q: tx, inTx: true}
+	if err := fn(scoped); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) withTx(ctx context.Context, fn func(*Store) error) error {
+	if fn == nil {
+		return errors.New("transaction callback is required")
+	}
+	if s.inTx {
+		return fn(s)
+	}
+	if s.db == nil {
+		return errors.New("store database is not configured")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	scoped := &Store{db: s.db, q: tx, inTx: true}
 	if err := fn(scoped); err != nil {
 		return err
 	}

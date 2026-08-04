@@ -157,6 +157,7 @@ func (a *App) Serve(ctx context.Context) error {
 		Addr:              a.Config.HTTP.Addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       a.Config.HTTP.ReadTimeout,
 	}
 	go func() {
 		<-ctx.Done()

@@ -23,6 +23,16 @@ const MaxOutboxRetries = 5
 // a message that would fail every retry.
 var ErrDomainNotVerified = errors.New("domain not verified")
 
+// OutboundAttachment is the shared provider-facing attachment shape. Content
+// is populated only immediately before delivery and is never stored on the
+// outbox queue row itself.
+type OutboundAttachment struct {
+	Filename    string
+	ContentType string
+	SHA256      string
+	Content     []byte
+}
+
 type OutboxMessage struct {
 	ID                string
 	OrgID             string
