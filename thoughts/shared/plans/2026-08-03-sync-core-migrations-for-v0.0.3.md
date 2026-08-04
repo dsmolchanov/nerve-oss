@@ -48,8 +48,11 @@ support from `v0.0.2`.
 - Keep migration test databases and application roles disposable: close each
   test connection, revoke/drop its temporary RLS role, terminate/drop its
   database while the admin handle is still open, then close the admin handle.
-- Publish the merged commit as immutable runtime tag `v0.0.3` only after CI
-  and Codex review are green.
+- Publish the merged commit as immutable runtime tag `v0.0.3` only after OSS
+  CI/Codex review are green and the Cloud mirror branch is byte-identical with
+  green functional CI. Cloud Codex requires the matching immutable artifact
+  to exist before its lock update can merge, so publication precedes the final
+  Cloud review/merge but never precedes verified mirror content.
 
 ## Compatibility Evidence
 
@@ -77,15 +80,19 @@ support from `v0.0.2`.
 - [x] Upgrade from version `15` enables and forces tenant RLS with the standard
   policy on `outbox_events`, `inbox_smtp_configs`, and `suppressions`; rolling
   `0016` back restores the prior RLS state on the surviving tables.
+- [x] A scoped org session sees only its own rows and cross-org writes are
+  rejected independently for `outbox_events`, `inbox_smtp_configs`, and
+  `suppressions`, exercising every repaired `WITH CHECK` policy.
 - [x] Migration `0017` rejects a duplicate active `(org_id, url)` and permits a
   disabled historical duplicate.
 - [x] Migration `0018` refuses a legacy version-17 schema with duplicate active
   endpoints without changing its version or partial RLS state, then repairs
   RLS/index state after the duplicate is explicitly disabled. Rolling its
   marker back keeps the corrected version-17 guarantees.
-- [ ] The corrected `0014`, corrected `0016`/`0017`, and new `0018` are synced
-  to `nerve-cloud`, restoring full core-tree byte identity before runtime
-  publication.
+- [x] The corrected `0014`, corrected `0016`/`0017`, new `0018`, and shared
+  migration tests are byte-identical on the Cloud mirror branch; its full
+  functional CI is green before runtime publication. Final Cloud review/merge
+  follows the immutable artifact pin.
 - [x] A canonical `v0.0.3` manifest reports the expected MCP and core hashes.
 - [x] Fresh PostgreSQL migration succeeds through core version `18`.
 - [x] Upgrade from core version `15` succeeds through version `18`.
