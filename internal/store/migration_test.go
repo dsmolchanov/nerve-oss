@@ -67,6 +67,91 @@ func TestCoreMigrationUpgradeFrom15To17(t *testing.T) {
 	})
 }
 
+func TestCoreMigration16DownRefusesNullProviderMessageID(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 16); err != nil {
+			t.Fatalf("migrate core to 16: %v", err)
+		}
+
+		orgID := uuid.NewString()
+		inboxID := uuid.NewString()
+		outboxID := uuid.NewString()
+		seed := []struct {
+			name string
+			stmt string
+			args []any
+		}{
+			{
+				name: "org",
+				stmt: `INSERT INTO orgs (id, name) VALUES ($1, 'rollback-guard')`,
+				args: []any{orgID},
+			},
+			{
+				name: "inbox",
+				stmt: `INSERT INTO inboxes (id, org_id, address, status)
+				       VALUES ($1, $2, 'rollback-guard@local.neuralmail', 'active')`,
+				args: []any{inboxID, orgID},
+			},
+			{
+				name: "outbox message",
+				stmt: `INSERT INTO outbox_messages (
+				         id, org_id, inbox_id, provider, idempotency_key,
+				         "to", "from", subject
+				       ) VALUES (
+				         $1, $2, $3, 'resend', 'rollback-guard',
+				         'to@example.com', 'from@example.com', 'rollback guard'
+				       )`,
+				args: []any{outboxID, orgID, inboxID},
+			},
+			{
+				name: "pre-provider event",
+				stmt: `INSERT INTO outbox_events (
+				         org_id, outbox_message_id, provider_message_id,
+				         event_type, raw_payload
+				       ) VALUES ($1, $2, NULL, 'suppressed', '{}'::jsonb)`,
+				args: []any{orgID, outboxID},
+			},
+		}
+		for _, row := range seed {
+			if _, err := db.ExecContext(ctx, row.stmt, row.args...); err != nil {
+				t.Fatalf("seed %s: %v", row.name, err)
+			}
+		}
+
+		err := MigrateDownCore(ctx, db)
+		if err == nil {
+			t.Fatal("expected migration 0016 down to refuse NULL provider_message_id rows")
+		}
+		if !strings.Contains(err.Error(), "cannot roll back core migration 0016") {
+			t.Fatalf("unexpected migration 0016 down error: %v", err)
+		}
+
+		version, versionErr := CurrentVersionCore(ctx, db)
+		if versionErr != nil {
+			t.Fatalf("current core version after refused rollback: %v", versionErr)
+		}
+		if version != 16 {
+			t.Fatalf("refused rollback changed core version: got %d, want 16", version)
+		}
+		assertTableExists(t, db, "suppressions")
+
+		if _, err := db.ExecContext(ctx, `DELETE FROM outbox_events WHERE outbox_message_id = $1`, outboxID); err != nil {
+			t.Fatalf("remove blocking outbox event: %v", err)
+		}
+		if err := MigrateDownCore(ctx, db); err != nil {
+			t.Fatalf("migrate core 0016 down after resolving NULL rows: %v", err)
+		}
+		version, err = CurrentVersionCore(ctx, db)
+		if err != nil {
+			t.Fatalf("current core version after clean rollback: %v", err)
+		}
+		if version != 15 {
+			t.Fatalf("expected core version 15 after one-step rollback, got %d", version)
+		}
+		assertColumnNotNull(t, db, "outbox_events", "provider_message_id")
+	})
+}
+
 func TestCloudControlPlaneMigrationFromLegacyStateBackfillsOrgID(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToVersion(t, ctx, db, 1)

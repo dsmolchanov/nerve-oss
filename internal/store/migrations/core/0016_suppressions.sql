@@ -30,6 +30,25 @@ CREATE INDEX IF NOT EXISTS idx_outbox_events_outbox_msg
 
 -- +goose Down
 
+-- Rows without a provider_message_id are valid from this migration onward.
+-- Restoring NOT NULL cannot preserve those audit events, and inventing a
+-- provider id would make the timeline dishonest. Refuse the rollback before
+-- changing any schema so the operator can explicitly resolve the data first.
+-- +goose StatementBegin
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM outbox_events
+    WHERE provider_message_id IS NULL
+  ) THEN
+    RAISE EXCEPTION
+      'cannot roll back core migration 0016: outbox_events.provider_message_id contains NULL rows';
+  END IF;
+END;
+$$;
+-- +goose StatementEnd
+
 DROP INDEX IF EXISTS idx_outbox_events_outbox_msg;
 ALTER TABLE outbox_events
   ALTER COLUMN provider_message_id SET NOT NULL;
