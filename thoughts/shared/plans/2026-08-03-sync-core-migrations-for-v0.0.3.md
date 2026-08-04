@@ -33,9 +33,9 @@ support from `v0.0.2`.
   not misclassify it as a billing table reference.
 - Do not change runtime logic, MCP behavior, providers, cloud-only migrations,
   or dependencies.
-- Keep the migration test databases disposable: close each test connection,
-  terminate/drop its database while the admin handle is still open, then close
-  the admin handle.
+- Keep migration test databases and application roles disposable: close each
+  test connection, revoke/drop its temporary RLS role, terminate/drop its
+  database while the admin handle is still open, then close the admin handle.
 - Publish the merged commit as immutable runtime tag `v0.0.3` only after CI
   and Codex review are green.
 
@@ -75,7 +75,8 @@ support from `v0.0.2`.
 - [x] `go test ./... -count=1` passes against PostgreSQL.
 - [x] `go vet ./...` passes.
 - [x] `git diff --check` passes.
-- [x] Migration tests leave zero `nerve_test_*` databases behind.
+- [x] Migration tests leave zero `nerve_test_*` databases and zero
+  `rls_app_*` roles behind.
 - [ ] GitHub CI and Codex review pass.
 - [ ] Docker Publish creates the `v0.0.3` image and release artifacts.
 

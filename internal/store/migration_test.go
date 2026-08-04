@@ -412,7 +412,11 @@ func TestTenantRLSBlocksCrossOrgReadsWithScopedSession(t *testing.T) {
 		if err != nil {
 			t.Fatalf("open app role connection: %v", err)
 		}
-		defer appDB.Close()
+		t.Cleanup(func() {
+			_ = appDB.Close()
+			_, _ = db.ExecContext(context.Background(), fmt.Sprintf(`DROP OWNED BY %s`, roleName))
+			_, _ = db.ExecContext(context.Background(), fmt.Sprintf(`DROP ROLE IF EXISTS %s`, roleName))
+		})
 
 		st := &Store{db: appDB, q: appDB}
 		var visibleThreads int
