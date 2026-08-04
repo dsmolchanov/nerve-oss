@@ -1,8 +1,12 @@
 package httpsafe
 
 import (
+	"context"
+	"encoding/binary"
 	"errors"
+	"net"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 )
@@ -70,6 +74,47 @@ func TestClientRejectsHostnameResolvingToLoopbackAtDialTime(t *testing.T) {
 	}
 }
 
+func TestClientRejectsHostnameResolvingToPrivateAddressAtDialTime(t *testing.T) {
+	resolver, _ := newControlledResolver(t, [4]byte{10, 1, 2, 3})
+	client, err := New(Config{
+		Timeout:      time.Second,
+		AllowedHosts: []string{"private.test"},
+		Resolver:     resolver,
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	_, err = client.Get("http://private.test/")
+	if !errors.Is(err, ErrUnsafeAddress) {
+		t.Fatalf("expected controlled 10/8 resolution to fail at dial time, got %v", err)
+	}
+}
+
+func TestClientRejectsPublicToPrivateDNSRebindAtDialTime(t *testing.T) {
+	resolver, setAddress := newControlledResolver(t, [4]byte{93, 184, 216, 34})
+	resolved, err := resolver.LookupHost(context.Background(), "rebind.test")
+	if err != nil {
+		t.Fatalf("initial public lookup: %v", err)
+	}
+	if len(resolved) != 1 || resolved[0] != "93.184.216.34" {
+		t.Fatalf("initial lookup=%v, want public fixture address", resolved)
+	}
+
+	setAddress([4]byte{10, 20, 30, 40})
+	client, err := New(Config{
+		Timeout:      time.Second,
+		AllowedHosts: []string{"rebind.test"},
+		Resolver:     resolver,
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	_, err = client.Get("http://rebind.test/")
+	if !errors.Is(err, ErrUnsafeAddress) {
+		t.Fatalf("expected private rebound address to fail at dial time, got %v", err)
+	}
+}
+
 func TestClientRejectsRedirects(t *testing.T) {
 	t.Parallel()
 
@@ -115,4 +160,97 @@ func TestClientDisablesEnvironmentProxyBypass(t *testing.T) {
 	if transport.Proxy != nil {
 		t.Fatal("environment proxy remained enabled")
 	}
+}
+
+// newControlledResolver serves one mutable A record over a real UDP DNS
+// socket. That exercises net.Resolver and net.Dialer together instead of
+// calling the address validator directly, including a public-to-private
+// answer change between validation and the actual client dial.
+func newControlledResolver(t *testing.T, initial [4]byte) (*net.Resolver, func([4]byte)) {
+	t.Helper()
+	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen DNS fixture: %v", err)
+	}
+	t.Cleanup(func() { _ = packetConn.Close() })
+
+	var addressMu sync.RWMutex
+	address := initial
+	setAddress := func(next [4]byte) {
+		addressMu.Lock()
+		address = next
+		addressMu.Unlock()
+	}
+
+	go func() {
+		buffer := make([]byte, 512)
+		for {
+			read, peer, readErr := packetConn.ReadFrom(buffer)
+			if readErr != nil {
+				return
+			}
+			addressMu.RLock()
+			current := address
+			addressMu.RUnlock()
+			response, responseErr := controlledDNSResponse(buffer[:read], current)
+			if responseErr == nil {
+				_, _ = packetConn.WriteTo(response, peer)
+			}
+		}
+	}()
+
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, "udp", packetConn.LocalAddr().String())
+		},
+	}
+	return resolver, setAddress
+}
+
+func controlledDNSResponse(query []byte, address [4]byte) ([]byte, error) {
+	if len(query) < 17 {
+		return nil, errors.New("short DNS query")
+	}
+	questionEnd := 12
+	for {
+		if questionEnd >= len(query) {
+			return nil, errors.New("invalid DNS question")
+		}
+		labelLength := int(query[questionEnd])
+		questionEnd++
+		if labelLength == 0 {
+			break
+		}
+		questionEnd += labelLength
+	}
+	if questionEnd+4 > len(query) {
+		return nil, errors.New("truncated DNS question")
+	}
+	questionEnd += 4
+	questionType := binary.BigEndian.Uint16(query[questionEnd-4 : questionEnd-2])
+	answerCount := uint16(0)
+	if questionType == 1 {
+		answerCount = 1
+	}
+
+	response := make([]byte, 12, questionEnd+16)
+	copy(response[0:2], query[0:2])
+	binary.BigEndian.PutUint16(response[2:4], 0x8180)
+	binary.BigEndian.PutUint16(response[4:6], 1)
+	binary.BigEndian.PutUint16(response[6:8], answerCount)
+	response = append(response, query[12:questionEnd]...)
+	if answerCount == 0 {
+		return response, nil
+	}
+	response = append(response,
+		0xc0, 0x0c, // compressed owner name
+		0x00, 0x01, // A
+		0x00, 0x01, // IN
+		0x00, 0x00, 0x00, 0x3c, // TTL 60
+		0x00, 0x04,
+		address[0], address[1], address[2], address[3],
+	)
+	return response, nil
 }
