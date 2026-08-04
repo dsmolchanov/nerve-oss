@@ -11,12 +11,20 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 )
 
-// MaxOutboxRetries is the maximum number of delivery attempts before giving up.
-const MaxOutboxRetries = 5
+const (
+	// MaxOutboxRetries is the maximum number of delivery attempts before giving up.
+	MaxOutboxRetries = 5
+
+	maxOutboundAttachmentCount         = 10
+	maxOutboundAttachmentBytes         = 10 << 20
+	maxOutboundAttachmentTotalBytes    = 10 << 20
+	maxOutboundAttachmentFilenameBytes = 255
+)
 
 // ErrDomainNotVerified is returned by EnqueueOutboxMessage when the
 // `From` address's domain exists in org_domains but is not in a
@@ -27,9 +35,24 @@ var ErrDomainNotVerified = errors.New("domain not verified")
 
 var (
 	ErrOutboxIdempotencyConflict = errors.New("outbox idempotency conflict")
+	ErrAttachmentCountExceeded   = errors.New("attachment count exceeded")
+	ErrAttachmentTooLarge        = errors.New("attachment too large")
 	ErrAttachmentEmpty           = errors.New("attachment empty")
+	ErrAttachmentTotalTooLarge   = errors.New("attachment total too large")
+	ErrAttachmentInvalidFilename = errors.New("attachment invalid filename")
+	ErrAttachmentTypeNotAllowed  = errors.New("attachment type not allowed")
 	ErrAttachmentsReleased       = errors.New("outbox attachments released")
 )
+
+var allowedOutboundAttachmentContentTypes = map[string]struct{}{
+	"image/png":       {},
+	"image/jpeg":      {},
+	"image/webp":      {},
+	"application/pdf": {},
+	"text/plain":      {},
+	"application/vnd.openxmlformats-officedocument.wordprocessingml.document": {},
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":       {},
+}
 
 // OutboundAttachment is the shared provider-facing attachment shape. Content
 // is populated only immediately before delivery and is never stored on the
@@ -140,16 +163,47 @@ func contentHash(to, subject, textBody, htmlBody string, attachments []OutboundA
 }
 
 func normalizeOutboundAttachments(attachments []OutboundAttachment) ([]OutboundAttachment, error) {
+	if len(attachments) > maxOutboundAttachmentCount {
+		return nil, fmt.Errorf("%w: count=%d max=%d", ErrAttachmentCountExceeded, len(attachments), maxOutboundAttachmentCount)
+	}
 	normalized := make([]OutboundAttachment, len(attachments))
+	totalBytes := 0
 	for ordinal, attachment := range attachments {
+		attachment.Filename = strings.TrimSpace(attachment.Filename)
+		if invalidOutboundAttachmentFilename(attachment.Filename) {
+			return nil, fmt.Errorf("%w: ordinal=%d", ErrAttachmentInvalidFilename, ordinal)
+		}
+		attachment.ContentType = strings.ToLower(strings.TrimSpace(attachment.ContentType))
+		if _, allowed := allowedOutboundAttachmentContentTypes[attachment.ContentType]; !allowed {
+			return nil, fmt.Errorf("%w: ordinal=%d", ErrAttachmentTypeNotAllowed, ordinal)
+		}
 		if len(attachment.Content) == 0 {
 			return nil, fmt.Errorf("%w: ordinal=%d", ErrAttachmentEmpty, ordinal)
+		}
+		if len(attachment.Content) > maxOutboundAttachmentBytes {
+			return nil, fmt.Errorf("%w: ordinal=%d size=%d max=%d", ErrAttachmentTooLarge, ordinal, len(attachment.Content), maxOutboundAttachmentBytes)
+		}
+		totalBytes += len(attachment.Content)
+		if totalBytes > maxOutboundAttachmentTotalBytes {
+			return nil, fmt.Errorf("%w: ordinal=%d total=%d max=%d", ErrAttachmentTotalTooLarge, ordinal, totalBytes, maxOutboundAttachmentTotalBytes)
 		}
 		sum := sha256.Sum256(attachment.Content)
 		attachment.SHA256 = hex.EncodeToString(sum[:])
 		normalized[ordinal] = attachment
 	}
 	return normalized, nil
+}
+
+func invalidOutboundAttachmentFilename(filename string) bool {
+	if filename == "" || len([]byte(filename)) > maxOutboundAttachmentFilenameBytes {
+		return true
+	}
+	for _, character := range filename {
+		if character == '/' || character == '\\' || character == 0 || unicode.IsControl(character) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) EnqueueOutboxMessage(ctx context.Context, msg OutboxMessage) (string, error) {
