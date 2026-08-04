@@ -16,6 +16,7 @@ type Email struct {
 	HTML        string
 	From        store.Participant
 	To          []store.Participant
+	CC          []store.Participant
 	ReceivedAt  time.Time
 	InternetMsg string
 }
@@ -42,18 +43,7 @@ func Ingest(ctx context.Context, client Client, st *store.Store, inboxID string,
 	}
 	var ids []string
 	for _, email := range emails {
-		msg := store.Message{
-			Direction:         "inbound",
-			Subject:           email.Subject,
-			Text:              email.Text,
-			HTML:              email.HTML,
-			CreatedAt:         email.ReceivedAt,
-			ProviderMessageID: email.ID,
-			ProviderThreadID:  email.ThreadID,
-			InternetMessageID: email.InternetMsg,
-			From:              email.From,
-			To:                email.To,
-		}
+		msg := messageFromEmail(email)
 		_, msgID, err := st.InsertMessageWithThread(ctx, inboxID, email.ThreadID, msg)
 		if err != nil {
 			return sinceState, ids, err
@@ -61,4 +51,20 @@ func Ingest(ctx context.Context, client Client, st *store.Store, inboxID string,
 		ids = append(ids, msgID)
 	}
 	return newState, ids, nil
+}
+
+func messageFromEmail(email Email) store.Message {
+	return store.Message{
+		Direction:         "inbound",
+		Subject:           email.Subject,
+		Text:              email.Text,
+		HTML:              email.HTML,
+		CreatedAt:         email.ReceivedAt,
+		ProviderMessageID: email.ID,
+		ProviderThreadID:  email.ThreadID,
+		InternetMessageID: email.InternetMsg,
+		From:              email.From,
+		To:                email.To,
+		CC:                email.CC,
+	}
 }
