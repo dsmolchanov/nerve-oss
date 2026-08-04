@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"neuralmail/internal/config"
+	"neuralmail/internal/startup"
 	"neuralmail/internal/store"
 )
 
@@ -294,23 +295,36 @@ func execute(ctx context.Context, cmd command, backend migrationBackend) (string
 		if err != nil {
 			return "", err
 		}
-		if cmd.target != nil {
-			for _, scoped := range initial {
-				if err := validateTarget(scoped.scope, scoped.status, *cmd.target); err != nil {
-					return "", err
-				}
+		for _, scoped := range initial {
+			target := cmd.target
+			if target == nil {
+				bounded := defaultTarget(scoped.scope)
+				target = &bounded
+			}
+			if *target > defaultTarget(scoped.scope) {
+				return "", fmt.Errorf(
+					"%s migration target %d exceeds compiled runtime maximum %d",
+					scoped.scope,
+					*target,
+					defaultTarget(scoped.scope),
+				)
+			}
+			if err := validateTarget(scoped.scope, scoped.status, *target); err != nil {
+				return "", err
 			}
 		}
 
 		for _, scoped := range initial {
-			if cmd.target != nil && scoped.status.Current == *cmd.target {
+			target := cmd.target
+			if target == nil {
+				bounded := defaultTarget(scoped.scope)
+				target = &bounded
+			}
+			if scoped.status.Current == *target {
 				continue
 			}
-			if err := backend.Up(ctx, scoped.scope, cmd.target); err != nil {
-				if cmd.target == nil {
-					return "", fmt.Errorf("migrate %s: %w", scoped.scope, err)
-				}
-				return "", fmt.Errorf("migrate %s to %d: %w", scoped.scope, *cmd.target, err)
+			if err := backend.Up(ctx, scoped.scope, target); err != nil {
+				return "", fmt.Errorf("migrate %s to %d: %w", scoped.scope, *target, err)
 			}
 		}
 
@@ -337,6 +351,17 @@ func execute(ctx context.Context, cmd command, backend migrationBackend) (string
 		return formatStatuses(statuses), nil
 	default:
 		return "", fmt.Errorf("unsupported command %q", cmd.action)
+	}
+}
+
+func defaultTarget(scope migrationScope) int64 {
+	switch scope {
+	case scopeCore:
+		return startup.CoreMaxSupported
+	case scopeCloud:
+		return startup.RuntimeCloudMaxSupported
+	default:
+		return -1
 	}
 }
 
@@ -466,12 +491,12 @@ func (b *storeBackend) Up(ctx context.Context, scope migrationScope, target *int
 		if target != nil {
 			return store.MigrateUpToCore(ctx, b.store.DB(), *target)
 		}
-		return store.MigrateCore(ctx, b.store.DB())
+		return errors.New("core migration target is required")
 	case scopeCloud:
 		if target != nil {
 			return store.MigrateUpToCloud(ctx, b.store.DB(), *target)
 		}
-		return store.MigrateCloud(ctx, b.store.DB())
+		return errors.New("cloud migration target is required")
 	default:
 		return fmt.Errorf("unsupported migration scope %q", scope)
 	}

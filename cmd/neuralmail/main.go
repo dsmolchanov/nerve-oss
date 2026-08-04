@@ -21,6 +21,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"neuralmail/internal/config"
+	"neuralmail/internal/startup"
 	"neuralmail/internal/store"
 )
 
@@ -41,11 +42,11 @@ func main() {
 	case "down":
 		runCompose("down")
 	case "migrate-core":
-		runMigrations(cfg, store.MigrateCore)
+		runMigrations(cfg, migrateCoreToRuntimeWindow)
 	case "migrate-cloud":
-		runMigrations(cfg, store.MigrateCloud)
+		runMigrations(cfg, migrateCloudToRuntimeWindow)
 	case "migrate-all":
-		runMigrations(cfg, store.MigrateAll)
+		runMigrations(cfg, migrateAllToRuntimeWindow)
 	case "seed":
 		seed(cfg)
 	case "doctor":
@@ -57,6 +58,21 @@ func main() {
 	default:
 		usage()
 	}
+}
+
+func migrateCoreToRuntimeWindow(ctx context.Context, db *sql.DB) error {
+	return store.MigrateUpToCore(ctx, db, startup.CoreMaxSupported)
+}
+
+func migrateCloudToRuntimeWindow(ctx context.Context, db *sql.DB) error {
+	return store.MigrateUpToCloud(ctx, db, startup.RuntimeCloudMaxSupported)
+}
+
+func migrateAllToRuntimeWindow(ctx context.Context, db *sql.DB) error {
+	if err := migrateCoreToRuntimeWindow(ctx, db); err != nil {
+		return err
+	}
+	return migrateCloudToRuntimeWindow(ctx, db)
 }
 
 func runCompose(args ...string) {

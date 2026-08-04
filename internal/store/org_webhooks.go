@@ -31,6 +31,7 @@ type WebhookDelivery struct {
 	OrgID          string
 	WebhookID      string
 	OutboxEventID  string
+	OrgEventID     string
 	EventType      string
 	Payload        json.RawMessage
 	Status         string
@@ -207,29 +208,8 @@ func (s *Store) FanOutWebhookDeliveries(ctx context.Context, orgID, outboxEventI
 	if orgID == "" || outboxEventID == "" || eventType == "" {
 		return 0, nil
 	}
-	// Pull only active subscriptions that match the event filter.
-	// An empty events array means "all events", so we include rows
-	// where events = {} OR $2 = ANY(events).
-	rows, err := s.q.QueryContext(ctx, `
-		SELECT id::text FROM org_webhooks
-		WHERE org_id = $1
-		  AND disabled_at IS NULL
-		  AND (cardinality(events) = 0 OR $2 = ANY(events))
-	`, orgID, eventType)
+	webhookIDs, err := s.matchingOrgWebhookIDs(ctx, orgID, eventType)
 	if err != nil {
-		return 0, err
-	}
-	defer rows.Close()
-
-	var webhookIDs []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return 0, err
-		}
-		webhookIDs = append(webhookIDs, id)
-	}
-	if err := rows.Err(); err != nil {
 		return 0, err
 	}
 
@@ -241,6 +221,37 @@ func (s *Store) FanOutWebhookDeliveries(ctx context.Context, orgID, outboxEventI
 		created++
 	}
 	return created, nil
+}
+
+func (s *Store) matchingOrgWebhookIDs(ctx context.Context, orgID, eventType string) ([]string, error) {
+	// Empty events arrays are wildcards only for non-sensitive events. PII-
+	// bearing events such as email.received require explicit consent.
+	rows, err := s.q.QueryContext(ctx, `
+		SELECT id::text FROM org_webhooks
+		WHERE org_id = $1
+		  AND disabled_at IS NULL
+		  AND (
+		    ($2 = ANY(events) AND (NOT $3 OR lower(url) LIKE 'https://%'))
+		    OR (cardinality(events) = 0 AND NOT $3)
+		  )
+	`, orgID, eventType, SensitiveWebhookEventTypes[eventType])
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var webhookIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		webhookIDs = append(webhookIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return webhookIDs, nil
 }
 
 // ClaimWebhookDeliveries atomically claims up to limit deliveries for
@@ -283,7 +294,9 @@ func (s *Store) ClaimWebhookDeliveries(ctx context.Context, limit int, workerID 
 		    last_attempt_at = $1
 		FROM picked
 		WHERE d.id = picked.id
-		RETURNING d.id::text, d.org_id::text, d.webhook_id::text, d.outbox_event_id::text,
+		RETURNING d.id::text, d.org_id::text, d.webhook_id::text,
+		          COALESCE(d.outbox_event_id::text, ''),
+		          COALESCE(to_jsonb(d)->>'org_event_id', ''),
 		          d.event_type, d.payload, d.status, d.attempt_count,
 		          d.next_attempt_at, d.last_attempt_at, d.last_status_code, d.last_error,
 		          d.locked_at, d.locked_by, d.delivered_at, d.created_at
@@ -297,7 +310,7 @@ func (s *Store) ClaimWebhookDeliveries(ctx context.Context, limit int, workerID 
 	for rows.Next() {
 		var d WebhookDelivery
 		if err := rows.Scan(
-			&d.ID, &d.OrgID, &d.WebhookID, &d.OutboxEventID,
+			&d.ID, &d.OrgID, &d.WebhookID, &d.OutboxEventID, &d.OrgEventID,
 			&d.EventType, &d.Payload, &d.Status, &d.AttemptCount,
 			&d.NextAttemptAt, &d.LastAttemptAt, &d.LastStatusCode, &d.LastError,
 			&d.LockedAt, &d.LockedBy, &d.DeliveredAt, &d.CreatedAt,

@@ -41,7 +41,7 @@ func TestCloudControlPlaneMigrationFromEmptyDatabase(t *testing.T) {
 	})
 }
 
-func TestCoreMigrationUpgradeFrom15To19(t *testing.T) {
+func TestCoreMigrationUpgradeFrom15To21(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToVersion(t, ctx, db, 15)
 
@@ -57,11 +57,11 @@ func TestCoreMigrationUpgradeFrom15To19(t *testing.T) {
 		`).Scan(&version); err != nil {
 			t.Fatalf("query core migration version: %v", err)
 		}
-		if version != 19 {
-			t.Fatalf("expected core migration version 19, got %d", version)
+		if version != 21 {
+			t.Fatalf("expected core migration version 21, got %d", version)
 		}
 
-		for _, table := range []string{"suppressions", "org_webhooks", "org_webhook_deliveries"} {
+		for _, table := range []string{"suppressions", "org_webhooks", "org_webhook_deliveries", "org_events"} {
 			assertTableExists(t, db, table)
 		}
 		for _, table := range []string{"outbox_events", "inbox_smtp_configs", "suppressions"} {
@@ -491,6 +491,8 @@ func TestTenantRLSBlocksCrossOrgReadsAndWritesWithScopedSession(t *testing.T) {
 		threadB := uuid.NewString()
 		outboxA := uuid.NewString()
 		outboxB := uuid.NewString()
+		orgEventA := uuid.NewString()
+		orgEventB := uuid.NewString()
 
 		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'org-a'), ($2, 'org-b')`, orgA, orgB); err != nil {
 			t.Fatalf("insert orgs: %v", err)
@@ -539,6 +541,14 @@ func TestTenantRLSBlocksCrossOrgReadsAndWritesWithScopedSession(t *testing.T) {
 		`, orgA, orgB); err != nil {
 			t.Fatalf("insert suppressions: %v", err)
 		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO org_events (id, org_id, event_type, ref_kind, ref_id, payload, fanned_out_at)
+			VALUES
+			  ($1, $2, 'email.received', 'message', $3, '{}'::jsonb, now()),
+			  ($4, $5, 'email.received', 'message', $6, '{}'::jsonb, now())
+		`, orgEventA, orgA, uuid.NewString(), orgEventB, orgB, uuid.NewString()); err != nil {
+			t.Fatalf("insert org events: %v", err)
+		}
 
 		roleName := "rls_app_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 		if _, err := db.ExecContext(ctx, fmt.Sprintf(`CREATE ROLE %s LOGIN PASSWORD 'rls_app'`, roleName)); err != nil {
@@ -547,7 +557,7 @@ func TestTenantRLSBlocksCrossOrgReadsAndWritesWithScopedSession(t *testing.T) {
 		if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO %s`, roleName)); err != nil {
 			t.Fatalf("grant schema usage: %v", err)
 		}
-		if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON inboxes, threads, messages, outbox_events, inbox_smtp_configs, suppressions TO %s`, roleName)); err != nil {
+		if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON inboxes, threads, messages, outbox_events, inbox_smtp_configs, suppressions, org_events TO %s`, roleName)); err != nil {
 			t.Fatalf("grant table permissions: %v", err)
 		}
 
@@ -598,7 +608,7 @@ func TestTenantRLSBlocksCrossOrgReadsAndWritesWithScopedSession(t *testing.T) {
 			t.Fatalf("expected org A to see 0 rows for org B thread, got %d", crossOrgRows)
 		}
 
-		for _, table := range []string{"outbox_events", "inbox_smtp_configs", "suppressions"} {
+		for _, table := range []string{"outbox_events", "inbox_smtp_configs", "suppressions", "org_events"} {
 			var visibleRows int
 			if err := st.RunAsOrg(ctx, orgA, func(scoped *Store) error {
 				return scoped.q.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, table)).Scan(&visibleRows)
@@ -630,6 +640,12 @@ func TestTenantRLSBlocksCrossOrgReadsAndWritesWithScopedSession(t *testing.T) {
 				stmt: `INSERT INTO suppressions (org_id, email_lower, reason, source)
 				       VALUES ($1, 'cross-org@example.com', 'must be rejected', 'manual')`,
 				args: []any{orgB},
+			},
+			{
+				name: "org_events insert",
+				stmt: `INSERT INTO org_events (org_id, event_type, ref_kind, ref_id, payload)
+				       VALUES ($1, 'email.received', 'message', $2, '{}'::jsonb)`,
+				args: []any{orgB, uuid.NewString()},
 			},
 		}
 		for _, writeCase := range writeCases {

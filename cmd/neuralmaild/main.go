@@ -50,14 +50,29 @@ func main() {
 	case "mcp-stdio":
 		runStdio(ctx, cfg)
 	case "migrate-core":
-		runMigrations(ctx, cfg, store.MigrateCore)
+		runMigrations(ctx, cfg, migrateCoreToRuntimeWindow)
 	case "migrate-cloud":
-		runMigrations(ctx, cfg, store.MigrateCloud)
+		runMigrations(ctx, cfg, migrateCloudToRuntimeWindow)
 	case "migrate-all":
-		runMigrations(ctx, cfg, store.MigrateAll)
+		runMigrations(ctx, cfg, migrateAllToRuntimeWindow)
 	default:
 		usage()
 	}
+}
+
+func migrateCoreToRuntimeWindow(ctx context.Context, db *sql.DB) error {
+	return store.MigrateUpToCore(ctx, db, startup.CoreMaxSupported)
+}
+
+func migrateCloudToRuntimeWindow(ctx context.Context, db *sql.DB) error {
+	return store.MigrateUpToCloud(ctx, db, startup.RuntimeCloudMaxSupported)
+}
+
+func migrateAllToRuntimeWindow(ctx context.Context, db *sql.DB) error {
+	if err := migrateCoreToRuntimeWindow(ctx, db); err != nil {
+		return err
+	}
+	return migrateCloudToRuntimeWindow(ctx, db)
 }
 
 func runServe(ctx context.Context, cfg config.Config) {
