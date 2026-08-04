@@ -60,3 +60,36 @@ token, and usage store files are not backport dependencies.
 ## Rollback
 
 Move the methods back into `store.go`. There is no data migration or cleanup.
+
+## Boundary follow-up (2026-08-04)
+
+The first D9 PR aligned the thread/message layout, but the Phase 0 §4
+exact-mirror gate still could not treat `store.go` as shared: OSS kept
+cloud-control-plane billing, organization, token, and usage methods in that
+file while Cloud already isolates those methods behind four cloud-only file
+boundaries.
+
+Complete the behavior-preserving layout work by moving the existing OSS
+declarations into:
+
+- `store_billing.go` — entitlement, subscription, and billing webhook methods;
+- `store_orgs.go` — organization/default bootstrap and MCP endpoint methods;
+- `store_tokens.go` — service-token/API-key methods plus their private scope
+  parsing helpers;
+- `store_usage.go` — usage counter, reservation, reconciliation, and event
+  methods.
+
+This follow-up is still pure movement. It does not copy Cloud implementations,
+add Cloud-only methods, change types or queries, or claim that `store.go` is
+already byte-identical. The remaining shared type/order reconciliation and the
+three-list manifest belong to Phase 0 §4 after this boundary exists.
+
+Verification:
+
+- [x] The complete `go doc -all ./internal/store` output is identical before
+  and after the move (SHA-256
+  `2b19e61e36b0137c9c3e09ee3858f02d78003b9d2879c11ceca9e8c775f1216a`).
+- [x] All 36 moved methods and both private token helpers retain their original
+  declarations and bodies.
+- [x] `go build ./...`, `go vet ./...`, and `go test ./... -count=1` pass.
+- [x] `gofmt` and `git diff --check` pass.
