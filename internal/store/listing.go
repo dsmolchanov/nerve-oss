@@ -87,10 +87,10 @@ func (s *Store) ListOutboxForInbox(ctx context.Context, inboxID string, limit, o
 		       "to", "from", subject, coalesce(text_body, ''), coalesce(html_body, ''),
 		       status, delivery_status, delivery_status_at,
 		       attempt_count, next_attempt_at, last_attempt_at, last_error,
-		       locked_at, locked_by, next_attempt_at
+		       locked_at, locked_by, created_at
 		FROM outbox_messages
 		WHERE inbox_id = $1
-		ORDER BY next_attempt_at DESC
+		ORDER BY created_at DESC, id DESC
 		LIMIT $2 OFFSET $3
 	`, inboxID, limit, offset)
 	if err != nil {

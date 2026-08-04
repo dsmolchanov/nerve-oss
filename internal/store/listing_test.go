@@ -258,6 +258,56 @@ func TestListOutboxForInboxBasic(t *testing.T) {
 	})
 }
 
+func TestListOutboxUsesStableCreationTime(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		orgID := uuid.NewString()
+		inboxID := uuid.NewString()
+
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'stable-time')`, orgID); err != nil {
+			t.Fatalf("insert org: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO inboxes (id, org_id, address, status) VALUES ($1, $2, 'stable@example.com', 'active')`, inboxID, orgID); err != nil {
+			t.Fatalf("insert inbox: %v", err)
+		}
+
+		enqueue := func(key, body string) string {
+			id, err := st.EnqueueOutboxMessage(ctx, OutboxMessage{
+				OrgID: orgID, InboxID: inboxID, Provider: "smtp", IdempotencyKey: key,
+				To: "to@example.com", From: "stable@example.com", Subject: "stable", TextBody: body,
+			})
+			if err != nil {
+				t.Fatalf("enqueue %s: %v", key, err)
+			}
+			return id
+		}
+		olderID := enqueue("older", "older")
+		newerID := enqueue("newer", "newer")
+		olderCreated := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Microsecond)
+		newerCreated := olderCreated.Add(time.Hour)
+		if _, err := db.ExecContext(ctx, `
+			UPDATE outbox_messages
+			SET created_at = CASE id WHEN $1 THEN $3::timestamptz ELSE $4::timestamptz END,
+			    next_attempt_at = CASE id WHEN $1 THEN now() + interval '1 day' ELSE now() - interval '1 day' END
+			WHERE id IN ($1, $2)
+		`, olderID, newerID, olderCreated, newerCreated); err != nil {
+			t.Fatalf("set creation/schedule times: %v", err)
+		}
+
+		messages, err := st.ListOutboxForInbox(ctx, inboxID, 10, 0)
+		if err != nil {
+			t.Fatalf("list outbox: %v", err)
+		}
+		if len(messages) != 2 || messages[0].ID != newerID || messages[1].ID != olderID {
+			t.Fatalf("creation ordering changed with schedule: %+v", messages)
+		}
+		if !messages[0].CreatedAt.Equal(newerCreated) || !messages[1].CreatedAt.Equal(olderCreated) {
+			t.Fatalf("creation timestamps were not preserved: %+v", messages)
+		}
+	})
+}
+
 func TestListOutboxForInboxPagination(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToLatest(t, ctx, db)

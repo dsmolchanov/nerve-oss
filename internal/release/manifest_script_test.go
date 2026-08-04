@@ -114,7 +114,7 @@ func TestGenerateRuntimeManifestScript(t *testing.T) {
 		{name: "invalid core hash", key: "core_schema_hash", value: "not-a-sha256"},
 		{name: "uppercase core hash", key: "core_schema_hash", value: strings.Repeat("B", 64)},
 		{name: "invalid core minimum", key: "core_schema_min_required", value: "-1"},
-		{name: "inverted core window", key: "core_schema_min_required", value: "19"},
+		{name: "inverted core window", key: "core_schema_min_required", value: strconv.FormatInt(startup.CoreMaxSupported+1, 10)},
 		{name: "invalid core maximum", key: "core_schema_max_supported", value: "latest"},
 		{name: "invalid timestamp", key: "build_time", value: "not-a-timestamp"},
 		{name: "noncanonical UTC timestamp", key: "build_time", value: "2026-02-17T00:00:00+00:00"},

@@ -40,6 +40,13 @@ Cloud-only paths.
 6. Byte-compare every exact path after application, then run
    `go build ./...` and `go test ./...` in the staged Cloud checkout before
    opening its sync PR.
+7. Preserve the outbox read contract exposed by the backport: migration
+   `0019_outbox_created_at.sql` adds an immutable creation timestamp and
+   best-effort legacy backfill. Scheduling fields are never presented or
+   sorted as creation time. This newly discovered baseline prerequisite moves
+   the source plan's feature migrations from `0019`–`0023` to `0020`–`0024`.
+   The runtime compatibility window advances to `[19,19]` for the next
+   immutable runtime artifact.
 
 ## Verification
 
@@ -49,6 +56,10 @@ Cloud-only paths.
 - `TZ=Europe/Prague go test ./... -count=1`
 - `scripts/ci/test_sync_manifest.sh` covers exact replacement and deletion,
   bootstrap copy, Cloud-only preservation, and fatal 3-way conflicts.
+- Sixteen concurrent identical-content enqueues with distinct idempotency keys
+  resolve to one winner ID without surfacing a unique violation.
+- Migration 0019 chooses the earliest durable legacy timestamp; list, detail,
+  DLQ, retry, and replay paths preserve and order by `created_at`.
 - `scripts/sync/verify_exact_mirror.sh` validates the manifest and compares
   staged OSS/Cloud exact paths.
 - The pre/post D9 `go doc -all ./internal/store` snapshots are identical (476

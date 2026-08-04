@@ -180,6 +180,10 @@ func TestDLQListAndReplay(t *testing.T) {
 		if msg.Status != "failed" {
 			t.Errorf("expected status failed, got %q", msg.Status)
 		}
+		createdAt := msg.CreatedAt
+		if createdAt.IsZero() {
+			t.Fatal("expected stable created_at on failed row")
+		}
 
 		// Cross-org lookup returns ErrNoRows.
 		otherOrg := uuid.NewString()
@@ -205,6 +209,9 @@ func TestDLQListAndReplay(t *testing.T) {
 		}
 		if after.LastError.Valid && after.LastError.String != "" {
 			t.Errorf("expected last_error cleared after replay, got %q", after.LastError.String)
+		}
+		if !after.CreatedAt.Equal(createdAt) {
+			t.Errorf("replay changed created_at from %s to %s", createdAt, after.CreatedAt)
 		}
 
 		// Replaying a non-failed row (now 'queued') returns false.
