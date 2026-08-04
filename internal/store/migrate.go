@@ -67,12 +67,12 @@ func MigrateDownCloud(ctx context.Context, db *sql.DB) error {
 
 // CurrentVersionCore reports the highest applied core migration version.
 func CurrentVersionCore(ctx context.Context, db *sql.DB) (int64, error) {
-	return currentVersion(ctx, db, migrationTableCore, migrationDir("core"))
+	return currentVersion(ctx, db, migrationTableCore)
 }
 
 // CurrentVersionCloud reports the highest applied cloud migration version.
 func CurrentVersionCloud(ctx context.Context, db *sql.DB) (int64, error) {
-	return currentVersion(ctx, db, migrationTableCloud, migrationDir("cloud"))
+	return currentVersion(ctx, db, migrationTableCloud)
 }
 
 func migrateScope(ctx context.Context, db *sql.DB, tableName string, dir string) error {
@@ -83,11 +83,39 @@ func migrateScope(ctx context.Context, db *sql.DB, tableName string, dir string)
 
 func migrateScopeTo(ctx context.Context, db *sql.DB, tableName string, dir string, version int64) error {
 	return withGoose(tableName, func() error {
+		if version < 0 {
+			return fmt.Errorf("migration target must be non-negative: %d", version)
+		}
+
+		targetAvailable := version == 0
+		if !targetAvailable {
+			migrations, err := goose.CollectMigrations(dir, 0, goose.MaxVersion)
+			if err != nil {
+				return fmt.Errorf("collect migrations for target %d: %w", version, err)
+			}
+			_, err = migrations.Current(version)
+			targetAvailable = err == nil
+		}
+
+		current, err := currentVersion(ctx, db, tableName)
+		if err != nil {
+			return fmt.Errorf("read current migration version: %w", err)
+		}
+		if current == version {
+			return nil
+		}
+		if !targetAvailable {
+			return fmt.Errorf("migration target %d is not available", version)
+		}
+		if current > version {
+			return fmt.Errorf("migration target %d already passed: current version is %d", version, current)
+		}
+
 		if err := goose.UpToContext(ctx, db, dir, version); err != nil {
 			return err
 		}
 
-		current, err := goose.GetDBVersionContext(ctx, db)
+		current, err = goose.GetDBVersionContext(ctx, db)
 		if err != nil {
 			return fmt.Errorf("verify migration target %d: %w", version, err)
 		}
@@ -104,14 +132,56 @@ func migrateScopeDown(ctx context.Context, db *sql.DB, tableName string, dir str
 	})
 }
 
-func currentVersion(ctx context.Context, db *sql.DB, tableName string, dir string) (int64, error) {
-	var version int64
-	err := withGoose(tableName, func() error {
-		var err error
-		version, err = goose.GetDBVersionContext(ctx, db)
-		return err
-	})
-	return version, err
+func currentVersion(ctx context.Context, db *sql.DB, tableName string) (int64, error) {
+	exists, err := migrationTableExists(ctx, db, tableName)
+	if err != nil {
+		return 0, err
+	}
+	if !exists {
+		return 0, nil
+	}
+
+	var query string
+	switch tableName {
+	case migrationTableCore:
+		query = `SELECT version_id, is_applied FROM schema_migrations_core ORDER BY id DESC`
+	case migrationTableCloud:
+		query = `SELECT version_id, is_applied FROM schema_migrations_cloud ORDER BY id DESC`
+	default:
+		return 0, fmt.Errorf("unknown migration table %q", tableName)
+	}
+
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	seen := make(map[int64]struct{})
+	for rows.Next() {
+		var version int64
+		var applied bool
+		if err := rows.Scan(&version, &applied); err != nil {
+			return 0, err
+		}
+		if _, ok := seen[version]; ok {
+			continue
+		}
+		seen[version] = struct{}{}
+		if applied {
+			return version, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	return 0, nil
+}
+
+func migrationTableExists(ctx context.Context, db *sql.DB, tableName string) (bool, error) {
+	var exists bool
+	err := db.QueryRowContext(ctx, `SELECT to_regclass($1) IS NOT NULL`, tableName).Scan(&exists)
+	return exists, err
 }
 
 // withGoose serializes configuration and execution of goose's legacy API.

@@ -632,13 +632,20 @@ func TestMigrateUpToCore_StopsAtTarget(t *testing.T) {
 		// UpToContext itself treats both an already-passed target and a target
 		// beyond the available migrations as successful no-ops. The store API
 		// must reject both because its contract is to reach the exact target.
-		for _, invalidTarget := range []int64{head - 1, head + 1} {
-			err := MigrateUpToCore(ctx, db, invalidTarget)
+		for _, tc := range []struct {
+			target  int64
+			message string
+		}{
+			{target: head - 1, message: "already passed"},
+			{target: head + 1, message: "is not available"},
+		} {
+			err := MigrateUpToCore(ctx, db, tc.target)
 			if err == nil {
-				t.Fatalf("expected exact-target migration to %d to fail from version %d", invalidTarget, head)
+				t.Fatalf("expected exact-target migration to %d to fail from version %d", tc.target, head)
 			}
-			if !strings.Contains(err.Error(), fmt.Sprintf("migration target %d not reached", invalidTarget)) {
-				t.Fatalf("unexpected exact-target error for %d: %v", invalidTarget, err)
+			if !strings.Contains(err.Error(), fmt.Sprintf("migration target %d", tc.target)) ||
+				!strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("unexpected exact-target error for %d: %v", tc.target, err)
 			}
 		}
 
@@ -661,6 +668,51 @@ func TestMigrateUpToCore_StopsAtTarget(t *testing.T) {
 		}
 		if afterDown != previous {
 			t.Fatalf("expected one-step rollback from %d to %d, got %d", head, previous, afterDown)
+		}
+	})
+}
+
+func TestMigrateUpToCloud_RejectsUnavailableTargetBeforeApplying(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		// Cloud migrations intentionally jump from 1 to 3. Target 2 must fail
+		// before version 1 is applied rather than partially migrating the DB.
+		err := MigrateUpToCloud(ctx, db, 2)
+		if err == nil {
+			t.Fatal("expected unavailable cloud target to fail")
+		}
+		if !strings.Contains(err.Error(), "migration target 2 is not available") {
+			t.Fatalf("unexpected unavailable-target error: %v", err)
+		}
+		if tableExists(ctx, t, db, "plan_entitlements") {
+			t.Fatal("cloud version 1 was applied before unavailable target 2 failed")
+		}
+		if tableExists(ctx, t, db, migrationTableCloud) {
+			t.Fatal("cloud migration table was created before unavailable target 2 failed")
+		}
+	})
+}
+
+func TestCurrentVersionDoesNotInitializeMigrationTables(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		core, err := CurrentVersionCore(ctx, db)
+		if err != nil {
+			t.Fatalf("current core version: %v", err)
+		}
+		cloud, err := CurrentVersionCloud(ctx, db)
+		if err != nil {
+			t.Fatalf("current cloud version: %v", err)
+		}
+		if core != 0 || cloud != 0 {
+			t.Fatalf("fresh database versions = core %d, cloud %d; want 0, 0", core, cloud)
+		}
+		if err := MigrateUpToCore(ctx, db, 0); err != nil {
+			t.Fatalf("migrate core to current zero version: %v", err)
+		}
+		if err := MigrateUpToCloud(ctx, db, 0); err != nil {
+			t.Fatalf("migrate cloud to current zero version: %v", err)
+		}
+		if tableExists(ctx, t, db, migrationTableCore) || tableExists(ctx, t, db, migrationTableCloud) {
+			t.Fatal("read-only version inspection or up-to-current zero created a migration table")
 		}
 	})
 }
