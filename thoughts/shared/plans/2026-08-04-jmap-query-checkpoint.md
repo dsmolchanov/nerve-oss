@@ -27,6 +27,10 @@ part of this branch.
   callers, risking a skipped retry if they persist it.
 - The client does not read the Core capability's `maxObjectsInGet`, so a large
   recovery set could exceed a provider's per-call `Email/get` limit.
+- Session discovery ignores a configured `JMAP.AccountID` and always selects
+  the primary mail account.
+- `Email/get` asks for `cc`, but the inbound Email model and store mapping drop
+  those recipients before persistence.
 
 ## Desired End State
 
@@ -47,11 +51,20 @@ part of this branch.
 9. All ordered text and HTML body parts are concatenated.
 10. A checkpoint advances only when every requested `Email/get` ID is accounted
     for exactly once by `list` or `notFound`.
+11. A configured account ID selects that exact session account only when it
+    exists and advertises the Mail capability; otherwise discovery fails
+    without partially mutating the client. With no configured ID, the primary
+    mail account remains the compatibility default.
+12. `cc` recipients survive response parsing, the inbound Email model, and the
+    `store.Message` mapping.
 
 ## Files in This Branch
 
 - `internal/jmap/jmap_client.go`: query checkpoint, inbox scope, body fetch,
-  cursor-on-error, Message-ID, and multipart extraction behavior.
+  cursor-on-error, Message-ID, multipart extraction, configured-account
+  selection, and Cc response parsing behavior.
+- `internal/jmap/ingestor.go`: Cc-bearing inbound model and pure store-message
+  mapping.
 - `internal/jmap/jmap_client_test.go`: `httptest` protocol regressions for every
   behavior in this plan.
 - `thoughts/shared/plans/2026-08-04-jmap-query-checkpoint.md`: scope, follow-ups,
@@ -106,6 +119,11 @@ part of this branch.
 - Read the first value from the RFC `messageId` string array.
 - Walk `textBody` and `htmlBody` in server-provided order and append each
   referenced `bodyValues[partId].value`.
+- Decode Session `accounts`. When `JMAP.AccountID` is configured, require that
+  exact account and its Mail account capability before assigning any discovered
+  fields; otherwise retain the primary mail account fallback.
+- Parse every `cc` participant into the inbound Email and map it to
+  `store.Message.CC` before insertion.
 
 ### 3. Add HTTP-Level Regression Coverage
 
@@ -131,19 +149,16 @@ method responses. Cover:
 - cursor advancement when `added` is empty;
 - old-cursor preservation when `Email/get` fails after query advancement;
 - first-value parsing of the `messageId` array;
-- ordered multipart text and HTML concatenation.
+- ordered multipart text and HTML concatenation;
+- configured non-primary account selection plus rejection of unknown and
+  non-Mail configured accounts without partial client mutation;
+- Cc response parsing and pure Email-to-store-message mapping.
 
 ## Out-of-Scope Follow-ups
 
-- **`cc` persistence:** `Email/get` already asks for `cc`, but the inbound
-  model and store path do not preserve it. Add model/storage support in a
-  separate change.
 - **Ordinary initial backlog pagination:** first-time bootstrap still imports
   only the newest 50 IDs. Recovery from an invalid persisted checkpoint is
   fully paginated; changing the initial product behavior remains a follow-up.
-- **Configured `AccountID`:** session discovery still chooses the mail primary
-  account rather than honoring `cfg.JMAP.AccountID`. Account-selection policy
-  needs a separate compatibility decision and tests.
 - **Poll-loop error handling:** checkpoint read/write errors, ingestion errors,
   and embedding-queue errors in `App.PollLoop` still need explicit logging,
   retry/backoff, and failure semantics. This branch only guarantees cursor
@@ -153,10 +168,11 @@ method responses. Cover:
 
 ## Automated Verification
 
-- [x] Go formatting: `gofmt -w internal/jmap/jmap_client.go internal/jmap/jmap_client_test.go`
-- [x] Focused regressions: `go test ./internal/jmap -run 'Test(FetchChanges|EmailGet|Call|EnsureSession|Recovery)' -count=1`
-- [x] Race regressions: `go test -race ./internal/jmap -run 'Test(FetchChanges|EmailGet|Call|EnsureSession|Recovery)' -count=1`
+- [x] Go formatting: `gofmt -w internal/jmap/ingestor.go internal/jmap/jmap_client.go internal/jmap/jmap_client_test.go`
+- [x] Focused regressions: `go test ./internal/jmap -run 'Test(EnsureSession|EmailGetPreservesCCRecipients|MessageFromEmailPreservesCC)' -count=1`
+- [x] Race regressions: `go test -race ./internal/jmap -run 'Test(EnsureSession|EmailGetPreservesCCRecipients|MessageFromEmailPreservesCC)' -count=1`
 - [x] JMAP package: `go test ./internal/jmap -count=1`
+- [x] Full Go suite: `go test ./... -count=1`
 - [x] Static analysis: `go vet ./internal/jmap`
 - [x] Patch hygiene: `git diff --check`
 

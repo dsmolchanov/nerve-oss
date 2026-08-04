@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"neuralmail/internal/config"
+	"neuralmail/internal/store"
 )
 
 func TestFetchChangesUsesQueryStateFamily(t *testing.T) {
@@ -440,6 +441,94 @@ func TestEnsureSessionParsesMaxObjectsInGet(t *testing.T) {
 	}
 }
 
+func TestEnsureSessionHonorsConfiguredAccountID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"apiUrl": "/api",
+			"capabilities": map[string]any{
+				coreCapability: map[string]any{"maxObjectsInGet": 17},
+			},
+			"primaryAccounts": map[string]any{mailCapability: "primary-account"},
+			"accounts": map[string]any{
+				"primary-account": map[string]any{
+					"accountCapabilities": map[string]any{mailCapability: map[string]any{}},
+				},
+				"configured-account": map[string]any{
+					"accountCapabilities": map[string]any{mailCapability: map[string]any{}},
+				},
+			},
+		}); err != nil {
+			t.Errorf("encode session: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client := newJMAPDiscoveryClient(t, server)
+	client.cfg.JMAP.AccountID = "configured-account"
+	if err := client.ensureSession(context.Background()); err != nil {
+		t.Fatalf("ensure session: %v", err)
+	}
+	if client.accountID != "configured-account" {
+		t.Fatalf("accountID = %q, want configured-account", client.accountID)
+	}
+}
+
+func TestEnsureSessionRejectsInvalidConfiguredAccountID(t *testing.T) {
+	tests := []struct {
+		name      string
+		accountID string
+		wantError string
+	}{
+		{
+			name:      "unknown account",
+			accountID: "missing-account",
+			wantError: `configured JMAP account "missing-account" not found in session`,
+		},
+		{
+			name:      "account without mail capability",
+			accountID: "non-mail-account",
+			wantError: `configured JMAP account "non-mail-account" does not support mail`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if err := json.NewEncoder(w).Encode(map[string]any{
+					"apiUrl": "/api",
+					"capabilities": map[string]any{
+						coreCapability: map[string]any{"maxObjectsInGet": 17},
+					},
+					"primaryAccounts": map[string]any{mailCapability: "primary-account"},
+					"accounts": map[string]any{
+						"primary-account": map[string]any{
+							"accountCapabilities": map[string]any{mailCapability: map[string]any{}},
+						},
+						"non-mail-account": map[string]any{
+							"accountCapabilities": map[string]any{coreCapability: map[string]any{}},
+						},
+					},
+				}); err != nil {
+					t.Errorf("encode session: %v", err)
+				}
+			}))
+			defer server.Close()
+
+			client := newJMAPDiscoveryClient(t, server)
+			client.cfg.JMAP.AccountID = tt.accountID
+			err := client.ensureSession(context.Background())
+			if err == nil || err.Error() != tt.wantError {
+				t.Fatalf("ensure session error = %v, want %q", err, tt.wantError)
+			}
+			if client.apiURL != "" || client.accountID != "" || client.maxObjectsInGet != 0 {
+				t.Fatalf("invalid configured account partially mutated client: %#v", client)
+			}
+		})
+	}
+}
+
 func TestEnsureSessionRejectsInvalidMaxObjectsInGet(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -769,6 +858,54 @@ func TestEmailGetRequestsTextAndHTMLBodyValues(t *testing.T) {
 
 	if _, err := client.emailGet(context.Background(), []string{"email-1"}); err != nil {
 		t.Fatalf("email get: %v", err)
+	}
+}
+
+func TestEmailGetPreservesCCRecipients(t *testing.T) {
+	client := newJMAPTestClient(t, func(w http.ResponseWriter, method string, args map[string]any) {
+		properties, ok := args["properties"].([]any)
+		if !ok {
+			t.Errorf("Email/get properties = %#v, want an array", args["properties"])
+		}
+		requestedCC := false
+		for _, property := range properties {
+			if property == "cc" {
+				requestedCC = true
+				break
+			}
+		}
+		if !requestedCC {
+			t.Error("Email/get must request cc")
+		}
+		writeJMAPTestResponse(t, w, method, map[string]any{
+			"list": []any{map[string]any{
+				"id": "email-1",
+				"cc": []any{
+					map[string]any{"name": "Casey", "email": "casey@example.com"},
+					map[string]any{"name": "Dee", "email": "dee@example.com"},
+				},
+			}},
+		})
+	})
+
+	emails, err := client.emailGet(context.Background(), []string{"email-1"})
+	if err != nil {
+		t.Fatalf("email get: %v", err)
+	}
+	want := []store.Participant{
+		{Name: "Casey", Email: "casey@example.com"},
+		{Name: "Dee", Email: "dee@example.com"},
+	}
+	if len(emails) != 1 || !reflect.DeepEqual(emails[0].CC, want) {
+		t.Fatalf("email CC = %#v, want %#v", emails, want)
+	}
+}
+
+func TestMessageFromEmailPreservesCC(t *testing.T) {
+	want := []store.Participant{{Name: "Casey", Email: "casey@example.com"}}
+	msg := messageFromEmail(Email{CC: want})
+	if !reflect.DeepEqual(msg.CC, want) {
+		t.Fatalf("message CC = %#v, want %#v", msg.CC, want)
 	}
 }
 

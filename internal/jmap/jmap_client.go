@@ -134,6 +134,9 @@ func (c *JMAPClient) ensureSession(ctx context.Context) error {
 		APIURL          string                     `json:"apiUrl"`
 		Capabilities    map[string]json.RawMessage `json:"capabilities"`
 		PrimaryAccounts map[string]string          `json:"primaryAccounts"`
+		Accounts        map[string]struct {
+			AccountCapabilities map[string]json.RawMessage `json:"accountCapabilities"`
+		} `json:"accounts"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&session); err != nil {
 		return err
@@ -141,9 +144,20 @@ func (c *JMAPClient) ensureSession(ctx context.Context) error {
 	if session.APIURL == "" {
 		return errors.New("missing apiUrl in session")
 	}
-	accountID := session.PrimaryAccounts[mailCapability]
-	if accountID == "" {
-		return errors.New("missing mail account id")
+	accountID := c.cfg.JMAP.AccountID
+	if accountID != "" {
+		account, ok := session.Accounts[accountID]
+		if !ok {
+			return fmt.Errorf("configured JMAP account %q not found in session", accountID)
+		}
+		if _, ok := account.AccountCapabilities[mailCapability]; !ok {
+			return fmt.Errorf("configured JMAP account %q does not support mail", accountID)
+		}
+	} else {
+		accountID = session.PrimaryAccounts[mailCapability]
+		if accountID == "" {
+			return errors.New("missing mail account id")
+		}
 	}
 	coreRaw, ok := session.Capabilities[coreCapability]
 	if !ok {
@@ -445,6 +459,7 @@ func (c *JMAPClient) emailGetBatch(ctx context.Context, ids []string) ([]Email, 
 			HTML:        html,
 			From:        firstParticipant(emailMap["from"]),
 			To:          parseParticipants(emailMap["to"]),
+			CC:          parseParticipants(emailMap["cc"]),
 			ReceivedAt:  received,
 			InternetMsg: firstString(emailMap["messageId"]),
 		}
