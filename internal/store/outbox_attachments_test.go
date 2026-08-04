@@ -181,6 +181,65 @@ func TestEnqueueOutboxMessageRejectsEmptyAttachmentBeforeSQL(t *testing.T) {
 	}
 }
 
+func TestEnqueueOutboxMessageEnforcesAttachmentCapsBeforeSQL(t *testing.T) {
+	valid := OutboundAttachment{
+		Filename:    "file.txt",
+		ContentType: "text/plain",
+		Content:     []byte("x"),
+	}
+	repeat := func(count int) []OutboundAttachment {
+		attachments := make([]OutboundAttachment, count)
+		for index := range attachments {
+			attachments[index] = valid
+		}
+		return attachments
+	}
+
+	tests := []struct {
+		name        string
+		attachments []OutboundAttachment
+		want        error
+	}{
+		{name: "count", attachments: repeat(maxOutboundAttachmentCount + 1), want: ErrAttachmentCountExceeded},
+		{name: "file size", attachments: []OutboundAttachment{{Filename: "large.pdf", ContentType: "application/pdf", Content: make([]byte, maxOutboundAttachmentBytes+1)}}, want: ErrAttachmentTooLarge},
+		{name: "total size", attachments: []OutboundAttachment{
+			{Filename: "first.pdf", ContentType: "application/pdf", Content: make([]byte, maxOutboundAttachmentTotalBytes/2+1)},
+			{Filename: "second.pdf", ContentType: "application/pdf", Content: make([]byte, maxOutboundAttachmentTotalBytes/2+1)},
+		}, want: ErrAttachmentTotalTooLarge},
+		{name: "empty filename", attachments: []OutboundAttachment{{ContentType: "text/plain", Content: []byte("x")}}, want: ErrAttachmentInvalidFilename},
+		{name: "path filename", attachments: []OutboundAttachment{{Filename: "../file.txt", ContentType: "text/plain", Content: []byte("x")}}, want: ErrAttachmentInvalidFilename},
+		{name: "control filename", attachments: []OutboundAttachment{{Filename: "file\n.txt", ContentType: "text/plain", Content: []byte("x")}}, want: ErrAttachmentInvalidFilename},
+		{name: "long filename", attachments: []OutboundAttachment{{Filename: strings.Repeat("é", 128), ContentType: "text/plain", Content: []byte("x")}}, want: ErrAttachmentInvalidFilename},
+		{name: "content type", attachments: []OutboundAttachment{{Filename: "file.html", ContentType: "text/html", Content: []byte("x")}}, want: ErrAttachmentTypeNotAllowed},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			st := &Store{}
+			_, err := st.EnqueueOutboxMessage(context.Background(), outboundAttachmentMessage(
+				uuid.NewString(), uuid.NewString(), "attachment-caps", test.attachments,
+			))
+			if !errors.Is(err, test.want) {
+				t.Fatalf("err=%v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func TestEnqueueOutboxMessageNormalizesAttachmentMetadata(t *testing.T) {
+	attachments, err := normalizeOutboundAttachments([]OutboundAttachment{{
+		Filename:    "  report.pdf  ",
+		ContentType: " APPLICATION/PDF ",
+		Content:     []byte("report"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attachments[0].Filename != "report.pdf" || attachments[0].ContentType != "application/pdf" {
+		t.Fatalf("attachment metadata not normalized: %#v", attachments[0])
+	}
+}
+
 func TestEnqueueOutboxMessageQuotaFailureIsAtomic(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		st, orgID, inboxID := seedOutboundAttachmentStore(t, ctx, db, "quota-atomic")
