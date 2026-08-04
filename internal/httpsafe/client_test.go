@@ -100,7 +100,6 @@ func TestClientRejectsPublicToPrivateDNSRebindAtDialTime(t *testing.T) {
 		t.Fatalf("initial lookup=%v, want public fixture address", resolved)
 	}
 
-	setAddress([4]byte{10, 20, 30, 40})
 	client, err := New(Config{
 		Timeout:      time.Second,
 		AllowedHosts: []string{"rebind.test"},
@@ -109,6 +108,19 @@ func TestClientRejectsPublicToPrivateDNSRebindAtDialTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
+	validatedTransport, ok := client.Transport.(*hostAllowlistTransport)
+	if !ok {
+		t.Fatalf("unexpected transport %T", client.Transport)
+	}
+	dialTransport := validatedTransport.next
+	validatedTransport.next = roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		// hostAllowlistTransport invokes next only after the production URL and
+		// host validation has passed. Rebind at that exact boundary so the
+		// production dialer, rather than the preflight lookup above, receives
+		// the private answer.
+		setAddress([4]byte{10, 20, 30, 40})
+		return dialTransport.RoundTrip(request)
+	})
 	_, err = client.Get("http://rebind.test/")
 	if !errors.Is(err, ErrUnsafeAddress) {
 		t.Fatalf("expected private rebound address to fail at dial time, got %v", err)
@@ -253,4 +265,10 @@ func controlledDNSResponse(query []byte, address [4]byte) ([]byte, error) {
 		address[0], address[1], address[2], address[3],
 	)
 	return response, nil
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
 }
