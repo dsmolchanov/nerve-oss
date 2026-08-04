@@ -115,6 +115,12 @@ func TestGenerateRuntimeManifestScript(t *testing.T) {
 			value:           "v0.0.0-test\u0085",
 			expectedVersion: "v0.0.0-test\u0085",
 		},
+		{
+			name:            "DEL control",
+			key:             "runtime_version",
+			value:           "v0.0.0-test\u007f",
+			expectedVersion: "v0.0.0-test\u007f",
+		},
 	}
 	for _, invalid := range invalidValues {
 		original := manifest[invalid.key]
