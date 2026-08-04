@@ -64,7 +64,38 @@ func (s *Store) EnsureOrgDomain(ctx context.Context, orgID, domain, verification
 	if externalRef == "" {
 		return OrgDomain{}, false, errors.New("missing external_ref")
 	}
+	orgID = strings.TrimSpace(orgID)
+	if orgID == "" {
+		return OrgDomain{}, false, errors.New("missing org_id")
+	}
 
+	var rec OrgDomain
+	created := false
+	err := s.withTx(ctx, func(scoped *Store) error {
+		if err := scoped.lockReconciliationResources(ctx, "org:"+orgID); err != nil {
+			return err
+		}
+		var orgActive bool
+		if err := scoped.q.QueryRowContext(ctx, `
+			SELECT EXISTS(SELECT 1 FROM orgs WHERE id = $1 AND deleted_at IS NULL)
+		`, orgID).Scan(&orgActive); err != nil {
+			return err
+		}
+		if !orgActive {
+			return sql.ErrNoRows
+		}
+
+		var ensureErr error
+		rec, created, ensureErr = scoped.ensureOrgDomainLocked(
+			ctx, orgID, domain, verificationToken, dkimSelector,
+			dkimPrivateKeyEnc, dkimPublicKey, dkimMethod, externalRef,
+		)
+		return ensureErr
+	})
+	return rec, created, err
+}
+
+func (s *Store) ensureOrgDomainLocked(ctx context.Context, orgID, domain, verificationToken, dkimSelector, dkimPrivateKeyEnc, dkimPublicKey, dkimMethod, externalRef string) (OrgDomain, bool, error) {
 	// Insert first and let the unique external_ref index serialize concurrent
 	// reconciler replays. A pre-read followed by an unchecked insert leaves a
 	// race where the losing worker exposes a raw unique-constraint error.

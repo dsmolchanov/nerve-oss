@@ -139,6 +139,54 @@ func TestEnsureOrgDomainConcurrentReplay(t *testing.T) {
 	})
 }
 
+func TestEnsureOrgDomainSerializesWithOrgDeletion(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		orgID, err := st.CreateOrg(ctx, "serialized-domain-owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "org:"+orgID); err != nil {
+			t.Fatal(err)
+		}
+		ensureResult := make(chan error, 1)
+		go func() {
+			_, _, ensureErr := st.EnsureOrgDomain(
+				ctx, orgID, "abrolia.com", "verify", "selector", "private", "public", "cname", "serialized:domain",
+			)
+			ensureResult <- ensureErr
+		}()
+
+		select {
+		case err := <-ensureResult:
+			t.Fatalf("domain ensure did not wait for reconciliation lock: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE orgs SET deleted_at = now() WHERE id = $1`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-ensureResult; !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("domain ensure after serialized deletion error=%v, want no rows", err)
+		}
+		var domains int
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM org_domains WHERE org_id = $1`, orgID).Scan(&domains); err != nil {
+			t.Fatal(err)
+		}
+		if domains != 0 {
+			t.Fatalf("deleted org received %d domains", domains)
+		}
+	})
+}
+
 func TestEnsureOrgWebhookConcurrentReplay(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToLatest(t, ctx, db)

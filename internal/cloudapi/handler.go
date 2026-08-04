@@ -1302,52 +1302,24 @@ func (h *Handler) handleCreateInbox(w http.ResponseWriter, r *http.Request) {
 	orgDomainID := ""
 	if h.Config.Cloud.Mode {
 		domainIDCandidate := strings.TrimSpace(req.DomainID)
-		if domainIDCandidate != "" {
-			var d store.OrgDomain
-			err := h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
-				var err error
-				d, err = scoped.GetOrgDomainByIDForOrg(r.Context(), orgID, domainIDCandidate)
-				return err
-			})
-			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					http.Error(w, "domain not verified", http.StatusBadRequest)
-					return
-				}
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			if d.Status != "active" {
+		var d store.OrgDomain
+		err := h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+			var resolveErr error
+			d, resolveErr = scoped.GetActiveOrgDomainForInboxOrg(
+				r.Context(), orgID, domainIDCandidate, domainPart,
+			)
+			return resolveErr
+		})
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				// Do not reveal whether the domain exists or belongs to another org.
 				http.Error(w, "domain not verified", http.StatusBadRequest)
 				return
 			}
-			if !strings.EqualFold(d.Domain, domainPart) {
-				http.Error(w, "address domain mismatch", http.StatusBadRequest)
-				return
-			}
-			orgDomainID = d.ID
-		} else {
-			var d store.OrgDomain
-			err := h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
-				var err error
-				d, err = scoped.GetOrgDomainForSending(r.Context(), domainPart)
-				return err
-			})
-			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					http.Error(w, "domain not verified", http.StatusBadRequest)
-					return
-				}
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			if d.OrgID != orgID {
-				// Don't leak domain ownership information.
-				http.Error(w, "domain not verified", http.StatusBadRequest)
-				return
-			}
-			orgDomainID = d.ID
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
+		orgDomainID = d.ID
 	}
 
 	var created store.InboxRecord

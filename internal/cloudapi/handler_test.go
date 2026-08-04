@@ -877,6 +877,69 @@ func TestInboxesCreateAndList(t *testing.T) {
 	})
 }
 
+func TestInboxCreationAcceptsOnlyOwnedOrGrantedActiveDomains(t *testing.T) {
+	withTempStore(t, func(ctx context.Context, st *store.Store) {
+		cfg := config.Default()
+		cfg.Security.APIKey = "bootstrap-admin"
+		cfg.Cloud.Mode = true
+		handler := NewHandler(cfg, st, &auth.Service{Config: cfg, Now: time.Now}, &stubBilling{}, &stubTokenIssuer{})
+		mux := http.NewServeMux()
+		handler.RegisterRoutes(mux)
+
+		ownerID, err := st.CreateOrg(ctx, "platform-domain-owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+		explicitOrgID, err := st.CreateOrg(ctx, "explicit-grantee")
+		if err != nil {
+			t.Fatal(err)
+		}
+		inferredOrgID, err := st.CreateOrg(ctx, "inferred-grantee")
+		if err != nil {
+			t.Fatal(err)
+		}
+		outsiderID, err := st.CreateOrg(ctx, "ungranted-outsider")
+		if err != nil {
+			t.Fatal(err)
+		}
+		domainID, err := st.CreateOrgDomain(ctx, ownerID, "abrolia.com", "verify", "selector", "private", "public", "cname")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.UpdateOrgDomainStatus(ctx, domainID, "active"); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := st.EnsureOrgDomainGrant(ctx, ownerID, domainID, explicitOrgID, "grant:explicit"); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := st.EnsureOrgDomainGrant(ctx, ownerID, domainID, inferredOrgID, "grant:inferred"); err != nil {
+			t.Fatal(err)
+		}
+
+		create := func(orgID, address, requestedDomainID string) *httptest.ResponseRecorder {
+			body := map[string]any{"org_id": orgID, "address": address}
+			if requestedDomainID != "" {
+				body["domain_id"] = requestedDomainID
+			}
+			req := jsonRequest(t, http.MethodPost, "/v1/inboxes", body)
+			req.Header.Set("X-API-Key", "bootstrap-admin")
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			return rec
+		}
+
+		if rec := create(explicitOrgID, "explicit@abrolia.com", domainID); rec.Code != http.StatusOK {
+			t.Fatalf("explicit granted domain create: status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		if rec := create(inferredOrgID, "inferred@abrolia.com", ""); rec.Code != http.StatusOK {
+			t.Fatalf("inferred granted domain create: status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		if rec := create(outsiderID, "outsider@abrolia.com", domainID); rec.Code != http.StatusBadRequest {
+			t.Fatalf("ungranted domain create: status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+}
+
 func jsonRequest(t *testing.T, method, target string, body any) *http.Request {
 	t.Helper()
 	raw, err := json.Marshal(body)
