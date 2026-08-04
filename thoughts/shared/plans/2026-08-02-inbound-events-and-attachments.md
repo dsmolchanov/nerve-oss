@@ -1,5 +1,14 @@
 # Nerve: Inbound Event Fan-out + Attachments (Both Directions)
 
+> **Revision 13 (2026-08-04)** — Phase 2.1 org tombstoning now treats active
+> service tokens as durable tenant resources. `DeleteOrgIfEmpty` refuses while
+> an unexpired, unrevoked token exists, and `CreateServiceToken` takes the same
+> org reconciliation lock plus active-org check so issuance cannot race a
+> tombstone or recreate credentials for a deleted org. Rotation revokes the old
+> token and inserts its replacement in that same locked transaction; a failed
+> replacement insert rolls the revocation back. The OSS hotfix is
+> promoted as a new immutable runtime before the Cloud production rollout.
+>
 > **Revision 12 (2026-08-04)** — Abrolia Phase 2.1 household email tenancy
 > is an approved interleaved prerequisite and owns core migration `0024`
 > (Cloud reconciliation owns `cloud/0008`). It adds replay-safe organization,
@@ -879,6 +888,11 @@ startup pins core `[24,24]`; the control plane pins core `[24,24]` and cloud
   then fails closed rather than creating a grant for a deleted org.
 - [x] Down migration refuses durable tenancy/reconciliation state instead of
   dropping it.
+- [x] An active service token blocks org deletion; after revocation deletion
+  succeeds; token issuance for the tombstoned org fails, with issuance and
+  deletion serialized by the same advisory lock. Rotation is atomic across old
+  token revocation and replacement insertion, including rollback on insert
+  failure.
 
 #### Manual:
 

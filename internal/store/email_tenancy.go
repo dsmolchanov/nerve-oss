@@ -95,6 +95,10 @@ func (s *Store) DeleteOrgIfEmpty(ctx context.Context, orgID string) (bool, error
 			UPDATE orgs o SET deleted_at = now()
 			WHERE o.id = $1
 			  AND o.deleted_at IS NULL
+			  AND NOT EXISTS (SELECT 1 FROM service_tokens t
+			                  WHERE t.org_id = o.id
+			                    AND t.revoked_at IS NULL
+			                    AND t.expires_at > now())
 			  AND NOT EXISTS (SELECT 1 FROM org_domains d WHERE d.org_id = o.id)
 			  AND NOT EXISTS (SELECT 1 FROM inboxes i WHERE i.org_id = o.id)
 			  AND NOT EXISTS (SELECT 1 FROM cloud_api_keys k WHERE k.org_id = o.id AND k.revoked_at IS NULL)
