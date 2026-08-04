@@ -41,6 +41,210 @@ func TestCloudControlPlaneMigrationFromEmptyDatabase(t *testing.T) {
 	})
 }
 
+func TestCoreMigrationUpgradeFrom15To17(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToVersion(t, ctx, db, 15)
+
+		if err := MigrateCore(ctx, db); err != nil {
+			t.Fatalf("upgrade core migrations from 15 to latest: %v", err)
+		}
+
+		var version int64
+		if err := db.QueryRowContext(ctx, `
+			SELECT coalesce(max(version_id), 0)
+			FROM schema_migrations_core
+			WHERE is_applied
+		`).Scan(&version); err != nil {
+			t.Fatalf("query core migration version: %v", err)
+		}
+		if version != 17 {
+			t.Fatalf("expected core migration version 17, got %d", version)
+		}
+
+		for _, table := range []string{"suppressions", "org_webhooks", "org_webhook_deliveries"} {
+			assertTableExists(t, db, table)
+		}
+		for _, table := range []string{"outbox_events", "inbox_smtp_configs", "suppressions"} {
+			assertTenantRLSState(t, db, table, true)
+		}
+	})
+}
+
+func TestCoreMigration16DownRefusesNullProviderMessageID(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 16); err != nil {
+			t.Fatalf("migrate core to 16: %v", err)
+		}
+
+		orgID := uuid.NewString()
+		inboxID := uuid.NewString()
+		outboxID := uuid.NewString()
+		seed := []struct {
+			name string
+			stmt string
+			args []any
+		}{
+			{
+				name: "org",
+				stmt: `INSERT INTO orgs (id, name) VALUES ($1, 'rollback-guard')`,
+				args: []any{orgID},
+			},
+			{
+				name: "inbox",
+				stmt: `INSERT INTO inboxes (id, org_id, address, status)
+				       VALUES ($1, $2, 'rollback-guard@local.neuralmail', 'active')`,
+				args: []any{inboxID, orgID},
+			},
+			{
+				name: "outbox message",
+				stmt: `INSERT INTO outbox_messages (
+				         id, org_id, inbox_id, provider, idempotency_key,
+				         "to", "from", subject
+				       ) VALUES (
+				         $1, $2, $3, 'resend', 'rollback-guard',
+				         'to@example.com', 'from@example.com', 'rollback guard'
+				       )`,
+				args: []any{outboxID, orgID, inboxID},
+			},
+			{
+				name: "pre-provider event",
+				stmt: `INSERT INTO outbox_events (
+				         org_id, outbox_message_id, provider_message_id,
+				         event_type, raw_payload
+				       ) VALUES ($1, $2, NULL, 'suppressed', '{}'::jsonb)`,
+				args: []any{orgID, outboxID},
+			},
+		}
+		for _, row := range seed {
+			if _, err := db.ExecContext(ctx, row.stmt, row.args...); err != nil {
+				t.Fatalf("seed %s: %v", row.name, err)
+			}
+		}
+
+		err := MigrateDownCore(ctx, db)
+		if err == nil {
+			t.Fatal("expected migration 0016 down to refuse NULL provider_message_id rows")
+		}
+		if !strings.Contains(err.Error(), "cannot roll back core migration 0016") {
+			t.Fatalf("unexpected migration 0016 down error: %v", err)
+		}
+
+		version, versionErr := CurrentVersionCore(ctx, db)
+		if versionErr != nil {
+			t.Fatalf("current core version after refused rollback: %v", versionErr)
+		}
+		if version != 16 {
+			t.Fatalf("refused rollback changed core version: got %d, want 16", version)
+		}
+		assertTableExists(t, db, "suppressions")
+
+		if _, err := db.ExecContext(ctx, `DELETE FROM outbox_events WHERE outbox_message_id = $1`, outboxID); err != nil {
+			t.Fatalf("remove blocking outbox event: %v", err)
+		}
+		if err := MigrateDownCore(ctx, db); err != nil {
+			t.Fatalf("migrate core 0016 down after resolving NULL rows: %v", err)
+		}
+		version, err = CurrentVersionCore(ctx, db)
+		if err != nil {
+			t.Fatalf("current core version after clean rollback: %v", err)
+		}
+		if version != 15 {
+			t.Fatalf("expected core version 15 after one-step rollback, got %d", version)
+		}
+		assertColumnNotNull(t, db, "outbox_events", "provider_message_id")
+		assertTenantRLSState(t, db, "outbox_events", false)
+		assertTenantRLSState(t, db, "inbox_smtp_configs", false)
+	})
+}
+
+func TestCoreMigration14DownRemovesOutboxNotificationObjects(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToVersion(t, ctx, db, 14)
+
+		var triggerExists, functionExists bool
+		if err := db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_trigger
+				WHERE tgname = 'trg_outbox_notify'
+				  AND tgrelid = 'outbox_messages'::regclass
+				  AND NOT tgisinternal
+			)
+		`).Scan(&triggerExists); err != nil {
+			t.Fatalf("inspect outbox notification trigger: %v", err)
+		}
+		if err := db.QueryRowContext(ctx, `SELECT to_regprocedure('notify_outbox_insert()') IS NOT NULL`).Scan(&functionExists); err != nil {
+			t.Fatalf("inspect outbox notification function: %v", err)
+		}
+		if !triggerExists || !functionExists {
+			t.Fatalf("migration 14 objects missing before rollback: trigger=%t function=%t", triggerExists, functionExists)
+		}
+
+		if err := MigrateDownCore(ctx, db); err != nil {
+			t.Fatalf("roll back core migration 14: %v", err)
+		}
+		version, err := CurrentVersionCore(ctx, db)
+		if err != nil {
+			t.Fatalf("read core version after migration 14 rollback: %v", err)
+		}
+		if version != 13 {
+			t.Fatalf("core version after migration 14 rollback = %d, want 13", version)
+		}
+
+		if err := db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_trigger
+				WHERE tgname = 'trg_outbox_notify'
+				  AND tgrelid = 'outbox_messages'::regclass
+				  AND NOT tgisinternal
+			)
+		`).Scan(&triggerExists); err != nil {
+			t.Fatalf("inspect trigger after rollback: %v", err)
+		}
+		if err := db.QueryRowContext(ctx, `SELECT to_regprocedure('notify_outbox_insert()') IS NOT NULL`).Scan(&functionExists); err != nil {
+			t.Fatalf("inspect function after rollback: %v", err)
+		}
+		if triggerExists || functionExists {
+			t.Fatalf("migration 14 objects survived rollback: trigger=%t function=%t", triggerExists, functionExists)
+		}
+	})
+}
+
+func TestCoreMigration17PreventsDuplicateActiveWebhookURLs(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 17); err != nil {
+			t.Fatalf("migrate core to 17: %v", err)
+		}
+
+		orgID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'webhook-unique')`, orgID); err != nil {
+			t.Fatalf("insert webhook test org: %v", err)
+		}
+		insertWebhook := func(disabled bool) error {
+			var disabledAt any
+			if disabled {
+				disabledAt = time.Now().UTC()
+			}
+			_, err := db.ExecContext(ctx, `
+				INSERT INTO org_webhooks (org_id, url, secret, disabled_at)
+				VALUES ($1, 'https://example.com/events', 'secret', $2)
+			`, orgID, disabledAt)
+			return err
+		}
+
+		if err := insertWebhook(false); err != nil {
+			t.Fatalf("insert first active webhook: %v", err)
+		}
+		if err := insertWebhook(false); err == nil {
+			t.Fatal("expected duplicate active webhook URL to violate unique index")
+		}
+		if err := insertWebhook(true); err != nil {
+			t.Fatalf("insert disabled duplicate webhook: %v", err)
+		}
+	})
+}
+
 func TestCloudControlPlaneMigrationFromLegacyStateBackfillsOrgID(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToVersion(t, ctx, db, 1)
@@ -126,6 +330,8 @@ func TestTenantRLSBlocksCrossOrgReadsWithScopedSession(t *testing.T) {
 		inboxB := uuid.NewString()
 		threadA := uuid.NewString()
 		threadB := uuid.NewString()
+		outboxA := uuid.NewString()
+		outboxB := uuid.NewString()
 
 		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'org-a'), ($2, 'org-b')`, orgA, orgB); err != nil {
 			t.Fatalf("insert orgs: %v", err)
@@ -142,6 +348,38 @@ func TestTenantRLSBlocksCrossOrgReadsWithScopedSession(t *testing.T) {
 		if _, err := db.ExecContext(ctx, `INSERT INTO threads (id, inbox_id, org_id, subject, status, participants, updated_at) VALUES ($1, $2, $3, 'thread-b', 'open', '[]'::jsonb, now())`, threadB, inboxB, orgB); err != nil {
 			t.Fatalf("insert org B thread: %v", err)
 		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO outbox_messages (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject)
+			VALUES
+			  ($1, $2, $3, 'resend', 'rls-outbox-a', 'to@example.com', 'a@local.neuralmail', 'org A'),
+			  ($4, $5, $6, 'resend', 'rls-outbox-b', 'to@example.com', 'b@local.neuralmail', 'org B')
+		`, outboxA, orgA, inboxA, outboxB, orgB, inboxB); err != nil {
+			t.Fatalf("insert outbox messages: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO outbox_events (org_id, outbox_message_id, provider_message_id, event_type, raw_payload)
+			VALUES
+			  ($1, $2, 'provider-a', 'delivered', '{}'::jsonb),
+			  ($3, $4, 'provider-b', 'delivered', '{}'::jsonb)
+		`, orgA, outboxA, orgB, outboxB); err != nil {
+			t.Fatalf("insert outbox events: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO inbox_smtp_configs (inbox_id, org_id, host, username, password_enc)
+			VALUES
+			  ($1, $2, 'smtp-a.example.com', 'user-a', 'cipher-a'),
+			  ($3, $4, 'smtp-b.example.com', 'user-b', 'cipher-b')
+		`, inboxA, orgA, inboxB, orgB); err != nil {
+			t.Fatalf("insert SMTP configs: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO suppressions (org_id, email_lower, reason, source)
+			VALUES
+			  ($1, 'blocked-a@example.com', 'rls test', 'manual'),
+			  ($2, 'blocked-b@example.com', 'rls test', 'manual')
+		`, orgA, orgB); err != nil {
+			t.Fatalf("insert suppressions: %v", err)
+		}
 
 		roleName := "rls_app_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 		if _, err := db.ExecContext(ctx, fmt.Sprintf(`CREATE ROLE %s LOGIN PASSWORD 'rls_app'`, roleName)); err != nil {
@@ -150,7 +388,7 @@ func TestTenantRLSBlocksCrossOrgReadsWithScopedSession(t *testing.T) {
 		if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO %s`, roleName)); err != nil {
 			t.Fatalf("grant schema usage: %v", err)
 		}
-		if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON inboxes, threads, messages TO %s`, roleName)); err != nil {
+		if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON inboxes, threads, messages, outbox_events, inbox_smtp_configs, suppressions TO %s`, roleName)); err != nil {
 			t.Fatalf("grant table permissions: %v", err)
 		}
 
@@ -174,7 +412,11 @@ func TestTenantRLSBlocksCrossOrgReadsWithScopedSession(t *testing.T) {
 		if err != nil {
 			t.Fatalf("open app role connection: %v", err)
 		}
-		defer appDB.Close()
+		t.Cleanup(func() {
+			_ = appDB.Close()
+			_, _ = db.ExecContext(context.Background(), fmt.Sprintf(`DROP OWNED BY %s`, roleName))
+			_, _ = db.ExecContext(context.Background(), fmt.Sprintf(`DROP ROLE IF EXISTS %s`, roleName))
+		})
 
 		st := &Store{db: appDB, q: appDB}
 		var visibleThreads int
@@ -195,6 +437,28 @@ func TestTenantRLSBlocksCrossOrgReadsWithScopedSession(t *testing.T) {
 		}
 		if crossOrgRows != 0 {
 			t.Fatalf("expected org A to see 0 rows for org B thread, got %d", crossOrgRows)
+		}
+
+		for _, table := range []string{"outbox_events", "inbox_smtp_configs", "suppressions"} {
+			var visibleRows int
+			if err := st.RunAsOrg(ctx, orgA, func(scoped *Store) error {
+				return scoped.q.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, table)).Scan(&visibleRows)
+			}); err != nil {
+				t.Fatalf("read %s as org A: %v", table, err)
+			}
+			if visibleRows != 1 {
+				t.Fatalf("expected org A to see 1 row in %s via RLS, got %d", table, visibleRows)
+			}
+		}
+
+		if err := st.RunAsOrg(ctx, orgA, func(scoped *Store) error {
+			_, err := scoped.q.ExecContext(ctx, `
+				INSERT INTO suppressions (org_id, email_lower, reason, source)
+				VALUES ($1, 'cross-org@example.com', 'must be rejected', 'manual')
+			`, orgB)
+			return err
+		}); err == nil {
+			t.Fatal("expected org A cross-org suppression insert to be rejected by RLS")
 		}
 	})
 }
@@ -516,6 +780,39 @@ func assertColumnNotNull(t *testing.T, db *sql.DB, table, column string) {
 	}
 }
 
+func assertTenantRLSState(t *testing.T, db *sql.DB, table string, enabled bool) {
+	t.Helper()
+	policy := "tenant_isolation_" + table
+	var rowSecurity, forceRowSecurity, policyExists bool
+	if err := db.QueryRow(`
+		SELECT c.relrowsecurity,
+		       c.relforcerowsecurity,
+		       EXISTS (
+		         SELECT 1
+		         FROM pg_policies p
+		         WHERE p.schemaname = n.nspname
+		           AND p.tablename = c.relname
+		           AND p.policyname = $2
+		       )
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'public'
+		  AND c.relname = $1
+	`, table, policy).Scan(&rowSecurity, &forceRowSecurity, &policyExists); err != nil {
+		t.Fatalf("inspect tenant RLS for %s: %v", table, err)
+	}
+	if rowSecurity != enabled || forceRowSecurity != enabled || policyExists != enabled {
+		t.Fatalf(
+			"tenant RLS for %s = enabled:%t forced:%t policy:%t; want all %t",
+			table,
+			rowSecurity,
+			forceRowSecurity,
+			policyExists,
+			enabled,
+		)
+	}
+}
+
 func withTempDatabase(t *testing.T, run func(ctx context.Context, db *sql.DB)) {
 	t.Helper()
 
@@ -532,7 +829,9 @@ func withTempDatabase(t *testing.T, run func(ctx context.Context, db *sql.DB)) {
 	if err != nil {
 		t.Fatalf("open admin database: %v", err)
 	}
-	defer adminDB.Close()
+	t.Cleanup(func() {
+		_ = adminDB.Close()
+	})
 
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer pingCancel()
@@ -544,6 +843,10 @@ func withTempDatabase(t *testing.T, run func(ctx context.Context, db *sql.DB)) {
 	if _, err := adminDB.ExecContext(context.Background(), fmt.Sprintf(`CREATE DATABASE %s`, dbName)); err != nil {
 		t.Fatalf("create temp database %s: %v", dbName, err)
 	}
+	t.Cleanup(func() {
+		_, _ = adminDB.ExecContext(context.Background(), `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1`, dbName)
+		_, _ = adminDB.ExecContext(context.Background(), fmt.Sprintf(`DROP DATABASE IF EXISTS %s`, dbName))
+	})
 
 	testDSN, err := dsnWithDatabase(baseDSN, dbName)
 	if err != nil {
@@ -553,11 +856,8 @@ func withTempDatabase(t *testing.T, run func(ctx context.Context, db *sql.DB)) {
 	if err != nil {
 		t.Fatalf("open temp database: %v", err)
 	}
-
 	t.Cleanup(func() {
 		_ = db.Close()
-		_, _ = adminDB.ExecContext(context.Background(), `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1`, dbName)
-		_, _ = adminDB.ExecContext(context.Background(), fmt.Sprintf(`DROP DATABASE IF EXISTS %s`, dbName))
 	})
 
 	run(context.Background(), db)
