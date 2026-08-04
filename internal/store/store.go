@@ -22,6 +22,8 @@ type queryer interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// Types: credentials
+
 type CloudAPIKey struct {
 	ID        string
 	OrgID     string
@@ -40,6 +42,8 @@ type ServiceToken struct {
 	ExpiresAt time.Time
 	RevokedAt sql.NullTime
 }
+
+// Types: billing & entitlements
 
 type OrgEntitlement struct {
 	OrgID              string
@@ -77,15 +81,19 @@ type SubscriptionRecord struct {
 }
 
 type SubscriptionSummary struct {
-	OrgID                  string
-	PlanCode               string
-	SubscriptionStatus     string
-	ExternalCustomerID     string
-	ExternalSubscriptionID string
-	CurrentPeriodStart     sql.NullTime
-	CurrentPeriodEnd       sql.NullTime
-	CancelAtPeriodEnd      bool
-	GraceUntil             sql.NullTime
+	OrgID                  string     `json:"org_id"`
+	PlanCode               string     `json:"plan_code"`
+	SubscriptionStatus     string     `json:"subscription_status"`
+	ExternalCustomerID     string     `json:"external_customer_id"`
+	ExternalSubscriptionID string     `json:"external_subscription_id"`
+	CurrentPeriodStart     *time.Time `json:"current_period_start"`
+	CurrentPeriodEnd       *time.Time `json:"current_period_end"`
+	CancelAtPeriodEnd      bool       `json:"cancel_at_period_end"`
+	GraceUntil             *time.Time `json:"grace_until"`
+	MCPRPM                 int        `json:"mcp_rpm"`
+	MonthlyUnits           int64      `json:"monthly_units"`
+	MaxInboxes             int        `json:"max_inboxes"`
+	MaxDomains             int        `json:"max_domains"`
 }
 
 type UsageCounter struct {
@@ -95,6 +103,64 @@ type UsageCounter struct {
 	PeriodEnd   time.Time
 	Used        int64
 }
+
+type UsageBreakdown struct {
+	ToolName  string `json:"tool_name"`
+	Category  string `json:"category"`
+	CallCount int64  `json:"call_count"`
+	UnitsUsed int64  `json:"units_used"`
+}
+
+// Types: threads & messages
+
+type Thread struct {
+	ID               string
+	InboxID          string
+	Subject          string
+	Status           string
+	Participants     []Participant
+	UpdatedAt        time.Time
+	SentimentScore   *float64
+	PriorityLevel    *string
+	ProviderThreadID string
+}
+
+type Message struct {
+	ID                string
+	InboxID           string
+	ThreadID          string
+	Direction         string
+	Subject           string
+	Text              string
+	HTML              string
+	CreatedAt         time.Time
+	ProviderMessageID string
+	ProviderThreadID  string
+	InternetMessageID string
+	From              Participant
+	To                []Participant
+	CC                []Participant
+
+	InReplyTo       string
+	References      []string
+	ReceivedEmailID string
+}
+
+type Participant struct {
+	Name  string `json:"name"`
+	Email string `json:"email"`
+}
+
+type SearchResult struct {
+	MessageID string  `json:"message_id"`
+	ThreadID  string  `json:"thread_id"`
+	Score     float64 `json:"score"`
+	Snippet   string  `json:"snippet"`
+}
+
+var ErrOwnershipMismatch = errors.New("resource does not belong to org")
+
+// Core store lifecycle
 
 func Open(dsn string) (*Store, error) {
 	if dsn == "" {
@@ -155,48 +221,14 @@ func (s *Store) RunAsOrg(ctx context.Context, orgID string, fn func(scoped *Stor
 	return tx.Commit()
 }
 
-type Thread struct {
-	ID               string
-	InboxID          string
-	Subject          string
-	Status           string
-	Participants     []Participant
-	UpdatedAt        time.Time
-	SentimentScore   *float64
-	PriorityLevel    *string
-	ProviderThreadID string
+func (s *Store) HealthSummary(ctx context.Context) (map[string]string, error) {
+	if err := s.db.PingContext(ctx); err != nil {
+		return nil, err
+	}
+	return map[string]string{"database": "ok"}, nil
 }
 
-type Message struct {
-	ID                string
-	InboxID           string
-	ThreadID          string
-	Direction         string
-	Subject           string
-	Text              string
-	HTML              string
-	CreatedAt         time.Time
-	ProviderMessageID string
-	ProviderThreadID  string
-	InternetMessageID string
-	From              Participant
-	To                []Participant
-	CC                []Participant
-}
-
-type Participant struct {
-	Name  string `json:"name"`
-	Email string `json:"email"`
-}
-
-type SearchResult struct {
-	MessageID string  `json:"message_id"`
-	ThreadID  string  `json:"thread_id"`
-	Score     float64 `json:"score"`
-	Snippet   string  `json:"snippet"`
-}
-
-var ErrOwnershipMismatch = errors.New("resource does not belong to org")
+// Shared inbox helpers used by multiple files
 
 func (s *Store) EnsureInbox(ctx context.Context, address string) (string, error) {
 	orgID, err := s.EnsureDefaultOrg(ctx)
@@ -216,25 +248,6 @@ func (s *Store) EnsureInbox(ctx context.Context, address string) (string, error)
 	default:
 		return "", err
 	}
-}
-
-func (s *Store) UpdateCheckpoint(ctx context.Context, inboxID string, provider string, lastState string) error {
-	_, err := s.q.ExecContext(ctx, `INSERT INTO inbox_checkpoints (inbox_id, provider, last_state, updated_at)
-		VALUES ($1,$2,$3,now())
-		ON CONFLICT (inbox_id, provider) DO UPDATE SET last_state = EXCLUDED.last_state, updated_at = now()`, inboxID, provider, lastState)
-	return err
-}
-
-func (s *Store) GetCheckpoint(ctx context.Context, inboxID string, provider string) (string, error) {
-	row := s.q.QueryRowContext(ctx, `SELECT last_state FROM inbox_checkpoints WHERE inbox_id = $1 AND provider = $2`, inboxID, provider)
-	var state sql.NullString
-	if err := row.Scan(&state); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", nil
-		}
-		return "", err
-	}
-	return state.String, nil
 }
 
 func (s *Store) ListInboxes(ctx context.Context) ([]string, error) {
@@ -285,12 +298,35 @@ func (s *Store) LastInboxState(ctx context.Context, inboxID string) (string, err
 	return state.String, nil
 }
 
-func (s *Store) HealthSummary(ctx context.Context) (map[string]string, error) {
-	if err := s.db.PingContext(ctx); err != nil {
-		return nil, err
-	}
-	return map[string]string{"database": "ok"}, nil
+func (s *Store) UpdateCheckpoint(ctx context.Context, inboxID string, provider string, lastState string) error {
+	_, err := s.q.ExecContext(ctx, `INSERT INTO inbox_checkpoints (inbox_id, provider, last_state, updated_at)
+		VALUES ($1,$2,$3,now())
+		ON CONFLICT (inbox_id, provider) DO UPDATE SET last_state = EXCLUDED.last_state, updated_at = now()`, inboxID, provider, lastState)
+	return err
 }
+
+func (s *Store) GetCheckpoint(ctx context.Context, inboxID string, provider string) (string, error) {
+	row := s.q.QueryRowContext(ctx, `SELECT last_state FROM inbox_checkpoints WHERE inbox_id = $1 AND provider = $2`, inboxID, provider)
+	var state sql.NullString
+	if err := row.Scan(&state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	return state.String, nil
+}
+
+func (s *Store) CountInboxesByOrg(ctx context.Context, orgID string) (int, error) {
+	row := s.q.QueryRowContext(ctx, `SELECT count(*) FROM inboxes WHERE org_id = $1`, orgID)
+	var count int
+	if err := row.Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// Ownership enforcement
 
 func (s *Store) EnsureInboxBelongsToOrg(ctx context.Context, inboxID string, orgID string) error {
 	return s.ensureBelongsToOrg(ctx, `SELECT EXISTS(SELECT 1 FROM inboxes WHERE id = $1 AND org_id = $2)`, inboxID, orgID)
@@ -318,11 +354,12 @@ func (s *Store) ensureBelongsToOrg(ctx context.Context, query string, resourceID
 	return nil
 }
 
-func (s *Store) CountInboxesByOrg(ctx context.Context, orgID string) (int, error) {
-	row := s.q.QueryRowContext(ctx, `SELECT count(*) FROM inboxes WHERE org_id = $1`, orgID)
-	var count int
-	if err := row.Scan(&count); err != nil {
-		return 0, err
+// Shared helpers
+
+func nullTimePtr(value sql.NullTime) *time.Time {
+	if !value.Valid {
+		return nil
 	}
-	return count, nil
+	ts := value.Time.UTC()
+	return &ts
 }

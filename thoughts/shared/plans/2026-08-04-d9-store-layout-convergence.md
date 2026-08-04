@@ -93,3 +93,55 @@ Verification:
   declarations and bodies.
 - [x] `go build ./...`, `go vet ./...`, and `go test ./... -count=1` pass.
 - [x] `gofmt` and `git diff --check` pass.
+
+## Phase 0 §4 shared-core reconciliation (2026-08-04)
+
+The boundary split exposed a second class of drift: files intended for the
+exact-mirror set differed in both additive baseline behavior and internal Go
+types. Reconcile the OSS copies to nerve-cloud at `d62c4a0` for:
+
+- `store.go`;
+- `store_threads.go`;
+- `org_domains.go`;
+- `inboxes_manage.go`.
+
+This is the start of the Phase 0 §4 baseline backport, not another pure-move
+D9 change. The new message reply/receiving fields and domain receiving,
+catch-all, and forwarding accessors depend on the separately backported core
+migrations `0011`-`0017` before they can execute against a fresh OSS database.
+
+Two internal API changes are intentional convergence, not removals from the
+supported runtime contract:
+
+- `SubscriptionSummary` now uses JSON-ready `*time.Time` values and includes
+  the entitlement limits already returned by Cloud. `internal/store` is a Go
+  `internal` package, and all repository consumers are updated and tested in
+  the same baseline integration. The OSS-only billing boundary converts its
+  existing `sql.NullTime` scan values and populates the added limits without
+  changing the shared file.
+- `CreateInboxForOrg` gains the Cloud `outboundProvider` argument. The existing
+  OSS handler passes `"smtp"` explicitly, preserving its prior provider and
+  database behavior.
+
+Ownership correction: add `internal/store/inboxes_manage.go` to the
+**exact-mirror** list. Its old three-argument constructor was the only reason it
+could not be asserted; after the caller update, the file is byte-identical.
+The OSS-only handler call remains outside the exact set.
+
+`docs/MCP_Contract.md` deliberately remains OSS-authoritative. OSS implements
+and tests `compose_email.from_name`; Cloud's copy is stale by that one field.
+The exact-mirror gate must copy this OSS document into Cloud, not delete a live
+runtime contract from OSS.
+
+Verification:
+
+- [x] The four reconciled store files are byte-identical to Cloud `d62c4a0`.
+- [x] The complete pre-change exported declaration set remains present; the
+  only changed existing shapes are the two documented internal convergences.
+- [x] `go build ./...`, `go vet ./...`, and `go test -race ./... -count=1`
+  pass without a database DSN.
+- [ ] The real-PostgreSQL suite becomes green only when this commit is combined
+  with the §4 migration backport: the isolated branch still ends at core
+  `0010`, so the reconciled queries correctly expose missing `in_reply_to`,
+  `references`, `received_email_id`, `forward_to`, and receiving columns.
+- [x] `gofmt -l` and `git diff --check` pass.

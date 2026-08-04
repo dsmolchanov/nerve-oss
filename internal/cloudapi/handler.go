@@ -1353,7 +1353,7 @@ func (h *Handler) handleCreateInbox(w http.ResponseWriter, r *http.Request) {
 	var created store.InboxRecord
 	err = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
 		var err error
-		created, err = scoped.CreateInboxForOrg(r.Context(), orgID, canonical, orgDomainID)
+		created, err = scoped.CreateInboxForOrg(r.Context(), orgID, canonical, orgDomainID, "smtp")
 		return err
 	})
 	if err != nil {

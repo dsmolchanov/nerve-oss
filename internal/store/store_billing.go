@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"time"
 )
@@ -204,6 +205,9 @@ func (s *Store) FindStripeCustomerByOrg(ctx context.Context, orgID string) (stri
 
 func (s *Store) GetSubscriptionSummaryByOrg(ctx context.Context, orgID string) (SubscriptionSummary, error) {
 	var summary SubscriptionSummary
+	var currentPeriodStart sql.NullTime
+	var currentPeriodEnd sql.NullTime
+	var graceUntil sql.NullTime
 	row := s.q.QueryRowContext(ctx, `
 		SELECT
 			e.org_id,
@@ -214,7 +218,11 @@ func (s *Store) GetSubscriptionSummaryByOrg(ctx context.Context, orgID string) (
 			s.current_period_start,
 			s.current_period_end,
 			coalesce(s.cancel_at_period_end, false),
-			e.grace_until
+			e.grace_until,
+			e.mcp_rpm,
+			e.monthly_units,
+			e.max_inboxes,
+			coalesce(e.max_domains, 0)
 		FROM org_entitlements e
 		LEFT JOIN subscriptions s ON s.org_id = e.org_id
 		WHERE e.org_id = $1
@@ -227,13 +235,20 @@ func (s *Store) GetSubscriptionSummaryByOrg(ctx context.Context, orgID string) (
 		&summary.SubscriptionStatus,
 		&summary.ExternalCustomerID,
 		&summary.ExternalSubscriptionID,
-		&summary.CurrentPeriodStart,
-		&summary.CurrentPeriodEnd,
+		&currentPeriodStart,
+		&currentPeriodEnd,
 		&summary.CancelAtPeriodEnd,
-		&summary.GraceUntil,
+		&graceUntil,
+		&summary.MCPRPM,
+		&summary.MonthlyUnits,
+		&summary.MaxInboxes,
+		&summary.MaxDomains,
 	); err != nil {
 		return summary, err
 	}
+	summary.CurrentPeriodStart = nullTimePtr(currentPeriodStart)
+	summary.CurrentPeriodEnd = nullTimePtr(currentPeriodEnd)
+	summary.GraceUntil = nullTimePtr(graceUntil)
 	return summary, nil
 }
 

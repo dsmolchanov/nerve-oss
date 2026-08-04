@@ -1,11 +1,5 @@
 package store
 
-// Thread, message, search and audit accessors.
-//
-// Extracted verbatim from store.go so this package mirrors nerve-cloud's file
-// layout, which is a precondition for byte-identical mirroring of the shared
-// store surface. Pure code movement: no signature, body or behaviour change.
-
 import (
 	"context"
 	"database/sql"
@@ -20,7 +14,7 @@ func (s *Store) ListThreads(ctx context.Context, inboxID string, status string, 
 	if limit <= 0 {
 		limit = 50
 	}
-	query := `SELECT id, inbox_id, subject, status, participants, updated_at, sentiment_score, priority_level, provider_thread_id
+	query := `SELECT id, inbox_id, coalesce(subject,''), status, participants, updated_at, sentiment_score, priority_level, coalesce(provider_thread_id,'')
 		FROM threads WHERE inbox_id = $1`
 	args := []any{inboxID}
 	if status != "" {
@@ -52,13 +46,13 @@ func (s *Store) ListThreads(ctx context.Context, inboxID string, status string, 
 func (s *Store) GetThread(ctx context.Context, threadID string) (Thread, []Message, error) {
 	var t Thread
 	var participantsJSON []byte
-	row := s.q.QueryRowContext(ctx, `SELECT id, inbox_id, subject, status, participants, updated_at, sentiment_score, priority_level, provider_thread_id FROM threads WHERE id = $1`, threadID)
+	row := s.q.QueryRowContext(ctx, `SELECT id, inbox_id, coalesce(subject,''), status, participants, updated_at, sentiment_score, priority_level, coalesce(provider_thread_id,'') FROM threads WHERE id = $1`, threadID)
 	if err := row.Scan(&t.ID, &t.InboxID, &t.Subject, &t.Status, &participantsJSON, &t.UpdatedAt, &t.SentimentScore, &t.PriorityLevel, &t.ProviderThreadID); err != nil {
 		return t, nil, err
 	}
 	_ = json.Unmarshal(participantsJSON, &t.Participants)
 
-	rows, err := s.q.QueryContext(ctx, `SELECT id, inbox_id, thread_id, direction, subject, text, html, created_at, provider_message_id, internet_message_id, from_json, to_json, cc_json FROM messages WHERE thread_id = $1 ORDER BY created_at ASC`, threadID)
+	rows, err := s.q.QueryContext(ctx, `SELECT id, inbox_id, thread_id, direction, coalesce(subject,''), coalesce(text,''), coalesce(html,''), created_at, coalesce(provider_message_id,''), coalesce(internet_message_id,''), coalesce(from_json,'{}'), coalesce(to_json,'[]'), coalesce(cc_json,'[]') FROM messages WHERE thread_id = $1 ORDER BY created_at ASC`, threadID)
 	if err != nil {
 		return t, nil, err
 	}
@@ -91,8 +85,8 @@ func (s *Store) GetThreadInboxID(ctx context.Context, threadID string) (string, 
 func (s *Store) GetMessage(ctx context.Context, messageID string) (Message, error) {
 	var m Message
 	var fromJSON, toJSON, ccJSON []byte
-	row := s.q.QueryRowContext(ctx, `SELECT id, inbox_id, thread_id, direction, subject, text, html, created_at, provider_message_id, internet_message_id, from_json, to_json, cc_json FROM messages WHERE id = $1`, messageID)
-	if err := row.Scan(&m.ID, &m.InboxID, &m.ThreadID, &m.Direction, &m.Subject, &m.Text, &m.HTML, &m.CreatedAt, &m.ProviderMessageID, &m.InternetMessageID, &fromJSON, &toJSON, &ccJSON); err != nil {
+	row := s.q.QueryRowContext(ctx, `SELECT id, inbox_id, thread_id, direction, subject, text, html, created_at, provider_message_id, internet_message_id, from_json, to_json, cc_json, coalesce(received_email_id, '') FROM messages WHERE id = $1`, messageID)
+	if err := row.Scan(&m.ID, &m.InboxID, &m.ThreadID, &m.Direction, &m.Subject, &m.Text, &m.HTML, &m.CreatedAt, &m.ProviderMessageID, &m.InternetMessageID, &fromJSON, &toJSON, &ccJSON, &m.ReceivedEmailID); err != nil {
 		return m, err
 	}
 	_ = json.Unmarshal(fromJSON, &m.From)
@@ -161,11 +155,17 @@ func (s *Store) InsertMessage(ctx context.Context, msg Message) (string, error) 
 	fromJSON, _ := json.Marshal(msg.From)
 	toJSON, _ := json.Marshal(msg.To)
 	ccJSON, _ := json.Marshal(msg.CC)
-	row := s.q.QueryRowContext(ctx, `INSERT INTO messages (id, inbox_id, org_id, thread_id, direction, subject, text, html, created_at, provider_message_id, internet_message_id, from_json, to_json, cc_json)
-		VALUES ($1,$2,(SELECT org_id FROM inboxes WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+
+	var refs any
+	if len(msg.References) > 0 {
+		refs = msg.References
+	}
+
+	row := s.q.QueryRowContext(ctx, `INSERT INTO messages (id, inbox_id, org_id, thread_id, direction, subject, text, html, created_at, provider_message_id, internet_message_id, from_json, to_json, cc_json, in_reply_to, "references", received_email_id)
+		VALUES ($1,$2,(SELECT org_id FROM inboxes WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,nullif($14,''),$15,nullif($16,''))
 		ON CONFLICT (inbox_id, provider_message_id) DO UPDATE SET thread_id = EXCLUDED.thread_id
 		RETURNING id`,
-		msg.ID, msg.InboxID, msg.ThreadID, msg.Direction, msg.Subject, msg.Text, msg.HTML, msg.CreatedAt, msg.ProviderMessageID, msg.InternetMessageID, fromJSON, toJSON, ccJSON)
+		msg.ID, msg.InboxID, msg.ThreadID, msg.Direction, msg.Subject, msg.Text, msg.HTML, msg.CreatedAt, msg.ProviderMessageID, msg.InternetMessageID, fromJSON, toJSON, ccJSON, msg.InReplyTo, refs, msg.ReceivedEmailID)
 	var id string
 	if err := row.Scan(&id); err != nil {
 		return "", err
@@ -173,58 +173,9 @@ func (s *Store) InsertMessage(ctx context.Context, msg Message) (string, error) 
 	return id, nil
 }
 
-func (s *Store) RecordToolCall(ctx context.Context, toolName string, idempotencyKey string, modelName string, promptVersion string, latencyMS int) (string, error) {
-	id := uuid.NewString()
-	_, err := s.q.ExecContext(ctx, `INSERT INTO tool_calls (id, tool_name, idempotency_key, model_name, prompt_version, latency_ms) VALUES ($1,$2,$3,$4,$5,$6)`,
-		id, toolName, idempotencyKey, modelName, promptVersion, latencyMS)
-	if err != nil {
-		return "", err
-	}
-	return id, nil
-}
-
-func (s *Store) RecordAudit(ctx context.Context, toolCallID string, actor string, inputsHash string, outputsHash string, replayID string) error {
-	_, err := s.q.ExecContext(ctx, `INSERT INTO audit_log (tool_call_id, actor, inputs_hash, outputs_hash, replay_id) VALUES ($1,$2,$3,$4,$5)`,
-		toolCallID, actor, inputsHash, outputsHash, replayID)
-	return err
-}
-
-func (s *Store) ListAudit(ctx context.Context, limit int) ([]map[string]any, error) {
-	if limit <= 0 {
-		limit = 20
-	}
-	rows, err := s.q.QueryContext(ctx, `SELECT a.id, a.replay_id, a.created_at, t.tool_name, t.latency_ms
-		FROM audit_log a
-		LEFT JOIN tool_calls t ON t.id = a.tool_call_id
-		ORDER BY a.created_at DESC
-		LIMIT $1`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []map[string]any
-	for rows.Next() {
-		var id, replayID, toolName sql.NullString
-		var createdAt time.Time
-		var latency sql.NullInt64
-		if err := rows.Scan(&id, &replayID, &createdAt, &toolName, &latency); err != nil {
-			return nil, err
-		}
-		out = append(out, map[string]any{
-			"id":         id.String,
-			"replay_id":  replayID.String,
-			"created_at": createdAt,
-			"tool_name":  toolName.String,
-			"latency_ms": latency.Int64,
-		})
-	}
-	return out, rows.Err()
-}
-
 func (s *Store) EnsureThread(ctx context.Context, inboxID string, providerThreadID string, subject string, participants []Participant) (string, error) {
 	if providerThreadID != "" {
-		row := s.q.QueryRowContext(ctx, `SELECT id FROM threads WHERE inbox_id = $1 AND provider_thread_id = $2`, inboxID, providerThreadID)
+		row := s.q.QueryRowContext(ctx, `UPDATE threads SET updated_at = $3 WHERE inbox_id = $1 AND provider_thread_id = $2 RETURNING id`, inboxID, providerThreadID, time.Now().UTC())
 		var id string
 		if err := row.Scan(&id); err == nil {
 			return id, nil
@@ -275,4 +226,53 @@ func (s *Store) MessageCount(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	return count, nil
+}
+
+func (s *Store) RecordToolCall(ctx context.Context, toolName string, idempotencyKey string, modelName string, promptVersion string, latencyMS int) (string, error) {
+	id := uuid.NewString()
+	_, err := s.q.ExecContext(ctx, `INSERT INTO tool_calls (id, tool_name, idempotency_key, model_name, prompt_version, latency_ms) VALUES ($1,$2,$3,$4,$5,$6)`,
+		id, toolName, idempotencyKey, modelName, promptVersion, latencyMS)
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func (s *Store) RecordAudit(ctx context.Context, toolCallID string, actor string, inputsHash string, outputsHash string, replayID string) error {
+	_, err := s.q.ExecContext(ctx, `INSERT INTO audit_log (tool_call_id, actor, inputs_hash, outputs_hash, replay_id) VALUES ($1,$2,$3,$4,$5)`,
+		toolCallID, actor, inputsHash, outputsHash, replayID)
+	return err
+}
+
+func (s *Store) ListAudit(ctx context.Context, limit int) ([]map[string]any, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.q.QueryContext(ctx, `SELECT a.id, a.replay_id, a.created_at, t.tool_name, t.latency_ms
+		FROM audit_log a
+		LEFT JOIN tool_calls t ON t.id = a.tool_call_id
+		ORDER BY a.created_at DESC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []map[string]any
+	for rows.Next() {
+		var id, replayID, toolName sql.NullString
+		var createdAt time.Time
+		var latency sql.NullInt64
+		if err := rows.Scan(&id, &replayID, &createdAt, &toolName, &latency); err != nil {
+			return nil, err
+		}
+		out = append(out, map[string]any{
+			"id":         id.String,
+			"replay_id":  replayID.String,
+			"created_at": createdAt,
+			"tool_name":  toolName.String,
+			"latency_ms": latency.Int64,
+		})
+	}
+	return out, rows.Err()
 }
