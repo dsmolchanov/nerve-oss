@@ -15,7 +15,9 @@ jobs:
         with:
           go-version: "1.23"
       - name: Go fmt
-        run: test -z "$(gofmt -l $(git ls-files '*.go'))"
+        run: |
+          unformatted="$(git ls-files -z '*.go' | xargs -0 -r gofmt -l)"
+          test -z "$unformatted"
       - name: Go vet
         run: go vet ./...
       - name: Go test
@@ -25,4 +27,6 @@ jobs:
       - name: Verify migration ownership
         run: ./scripts/ci/verify_migration_ownership.sh
       - name: Docker build
-        run: docker build -f deploy/docker/cortex/Dockerfile .
+        run: docker build -t nerve-oss-ci:test -f deploy/docker/cortex/Dockerfile .
+      - name: Migration CLI image smoke
+        run: docker run --rm --entrypoint /app/nerve-migrate nerve-oss-ci:test --help

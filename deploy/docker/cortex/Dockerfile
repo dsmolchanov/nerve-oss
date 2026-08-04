@@ -18,8 +18,11 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -X neuralmail/internal/release.MCPContractHash=${MCP_CONTRACT_HASH} \
     -X neuralmail/internal/release.CoreSchemaHash=${CORE_SCHEMA_HASH} \
     -X neuralmail/internal/release.BuildCommit=${BUILD_COMMIT} \
-    -X neuralmail/internal/release.BuildTime=${BUILD_TIME}" \
+  -X neuralmail/internal/release.BuildTime=${BUILD_TIME}" \
   -o /out/nerve-runtime ./cmd/neuralmaild
+RUN CGO_ENABLED=0 GOOS=linux go build \
+  -ldflags "-s -w" \
+  -o /out/nerve-migrate ./cmd/nerve-migrate
 
 FROM alpine:3.20
 
@@ -29,6 +32,7 @@ USER neuralmail
 WORKDIR /app
 
 COPY --from=build /out/nerve-runtime /app/nerve-runtime
+COPY --from=build /out/nerve-migrate /app/nerve-migrate
 RUN ln -s /app/nerve-runtime /app/neuralmaild
 COPY configs /app/configs
 COPY internal/store/migrations /app/internal/store/migrations
