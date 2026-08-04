@@ -419,7 +419,7 @@ func TestUsageEventsReplayIDPartialUniqueIndex(t *testing.T) {
 	})
 }
 
-func TestTenantRLSBlocksCrossOrgReadsWithScopedSession(t *testing.T) {
+func TestTenantRLSBlocksCrossOrgReadsAndWritesWithScopedSession(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToLatest(t, ctx, db)
 
@@ -550,14 +550,36 @@ func TestTenantRLSBlocksCrossOrgReadsWithScopedSession(t *testing.T) {
 			}
 		}
 
-		if err := st.RunAsOrg(ctx, orgA, func(scoped *Store) error {
-			_, err := scoped.q.ExecContext(ctx, `
-				INSERT INTO suppressions (org_id, email_lower, reason, source)
-				VALUES ($1, 'cross-org@example.com', 'must be rejected', 'manual')
-			`, orgB)
-			return err
-		}); err == nil {
-			t.Fatal("expected org A cross-org suppression insert to be rejected by RLS")
+		writeCases := []struct {
+			name string
+			stmt string
+			args []any
+		}{
+			{
+				name: "outbox_events update",
+				stmt: `UPDATE outbox_events SET org_id = $1 WHERE outbox_message_id = $2`,
+				args: []any{orgB, outboxA},
+			},
+			{
+				name: "inbox_smtp_configs update",
+				stmt: `UPDATE inbox_smtp_configs SET org_id = $1 WHERE inbox_id = $2`,
+				args: []any{orgB, inboxA},
+			},
+			{
+				name: "suppressions insert",
+				stmt: `INSERT INTO suppressions (org_id, email_lower, reason, source)
+				       VALUES ($1, 'cross-org@example.com', 'must be rejected', 'manual')`,
+				args: []any{orgB},
+			},
+		}
+		for _, writeCase := range writeCases {
+			err := st.RunAsOrg(ctx, orgA, func(scoped *Store) error {
+				_, err := scoped.q.ExecContext(ctx, writeCase.stmt, writeCase.args...)
+				return err
+			})
+			if err == nil {
+				t.Fatalf("expected org A cross-org %s to be rejected by RLS", writeCase.name)
+			}
 		}
 	})
 }
