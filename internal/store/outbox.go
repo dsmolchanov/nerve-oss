@@ -35,6 +35,7 @@ var ErrDomainNotVerified = errors.New("domain not verified")
 
 var (
 	ErrOutboxIdempotencyConflict = errors.New("outbox idempotency conflict")
+	ErrOutboxNotFailed           = errors.New("outbox message is not failed")
 	ErrAttachmentCountExceeded   = errors.New("attachment count exceeded")
 	ErrAttachmentTooLarge        = errors.New("attachment too large")
 	ErrAttachmentEmpty           = errors.New("attachment empty")
@@ -85,16 +86,19 @@ type OutboxMessage struct {
 	InReplyToMessageID string // Internet-Message-ID of the message being replied to
 	References         string // Space-separated list of ancestor message IDs
 
-	Status           string
-	DeliveryStatus   string
-	DeliveryStatusAt sql.NullTime
-	AttemptCount     int
-	NextAttemptAt    time.Time
-	LastAttemptAt    sql.NullTime
-	LastError        sql.NullString
-	LockedAt         sql.NullTime
-	LockedBy         sql.NullString
-	CreatedAt        time.Time
+	Status                string
+	DeliveryStatus        string
+	DeliveryStatusAt      sql.NullTime
+	AttemptCount          int
+	NextAttemptAt         time.Time
+	LastAttemptAt         sql.NullTime
+	LastError             sql.NullString
+	LockedAt              sql.NullTime
+	LockedBy              sql.NullString
+	CreatedAt             time.Time
+	TerminalAt            sql.NullTime
+	AttachmentsReleasedAt sql.NullTime
+	AttachmentsAvailable  bool
 }
 
 // OutboxEvent represents a delivery event in the append-only timeline.
@@ -807,7 +811,13 @@ func (s *Store) GetOutboxMessageByIDForOrg(ctx context.Context, orgID, id string
 		       "to", "from", subject, coalesce(text_body, ''), coalesce(html_body, ''),
 		       status, delivery_status, delivery_status_at,
 		       attempt_count, next_attempt_at, last_attempt_at, last_error,
-		       locked_at, locked_by, created_at
+		       locked_at, locked_by, created_at, terminal_at, attachments_released_at,
+		       NOT EXISTS (
+		         SELECT 1 FROM outbox_attachments attachment
+		         WHERE attachment.org_id = outbox_messages.org_id
+		           AND attachment.outbox_message_id = outbox_messages.id
+		           AND attachment.blob_sha256 IS NULL
+		       ) AS attachments_available
 		FROM outbox_messages
 		WHERE org_id = $1 AND id = $2
 	`, orgID, id)
@@ -816,7 +826,8 @@ func (s *Store) GetOutboxMessageByIDForOrg(ctx context.Context, orgID, id string
 		&m.To, &m.From, &m.Subject, &m.TextBody, &m.HTMLBody,
 		&m.Status, &m.DeliveryStatus, &m.DeliveryStatusAt,
 		&m.AttemptCount, &m.NextAttemptAt, &m.LastAttemptAt, &m.LastError,
-		&m.LockedAt, &m.LockedBy, &m.CreatedAt,
+		&m.LockedAt, &m.LockedBy, &m.CreatedAt, &m.TerminalAt, &m.AttachmentsReleasedAt,
+		&m.AttachmentsAvailable,
 	); err != nil {
 		return OutboxMessage{}, err
 	}
@@ -838,7 +849,13 @@ func (s *Store) ListFailedOutboxForOrg(ctx context.Context, orgID string, limit 
 		       "to", "from", subject, coalesce(text_body, ''), coalesce(html_body, ''),
 		       status, delivery_status, delivery_status_at,
 		       attempt_count, next_attempt_at, last_attempt_at, last_error,
-		       locked_at, locked_by, created_at
+		       locked_at, locked_by, created_at, terminal_at, attachments_released_at,
+		       NOT EXISTS (
+		         SELECT 1 FROM outbox_attachments attachment
+		         WHERE attachment.org_id = outbox_messages.org_id
+		           AND attachment.outbox_message_id = outbox_messages.id
+		           AND attachment.blob_sha256 IS NULL
+		       ) AS attachments_available
 		FROM outbox_messages
 		WHERE org_id = $1 AND status = 'failed'
 		ORDER BY created_at DESC, id DESC
@@ -856,7 +873,8 @@ func (s *Store) ListFailedOutboxForOrg(ctx context.Context, orgID string, limit 
 			&m.To, &m.From, &m.Subject, &m.TextBody, &m.HTMLBody,
 			&m.Status, &m.DeliveryStatus, &m.DeliveryStatusAt,
 			&m.AttemptCount, &m.NextAttemptAt, &m.LastAttemptAt, &m.LastError,
-			&m.LockedAt, &m.LockedBy, &m.CreatedAt,
+			&m.LockedAt, &m.LockedBy, &m.CreatedAt, &m.TerminalAt, &m.AttachmentsReleasedAt,
+			&m.AttachmentsAvailable,
 		); err != nil {
 			return nil, err
 		}
@@ -895,6 +913,106 @@ func (s *Store) ListOutboxEventsForMessage(ctx context.Context, orgID, outboxMes
 	return out, rows.Err()
 }
 
+// ReleaseSentOutboxAttachments releases blob references for sent messages
+// whose terminal timestamp is at or before terminalBefore. Message rows,
+// attachment metadata, digests, events, and idempotency tombstones remain.
+func (s *Store) ReleaseSentOutboxAttachments(ctx context.Context, terminalBefore time.Time, limit int) (int, error) {
+	if terminalBefore.IsZero() {
+		return 0, errors.New("missing outbox attachment release cutoff")
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	var released int
+	err := s.q.QueryRowContext(ctx, `
+		WITH picked AS (
+		  SELECT id, org_id
+		  FROM outbox_messages
+		  WHERE status = 'sent'
+		    AND terminal_at <= $1
+		    AND attachments_released_at IS NULL
+		  ORDER BY terminal_at, id
+		  LIMIT $2
+		  FOR UPDATE SKIP LOCKED
+		), released_refs AS (
+		  UPDATE outbox_attachments attachment
+		  SET blob_sha256 = NULL
+		  FROM picked
+		  WHERE attachment.org_id = picked.org_id
+		    AND attachment.outbox_message_id = picked.id
+		    AND attachment.blob_sha256 IS NOT NULL
+		  RETURNING attachment.id
+		), stamped AS (
+		  UPDATE outbox_messages message
+		  SET attachments_released_at = now()
+		  FROM picked
+		  WHERE message.org_id = picked.org_id
+		    AND message.id = picked.id
+		  RETURNING message.id
+		)
+		SELECT count(*) FROM stamped
+	`, terminalBefore, limit).Scan(&released)
+	return released, err
+}
+
+// AbandonOutboxMessage permanently releases attachment bytes for a failed
+// outbox row while retaining its DLQ history and attachment metadata. Repeating
+// an already-completed abandon is a no-op. The parent lock serializes callers.
+func (s *Store) AbandonOutboxMessage(ctx context.Context, orgID, id string) error {
+	if orgID == "" || id == "" {
+		return errors.New("missing org_id or id")
+	}
+	return s.withTx(ctx, func(scoped *Store) error {
+		var status string
+		var releasedAt sql.NullTime
+		if err := scoped.q.QueryRowContext(ctx, `
+			SELECT status, attachments_released_at
+			FROM outbox_messages
+			WHERE org_id = $1 AND id = $2
+			FOR UPDATE
+		`, orgID, id).Scan(&status, &releasedAt); err != nil {
+			return err
+		}
+		if status != "failed" {
+			return ErrOutboxNotFailed
+		}
+		if releasedAt.Valid {
+			return nil
+		}
+		if _, err := scoped.q.ExecContext(ctx, `
+			UPDATE outbox_attachments
+			SET blob_sha256 = NULL
+			WHERE org_id = $1
+			  AND outbox_message_id = $2
+			  AND blob_sha256 IS NOT NULL
+		`, orgID, id); err != nil {
+			return err
+		}
+		if _, err := scoped.q.ExecContext(ctx, `
+			UPDATE outbox_messages
+			SET attachments_released_at = now()
+			WHERE org_id = $1 AND id = $2
+		`, orgID, id); err != nil {
+			return err
+		}
+
+		toolCallID, err := scoped.RecordToolCall(ctx, "abandon_outbox_message", id, "", "control-plane", 0)
+		if err != nil {
+			return err
+		}
+		input := sha256.Sum256([]byte(orgID + "\x00" + id))
+		output := sha256.Sum256([]byte("attachments_released"))
+		return scoped.RecordAudit(
+			ctx,
+			toolCallID,
+			"nerve:admin.deliverability",
+			hex.EncodeToString(input[:]),
+			hex.EncodeToString(output[:]),
+			id,
+		)
+	})
+}
+
 // ReplayOutboxMessage resets a failed outbox row so the worker picks it
 // up on the next claim cycle. Clears attempt_count, last_error, lock
 // fields, and sets next_attempt_at to now. Only replays rows in the
@@ -906,19 +1024,20 @@ func (s *Store) ReplayOutboxMessage(ctx context.Context, orgID, id string) (bool
 	var replayed bool
 	err := s.withTx(ctx, func(scoped *Store) error {
 		var status string
-		var released bool
+		var releasedDigests string
 		if err := scoped.q.QueryRowContext(ctx, `
 			SELECT outbox.status,
-			       EXISTS (
-			         SELECT 1 FROM outbox_attachments attachment
+			       COALESCE((
+			         SELECT string_agg(DISTINCT attachment.sha256, ',' ORDER BY attachment.sha256)
+			         FROM outbox_attachments attachment
 			         WHERE attachment.org_id = outbox.org_id
 			           AND attachment.outbox_message_id = outbox.id
 			           AND attachment.blob_sha256 IS NULL
-			       )
+			       ), '')
 			FROM outbox_messages outbox
 			WHERE outbox.org_id = $1 AND outbox.id = $2
 			FOR UPDATE
-		`, orgID, id).Scan(&status, &released); err != nil {
+		`, orgID, id).Scan(&status, &releasedDigests); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil
 			}
@@ -927,8 +1046,8 @@ func (s *Store) ReplayOutboxMessage(ctx context.Context, orgID, id string) (bool
 		if status != "failed" {
 			return nil
 		}
-		if released {
-			return ErrAttachmentsReleased
+		if releasedDigests != "" {
+			return fmt.Errorf("%w: digests=%s", ErrAttachmentsReleased, releasedDigests)
 		}
 		if _, err := scoped.q.ExecContext(ctx, `
 			UPDATE outbox_messages

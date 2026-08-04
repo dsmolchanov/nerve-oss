@@ -146,3 +146,50 @@ func (s *Store) LoadAttachmentBlob(ctx context.Context, orgID, digest string) ([
 	`, orgID, digest).Scan(&content)
 	return content, err
 }
+
+// DeleteUnreferencedAttachmentBlobs garbage-collects blobs that have remained
+// unreferenced through the supplied grace-period cutoff. Usage is decremented
+// in the same statement, while attachment metadata and its durable digest live
+// on in the reference tables.
+func (s *Store) DeleteUnreferencedAttachmentBlobs(ctx context.Context, lastRefBefore time.Time, limit int) (int, int64, error) {
+	if lastRefBefore.IsZero() {
+		return 0, 0, errors.New("missing attachment garbage-collection cutoff")
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	var deleted int
+	var bytesReleased int64
+	err := s.q.QueryRowContext(ctx, `
+		WITH picked AS (
+		  SELECT org_id, sha256
+		  FROM attachment_blobs
+		  WHERE ref_count = 0
+		    AND last_ref_at <= $1
+		  ORDER BY last_ref_at, org_id, sha256
+		  LIMIT $2
+		  FOR UPDATE SKIP LOCKED
+		), removed AS (
+		  DELETE FROM attachment_blobs blob
+		  USING picked
+		  WHERE blob.org_id = picked.org_id
+		    AND blob.sha256 = picked.sha256
+		    AND blob.ref_count = 0
+		  RETURNING blob.org_id, blob.size_bytes
+		), released_by_org AS (
+		  SELECT org_id, sum(size_bytes)::bigint AS size_bytes
+		  FROM removed
+		  GROUP BY org_id
+		), usage_updated AS (
+		  UPDATE org_attachment_usage usage
+		  SET bytes_used = greatest(usage.bytes_used - released.size_bytes, 0),
+		      updated_at = now()
+		  FROM released_by_org released
+		  WHERE usage.org_id = released.org_id
+		  RETURNING usage.org_id
+		)
+		SELECT count(*), COALESCE(sum(size_bytes), 0)::bigint
+		FROM removed
+	`, lastRefBefore, limit).Scan(&deleted, &bytesReleased)
+	return deleted, bytesReleased, err
+}

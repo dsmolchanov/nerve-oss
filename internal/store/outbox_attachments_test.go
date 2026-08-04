@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -382,6 +384,189 @@ func TestReplayOutboxMessageRejectsReleasedAttachments(t *testing.T) {
 		}
 		if !digest.Valid || digest.String == "" || blobDigest.Valid {
 			t.Fatalf("sha256=%v blob_sha256=%v after release", digest, blobDigest)
+		}
+	})
+}
+
+func TestReleaseSentOutboxAttachmentsRetainsHistoryAndGarbageCollectsBytes(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		st, orgID, inboxID := seedOutboundAttachmentStore(t, ctx, db, "sent-retention")
+		message := outboundAttachmentMessage(orgID, inboxID, "sent-retention-key", []OutboundAttachment{
+			{Filename: "audit.txt", ContentType: "text/plain", Content: []byte("retained audit metadata")},
+		})
+		outboxID, err := st.EnqueueOutboxMessage(ctx, message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.InsertOutboxEvent(ctx, OutboxEvent{
+			OrgID:           orgID,
+			OutboxMessageID: outboxID,
+			EventType:       "delivered",
+			RawPayload:      []byte(`{"status":"delivered"}`),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.MarkOutboxMessageSent(ctx, outboxID, "provider-sent"); err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC()
+		if _, err := db.ExecContext(ctx, `
+			UPDATE outbox_messages SET terminal_at = $2 WHERE id = $1
+		`, outboxID, now.Add(-91*24*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+
+		released, err := st.ReleaseSentOutboxAttachments(ctx, now.Add(-90*24*time.Hour), 100)
+		if err != nil || released != 1 {
+			t.Fatalf("released=%d err=%v, want 1", released, err)
+		}
+		released, err = st.ReleaseSentOutboxAttachments(ctx, now.Add(-90*24*time.Hour), 100)
+		if err != nil || released != 0 {
+			t.Fatalf("repeat released=%d err=%v, want 0", released, err)
+		}
+
+		detail, err := st.GetOutboxMessageByIDForOrg(ctx, orgID, outboxID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if detail.Status != "sent" || detail.AttachmentsAvailable || !detail.AttachmentsReleasedAt.Valid {
+			t.Fatalf("detail status=%s available=%t released_at=%v", detail.Status, detail.AttachmentsAvailable, detail.AttachmentsReleasedAt)
+		}
+		failed, err := st.ListFailedOutboxForOrg(ctx, orgID, 10)
+		if err != nil || len(failed) != 0 {
+			t.Fatalf("failed rows=%d err=%v, want none", len(failed), err)
+		}
+		events, err := st.ListOutboxEventsForMessage(ctx, orgID, outboxID)
+		if err != nil || len(events) != 1 || events[0].EventType != "delivered" {
+			t.Fatalf("events=%+v err=%v", events, err)
+		}
+		replayID, err := st.EnqueueOutboxMessage(ctx, message)
+		if err != nil || replayID != outboxID {
+			t.Fatalf("idempotency tombstone id=%s err=%v, want %s", replayID, err, outboxID)
+		}
+
+		var digest string
+		var blobDigest sql.NullString
+		if err := db.QueryRowContext(ctx, `
+			SELECT sha256, blob_sha256
+			FROM outbox_attachments
+			WHERE org_id = $1 AND outbox_message_id = $2
+		`, orgID, outboxID).Scan(&digest, &blobDigest); err != nil {
+			t.Fatal(err)
+		}
+		if digest == "" || blobDigest.Valid {
+			t.Fatalf("metadata digest=%q blob=%v after release", digest, blobDigest)
+		}
+		if _, err := db.ExecContext(ctx, `
+			UPDATE attachment_blobs SET last_ref_at = $3
+			WHERE org_id = $1 AND sha256 = $2
+		`, orgID, digest, now.Add(-8*24*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		deleted, bytesReleased, err := st.DeleteUnreferencedAttachmentBlobs(ctx, now.Add(-7*24*time.Hour), 100)
+		if err != nil || deleted != 1 || bytesReleased != int64(len(message.Attachments[0].Content)) {
+			t.Fatalf("deleted=%d bytes=%d err=%v", deleted, bytesReleased, err)
+		}
+		var blobs int
+		var bytesUsed int64
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM attachment_blobs WHERE org_id = $1`, orgID).Scan(&blobs); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.QueryRowContext(ctx, `SELECT bytes_used FROM org_attachment_usage WHERE org_id = $1`, orgID).Scan(&bytesUsed); err != nil {
+			t.Fatal(err)
+		}
+		if blobs != 0 || bytesUsed != 0 {
+			t.Fatalf("post-GC blobs=%d bytes_used=%d, want 0/0", blobs, bytesUsed)
+		}
+	})
+}
+
+func TestFailedOutboxRetentionRequiresAuditedIdempotentAbandon(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		st, orgID, inboxID := seedOutboundAttachmentStore(t, ctx, db, "failed-retention")
+		message := outboundAttachmentMessage(orgID, inboxID, "failed-retention-key", []OutboundAttachment{
+			{Filename: "replay.txt", ContentType: "text/plain", Content: []byte("replayable failure")},
+		})
+		outboxID, err := st.EnqueueOutboxMessage(ctx, message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.MarkOutboxMessageFailed(ctx, outboxID, "provider failure"); err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC()
+		if _, err := db.ExecContext(ctx, `UPDATE outbox_messages SET terminal_at = $2 WHERE id = $1`, outboxID, now.Add(-91*24*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		released, err := st.ReleaseSentOutboxAttachments(ctx, now.Add(-90*24*time.Hour), 100)
+		if err != nil || released != 0 {
+			t.Fatalf("failed sweep released=%d err=%v, want 0", released, err)
+		}
+		if loaded, err := st.LoadOutboxMessageAttachments(ctx, orgID, outboxID); err != nil || len(loaded) != 1 {
+			t.Fatalf("failed attachment load=%d err=%v, want replayable", len(loaded), err)
+		}
+
+		replayed, err := st.ReplayOutboxMessage(ctx, orgID, outboxID)
+		if err != nil || !replayed {
+			t.Fatalf("pre-abandon replayed=%t err=%v", replayed, err)
+		}
+		assertOutboxTerminalState(t, ctx, db, outboxID, "queued", false)
+		if err := st.MarkOutboxMessageFailed(ctx, outboxID, "provider failed again"); err != nil {
+			t.Fatal(err)
+		}
+
+		errs := make(chan error, 2)
+		var wg sync.WaitGroup
+		for range 2 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				errs <- st.AbandonOutboxMessage(ctx, orgID, outboxID)
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("concurrent abandon: %v", err)
+			}
+		}
+		if err := st.AbandonOutboxMessage(ctx, orgID, outboxID); err != nil {
+			t.Fatalf("repeat abandon: %v", err)
+		}
+
+		var digest string
+		if err := db.QueryRowContext(ctx, `SELECT sha256 FROM outbox_attachments WHERE outbox_message_id = $1`, outboxID).Scan(&digest); err != nil {
+			t.Fatal(err)
+		}
+		replayed, err = st.ReplayOutboxMessage(ctx, orgID, outboxID)
+		if replayed || !errors.Is(err, ErrAttachmentsReleased) || !strings.Contains(err.Error(), digest) {
+			t.Fatalf("post-abandon replayed=%t err=%v, want digest %s", replayed, err, digest)
+		}
+		detail, err := st.GetOutboxMessageByIDForOrg(ctx, orgID, outboxID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if detail.Status != "failed" || detail.AttachmentsAvailable || !detail.AttachmentsReleasedAt.Valid {
+			t.Fatalf("detail status=%s available=%t released_at=%v", detail.Status, detail.AttachmentsAvailable, detail.AttachmentsReleasedAt)
+		}
+		var audits int
+		if err := db.QueryRowContext(ctx, `
+			SELECT count(*) FROM audit_log
+			WHERE replay_id = $1 AND actor = 'nerve:admin.deliverability'
+		`, outboxID).Scan(&audits); err != nil {
+			t.Fatal(err)
+		}
+		if audits != 1 {
+			t.Fatalf("abandon audit rows=%d, want 1", audits)
+		}
+
+		queuedID, err := st.EnqueueOutboxMessage(ctx, outboundAttachmentMessage(orgID, inboxID, "non-failed-abandon", nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.AbandonOutboxMessage(ctx, orgID, queuedID); !errors.Is(err, ErrOutboxNotFailed) {
+			t.Fatalf("non-failed abandon err=%v, want ErrOutboxNotFailed", err)
 		}
 	})
 }
