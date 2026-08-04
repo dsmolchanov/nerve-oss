@@ -729,6 +729,7 @@ func TestMigrationStatusOnFreshDatabaseIsReadOnly(t *testing.T) {
 		assertMigrationStatus(t, core, 0, coreVersions)
 		assertMigrationStatus(t, cloud, 0, cloudVersions)
 		assertVersionAbsent(t, cloud.Pending, 2)
+		assertVersionPresent(t, cloud.Pending, 3)
 		if tableExists(ctx, t, db, migrationTableCore) || tableExists(ctx, t, db, migrationTableCloud) {
 			t.Fatal("read-only migration status created a migration table")
 		}
@@ -770,6 +771,7 @@ func TestMigrationStatusCloudPreservesSparsePendingVersions(t *testing.T) {
 		status = requireMigrationStatus(t, status, err)
 		assertMigrationStatus(t, status, 1, versionsAfter(versions, 1))
 		assertVersionAbsent(t, status.Pending, 2)
+		assertVersionPresent(t, status.Pending, 3)
 	})
 }
 
@@ -878,6 +880,16 @@ func assertVersionAbsent(t *testing.T, versions []int64, absent int64) {
 			t.Fatalf("migration versions = %v; synthetic gap version %d must be absent", versions, absent)
 		}
 	}
+}
+
+func assertVersionPresent(t *testing.T, versions []int64, required int64) {
+	t.Helper()
+	for _, version := range versions {
+		if version == required {
+			return
+		}
+	}
+	t.Fatalf("migration versions = %v; required version %d is missing", versions, required)
 }
 
 func TestWithGooseSerializesConfigurationAndOperation(t *testing.T) {
