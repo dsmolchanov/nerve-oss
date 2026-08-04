@@ -32,16 +32,17 @@ const (
 )
 
 type OutboundMessage struct {
-	From     string
-	To       []string
-	CC       []string
-	BCC      []string
-	ReplyTo  []string
-	Subject  string
-	TextBody string
-	HTMLBody string
-	Headers  map[string]string
-	Tags     map[string]string
+	From        string
+	To          []string
+	CC          []string
+	BCC         []string
+	ReplyTo     []string
+	Subject     string
+	TextBody    string
+	HTMLBody    string
+	Headers     map[string]string
+	Tags        map[string]string
+	Attachments []store.OutboundAttachment
 }
 
 type OutboundAdapter interface {

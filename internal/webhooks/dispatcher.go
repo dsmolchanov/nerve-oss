@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"time"
 
+	"neuralmail/internal/httpsafe"
 	"neuralmail/internal/store"
 )
 
@@ -85,7 +86,11 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 		d.MaxAttempts = store.MaxWebhookRetries
 	}
 	if d.HTTPClient == nil {
-		d.HTTPClient = &http.Client{Timeout: 10 * time.Second}
+		client, err := httpsafe.New(httpsafe.Config{Timeout: 10 * time.Second})
+		if err != nil {
+			return err
+		}
+		d.HTTPClient = client
 	}
 
 	ticker := time.NewTicker(d.PollInterval)
@@ -201,7 +206,7 @@ func (d *Dispatcher) postSigned(ctx context.Context, url, secret string, payload
 	}
 	defer resp.Body.Close()
 	// Drain the body so the connection can be reused.
-	_, _ = io.Copy(io.Discard, resp.Body)
+	_, _ = io.CopyN(io.Discard, resp.Body, 64<<10)
 	return resp.StatusCode, nil
 }
 

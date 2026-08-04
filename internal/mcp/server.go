@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
 	"neuralmail/internal/entitlements"
+	"neuralmail/internal/memguard"
 	"neuralmail/internal/observability"
 	"neuralmail/internal/tools"
 )
@@ -31,12 +33,71 @@ type Server struct {
 	Auth         *auth.Service
 	Entitlements EntitlementGate
 	Tools        *tools.Service
+	MemoryBudget *memguard.Budget
 	mu           sync.Mutex
 	sessions     map[string]time.Time
 }
 
 func NewServer(cfg config.Config, toolsSvc *tools.Service, authSvc *auth.Service, entitlementSvc EntitlementGate) *Server {
-	return &Server{Config: cfg, Auth: authSvc, Entitlements: entitlementSvc, Tools: toolsSvc, sessions: make(map[string]time.Time)}
+	budget, err := memguard.New(cfg.Memory.BudgetBytes)
+	if err != nil {
+		budget, _ = memguard.New(64 << 20)
+	}
+	return &Server{Config: cfg, Auth: authSvc, Entitlements: entitlementSvc, Tools: toolsSvc, MemoryBudget: budget, sessions: make(map[string]time.Time)}
+}
+
+const maxMCPBodyBytes int64 = 16 << 20
+
+type budgetedReadCloser struct {
+	ctx              context.Context
+	reader           io.Reader
+	closer           io.Closer
+	budget           *memguard.Budget
+	prepaidRemaining int64
+	releases         []func()
+	closed           bool
+}
+
+func newBudgetedReadCloser(ctx context.Context, body io.ReadCloser, budget *memguard.Budget, prepaid int64) (*budgetedReadCloser, error) {
+	guarded := &budgetedReadCloser{ctx: ctx, reader: body, closer: body, budget: budget, prepaidRemaining: prepaid}
+	if prepaid > 0 {
+		release, err := budget.Acquire(ctx, prepaid)
+		if err != nil {
+			return nil, err
+		}
+		guarded.releases = append(guarded.releases, release)
+	}
+	return guarded, nil
+}
+
+func (r *budgetedReadCloser) Read(buffer []byte) (int, error) {
+	read, readErr := r.reader.Read(buffer)
+	charge := int64(read)
+	if charge <= r.prepaidRemaining {
+		r.prepaidRemaining -= charge
+		return read, readErr
+	}
+	charge -= r.prepaidRemaining
+	r.prepaidRemaining = 0
+	if charge > 0 {
+		release, err := r.budget.Acquire(r.ctx, charge)
+		if err != nil {
+			return 0, err
+		}
+		r.releases = append(r.releases, release)
+	}
+	return read, readErr
+}
+
+func (r *budgetedReadCloser) Close() error {
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	for index := len(r.releases) - 1; index >= 0; index-- {
+		r.releases[index]()
+	}
+	return r.closer.Close()
 }
 
 func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
@@ -49,6 +110,33 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("mcp request protocol_version=%q", strings.TrimSpace(r.Header.Get("MCP-Protocol-Version")))
+
+	readTimeout := s.Config.HTTP.ReadTimeout
+	if readTimeout <= 0 {
+		readTimeout = 30 * time.Second
+	}
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(readTimeout))
+	r.Body = http.MaxBytesReader(w, r.Body, maxMCPBodyBytes)
+	if r.ContentLength > maxMCPBodyBytes {
+		_ = r.Body.Close()
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	prepaid := r.ContentLength
+	if prepaid < 0 {
+		prepaid = 0
+	}
+	if prepaid > maxMCPBodyBytes {
+		prepaid = maxMCPBodyBytes
+	}
+	guardedBody, err := newBudgetedReadCloser(r.Context(), r.Body, s.MemoryBudget, prepaid)
+	if err != nil {
+		_ = r.Body.Close()
+		writeMemoryBudgetError(w)
+		return
+	}
+	r.Body = guardedBody
+	defer r.Body.Close()
 
 	ctx := r.Context()
 	var principal auth.Principal
@@ -66,9 +154,18 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		ctx = auth.WithPrincipal(ctx, authenticated)
 	}
 
+	decoder := json.NewDecoder(r.Body)
 	var req Request
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	if err := decoder.Decode(&req); err != nil {
+		writeMCPDecodeError(w, err)
+		return
+	}
+	// A single Decode may stop after one valid JSON value without consuming a
+	// chunked request's trailing bytes. Require EOF and, after detecting an
+	// extra value or syntax error, drain the rest so an oversized tail still
+	// wins as 413 instead of being hidden behind an early 400.
+	if err := requireJSONEOF(decoder, r.Body); err != nil {
+		writeMCPDecodeError(w, err)
 		return
 	}
 	if s.Config.Cloud.Mode {
@@ -102,6 +199,43 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	resp := Response{JSONRPC: "2.0", ID: req.ID, Result: result}
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func requireJSONEOF(decoder *json.Decoder, body io.Reader) error {
+	var extra json.RawMessage
+	err := decoder.Decode(&extra)
+	if errors.Is(err, io.EOF) {
+		return nil
+	}
+	if err == nil {
+		err = errors.New("multiple JSON values")
+	}
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) || errors.Is(err, memguard.ErrExhausted) {
+		return err
+	}
+	if _, drainErr := io.Copy(io.Discard, body); drainErr != nil {
+		return drainErr
+	}
+	return err
+}
+
+func writeMemoryBudgetError(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "1")
+	http.Error(w, "memory budget exhausted", http.StatusServiceUnavailable)
+}
+
+func writeMCPDecodeError(w http.ResponseWriter, err error) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if errors.Is(err, memguard.ErrExhausted) {
+		writeMemoryBudgetError(w)
+		return
+	}
+	http.Error(w, "invalid json", http.StatusBadRequest)
 }
 
 func (s *Server) HandleSSEStub(w http.ResponseWriter, r *http.Request) {
