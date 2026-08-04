@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"neuralmail/internal/memguard"
 	"neuralmail/internal/store"
 )
 
@@ -23,11 +24,15 @@ type capturedOutbound struct {
 
 type captureOutboundAdapter struct {
 	deliveries []capturedOutbound
+	onSend     func()
 }
 
 func (a *captureOutboundAdapter) Name() string { return "capture" }
 
 func (a *captureOutboundAdapter) SendMessage(_ context.Context, message OutboundMessage, idempotencyKey string) (string, error) {
+	if a.onSend != nil {
+		a.onSend()
+	}
 	copyMessage := message
 	copyMessage.Attachments = make([]store.OutboundAttachment, len(message.Attachments))
 	for index, attachment := range message.Attachments {
@@ -36,6 +41,114 @@ func (a *captureOutboundAdapter) SendMessage(_ context.Context, message Outbound
 	}
 	a.deliveries = append(a.deliveries, capturedOutbound{idempotencyKey: idempotencyKey, message: copyMessage})
 	return "provider-" + idempotencyKey, nil
+}
+
+func TestOutboxWorkerReservesSharedMemoryBeforeBlobLoad(t *testing.T) {
+	withOutboxWorkerDatabase(t, func(ctx context.Context, db *sql.DB, st *store.Store) {
+		orgID := uuid.NewString()
+		inboxID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'worker-memory')`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO inboxes (id, org_id, address, status)
+			VALUES ($1, $2, 'worker-memory@local.neuralmail', 'active')
+		`, inboxID, orgID); err != nil {
+			t.Fatal(err)
+		}
+		content := []byte("reserved bytes")
+		outboxID, err := st.EnqueueOutboxMessage(ctx, workerAttachmentMessage(orgID, inboxID, "memory-held", []store.OutboundAttachment{{
+			Filename: "memory.txt", ContentType: "text/plain", Content: content,
+		}}))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		budget, err := memguard.New(int64(len(content)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		adapter := &captureOutboundAdapter{}
+		adapter.onSend = func() {
+			if used := budget.Used(); used != int64(len(content)) {
+				t.Fatalf("budget used during provider call=%d, want %d", used, len(content))
+			}
+		}
+		registry := NewRegistry()
+		if err := registry.RegisterOutbound(adapter); err != nil {
+			t.Fatal(err)
+		}
+		worker := NewOutboxWorker(st, registry, "memory-held-test")
+		worker.MemoryBudget = budget
+		worker.ClaimLimit = 1
+		worker.claimAndDeliver(ctx)
+
+		if len(adapter.deliveries) != 1 {
+			t.Fatalf("deliveries=%d, want 1", len(adapter.deliveries))
+		}
+		if budget.Used() != 0 {
+			t.Fatalf("budget leaked %d bytes after delivery", budget.Used())
+		}
+		var status string
+		if err := db.QueryRowContext(ctx, `SELECT status FROM outbox_messages WHERE id = $1`, outboxID).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status != "sent" {
+			t.Fatalf("status=%q, want sent", status)
+		}
+	})
+}
+
+func TestOutboxWorkerRequeuesBeforeBlobLoadWhenMemoryExhausted(t *testing.T) {
+	withOutboxWorkerDatabase(t, func(ctx context.Context, db *sql.DB, st *store.Store) {
+		orgID := uuid.NewString()
+		inboxID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'worker-memory-exhausted')`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO inboxes (id, org_id, address, status)
+			VALUES ($1, $2, 'worker-memory-exhausted@local.neuralmail', 'active')
+		`, inboxID, orgID); err != nil {
+			t.Fatal(err)
+		}
+		outboxID, err := st.EnqueueOutboxMessage(ctx, workerAttachmentMessage(orgID, inboxID, "memory-exhausted", []store.OutboundAttachment{{
+			Filename: "large.txt", ContentType: "text/plain", Content: []byte("larger than budget"),
+		}}))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		budget, err := memguard.New(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		adapter := &captureOutboundAdapter{}
+		registry := NewRegistry()
+		if err := registry.RegisterOutbound(adapter); err != nil {
+			t.Fatal(err)
+		}
+		worker := NewOutboxWorker(st, registry, "memory-exhausted-test")
+		worker.MemoryBudget = budget
+		worker.ClaimLimit = 1
+		worker.BaseBackoff = time.Millisecond
+		worker.claimAndDeliver(ctx)
+
+		if len(adapter.deliveries) != 0 {
+			t.Fatalf("provider called %d times despite exhausted budget", len(adapter.deliveries))
+		}
+		if budget.Used() != 0 {
+			t.Fatalf("exhausted reservation changed budget usage to %d", budget.Used())
+		}
+		var status string
+		var lastError sql.NullString
+		if err := db.QueryRowContext(ctx, `SELECT status, last_error FROM outbox_messages WHERE id = $1`, outboxID).Scan(&status, &lastError); err != nil {
+			t.Fatal(err)
+		}
+		if status != "queued" || !lastError.Valid || !strings.Contains(lastError.String, "memory budget exhausted") {
+			t.Fatalf("status=%q last_error=%q, want queued budget exhaustion", status, lastError.String)
+		}
+	})
 }
 
 func (a *captureOutboundAdapter) GetDeliveryStatus(context.Context, string) (DeliveryStatus, error) {
