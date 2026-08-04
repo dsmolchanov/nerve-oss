@@ -589,3 +589,67 @@ func coreMigrationDir(t *testing.T) string {
 	}
 	return filepath.Join(filepath.Dir(currentFile), "migrations", "core")
 }
+
+// TestMigrateCoreTo_StopsAtTarget is the guard for the staged rollout: the
+// expand step must be able to land without dragging the relax step in behind
+// it. A plain MigrateCore applies everything, so a target-version path is the
+// only way to deploy readers between two migrations.
+func TestMigrateCoreTo_StopsAtTarget(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		const target = int64(5)
+
+		if err := MigrateCoreTo(ctx, db, target); err != nil {
+			t.Fatalf("migrate core to %d: %v", target, err)
+		}
+		got, err := CurrentVersionCore(ctx, db)
+		if err != nil {
+			t.Fatalf("current core version: %v", err)
+		}
+		if got != target {
+			t.Fatalf("expected core version %d, got %d", target, got)
+		}
+
+		// A later migration must still be pending, not silently applied.
+		if tableExists(ctx, t, db, "outbox_messages") {
+			t.Fatal("outbox_messages exists at version 5; a later migration was applied")
+		}
+
+		// Completing the run reaches the head and creates it.
+		if err := MigrateCore(ctx, db); err != nil {
+			t.Fatalf("migrate core to head: %v", err)
+		}
+		head, err := CurrentVersionCore(ctx, db)
+		if err != nil {
+			t.Fatalf("current core version after head: %v", err)
+		}
+		if head <= target {
+			t.Fatalf("expected head > %d, got %d", target, head)
+		}
+		if !tableExists(ctx, t, db, "outbox_messages") {
+			t.Fatal("outbox_messages missing after migrating to head")
+		}
+
+		// Down must undo exactly one step.
+		if err := MigrateDownCore(ctx, db); err != nil {
+			t.Fatalf("migrate down core: %v", err)
+		}
+		afterDown, err := CurrentVersionCore(ctx, db)
+		if err != nil {
+			t.Fatalf("current core version after down: %v", err)
+		}
+		if afterDown >= head {
+			t.Fatalf("expected version below %d after down, got %d", head, afterDown)
+		}
+	})
+}
+
+func tableExists(ctx context.Context, t *testing.T, db *sql.DB, name string) bool {
+	t.Helper()
+	var exists bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)`,
+		name).Scan(&exists); err != nil {
+		t.Fatalf("check table %s: %v", name, err)
+	}
+	return exists
+}
