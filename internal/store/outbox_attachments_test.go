@@ -4,10 +4,38 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+func TestOutboxAttachmentReverseFKOrderingFails(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		_, orgID, _ := seedOutboundAttachmentStore(t, ctx, db, "reverse-fk-order")
+		digest := "reverse-order-blob"
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO attachment_blobs (org_id, sha256, size_bytes, content_type, content)
+			VALUES ($1, $2, 1, 'text/plain', '\x01')
+		`, orgID, digest); err != nil {
+			t.Fatal(err)
+		}
+
+		// EnqueueOutboxMessage must insert the parent first. Force the reverse
+		// order directly to keep the immediate composite FK as a regression gate.
+		_, err := db.ExecContext(ctx, `
+			INSERT INTO outbox_attachments
+			  (org_id, outbox_message_id, ordinal, filename, content_type, size_bytes, sha256, blob_sha256)
+			VALUES ($1, $2, 0, 'before-parent.txt', 'text/plain', 1, $3, $3)
+		`, orgID, uuid.NewString(), digest)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "23503" ||
+			!strings.Contains(pgErr.ConstraintName, "outbox_message_id") {
+			t.Fatalf("reverse child-before-parent insert err=%v, want outbox parent FK violation", err)
+		}
+	})
+}
 
 func TestEnqueueOutboxMessageAttachmentFingerprintAndReplay(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
@@ -95,6 +123,48 @@ func TestEnqueueOutboxMessageIdempotencyConflictIncludesAttachments(t *testing.T
 		}
 		if messages != 1 || blobs != 1 || refs != 1 {
 			t.Fatalf("messages=%d blobs=%d refs=%d, want 1/1/1", messages, blobs, refs)
+		}
+	})
+}
+
+func TestEnqueueOutboxMessageReplaysLegacyNullFingerprint(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		st, orgID, inboxID := seedOutboundAttachmentStore(t, ctx, db, "legacy-null-fingerprint")
+		legacyID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO outbox_messages (
+			  id, org_id, inbox_id, provider, idempotency_key,
+			  "to", "from", subject, text_body, content_hash
+			) VALUES (
+			  $1, $2, $3, 'smtp', 'legacy-key',
+			  'to@example.com', 'from@example.com', 'legacy subject', 'legacy body', NULL
+			)
+		`, legacyID, orgID, inboxID); err != nil {
+			t.Fatal(err)
+		}
+
+		replayedID, err := st.EnqueueOutboxMessage(ctx, OutboxMessage{
+			OrgID:          orgID,
+			InboxID:        inboxID,
+			Provider:       "smtp",
+			IdempotencyKey: "legacy-key",
+			To:             "to@example.com",
+			From:           "from@example.com",
+			Subject:        "legacy subject",
+			TextBody:       "legacy body",
+		})
+		if err != nil {
+			t.Fatalf("legacy retry returned error: %v", err)
+		}
+		if replayedID != legacyID {
+			t.Fatalf("legacy retry id=%q, want %q", replayedID, legacyID)
+		}
+		var rows int
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM outbox_messages WHERE org_id = $1 AND idempotency_key = 'legacy-key'`, orgID).Scan(&rows); err != nil {
+			t.Fatal(err)
+		}
+		if rows != 1 {
+			t.Fatalf("legacy retry left %d rows, want 1", rows)
 		}
 	})
 }

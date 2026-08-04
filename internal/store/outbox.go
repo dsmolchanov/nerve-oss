@@ -319,9 +319,10 @@ func (s *Store) resolveOrInsertOutboxParent(
 			afterConflict = nil
 		}
 
-		var storedHash, storedKey string
+		var storedHash sql.NullString
+		var storedKey string
 		row = s.q.QueryRowContext(ctx, `
-			SELECT id::text, coalesce(content_hash, ''), idempotency_key
+			SELECT id::text, content_hash, idempotency_key
 			FROM outbox_messages
 			WHERE org_id = $1
 			  AND (
@@ -336,7 +337,7 @@ func (s *Store) resolveOrInsertOutboxParent(
 			LIMIT 1
 		`, msg.OrgID, msg.IdempotencyKey, msg.InboxID, hash)
 		if scanErr := row.Scan(&outID, &storedHash, &storedKey); scanErr == nil {
-			if storedKey == msg.IdempotencyKey && storedHash != hash {
+			if storedKey == msg.IdempotencyKey && storedHash.Valid && storedHash.String != hash {
 				return "", false, fmt.Errorf("%w: key=%q", ErrOutboxIdempotencyConflict, msg.IdempotencyKey)
 			}
 			return outID, false, nil
