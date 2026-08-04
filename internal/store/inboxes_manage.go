@@ -148,9 +148,10 @@ func (s *Store) GetInboxByAddress(ctx context.Context, address string) (InboxRec
 	return rec, nil
 }
 
-func (s *Store) CreateInboxForOrg(ctx context.Context, orgID string, address string, orgDomainID string, outboundProvider string) (InboxRecord, error) {
-	if outboundProvider == "" {
-		outboundProvider = "smtp"
+func (s *Store) CreateInboxForOrg(ctx context.Context, orgID string, address string, orgDomainID string, outboundProviders ...string) (InboxRecord, error) {
+	outboundProvider := "smtp"
+	if len(outboundProviders) > 0 && outboundProviders[0] != "" {
+		outboundProvider = outboundProviders[0]
 	}
 	rec := InboxRecord{
 		ID:      uuid.NewString(),

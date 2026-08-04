@@ -5,7 +5,7 @@ branch: codex/sync-manifest-baseline
 repository: nerve-oss
 source_plan: nerve-cloud/thoughts/shared/plans/2026-08-02-inbound-events-and-attachments.md
 source_section: Phase 0 section 4
-status: implementing
+status: ready_for_review
 ---
 
 # Shared baseline and ownership-aware OSS to Cloud sync
@@ -27,6 +27,10 @@ Cloud-only paths.
    delivery/DLQ/suppression coverage.
 3. Backport the shared email transport baseline. Keep `internal/jmap` in the
    exact mirror so the JMAP provider dependency cannot be omitted again.
+   `CreateInboxForOrg` accepts an optional provider so the OSS monolithic
+   handler keeps its existing call while Cloud's richer, Cloud-only split
+   inbox handler remains untouched; this prevents a false 3-way conflict on
+   code that Cloud has already moved and superseded.
 4. Add `sync-manifest.yaml` with the exact-mirror, patch-synced, and
    cloud-only ownership lists specified by the source plan.
 5. Replace hardcoded workflow path filters with manifest-driven changed-file
@@ -47,6 +51,8 @@ Cloud-only paths.
   bootstrap copy, Cloud-only preservation, and fatal 3-way conflicts.
 - `scripts/sync/verify_exact_mirror.sh` validates the manifest and compares
   staged OSS/Cloud exact paths.
+- The pre/post D9 `go doc -all ./internal/store` snapshots are identical (476
+  lines each); the boundary split removed no exported API.
 - `actionlint` validates the changed workflows; `shellcheck` and `bash -n`
   validate the sync scripts.
 
