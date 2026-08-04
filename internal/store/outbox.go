@@ -111,6 +111,13 @@ func contentHash(to, subject, textBody, htmlBody string) string {
 }
 
 func (s *Store) EnqueueOutboxMessage(ctx context.Context, msg OutboxMessage) (string, error) {
+	return s.enqueueOutboxMessage(ctx, msg, nil)
+}
+
+// enqueueOutboxMessage's afterConflict hook exists only to make the
+// conflict-to-terminal race deterministic in tests. Production callers always
+// pass nil through EnqueueOutboxMessage.
+func (s *Store) enqueueOutboxMessage(ctx context.Context, msg OutboxMessage, afterConflict func() error) (string, error) {
 	if msg.OrgID == "" || msg.InboxID == "" {
 		return "", errors.New("missing org_id or inbox_id")
 	}
@@ -155,44 +162,62 @@ func (s *Store) EnqueueOutboxMessage(ctx context.Context, msg OutboxMessage) (st
 
 	hash := contentHash(msg.To, msg.Subject, msg.TextBody, msg.HTMLBody)
 
-	row := s.q.QueryRowContext(ctx, `
-		INSERT INTO outbox_messages (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject, text_body, html_body, content_hash, in_reply_to_message_id, "references")
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, nullif($9, ''), nullif($10, ''), $11, nullif($12, ''), nullif($13, ''))
-		ON CONFLICT DO NOTHING
-		RETURNING id
-	`, id, msg.OrgID, msg.InboxID, msg.Provider, msg.IdempotencyKey, msg.To, msg.From, msg.Subject, msg.TextBody, msg.HTMLBody, hash,
-		msg.InReplyToMessageID, msg.References)
-	var outID string
-	if err := row.Scan(&outID); err == nil {
-		return outID, nil
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return "", err
-	}
+	const maxConflictRetries = 3
+	for attempt := 0; ; attempt++ {
+		row := s.q.QueryRowContext(ctx, `
+			INSERT INTO outbox_messages (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject, text_body, html_body, content_hash, in_reply_to_message_id, "references")
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, nullif($9, ''), nullif($10, ''), $11, nullif($12, ''), nullif($13, ''))
+			ON CONFLICT DO NOTHING
+			RETURNING id
+		`, id, msg.OrgID, msg.InboxID, msg.Provider, msg.IdempotencyKey, msg.To, msg.From, msg.Subject, msg.TextBody, msg.HTMLBody, hash,
+			msg.InReplyToMessageID, msg.References)
+		var outID string
+		if err := row.Scan(&outID); err == nil {
+			return outID, nil
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
 
-	// ON CONFLICT DO NOTHING can wait for a concurrent insert that was not
-	// visible in the INSERT statement's snapshot. Resolve the winner in a
-	// separate statement so READ COMMITTED takes a fresh snapshot after that
-	// transaction commits. This covers both idempotency-key and partial
-	// content-hash conflicts without surfacing a uniqueness error to callers.
-	row = s.q.QueryRowContext(ctx, `
-		SELECT id
-		FROM outbox_messages
-		WHERE org_id = $1
-		  AND (
-			idempotency_key = $2
-			OR (inbox_id = $3 AND content_hash = $4 AND status IN ('queued', 'sending'))
-		  )
-		ORDER BY
-		  CASE WHEN idempotency_key = $2 THEN 0 ELSE 1 END,
-		  CASE WHEN status IN ('queued', 'sending') THEN 0 ELSE 1 END,
-		  created_at DESC,
-		  id DESC
-		LIMIT 1
-	`, msg.OrgID, msg.IdempotencyKey, msg.InboxID, hash)
-	if err := row.Scan(&outID); err != nil {
-		return "", err
+		if afterConflict != nil {
+			if err := afterConflict(); err != nil {
+				return "", fmt.Errorf("after outbox conflict: %w", err)
+			}
+			afterConflict = nil
+		}
+
+		// ON CONFLICT DO NOTHING can wait for a concurrent insert that was not
+		// visible in the INSERT statement's snapshot. Resolve the winner in a
+		// separate statement so READ COMMITTED takes a fresh snapshot after that
+		// transaction commits. This covers both idempotency-key and partial
+		// content-hash conflicts without surfacing a uniqueness error to callers.
+		row = s.q.QueryRowContext(ctx, `
+			SELECT id
+			FROM outbox_messages
+			WHERE org_id = $1
+			  AND (
+				idempotency_key = $2
+				OR (inbox_id = $3 AND content_hash = $4 AND status IN ('queued', 'sending'))
+			  )
+			ORDER BY
+			  CASE WHEN idempotency_key = $2 THEN 0 ELSE 1 END,
+			  CASE WHEN status IN ('queued', 'sending') THEN 0 ELSE 1 END,
+			  created_at DESC,
+			  id DESC
+			LIMIT 1
+		`, msg.OrgID, msg.IdempotencyKey, msg.InboxID, hash)
+		if err := row.Scan(&outID); err == nil {
+			return outID, nil
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+
+		// A content-hash winner may become terminal between the INSERT conflict
+		// and this lookup. It no longer blocks a legitimate resend, so retry the
+		// INSERT with a fresh statement snapshot instead of returning ErrNoRows.
+		if attempt >= maxConflictRetries {
+			return "", fmt.Errorf("enqueue outbox message: unresolved conflict after %d retries", maxConflictRetries)
+		}
 	}
-	return outID, nil
 }
 
 func (s *Store) ClaimOutboxMessages(ctx context.Context, limit int, workerID string, now time.Time, staleLockAfter time.Duration) ([]OutboxMessage, error) {
