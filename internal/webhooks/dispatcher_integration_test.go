@@ -34,7 +34,7 @@ func TestDispatcher_EndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
-	defer adminDB.Close()
+	t.Cleanup(func() { _ = adminDB.Close() })
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer pingCancel()
 	if err := adminDB.PingContext(pingCtx); err != nil {

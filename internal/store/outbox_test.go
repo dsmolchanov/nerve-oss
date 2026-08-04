@@ -234,6 +234,56 @@ func TestOutboxContentDedupAllowsResendAfterSent(t *testing.T) {
 	})
 }
 
+func TestOutboxContentDedupRetriesWhenWinnerBecomesTerminal(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+
+		st := &Store{db: db, q: db}
+		orgID := uuid.NewString()
+		inboxID := uuid.NewString()
+
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'acme')`, orgID); err != nil {
+			t.Fatalf("insert org: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO inboxes (id, org_id, address, status) VALUES ($1, $2, 'a@local.neuralmail', 'active')`, inboxID, orgID); err != nil {
+			t.Fatalf("insert inbox: %v", err)
+		}
+
+		firstID, err := st.EnqueueOutboxMessage(ctx, OutboxMessage{
+			OrgID:          orgID,
+			InboxID:        inboxID,
+			Provider:       "smtp",
+			IdempotencyKey: "terminal-race-1",
+			To:             "to@local.neuralmail",
+			From:           "a@local.neuralmail",
+			Subject:        "hello",
+			TextBody:       "terminal race body",
+		})
+		if err != nil {
+			t.Fatalf("enqueue first: %v", err)
+		}
+
+		secondID, err := st.enqueueOutboxMessage(ctx, OutboxMessage{
+			OrgID:          orgID,
+			InboxID:        inboxID,
+			Provider:       "smtp",
+			IdempotencyKey: "terminal-race-2",
+			To:             "to@local.neuralmail",
+			From:           "a@local.neuralmail",
+			Subject:        "hello",
+			TextBody:       "terminal race body",
+		}, func() error {
+			return st.MarkOutboxMessageSent(ctx, firstID, "provider-msg-race")
+		})
+		if err != nil {
+			t.Fatalf("enqueue after conflict winner became terminal: %v", err)
+		}
+		if secondID == firstID {
+			t.Fatalf("expected a new outbox row after winner became terminal, got %s", secondID)
+		}
+	})
+}
+
 func TestOutboxClaimQueryIsConcurrencySafe(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToLatest(t, ctx, db)
