@@ -151,7 +151,10 @@ replacement for the deployment migration job.
 
 ## Not in This Branch
 
-- No startup environment mode or compiled compatibility constants.
+- No startup environment mode or compiled compatibility constants **in the
+  target-version CLI PR**. That historical scope boundary is complete; the
+  separately authorized follow-up is
+  `2026-08-04-bounded-startup-migrations.md`.
 - No changes to cloud deployment scripts or cloud startup wiring.
 - No schema migrations or data changes.
 - No multi-step or automatic rollback policy.

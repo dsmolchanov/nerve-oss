@@ -26,6 +26,22 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 
 FROM alpine:3.20
 
+ARG RUNTIME_VERSION=dev
+ARG MCP_CONTRACT_HASH=unknown
+ARG CORE_SCHEMA_HASH=unknown
+ARG CORE_SCHEMA_MIN_REQUIRED=unknown
+ARG CORE_SCHEMA_MAX_SUPPORTED=unknown
+ARG BUILD_COMMIT=unknown
+ARG BUILD_TIME=unknown
+
+LABEL io.nerve.runtime.version="${RUNTIME_VERSION}" \
+      io.nerve.runtime.mcp-contract-sha256="${MCP_CONTRACT_HASH}" \
+      io.nerve.runtime.core-schema-sha256="${CORE_SCHEMA_HASH}" \
+      io.nerve.runtime.core-schema-min-required="${CORE_SCHEMA_MIN_REQUIRED}" \
+      io.nerve.runtime.core-schema-max-supported="${CORE_SCHEMA_MAX_SUPPORTED}" \
+      io.nerve.runtime.build-commit="${BUILD_COMMIT}" \
+      io.nerve.runtime.build-time="${BUILD_TIME}"
+
 RUN addgroup -S neuralmail && adduser -S neuralmail -G neuralmail
 
 USER neuralmail

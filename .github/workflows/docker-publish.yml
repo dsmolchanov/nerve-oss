@@ -6,8 +6,12 @@ on:
       - "v*"
 
 permissions:
-  contents: read
+  contents: write
   packages: write
+
+concurrency:
+  group: runtime-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -19,11 +23,36 @@ jobs:
         run: |
           mkdir -p dist/runtime
           VERSION="${GITHUB_REF_NAME:?GITHUB_REF_NAME is required}"
-          ./scripts/release/generate_runtime_manifest.sh "$VERSION" "dist/runtime/runtime-manifest.json"
+          GIT_COMMIT="${GITHUB_SHA}" \
+            ./scripts/release/generate_runtime_manifest.sh "$VERSION" "dist/runtime/runtime-manifest.json"
           ./scripts/release/export_runtime_manifest_outputs.sh \
             "dist/runtime/runtime-manifest.json" \
             "$VERSION" \
             "$GITHUB_OUTPUT"
+      - name: Refuse to replace a published runtime release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          release_status="$(curl --silent --show-error \
+            --output /tmp/runtime-release-preflight.json \
+            --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${REPOSITORY}/releases/tags/${VERSION}")"
+          case "${release_status}" in
+            404) ;;
+            200)
+              echo "release ${VERSION} already exists; refusing before any image or asset is published" >&2
+              exit 1
+              ;;
+            *)
+              echo "release preflight failed with HTTP ${release_status}; refusing to publish" >&2
+              exit 1
+              ;;
+          esac
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -46,6 +75,8 @@ jobs:
             RUNTIME_VERSION=${{ steps.manifest.outputs.runtime_version }}
             MCP_CONTRACT_HASH=${{ steps.manifest.outputs.mcp_contract_hash }}
             CORE_SCHEMA_HASH=${{ steps.manifest.outputs.core_schema_hash }}
+            CORE_SCHEMA_MIN_REQUIRED=${{ steps.manifest.outputs.core_schema_min_required }}
+            CORE_SCHEMA_MAX_SUPPORTED=${{ steps.manifest.outputs.core_schema_max_supported }}
             BUILD_COMMIT=${{ github.sha }}
             BUILD_TIME=${{ steps.manifest.outputs.build_time }}
       - name: Generate runtime release artifacts
@@ -67,3 +98,12 @@ jobs:
         with:
           name: runtime-release-assets
           path: dist/runtime/*
+      - name: Publish immutable GitHub release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          gh release create "${VERSION}" dist/runtime/* \
+            --verify-tag \
+            --title "${VERSION}" \
+            --generate-notes

@@ -21,6 +21,7 @@ import (
 	"neuralmail/internal/mcp"
 	"neuralmail/internal/queue"
 	"neuralmail/internal/release"
+	"neuralmail/internal/startup"
 	"neuralmail/internal/store"
 	"neuralmail/internal/vector"
 )
@@ -89,7 +90,7 @@ func runWorker(ctx context.Context, cfg config.Config) {
 		log.Fatalf("store error: %v", err)
 	}
 	defer storeInstance.Close()
-	if err := store.Migrate(ctx, storeInstance.DB()); err != nil {
+	if err := startup.Migrate(ctx, storeInstance.DB(), cfg.Cloud.Mode); err != nil {
 		log.Fatalf("migration error: %v", err)
 	}
 	queueInstance, err := queue.New(cfg.Redis.URL)

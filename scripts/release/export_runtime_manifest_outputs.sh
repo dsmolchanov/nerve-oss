@@ -24,6 +24,9 @@ if ! jq -e -s --arg expected_version "$EXPECTED_VERSION" '
     and (.runtime_version | output_safe and . == $expected_version)
     and (.mcp_contract_hash | output_safe and test("^[0-9a-f]{64}$"))
     and (.core_schema_hash | output_safe and test("^[0-9a-f]{64}$"))
+    and (.core_schema_min_required | output_safe and test("^(0|[1-9][0-9]*)$"))
+    and (.core_schema_max_supported | output_safe and test("^(0|[1-9][0-9]*)$"))
+    and ((.core_schema_min_required | tonumber) <= (.core_schema_max_supported | tonumber))
     and (.build_time |
       output_safe
       and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
@@ -39,11 +42,15 @@ fi
 RUNTIME_VERSION="$(jq -er -s '.[0].runtime_version' "$MANIFEST_PATH")"
 MCP_HASH="$(jq -er -s '.[0].mcp_contract_hash' "$MANIFEST_PATH")"
 CORE_HASH="$(jq -er -s '.[0].core_schema_hash' "$MANIFEST_PATH")"
+CORE_MIN_REQUIRED="$(jq -er -s '.[0].core_schema_min_required' "$MANIFEST_PATH")"
+CORE_MAX_SUPPORTED="$(jq -er -s '.[0].core_schema_max_supported' "$MANIFEST_PATH")"
 BUILD_TIME="$(jq -er -s '.[0].build_time' "$MANIFEST_PATH")"
 
 {
   printf 'runtime_version=%s\n' "$RUNTIME_VERSION"
   printf 'mcp_contract_hash=%s\n' "$MCP_HASH"
   printf 'core_schema_hash=%s\n' "$CORE_HASH"
+  printf 'core_schema_min_required=%s\n' "$CORE_MIN_REQUIRED"
+  printf 'core_schema_max_supported=%s\n' "$CORE_MAX_SUPPORTED"
   printf 'build_time=%s\n' "$BUILD_TIME"
 } >> "$OUTPUT_PATH"

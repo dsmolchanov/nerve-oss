@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/pressly/goose/v3"
@@ -26,6 +27,127 @@ type MigrationStatus struct {
 	Current int64
 	Head    int64
 	Pending []int64
+}
+
+// StartupMigrationMode controls whether a long-running process may change the
+// database schema while it starts.
+type StartupMigrationMode string
+
+const (
+	StartupMigrationVerify     StartupMigrationMode = "verify"
+	StartupMigrationApplyToMax StartupMigrationMode = "apply-to-max"
+	StartupMigrationOff        StartupMigrationMode = "off"
+)
+
+// MigrationWindow is the schema compatibility contract compiled into a
+// binary. Core and cloud have independent Goose version histories.
+type MigrationWindow struct {
+	CoreMinRequired   int64
+	CoreMaxSupported  int64
+	IncludeCloud      bool
+	CloudMinRequired  int64
+	CloudMaxSupported int64
+}
+
+// ParseStartupMigrationMode validates an NM_MIGRATE_ON_START value. An empty
+// value is safe-by-default in cloud mode and convenient for local OSS use.
+func ParseStartupMigrationMode(value string, cloudMode bool) (StartupMigrationMode, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		if cloudMode {
+			return StartupMigrationVerify, nil
+		}
+		return StartupMigrationApplyToMax, nil
+	}
+
+	mode := StartupMigrationMode(value)
+	switch mode {
+	case StartupMigrationVerify, StartupMigrationApplyToMax, StartupMigrationOff:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("invalid NM_MIGRATE_ON_START %q: want verify, apply-to-max, or off", value)
+	}
+}
+
+// MigrateOnStart enforces the migration policy for a long-running process.
+// Verify is strictly read-only. Apply-to-max never advances beyond the
+// binary's declared compatibility window.
+func MigrateOnStart(ctx context.Context, db *sql.DB, mode StartupMigrationMode, window MigrationWindow) error {
+	if err := validateMigrationWindow(window); err != nil {
+		return err
+	}
+
+	switch mode {
+	case StartupMigrationVerify:
+		if err := verifyMigrationVersion(ctx, db, "core", window.CoreMinRequired, window.CoreMaxSupported, CurrentVersionCore); err != nil {
+			return err
+		}
+		if window.IncludeCloud {
+			return verifyMigrationVersion(ctx, db, "cloud", window.CloudMinRequired, window.CloudMaxSupported, CurrentVersionCloud)
+		}
+		return nil
+	case StartupMigrationApplyToMax:
+		if err := MigrateUpToCore(ctx, db, window.CoreMaxSupported); err != nil {
+			return fmt.Errorf("apply core startup migrations through %d: %w", window.CoreMaxSupported, err)
+		}
+		if window.IncludeCloud {
+			if err := MigrateUpToCloud(ctx, db, window.CloudMaxSupported); err != nil {
+				return fmt.Errorf("apply cloud startup migrations through %d: %w", window.CloudMaxSupported, err)
+			}
+		}
+		return nil
+	case StartupMigrationOff:
+		return nil
+	default:
+		return fmt.Errorf("invalid startup migration mode %q", mode)
+	}
+}
+
+func validateMigrationWindow(window MigrationWindow) error {
+	type scopeWindow struct {
+		name string
+		min  int64
+		max  int64
+	}
+	scopes := []scopeWindow{
+		{name: "core", min: window.CoreMinRequired, max: window.CoreMaxSupported},
+	}
+	if window.IncludeCloud {
+		scopes = append(scopes, scopeWindow{name: "cloud", min: window.CloudMinRequired, max: window.CloudMaxSupported})
+	}
+	for _, scope := range scopes {
+		if scope.min < 0 || scope.max < 0 {
+			return fmt.Errorf("invalid %s migration window [%d,%d]: versions must be non-negative", scope.name, scope.min, scope.max)
+		}
+		if scope.min > scope.max {
+			return fmt.Errorf("invalid %s migration window [%d,%d]: minimum exceeds maximum", scope.name, scope.min, scope.max)
+		}
+	}
+	return nil
+}
+
+func verifyMigrationVersion(
+	ctx context.Context,
+	db *sql.DB,
+	scope string,
+	minRequired int64,
+	maxSupported int64,
+	currentVersion func(context.Context, *sql.DB) (int64, error),
+) error {
+	current, err := currentVersion(ctx, db)
+	if err != nil {
+		return fmt.Errorf("verify %s migration version: %w", scope, err)
+	}
+	if current < minRequired || current > maxSupported {
+		return fmt.Errorf(
+			"%s schema version %d is outside binary compatibility window [%d,%d]",
+			scope,
+			current,
+			minRequired,
+			maxSupported,
+		)
+	}
+	return nil
 }
 
 // Migrate is a compatibility wrapper used by existing entrypoints.

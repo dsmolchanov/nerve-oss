@@ -23,6 +23,7 @@ import (
 	"neuralmail/internal/observability"
 	"neuralmail/internal/policy"
 	"neuralmail/internal/queue"
+	"neuralmail/internal/startup"
 	"neuralmail/internal/store"
 	"neuralmail/internal/tools"
 	"neuralmail/internal/vector"
@@ -46,7 +47,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := store.Migrate(ctx, st.DB()); err != nil {
+	if err := startup.Migrate(ctx, st.DB(), cfg.Cloud.Mode); err != nil {
 		return nil, err
 	}
 	inboxAddr := cfg.SMTP.From
