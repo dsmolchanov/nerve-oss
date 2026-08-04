@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"time"
 
@@ -32,6 +33,10 @@ type OrgDomain struct {
 	ResendDNSRecords  []byte
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
+
+	ResendReceivingEnabled bool
+	CatchAllEnabled        bool
+	ForwardTo              sql.NullString // domain-level forwarding (overridden by inbox-level)
 }
 
 // CreateOrgDomain inserts a new domain registration. The domain must already be
@@ -58,6 +63,8 @@ func (s *Store) GetOrgDomain(ctx context.Context, domain string) (OrgDomain, err
 		       inbound_enabled, dkim_selector, dkim_private_key_enc, dkim_public_key,
 		       dkim_method, last_check_at, verified_at, expires_at,
 		       resend_domain_id, resend_domain_status, resend_dns_records,
+		       resend_receiving_enabled, catch_all_enabled,
+		       forward_to,
 		       created_at, updated_at
 		FROM org_domains
 		WHERE lower(domain) = lower($1)
@@ -79,6 +86,8 @@ func (s *Store) GetOrgDomainByID(ctx context.Context, id string) (OrgDomain, err
 		       inbound_enabled, dkim_selector, dkim_private_key_enc, dkim_public_key,
 		       dkim_method, last_check_at, verified_at, expires_at,
 		       resend_domain_id, resend_domain_status, resend_dns_records,
+		       resend_receiving_enabled, catch_all_enabled,
+		       forward_to,
 		       created_at, updated_at
 		FROM org_domains
 		WHERE id = $1
@@ -98,6 +107,8 @@ func (s *Store) GetOrgDomainByIDForOrg(ctx context.Context, orgID, id string) (O
 		       inbound_enabled, dkim_selector, dkim_private_key_enc, dkim_public_key,
 		       dkim_method, last_check_at, verified_at, expires_at,
 		       resend_domain_id, resend_domain_status, resend_dns_records,
+		       resend_receiving_enabled, catch_all_enabled,
+		       forward_to,
 		       created_at, updated_at
 		FROM org_domains
 		WHERE id = $1 AND org_id = $2
@@ -116,6 +127,8 @@ func (s *Store) ListOrgDomains(ctx context.Context, orgID string) ([]OrgDomain, 
 		       inbound_enabled, dkim_selector, dkim_private_key_enc, dkim_public_key,
 		       dkim_method, last_check_at, verified_at, expires_at,
 		       resend_domain_id, resend_domain_status, resend_dns_records,
+		       resend_receiving_enabled, catch_all_enabled,
+		       forward_to,
 		       created_at, updated_at
 		FROM org_domains
 		WHERE org_id = $1
@@ -135,6 +148,8 @@ func (s *Store) ListOrgDomains(ctx context.Context, orgID string) ([]OrgDomain, 
 			&d.InboundEnabled, &d.DKIMSelector, &d.DKIMPrivateKeyEnc, &d.DKIMPublicKey,
 			&d.DKIMMethod, &d.LastCheckAt, &d.VerifiedAt, &d.ExpiresAt,
 			&d.ResendDomainID, &d.ResendStatus, &d.ResendDNSRecords,
+			&d.ResendReceivingEnabled, &d.CatchAllEnabled,
+			&d.ForwardTo,
 			&d.CreatedAt, &d.UpdatedAt,
 		); err != nil {
 			return nil, err
@@ -197,6 +212,8 @@ func (s *Store) GetOrgDomainForSending(ctx context.Context, domain string) (OrgD
 		       inbound_enabled, dkim_selector, dkim_private_key_enc, dkim_public_key,
 		       dkim_method, last_check_at, verified_at, expires_at,
 		       resend_domain_id, resend_domain_status, resend_dns_records,
+		       resend_receiving_enabled, catch_all_enabled,
+		       forward_to,
 		       created_at, updated_at
 		FROM org_domains
 		WHERE lower(domain) = lower($1) AND status = 'active'
@@ -244,6 +261,8 @@ func scanOrgDomain(row *sql.Row, d *OrgDomain) error {
 		&d.InboundEnabled, &d.DKIMSelector, &d.DKIMPrivateKeyEnc, &d.DKIMPublicKey,
 		&d.DKIMMethod, &d.LastCheckAt, &d.VerifiedAt, &d.ExpiresAt,
 		&d.ResendDomainID, &d.ResendStatus, &d.ResendDNSRecords,
+		&d.ResendReceivingEnabled, &d.CatchAllEnabled,
+		&d.ForwardTo,
 		&d.CreatedAt, &d.UpdatedAt,
 	)
 }
@@ -264,5 +283,93 @@ func (s *Store) UpdateOrgDomainResend(ctx context.Context, id, resendDomainID, r
 		    updated_at = now()
 		WHERE id = $1
 	`, id, resendDomainID, resendStatus, dnsRecords)
+	return err
+}
+
+// GetReceivingOrgDomainByDomain finds an active domain record with receiving enabled.
+// This does NOT use RLS (called before we know the org).
+// Only routes if domain is active AND receiving is enabled.
+func (s *Store) GetReceivingOrgDomainByDomain(ctx context.Context, domain string) (*OrgDomain, error) {
+	var d OrgDomain
+	row := s.q.QueryRowContext(ctx, `
+		SELECT id, org_id, domain, status, verification_token,
+		       mx_verified, spf_verified, dkim_verified, dmarc_verified,
+		       inbound_enabled, dkim_selector, dkim_private_key_enc, dkim_public_key,
+		       dkim_method, last_check_at, verified_at, expires_at,
+		       resend_domain_id, resend_domain_status, resend_dns_records,
+		       resend_receiving_enabled, catch_all_enabled,
+		       forward_to,
+		       created_at, updated_at
+		FROM org_domains
+		WHERE lower(domain) = lower($1)
+		  AND status = 'active'
+		  AND resend_receiving_enabled = true
+		LIMIT 1
+	`, domain)
+	if err := scanOrgDomain(row, &d); err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+// UpdateOrgDomainCatchAll toggles catch-all on a domain.
+// Only allowed on domains with resend_receiving_enabled = true and status = 'active'.
+func (s *Store) UpdateOrgDomainCatchAll(ctx context.Context, orgID, domainID string, enabled bool) error {
+	result, err := s.q.ExecContext(ctx, `
+		UPDATE org_domains
+		SET catch_all_enabled = $3, updated_at = now()
+		WHERE id = $1 AND org_id = $2
+		  AND resend_receiving_enabled = true
+		  AND status = 'active'
+	`, domainID, orgID, enabled)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("domain not found, not active, or receiving not enabled")
+	}
+	return nil
+}
+
+// UpdateOrgDomainForwardTo sets or clears domain-level forwarding.
+// Only allowed on active domains with receiving enabled.
+func (s *Store) UpdateOrgDomainForwardTo(ctx context.Context, orgID, domainID, forwardTo string) error {
+	var ft any
+	if forwardTo == "" {
+		ft = nil
+	} else {
+		ft = forwardTo
+	}
+	result, err := s.q.ExecContext(ctx, `
+		UPDATE org_domains
+		SET forward_to = $3, updated_at = now()
+		WHERE id = $1 AND org_id = $2
+		  AND resend_receiving_enabled = true
+		  AND status = 'active'
+	`, domainID, orgID, ft)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("domain not found, not active, or receiving not enabled")
+	}
+	return nil
+}
+
+// UpdateOrgDomainResendReceiving sets the receiving flags on a domain.
+func (s *Store) UpdateOrgDomainResendReceiving(ctx context.Context, domainID string, enabled bool) error {
+	_, err := s.q.ExecContext(ctx, `
+		UPDATE org_domains
+		SET resend_receiving_enabled = $1, inbound_enabled = $1, updated_at = now()
+		WHERE id = $2
+	`, enabled, domainID)
 	return err
 }

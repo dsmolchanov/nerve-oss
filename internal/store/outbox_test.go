@@ -131,7 +131,7 @@ func TestOutboxContentDedupIsConcurrencySafe(t *testing.T) {
 		results := make(chan result, requests)
 		var wg sync.WaitGroup
 
-		for i := 0; i < requests; i++ {
+		for i := range requests {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
@@ -276,7 +276,7 @@ func TestOutboxClaimQueryIsConcurrencySafe(t *testing.T) {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				msgs, err := st.ClaimOutboxMessages(ctx, 20, fmt.Sprintf("w-%d", i), now)
+				msgs, err := st.ClaimOutboxMessages(ctx, 20, fmt.Sprintf("w-%d", i), now, 5*time.Minute)
 				if err != nil {
 					t.Errorf("claim worker %d: %v", i, err)
 					return

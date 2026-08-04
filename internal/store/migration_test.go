@@ -41,7 +41,7 @@ func TestCloudControlPlaneMigrationFromEmptyDatabase(t *testing.T) {
 	})
 }
 
-func TestCoreMigrationUpgradeFrom15To18(t *testing.T) {
+func TestCoreMigrationUpgradeFrom15To19(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToVersion(t, ctx, db, 15)
 
@@ -57,8 +57,8 @@ func TestCoreMigrationUpgradeFrom15To18(t *testing.T) {
 		`).Scan(&version); err != nil {
 			t.Fatalf("query core migration version: %v", err)
 		}
-		if version != 18 {
-			t.Fatalf("expected core migration version 18, got %d", version)
+		if version != 19 {
+			t.Fatalf("expected core migration version 19, got %d", version)
 		}
 
 		for _, table := range []string{"suppressions", "org_webhooks", "org_webhook_deliveries"} {
@@ -66,6 +66,66 @@ func TestCoreMigrationUpgradeFrom15To18(t *testing.T) {
 		}
 		for _, table := range []string{"outbox_events", "inbox_smtp_configs", "suppressions"} {
 			assertTenantRLSState(t, db, table, true)
+		}
+		assertColumnNotNull(t, db, "outbox_messages", "created_at")
+	})
+}
+
+func TestMigration19BackfillsStableOutboxCreationTime(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 18); err != nil {
+			t.Fatalf("migrate core to 18: %v", err)
+		}
+
+		orgID := uuid.NewString()
+		inboxID := uuid.NewString()
+		outboxID := uuid.NewString()
+		eventTime := time.Now().UTC().Add(-3 * time.Hour).Truncate(time.Microsecond)
+		lastAttempt := eventTime.Add(time.Hour)
+		nextAttempt := eventTime.Add(2 * time.Hour)
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'migration-19')`, orgID); err != nil {
+			t.Fatalf("insert org: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO inboxes (id, org_id, address, status) VALUES ($1, $2, 'migration-19@example.com', 'active')`, inboxID, orgID); err != nil {
+			t.Fatalf("insert inbox: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO outbox_messages (
+			  id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject,
+			  status, next_attempt_at, last_attempt_at
+			) VALUES ($1, $2, $3, 'smtp', 'migration-19', 'to@example.com',
+			          'migration-19@example.com', 'subject', 'failed', $4, $5)
+		`, outboxID, orgID, inboxID, nextAttempt, lastAttempt); err != nil {
+			t.Fatalf("insert legacy outbox row: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO outbox_events (
+			  org_id, outbox_message_id, provider_message_id, event_type, raw_payload, created_at
+			) VALUES ($1, $2, NULL, 'failed', '{}'::jsonb, $3)
+		`, orgID, outboxID, eventTime); err != nil {
+			t.Fatalf("insert legacy event: %v", err)
+		}
+
+		if err := MigrateUpToCore(ctx, db, 19); err != nil {
+			t.Fatalf("migrate core to 19: %v", err)
+		}
+		var createdAt time.Time
+		if err := db.QueryRowContext(ctx, `SELECT created_at FROM outbox_messages WHERE id = $1`, outboxID).Scan(&createdAt); err != nil {
+			t.Fatalf("read backfilled created_at: %v", err)
+		}
+		if !createdAt.Equal(eventTime) {
+			t.Fatalf("created_at=%s want earliest durable timestamp %s", createdAt, eventTime)
+		}
+
+		if _, err := db.ExecContext(ctx, `UPDATE outbox_messages SET next_attempt_at = now() + interval '7 days' WHERE id = $1`, outboxID); err != nil {
+			t.Fatalf("reschedule row: %v", err)
+		}
+		var after time.Time
+		if err := db.QueryRowContext(ctx, `SELECT created_at FROM outbox_messages WHERE id = $1`, outboxID).Scan(&after); err != nil {
+			t.Fatalf("read created_at after reschedule: %v", err)
+		}
+		if !after.Equal(createdAt) {
+			t.Fatalf("reschedule changed created_at from %s to %s", createdAt, after)
 		}
 	})
 }

@@ -20,18 +20,28 @@ type InboundAdapter interface {
 type DeliveryStatus string
 
 const (
-	DeliveryStatusUnknown DeliveryStatus = "unknown"
-	DeliveryStatusSent    DeliveryStatus = "sent"
-	DeliveryStatusFailed  DeliveryStatus = "failed"
+	DeliveryStatusUnknown    DeliveryStatus = "unknown"
+	DeliveryStatusQueued     DeliveryStatus = "queued"
+	DeliveryStatusSent       DeliveryStatus = "sent"
+	DeliveryStatusDelayed    DeliveryStatus = "delivery_delayed"
+	DeliveryStatusDelivered  DeliveryStatus = "delivered"
+	DeliveryStatusBounced    DeliveryStatus = "bounced"
+	DeliveryStatusFailed     DeliveryStatus = "failed"
+	DeliveryStatusComplained DeliveryStatus = "complained"
+	DeliveryStatusSuppressed DeliveryStatus = "suppressed"
 )
 
 type OutboundMessage struct {
 	From     string
 	To       []string
+	CC       []string
+	BCC      []string
+	ReplyTo  []string
 	Subject  string
 	TextBody string
 	HTMLBody string
 	Headers  map[string]string
+	Tags     map[string]string
 }
 
 type OutboundAdapter interface {

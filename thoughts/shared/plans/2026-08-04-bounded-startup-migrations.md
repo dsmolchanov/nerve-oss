@@ -1,5 +1,11 @@
 # Bounded Startup Migrations
 
+> Historical window note (2026-08-04): this plan produced runtime `v0.0.4`
+> with core window `[18,18]`. The later shared-baseline review identified that
+> outbox reads lacked a stable creation timestamp; migration `0019` and the
+> next runtime artifact advance the compiled window to `[19,19]`. The v0.0.4
+> manifest and immutable release assets remain unchanged.
+
 ## Metadata
 
 - Date: 2026-08-04 18:10:59 CEST
