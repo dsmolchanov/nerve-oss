@@ -3,11 +3,17 @@ package resend
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+)
+
+var (
+	ErrReceivedEmailNotFound = errors.New("resend received email not found")
+	ErrAttachmentNotFound    = errors.New("resend attachment not found")
 )
 
 // ReceivedEmail is the response from GET /emails/receiving/{id}
@@ -78,6 +84,9 @@ func (c *ReceivingClient) GetReceivedEmail(ctx context.Context, emailID string) 
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("%w (retention may have expired): %s", ErrReceivedEmailNotFound, strings.TrimSpace(string(body)))
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("resend receiving: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
@@ -115,7 +124,7 @@ func (c *ReceivingClient) GetAttachment(ctx context.Context, emailID, attachment
 	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("attachment not found (Resend retention may have expired)")
+		return nil, fmt.Errorf("%w (retention may have expired): %s", ErrAttachmentNotFound, strings.TrimSpace(string(body)))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("resend attachment: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
