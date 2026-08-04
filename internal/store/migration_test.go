@@ -589,3 +589,196 @@ func coreMigrationDir(t *testing.T) string {
 	}
 	return filepath.Join(filepath.Dir(currentFile), "migrations", "core")
 }
+
+// TestMigrateUpToCore_StopsAtTarget is the guard for the staged rollout: the
+// expand step must be able to land without dragging the relax step in behind
+// it. A plain MigrateCore applies everything, so a target-version path is the
+// only way to deploy readers between two migrations.
+func TestMigrateUpToCore_StopsAtTarget(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		const target = int64(5)
+
+		if err := MigrateUpToCore(ctx, db, target); err != nil {
+			t.Fatalf("migrate core to %d: %v", target, err)
+		}
+		got, err := CurrentVersionCore(ctx, db)
+		if err != nil {
+			t.Fatalf("current core version: %v", err)
+		}
+		if got != target {
+			t.Fatalf("expected core version %d, got %d", target, got)
+		}
+
+		// A later migration must still be pending, not silently applied.
+		if tableExists(ctx, t, db, "outbox_messages") {
+			t.Fatal("outbox_messages exists at version 5; a later migration was applied")
+		}
+
+		// Completing the run reaches the head and creates it.
+		if err := MigrateCore(ctx, db); err != nil {
+			t.Fatalf("migrate core to head: %v", err)
+		}
+		head, err := CurrentVersionCore(ctx, db)
+		if err != nil {
+			t.Fatalf("current core version after head: %v", err)
+		}
+		if head <= target {
+			t.Fatalf("expected head > %d, got %d", target, head)
+		}
+		if !tableExists(ctx, t, db, "outbox_messages") {
+			t.Fatal("outbox_messages missing after migrating to head")
+		}
+
+		// UpToContext itself treats both an already-passed target and a target
+		// beyond the available migrations as successful no-ops. The store API
+		// must reject both because its contract is to reach the exact target.
+		for _, tc := range []struct {
+			target  int64
+			message string
+		}{
+			{target: head - 1, message: "already passed"},
+			{target: head + 1, message: "is not available"},
+		} {
+			err := MigrateUpToCore(ctx, db, tc.target)
+			if err == nil {
+				t.Fatalf("expected exact-target migration to %d to fail from version %d", tc.target, head)
+			}
+			if !strings.Contains(err.Error(), fmt.Sprintf("migration target %d", tc.target)) ||
+				!strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("unexpected exact-target error for %d: %v", tc.target, err)
+			}
+		}
+
+		migrations, err := goose.CollectMigrations(coreMigrationDir(t), 0, head)
+		if err != nil {
+			t.Fatalf("collect core migrations through head: %v", err)
+		}
+		if len(migrations) < 2 || migrations[len(migrations)-1].Version != head {
+			t.Fatalf("expected at least two core migrations ending at head %d, got %v", head, migrations)
+		}
+		previous := migrations[len(migrations)-2].Version
+
+		// Down must undo exactly one step.
+		if err := MigrateDownCore(ctx, db); err != nil {
+			t.Fatalf("migrate down core: %v", err)
+		}
+		afterDown, err := CurrentVersionCore(ctx, db)
+		if err != nil {
+			t.Fatalf("current core version after down: %v", err)
+		}
+		if afterDown != previous {
+			t.Fatalf("expected one-step rollback from %d to %d, got %d", head, previous, afterDown)
+		}
+	})
+}
+
+func TestMigrateUpToCloud_RejectsUnavailableTargetBeforeApplying(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		// Cloud migrations intentionally jump from 1 to 3. Target 2 must fail
+		// before version 1 is applied rather than partially migrating the DB.
+		err := MigrateUpToCloud(ctx, db, 2)
+		if err == nil {
+			t.Fatal("expected unavailable cloud target to fail")
+		}
+		if !strings.Contains(err.Error(), "migration target 2 is not available") {
+			t.Fatalf("unexpected unavailable-target error: %v", err)
+		}
+		if tableExists(ctx, t, db, "plan_entitlements") {
+			t.Fatal("cloud version 1 was applied before unavailable target 2 failed")
+		}
+		if tableExists(ctx, t, db, migrationTableCloud) {
+			t.Fatal("cloud migration table was created before unavailable target 2 failed")
+		}
+	})
+}
+
+func TestCurrentVersionDoesNotInitializeMigrationTables(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		core, err := CurrentVersionCore(ctx, db)
+		if err != nil {
+			t.Fatalf("current core version: %v", err)
+		}
+		cloud, err := CurrentVersionCloud(ctx, db)
+		if err != nil {
+			t.Fatalf("current cloud version: %v", err)
+		}
+		if core != 0 || cloud != 0 {
+			t.Fatalf("fresh database versions = core %d, cloud %d; want 0, 0", core, cloud)
+		}
+		if err := MigrateUpToCore(ctx, db, 0); err != nil {
+			t.Fatalf("migrate core to current zero version: %v", err)
+		}
+		if err := MigrateUpToCloud(ctx, db, 0); err != nil {
+			t.Fatalf("migrate cloud to current zero version: %v", err)
+		}
+		if tableExists(ctx, t, db, migrationTableCore) || tableExists(ctx, t, db, migrationTableCloud) {
+			t.Fatal("read-only version inspection or up-to-current zero created a migration table")
+		}
+	})
+}
+
+func TestWithGooseSerializesConfigurationAndOperation(t *testing.T) {
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+
+	go func() {
+		firstDone <- withGoose(migrationTableCore, func() error {
+			close(firstEntered)
+			<-releaseFirst
+			if got := goose.TableName(); got != migrationTableCore {
+				return fmt.Errorf("first operation inherited table %q", got)
+			}
+			return nil
+		})
+	}()
+	<-firstEntered
+
+	secondStarted := make(chan struct{})
+	secondEntered := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		close(secondStarted)
+		secondDone <- withGoose(migrationTableCloud, func() error {
+			close(secondEntered)
+			if got := goose.TableName(); got != migrationTableCloud {
+				return fmt.Errorf("second operation inherited table %q", got)
+			}
+			return nil
+		})
+	}()
+	<-secondStarted
+
+	select {
+	case <-secondEntered:
+		close(releaseFirst)
+		<-firstDone
+		<-secondDone
+		t.Fatal("second goose operation entered before the first completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-secondEntered:
+	case <-time.After(time.Second):
+		t.Fatal("second goose operation did not enter after the first completed")
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func tableExists(ctx context.Context, t *testing.T, db *sql.DB, name string) bool {
+	t.Helper()
+	var exists bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)`,
+		name).Scan(&exists); err != nil {
+		t.Fatalf("check table %s: %v", name, err)
+	}
+	return exists
+}
