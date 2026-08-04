@@ -75,7 +75,9 @@ part of this branch.
 - Set `calculateTotal: true` on every recovery page. Require a non-empty
   `queryState`, `canCalculateChanges: true`, the requested `position`, and the
   same `queryState` and `total` on every page. Restart from position zero on
-  state/total drift, with three attempts maximum.
+  state/total drift, with three attempts maximum. Detect drift before enforcing
+  the exact response position because a shrinking result may clamp that position
+  to the new total.
 - Reject empty premature pages, malformed IDs, duplicate IDs, positions that
   do not match the request, and pages inconsistent with `total` or the limit.
 - Keep ordinary first-time bootstrap deliberately bounded to the newest 50

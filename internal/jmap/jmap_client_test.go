@@ -285,10 +285,11 @@ func TestFetchChangesRecoveryRetriesStateDrift(t *testing.T) {
 			if position == 0 {
 				attempt++
 			}
-			state := fmt.Sprintf("stable-state-%d", attempt)
 			if attempt == 1 && position == 50 {
-				state = "drifted-state"
+				writeJMAPTestResponse(t, w, method, recoveryQueryResponse("drifted-state", 40, 40, nil))
+				return
 			}
+			state := fmt.Sprintf("stable-state-%d", attempt)
 			end := position + recoveryQueryPageSize
 			if end > len(allIDs) {
 				end = len(allIDs)

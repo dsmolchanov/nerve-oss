@@ -267,6 +267,9 @@ func (c *JMAPClient) emailQueryAllAttempt(ctx context.Context) (string, []string
 		if err != nil {
 			return "", nil, false, fmt.Errorf("invalid recovery Email/query response: %w", err)
 		}
+		if expectedState != "" && (queryState != expectedState || total != expectedTotal) {
+			return "", nil, true, nil
+		}
 		responsePosition, err := nonNegativeInt(resp, "position")
 		if err != nil {
 			return "", nil, false, fmt.Errorf("invalid recovery Email/query response: %w", err)
@@ -278,8 +281,6 @@ func (c *JMAPClient) emailQueryAllAttempt(ctx context.Context) (string, []string
 		if expectedState == "" {
 			expectedState = queryState
 			expectedTotal = total
-		} else if queryState != expectedState || total != expectedTotal {
-			return "", nil, true, nil
 		}
 
 		ids, err := strictStringSlice(resp["ids"])
