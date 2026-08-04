@@ -73,43 +73,87 @@ func (a *OutboundAdapter) SendMessage(ctx context.Context, msg emailtransport.Ou
 	if strings.TrimSpace(msg.HTMLBody) != "" {
 		payload["html"] = msg.HTMLBody
 	}
+	if len(msg.CC) > 0 {
+		payload["cc"] = msg.CC
+	}
+	if len(msg.BCC) > 0 {
+		payload["bcc"] = msg.BCC
+	}
+	if len(msg.ReplyTo) > 0 {
+		payload["reply_to"] = msg.ReplyTo
+	}
+	if len(msg.Tags) > 0 {
+		var tags []map[string]string
+		for k, v := range msg.Tags {
+			tags = append(tags, map[string]string{"name": k, "value": v})
+		}
+		payload["tags"] = tags
+	}
+	if len(msg.Headers) > 0 {
+		payload["headers"] = msg.Headers
+	}
 
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.base+"/emails", bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+a.apiKey)
-	if strings.TrimSpace(idempotencyKey) != "" {
-		req.Header.Set("Idempotency-Key", idempotencyKey)
+	var lastStatus int
+	var lastBody []byte
+
+	for attempt := 0; attempt < maxResendRequestAttempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.base+"/emails", bytes.NewReader(body))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+a.apiKey)
+		if strings.TrimSpace(idempotencyKey) != "" {
+			req.Header.Set("Idempotency-Key", idempotencyKey)
+		}
+
+		resp, err := a.client.Do(req)
+		if err != nil {
+			return "", err
+		}
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			var parsed struct {
+				ID string `json:"id"`
+			}
+			if err := json.Unmarshal(respBody, &parsed); err != nil {
+				return "", err
+			}
+			if strings.TrimSpace(parsed.ID) == "" {
+				return "", errors.New("resend response missing id")
+			}
+			return parsed.ID, nil
+		}
+
+		lastStatus = resp.StatusCode
+		lastBody = respBody
+
+		if !isRetryableResendStatus(resp.StatusCode) || attempt == maxResendRequestAttempts-1 {
+			break
+		}
+
+		delay := resendRetryDelay(resp.Header.Get("Retry-After"), attempt)
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(delay):
+		}
 	}
 
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return "", err
+	permanent, reason := emailtransport.ClassifyHTTPStatus(lastStatus)
+	return "", &emailtransport.ProviderError{
+		Permanent:  permanent,
+		StatusCode: lastStatus,
+		Reason:     reason,
+		Cause:      fmt.Errorf("resend send failed: status=%d body=%s", lastStatus, strings.TrimSpace(string(lastBody))),
 	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("resend send failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(respBody)))
-	}
-
-	var parsed struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return "", err
-	}
-	if strings.TrimSpace(parsed.ID) == "" {
-		return "", errors.New("resend response missing id")
-	}
-	return parsed.ID, nil
 }
 
 func (a *OutboundAdapter) GetDeliveryStatus(context.Context, string) (emailtransport.DeliveryStatus, error) {

@@ -26,19 +26,35 @@ func TestResendDomainsClientCRUDPathsAndAuth(t *testing.T) {
 				t.Fatalf("expected name=example.com, got %#v", body["name"])
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"data":{"id":"d_123","name":"example.com","status":"not_started","records":[{"record":"SPF","name":"send","type":"TXT","value":"v=spf1 include:resend.com ~all","ttl":"Auto","status":"not_started"}]}}`))
+			_, _ = w.Write([]byte(`{"object":"domain","id":"d_123","name":"example.com","status":"not_started","records":[{"record":"SPF","name":"send","type":"TXT","value":"v=spf1 include:resend.com ~all","ttl":"Auto","status":"not_started"}]}`))
 			return
 		case r.Method == http.MethodGet && r.URL.Path == "/domains/d_123":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"data":{"id":"d_123","name":"example.com","status":"pending","records":[]}}`))
+			_, _ = w.Write([]byte(`{"object":"domain","id":"d_123","name":"example.com","status":"pending","records":[]}`))
 			return
 		case r.Method == http.MethodPost && r.URL.Path == "/domains/d_123/verify":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"data":{"id":"d_123","name":"example.com","status":"pending","records":[]}}`))
+			_, _ = w.Write([]byte(`{"object":"domain","id":"d_123","name":"example.com","status":"pending","records":[]}`))
 			return
 		case r.Method == http.MethodGet && r.URL.Path == "/domains":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"data":[{"id":"d_123","name":"example.com","status":"pending","region":"us-east-1"}]}`))
+			return
+		case r.Method == http.MethodPatch && r.URL.Path == "/domains/d_123":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode enable receiving body: %v", err)
+			}
+			caps, ok := body["capabilities"].(map[string]any)
+			if !ok {
+				t.Fatalf("expected capabilities map, got %#v", body["capabilities"])
+			}
+			if caps["receiving"] != "enabled" {
+				t.Fatalf("expected receiving=enabled, got %#v", caps["receiving"])
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"d_123","object":"domain"}`))
 			return
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
@@ -87,6 +103,10 @@ func TestResendDomainsClientCRUDPathsAndAuth(t *testing.T) {
 		t.Fatalf("unexpected listed domains: %+v", listed)
 	}
 
+	if err := client.EnableReceiving(context.Background(), "d_123"); err != nil {
+		t.Fatalf("EnableReceiving: %v", err)
+	}
+
 	for i, auth := range gotAuth {
 		if auth != "Bearer re_test_key" {
 			t.Fatalf("request %d expected auth bearer, got %q", i, auth)
@@ -97,6 +117,7 @@ func TestResendDomainsClientCRUDPathsAndAuth(t *testing.T) {
 		"GET /domains/d_123",
 		"POST /domains/d_123/verify",
 		"GET /domains",
+		"PATCH /domains/d_123",
 	}
 	if len(gotPaths) != len(expectedPaths) {
 		t.Fatalf("expected %d requests, got %d: %+v", len(expectedPaths), len(gotPaths), gotPaths)
@@ -105,5 +126,48 @@ func TestResendDomainsClientCRUDPathsAndAuth(t *testing.T) {
 		if gotPaths[i] != expectedPaths[i] {
 			t.Fatalf("request %d expected %q got %q", i, expectedPaths[i], gotPaths[i])
 		}
+	}
+}
+
+func TestResendDomainsClientRetriesRateLimitedGet(t *testing.T) {
+	attempts := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/domains/d_123" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer re_test_key" {
+			t.Fatalf("missing auth header")
+		}
+
+		attempts++
+		if attempts == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"statusCode":429,"name":"rate_limit_exceeded"}`))
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"id":"d_123","name":"example.com","status":"pending","records":[]}}`))
+	}))
+	defer srv.Close()
+
+	client := NewDomainsClient(Config{
+		APIKey:     "re_test_key",
+		BaseURL:    srv.URL,
+		HTTPClient: srv.Client(),
+	})
+
+	got, err := client.GetDomain(context.Background(), "d_123")
+	if err != nil {
+		t.Fatalf("GetDomain retry failed: %v", err)
+	}
+	if got.ID != "d_123" {
+		t.Fatalf("unexpected domain id: %+v", got)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected 2 attempts, got %d", attempts)
 	}
 }

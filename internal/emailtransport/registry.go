@@ -71,3 +71,13 @@ func (r *Registry) Domain(name string) (DomainAdapter, bool) {
 	adapter, ok := r.domain[name]
 	return adapter, ok
 }
+
+// OutboundCount returns the number of registered outbound adapters.
+// Used by the readiness check to assert "at least one adapter is
+// registered" without naming a specific provider — so SMTP-only or
+// Resend-only deployments are both valid.
+func (r *Registry) OutboundCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.outbound)
+}

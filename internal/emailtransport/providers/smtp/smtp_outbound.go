@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/mail"
 	"net/smtp"
+	"net/textproto"
 	"strings"
 
 	"github.com/google/uuid"
@@ -142,7 +143,23 @@ func buildMIMEMessage(msg emailtransport.OutboundMessage) (string, error) {
 	return b.String(), nil
 }
 
-func (a *OutboundAdapter) SendMessage(ctx context.Context, msg emailtransport.OutboundMessage, _ string) (string, error) {
+func (a *OutboundAdapter) SendMessage(ctx context.Context, msg emailtransport.OutboundMessage, key string) (string, error) {
+	id, err := a.doSend(ctx, msg, key)
+	if err == nil {
+		return id, nil
+	}
+	// If the error is already classified (e.g. from a nested call), pass
+	// it through untouched. Otherwise classify SMTP response codes and
+	// network errors into a ProviderError so the outbox worker can decide
+	// whether to retry.
+	var pe *emailtransport.ProviderError
+	if errors.As(err, &pe) {
+		return id, err
+	}
+	return id, classifySMTPError(err)
+}
+
+func (a *OutboundAdapter) doSend(ctx context.Context, msg emailtransport.OutboundMessage, _ string) (string, error) {
 	addr := fmt.Sprintf("%s:%d", a.cfg.Host, a.cfg.Port)
 	payload, err := buildMIMEMessage(msg)
 	if err != nil {
@@ -211,6 +228,49 @@ func (a *OutboundAdapter) SendMessage(ctx context.Context, msg emailtransport.Ou
 	_ = client.Quit()
 	// SMTP has no stable provider message ID; the message row ID is the durable identifier.
 	return "", nil
+}
+
+// classifySMTPError turns a net/smtp error into a ProviderError. SMTP
+// response codes in the 5xx range (550, 551, 553, etc.) are permanent
+// failures — no amount of retry will deliver to an invalid recipient or
+// over a forbidden auth method. 4xx responses (421, 450, 451) are
+// transient. Transport errors (dial, TLS, read) are transient by default.
+func classifySMTPError(err error) *emailtransport.ProviderError {
+	if err == nil {
+		return nil
+	}
+	var te *textproto.Error
+	if errors.As(err, &te) {
+		reason := smtpReasonForCode(te.Code)
+		if te.Code >= 500 && te.Code < 600 {
+			return emailtransport.NewPermanentError(te.Code, reason, err)
+		}
+		if te.Code >= 400 && te.Code < 500 {
+			return emailtransport.NewTransientError(te.Code, reason, err)
+		}
+	}
+	// Dial failures, TLS handshake errors, writer errors — all transient
+	// unless the upstream caller has already decided otherwise.
+	return emailtransport.NewTransientError(0, "network_error", err)
+}
+
+func smtpReasonForCode(code int) string {
+	switch code {
+	case 421:
+		return "service_unavailable"
+	case 450, 451, 452:
+		return "mailbox_busy"
+	case 550:
+		return "mailbox_unavailable"
+	case 551, 553:
+		return "invalid_recipient"
+	case 552:
+		return "storage_exceeded"
+	case 554:
+		return "transaction_failed"
+	default:
+		return "smtp_error"
+	}
 }
 
 func (a *OutboundAdapter) GetDeliveryStatus(context.Context, string) (emailtransport.DeliveryStatus, error) {
