@@ -128,7 +128,7 @@ func (s *Store) GetInboxByAddress(ctx context.Context, address string) (InboxRec
 		       inbound_provider_config_ref, outbound_provider_config_ref,
 		       forward_to
 		FROM inboxes
-		WHERE lower(address) = lower($1)
+		WHERE lower(address) = lower($1) AND status = 'active'
 		ORDER BY created_at DESC
 		LIMIT 1
 	`, address)

@@ -139,6 +139,30 @@ func TestEnsureOrgDomainConcurrentReplay(t *testing.T) {
 	})
 }
 
+func TestEnsureOrgDomainReturnsResourceConflictForLegacyActiveDomain(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		orgID, err := st.CreateOrg(ctx, "legacy-domain-owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+		domainID, err := st.CreateOrgDomain(ctx, orgID, "abrolia.com", "verify", "selector", "private", "public", "cname")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.UpdateOrgDomainStatus(ctx, domainID, "active"); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = st.EnsureOrgDomain(
+			ctx, orgID, "ABROLIA.COM", "verify", "selector", "private", "public", "cname", "domain:new-ref",
+		)
+		if !errors.Is(err, ErrResourceConflict) {
+			t.Fatalf("legacy active domain collision error=%v, want resource conflict", err)
+		}
+	})
+}
+
 func TestEnsureOrgDomainSerializesWithOrgDeletion(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToLatest(t, ctx, db)
@@ -301,6 +325,16 @@ func TestCreateInboxCanonicalAddressConflict(t *testing.T) {
 		if _, err := st.CreateInboxForOrg(ctx, secondOrgID, "Family@Abrolia.com", ""); !errors.Is(err, ErrResourceConflict) {
 			t.Fatalf("duplicate inbox error=%v, want resource conflict", err)
 		}
+		first, err := st.GetInboxByAddress(ctx, "family@abrolia.com")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if disabled, err := st.DisableInboxForOrg(ctx, firstOrgID, first.ID); err != nil || !disabled {
+			t.Fatalf("disable first inbox: disabled=%v err=%v", disabled, err)
+		}
+		if _, err := st.CreateInboxForOrg(ctx, secondOrgID, "Family@Abrolia.com", ""); err != nil {
+			t.Fatalf("recreate disabled canonical address: %v", err)
+		}
 	})
 }
 
@@ -452,6 +486,9 @@ func TestOwnerScopedGrantRevokeSeesGranteeInbox(t *testing.T) {
 			t.Fatalf("grant after refused revoke=%+v err=%v", current, err)
 		}
 
+		if err := st.UpdateOrgDomainStatus(ctx, domainID, "failed"); err != nil {
+			t.Fatal(err)
+		}
 		if err := st.RunAsOrg(ctx, granteeID, func(scoped *Store) error {
 			_, disableErr := scoped.DisableInboxForOrg(ctx, granteeID, inbox.ID)
 			return disableErr

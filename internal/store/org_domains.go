@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type OrgDomain struct {
@@ -72,7 +73,8 @@ func (s *Store) EnsureOrgDomain(ctx context.Context, orgID, domain, verification
 	var rec OrgDomain
 	created := false
 	err := s.withTx(ctx, func(scoped *Store) error {
-		if err := scoped.lockActiveOrgForReconciliation(ctx, orgID); err != nil {
+		canonicalDomain := strings.ToLower(strings.TrimSpace(domain))
+		if err := scoped.lockActiveOrgResourcesForReconciliation(ctx, orgID, "domain:"+canonicalDomain); err != nil {
 			return err
 		}
 
@@ -87,6 +89,22 @@ func (s *Store) EnsureOrgDomain(ctx context.Context, orgID, domain, verification
 }
 
 func (s *Store) ensureOrgDomainLocked(ctx context.Context, orgID, domain, verificationToken, dkimSelector, dkimPrivateKeyEnc, dkimPublicKey, dkimMethod, externalRef string) (OrgDomain, bool, error) {
+	canonicalDomain := strings.ToLower(strings.TrimSpace(domain))
+	var conflictingActiveDomain bool
+	if err := s.q.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM org_domains
+			WHERE lower(domain) = $1
+			  AND status IN ('verified_dns', 'provisioning', 'active')
+			  AND external_ref IS DISTINCT FROM $2
+		)
+	`, canonicalDomain, externalRef).Scan(&conflictingActiveDomain); err != nil {
+		return OrgDomain{}, false, err
+	}
+	if conflictingActiveDomain {
+		return OrgDomain{}, false, ErrResourceConflict
+	}
+
 	// Insert first and let the unique external_ref index serialize concurrent
 	// reconciler replays. A pre-read followed by an unchecked insert leaves a
 	// race where the losing worker exposes a raw unique-constraint error.
@@ -98,7 +116,7 @@ func (s *Store) ensureOrgDomainLocked(ctx context.Context, orgID, domain, verifi
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now() + interval '7 days', $9)
 		ON CONFLICT (external_ref) WHERE external_ref IS NOT NULL DO NOTHING
 		RETURNING id::text
-	`, id, orgID, strings.ToLower(domain), verificationToken, dkimSelector,
+	`, id, orgID, canonicalDomain, verificationToken, dkimSelector,
 		nullIfEmpty(dkimPrivateKeyEnc), nullIfEmpty(dkimPublicKey), dkimMethod, externalRef,
 	).Scan(&id)
 	if err == nil {
@@ -106,6 +124,10 @@ func (s *Store) ensureOrgDomainLocked(ctx context.Context, orgID, domain, verifi
 		return created, true, getErr
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "idx_org_domains_verified" {
+			return OrgDomain{}, false, ErrResourceConflict
+		}
 		return OrgDomain{}, false, err
 	}
 

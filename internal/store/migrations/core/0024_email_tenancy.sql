@@ -17,7 +17,9 @@ CREATE UNIQUE INDEX uq_org_webhooks_external_ref ON org_webhooks (external_ref) 
 DO $$
 BEGIN
   IF EXISTS (
-    SELECT lower(address) FROM inboxes GROUP BY lower(address) HAVING count(*) > 1
+    SELECT lower(address) FROM inboxes
+    WHERE status = 'active'
+    GROUP BY lower(address) HAVING count(*) > 1
   ) THEN
     RAISE EXCEPTION 'cannot apply core migration 0024: duplicate canonical inbox addresses exist';
   END IF;
@@ -25,7 +27,8 @@ END;
 $$;
 -- +goose StatementEnd
 
-CREATE UNIQUE INDEX uq_inboxes_canonical_address ON inboxes (lower(address));
+CREATE UNIQUE INDEX uq_inboxes_canonical_address ON inboxes (lower(address))
+  WHERE status = 'active';
 
 CREATE TABLE org_domain_grants (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -46,6 +49,9 @@ CREATE INDEX idx_org_domain_grants_grantee
 -- +goose StatementBegin
 CREATE FUNCTION enforce_inbox_domain_access() RETURNS trigger AS $$
 BEGIN
+  IF NEW.status <> 'active' THEN
+    RETURN NEW;
+  END IF;
   IF NEW.org_domain_id IS NULL THEN
     RETURN NEW;
   END IF;

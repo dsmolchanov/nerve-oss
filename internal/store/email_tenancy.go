@@ -266,7 +266,12 @@ func (s *Store) lockReconciliationResources(ctx context.Context, resources ...st
 }
 
 func (s *Store) lockActiveOrgForReconciliation(ctx context.Context, orgID string) error {
-	if err := s.lockReconciliationResources(ctx, "org:"+orgID); err != nil {
+	return s.lockActiveOrgResourcesForReconciliation(ctx, orgID)
+}
+
+func (s *Store) lockActiveOrgResourcesForReconciliation(ctx context.Context, orgID string, resources ...string) error {
+	resources = append(resources, "org:"+orgID)
+	if err := s.lockReconciliationResources(ctx, resources...); err != nil {
 		return err
 	}
 	var active bool
