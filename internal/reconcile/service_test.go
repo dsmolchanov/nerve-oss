@@ -98,6 +98,73 @@ func TestRunBackstopRolloverCreatesNewPeriodCounter(t *testing.T) {
 	})
 }
 
+func TestRunRepairsPendingOrgEventFanOut(t *testing.T) {
+	withTempStore(t, func(ctx context.Context, st *store.Store) {
+		orgID := uuid.NewString()
+		eventID := uuid.NewString()
+		now := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
+		if _, err := st.DB().ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'reconcile-events')`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.CreateOrgWebhook(ctx, orgID, "https://events.example.com", []string{"email.received"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.DB().ExecContext(ctx, `
+			INSERT INTO org_events (id, org_id, event_type, ref_kind, ref_id, payload, created_at)
+			VALUES ($1, $2, 'email.received', 'message', $3, '{}', $4)
+		`, eventID, orgID, uuid.NewString(), now.Add(-10*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+
+		svc := NewService(st)
+		svc.Now = func() time.Time { return now }
+		report, err := svc.Run(ctx)
+		if err != nil {
+			t.Fatalf("run reconciliation: %v", err)
+		}
+		if report.OrgEventsFannedOut != 1 {
+			t.Fatalf("org events fanned out=%d, want 1", report.OrgEventsFannedOut)
+		}
+		var fannedOut bool
+		if err := st.DB().QueryRowContext(ctx, `SELECT fanned_out_at IS NOT NULL FROM org_events WHERE id = $1`, eventID).Scan(&fannedOut); err != nil {
+			t.Fatal(err)
+		}
+		if !fannedOut {
+			t.Fatal("reconciler did not stamp pending org event")
+		}
+		var deliveries int
+		if err := st.DB().QueryRowContext(ctx, `SELECT count(*) FROM org_webhook_deliveries WHERE org_event_id = $1`, eventID).Scan(&deliveries); err != nil {
+			t.Fatal(err)
+		}
+		if deliveries != 1 {
+			t.Fatalf("deliveries=%d, want 1", deliveries)
+		}
+	})
+}
+
+func TestRunAtSchema19SkipsUnavailableOrgEventJournal(t *testing.T) {
+	withTempStore(t, func(ctx context.Context, st *store.Store) {
+		if err := store.MigrateDownCore(ctx, st.DB()); err != nil {
+			t.Fatalf("down from schema 21: %v", err)
+		}
+		if err := store.MigrateDownCore(ctx, st.DB()); err != nil {
+			t.Fatalf("down from schema 20: %v", err)
+		}
+		version, err := store.CurrentVersionCore(ctx, st.DB())
+		if err != nil || version != 19 {
+			t.Fatalf("core version=%d err=%v, want 19", version, err)
+		}
+
+		report, err := NewService(st).Run(ctx)
+		if err != nil {
+			t.Fatalf("run reconciliation at schema 19: %v", err)
+		}
+		if report.OrgEventsFannedOut != 0 {
+			t.Fatalf("org events fanned out=%d, want 0 without journal schema", report.OrgEventsFannedOut)
+		}
+	})
+}
+
 func insertOrgAndEntitlement(t *testing.T, ctx context.Context, st *store.Store, orgID string, periodStart, periodEnd time.Time) {
 	t.Helper()
 	if _, err := st.DB().ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'reconcile-org')`, orgID); err != nil {

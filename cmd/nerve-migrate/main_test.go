@@ -190,15 +190,15 @@ func TestRunBoundedAllCloudGapPreventsEveryMutation(t *testing.T) {
 	}
 }
 
-func TestRunUnboundedAllPreflightsBeforeCoreThenCloud(t *testing.T) {
+func TestRunWithoutTargetUsesCompiledRuntimeWindows(t *testing.T) {
 	backend := &fakeBackend{statuses: map[migrationScope][]statusResult{
 		scopeCore: {
-			{status: migrationStatus{Current: 1, Head: 2, Pending: []int64{2}}},
-			{status: migrationStatus{Current: 2, Head: 2}},
+			{status: migrationStatus{Current: 18, Head: 21, Pending: []int64{19, 20, 21}}},
+			{status: migrationStatus{Current: 19, Head: 21, Pending: []int64{20, 21}}},
 		},
 		scopeCloud: {
-			{status: migrationStatus{Current: 0, Head: 3, Pending: []int64{1, 3}}},
-			{status: migrationStatus{Current: 3, Head: 3}},
+			{status: migrationStatus{Current: 2, Head: 7, Pending: []int64{3, 4, 5, 6, 7}}},
+			{status: migrationStatus{Current: 3, Head: 7, Pending: []int64{4, 5, 6, 7}}},
 		},
 	}}
 
@@ -209,8 +209,8 @@ func TestRunUnboundedAllPreflightsBeforeCoreThenCloud(t *testing.T) {
 	wantCalls := []string{
 		"status:core",
 		"status:cloud",
-		"up:core:head",
-		"up:cloud:head",
+		"up:core:19",
+		"up:cloud:3",
 		"status:core",
 		"status:cloud",
 		"close",
@@ -235,6 +235,24 @@ func TestRunTargetAlreadyCurrentIsNoOp(t *testing.T) {
 	wantCalls := []string{"status:core", "status:core", "close"}
 	if !reflect.DeepEqual(backend.calls, wantCalls) {
 		t.Fatalf("calls = %#v, want %#v", backend.calls, wantCalls)
+	}
+}
+
+func TestRunRejectsExplicitTargetAboveCompiledRuntimeWindow(t *testing.T) {
+	backend := &fakeBackend{statuses: map[migrationScope][]statusResult{
+		scopeCore: {{status: migrationStatus{Current: 19, Head: 21, Pending: []int64{20, 21}}}},
+	}}
+
+	output, err := runFake(t, []string{"up", "--scope", "core", "--to", "20"}, backend)
+	if err == nil || !strings.Contains(err.Error(), "target 20 exceeds compiled runtime maximum 19") {
+		t.Fatalf("run() error=%v, want compiled-window refusal", err)
+	}
+	if output != "" {
+		t.Fatalf("output=%q, want empty", output)
+	}
+	wantCalls := []string{"status:core", "close"}
+	if !reflect.DeepEqual(backend.calls, wantCalls) {
+		t.Fatalf("calls=%#v, want %#v", backend.calls, wantCalls)
 	}
 }
 
@@ -355,7 +373,7 @@ func TestRunClosesBackendOnOperationAndOpenErrors(t *testing.T) {
 		closeErr := errors.New("close failed")
 		backend := &fakeBackend{
 			statuses: map[migrationScope][]statusResult{
-				scopeCore: {{status: migrationStatus{Current: 1, Head: 2, Pending: []int64{2}}}},
+				scopeCore: {{status: migrationStatus{Current: 18, Head: 21, Pending: []int64{19, 20, 21}}}},
 			},
 			upErrors:   map[migrationScope]error{scopeCore: operationErr},
 			closeError: closeErr,

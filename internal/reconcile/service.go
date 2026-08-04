@@ -13,8 +13,9 @@ type Service struct {
 }
 
 type Report struct {
-	CountersRepaired int
-	PeriodsRolled    int
+	CountersRepaired   int
+	PeriodsRolled      int
+	OrgEventsFannedOut int
 }
 
 func NewService(st *store.Store) *Service {
@@ -61,6 +62,28 @@ func (s *Service) Run(ctx context.Context) (Report, error) {
 			return report, err
 		}
 		report.PeriodsRolled++
+	}
+
+	journalAvailable, err := s.Store.OrgEventJournalAvailable(ctx)
+	if err != nil {
+		return report, err
+	}
+	if journalAvailable {
+		for {
+			pending, err := s.Store.ListPendingOrgEvents(ctx, now.Add(-5*time.Minute), 100)
+			if err != nil {
+				return report, err
+			}
+			for _, event := range pending {
+				if _, err := s.Store.ReFanOutOrgEvent(ctx, event.ID); err != nil {
+					return report, err
+				}
+				report.OrgEventsFannedOut++
+			}
+			if len(pending) < 100 {
+				break
+			}
+		}
 	}
 
 	return report, nil
