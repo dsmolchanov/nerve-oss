@@ -64,22 +64,37 @@ func (s *Store) EnsureOrgDomain(ctx context.Context, orgID, domain, verification
 	if externalRef == "" {
 		return OrgDomain{}, false, errors.New("missing external_ref")
 	}
-	existing, err := s.GetOrgDomainByExternalRef(ctx, externalRef)
+
+	// Insert first and let the unique external_ref index serialize concurrent
+	// reconciler replays. A pre-read followed by an unchecked insert leaves a
+	// race where the losing worker exposes a raw unique-constraint error.
+	id := uuid.NewString()
+	err := s.q.QueryRowContext(ctx, `
+		INSERT INTO org_domains
+		  (id, org_id, domain, verification_token, dkim_selector,
+		   dkim_private_key_enc, dkim_public_key, dkim_method, expires_at, external_ref)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now() + interval '7 days', $9)
+		ON CONFLICT (external_ref) WHERE external_ref IS NOT NULL DO NOTHING
+		RETURNING id::text
+	`, id, orgID, strings.ToLower(domain), verificationToken, dkimSelector,
+		nullIfEmpty(dkimPrivateKeyEnc), nullIfEmpty(dkimPublicKey), dkimMethod, externalRef,
+	).Scan(&id)
 	if err == nil {
-		if existing.OrgID != orgID || !strings.EqualFold(existing.Domain, domain) || existing.DKIMMethod != dkimMethod {
-			return OrgDomain{}, false, ErrIdempotencyConflict
-		}
-		return existing, false, nil
+		created, getErr := s.GetOrgDomainByIDForOrg(ctx, orgID, id)
+		return created, true, getErr
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return OrgDomain{}, false, err
 	}
-	id, err := s.createOrgDomain(ctx, orgID, domain, verificationToken, dkimSelector, dkimPrivateKeyEnc, dkimPublicKey, dkimMethod, externalRef)
+
+	existing, err := s.GetOrgDomainByExternalRef(ctx, externalRef)
 	if err != nil {
 		return OrgDomain{}, false, err
 	}
-	created, err := s.GetOrgDomainByIDForOrg(ctx, orgID, id)
-	return created, true, err
+	if existing.OrgID != orgID || !strings.EqualFold(existing.Domain, domain) || existing.DKIMMethod != dkimMethod {
+		return OrgDomain{}, false, ErrIdempotencyConflict
+	}
+	return existing, false, nil
 }
 
 func (s *Store) GetOrgDomainByExternalRef(ctx context.Context, externalRef string) (OrgDomain, error) {

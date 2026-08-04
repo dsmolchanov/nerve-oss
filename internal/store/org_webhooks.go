@@ -110,19 +110,48 @@ func (s *Store) EnsureOrgWebhook(ctx context.Context, orgID, url string, events 
 	if externalRef == "" {
 		return OrgWebhook{}, false, errors.New("missing external_ref")
 	}
-	existing, err := s.GetOrgWebhookByExternalRef(ctx, externalRef)
+	if orgID == "" || url == "" {
+		return OrgWebhook{}, false, errors.New("missing org_id or url")
+	}
+	secret, err := generateWebhookSecret()
+	if err != nil {
+		return OrgWebhook{}, false, fmt.Errorf("generate secret: %w", err)
+	}
+	if events == nil {
+		events = []string{}
+	}
+
+	// The unique external_ref index is the synchronization point for concurrent
+	// retries. ON CONFLICT waits for the winning transaction, then the loser
+	// resolves and validates that durable row below.
+	var created OrgWebhook
+	var eventsText string
+	err = s.q.QueryRowContext(ctx, `
+		INSERT INTO org_webhooks (org_id, url, secret, events, external_ref)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (external_ref) WHERE external_ref IS NOT NULL DO NOTHING
+		RETURNING id::text, org_id::text, external_ref, url, secret, events::text, created_at, disabled_at
+	`, orgID, url, secret, events, externalRef).Scan(
+		&created.ID, &created.OrgID, &created.ExternalRef, &created.URL, &created.Secret,
+		&eventsText, &created.CreatedAt, &created.DisabledAt,
+	)
 	if err == nil {
-		if existing.OrgID != orgID || existing.URL != url || !equalStrings(existing.Events, events) || existing.DisabledAt.Valid {
-			return OrgWebhook{}, false, ErrIdempotencyConflict
-		}
-		existing.Secret = ""
-		return existing, false, nil
+		created.Events = parseTextArray(eventsText)
+		return created, true, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return OrgWebhook{}, false, err
 	}
-	created, err := s.createOrgWebhook(ctx, orgID, url, events, externalRef)
-	return created, true, err
+
+	existing, err := s.GetOrgWebhookByExternalRef(ctx, externalRef)
+	if err != nil {
+		return OrgWebhook{}, false, err
+	}
+	if existing.OrgID != orgID || existing.URL != url || !equalStrings(existing.Events, events) || existing.DisabledAt.Valid {
+		return OrgWebhook{}, false, ErrIdempotencyConflict
+	}
+	existing.Secret = ""
+	return existing, false, nil
 }
 
 // ListOrgWebhooks returns all webhooks for an org, newest first.
