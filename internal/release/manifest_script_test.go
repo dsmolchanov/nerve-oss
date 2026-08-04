@@ -89,7 +89,12 @@ func TestGenerateRuntimeManifestScript(t *testing.T) {
 		key             string
 		value           string
 		expectedVersion string
+		remove          bool
 	}{
+		{name: "missing runtime version", key: "runtime_version", remove: true},
+		{name: "missing MCP hash", key: "mcp_contract_hash", remove: true},
+		{name: "missing core hash", key: "core_schema_hash", remove: true},
+		{name: "missing build time", key: "build_time", remove: true},
 		{name: "empty MCP hash", key: "mcp_contract_hash", value: ""},
 		{name: "invalid core hash", key: "core_schema_hash", value: "not-a-sha256"},
 		{name: "invalid timestamp", key: "build_time", value: "not-a-timestamp"},
@@ -113,7 +118,11 @@ func TestGenerateRuntimeManifestScript(t *testing.T) {
 	}
 	for _, invalid := range invalidValues {
 		original := manifest[invalid.key]
-		manifest[invalid.key] = invalid.value
+		if invalid.remove {
+			delete(manifest, invalid.key)
+		} else {
+			manifest[invalid.key] = invalid.value
+		}
 		data, err := json.Marshal(manifest)
 		if err != nil {
 			t.Fatalf("marshal invalid manifest: %v", err)
