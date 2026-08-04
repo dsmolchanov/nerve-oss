@@ -42,6 +42,7 @@ func TestMessageAttachmentWorkerLeaseMirrorAndLoad(t *testing.T) {
 		content := []byte("durable-pdf-content")
 		digest, err := st.StoreMirroredMessageAttachment(
 			ctx, orgID, claimed[0].ID, claimed[0].LockedBy.String, claimed[0].LockedAt.Time, "application/pdf", content,
+			time.Now().UTC(),
 		)
 		if err != nil || digest == "" {
 			t.Fatalf("digest=%q err=%v", digest, err)

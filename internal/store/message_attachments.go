@@ -2,9 +2,7 @@ package store
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -206,6 +204,8 @@ func (s *Store) ListMessageAttachments(ctx context.Context, orgID, messageID str
 	return attachments, rows.Err()
 }
 
+// GetMessageAttachment resolves an attachment only through its complete tenant
+// ownership tuple so callers cannot distinguish cross-org IDs from missing IDs.
 func (s *Store) GetMessageAttachment(ctx context.Context, orgID, messageID, attachmentID string) (MessageAttachment, error) {
 	row := s.q.QueryRowContext(ctx, `
 		SELECT attachment.id::text, attachment.org_id::text, attachment.message_id::text, attachment.ordinal,
@@ -329,101 +329,6 @@ func (s *Store) ClaimMessageAttachments(
 	return attachments, rows.Err()
 }
 
-// StoreMirroredMessageAttachment stores content and links the metadata row in
-// one transaction. The exact worker/timestamp lease pair prevents a reclaimed
-// stale worker from overwriting a newer result or charging orphaned bytes.
-func (s *Store) StoreMirroredMessageAttachment(
-	ctx context.Context,
-	orgID string,
-	attachmentID string,
-	workerID string,
-	leaseAcquiredAt time.Time,
-	contentType string,
-	content []byte,
-) (string, error) {
-	workerID = strings.TrimSpace(workerID)
-	if strings.TrimSpace(orgID) == "" || strings.TrimSpace(attachmentID) == "" || workerID == "" || leaseAcquiredAt.IsZero() {
-		return "", errors.New("missing attachment mirror lease owner")
-	}
-	if len(content) == 0 {
-		return "", errors.New("attachment content is empty")
-	}
-	contentType = strings.TrimSpace(contentType)
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
-
-	digestBytes := sha256.Sum256(content)
-	digest := hex.EncodeToString(digestBytes[:])
-	err := s.withTx(ctx, func(scoped *Store) error {
-		if _, err := scoped.q.ExecContext(ctx, `
-			INSERT INTO org_attachment_usage (org_id, bytes_used)
-			SELECT $1, COALESCE(sum(size_bytes), 0) FROM attachment_blobs WHERE org_id = $1
-			ON CONFLICT (org_id) DO NOTHING
-		`, orgID); err != nil {
-			return err
-		}
-		var used, quota int64
-		if err := scoped.q.QueryRowContext(ctx, `
-			SELECT bytes_used, bytes_quota FROM org_attachment_usage
-			WHERE org_id = $1 FOR UPDATE
-		`, orgID).Scan(&used, &quota); err != nil {
-			return err
-		}
-
-		inserted := false
-		var storedSize int64
-		insertErr := scoped.q.QueryRowContext(ctx, `
-			INSERT INTO attachment_blobs (org_id, sha256, size_bytes, content_type, content)
-			VALUES ($1, $2, $3, $4, $5)
-			ON CONFLICT (org_id, sha256) DO NOTHING
-			RETURNING size_bytes
-		`, orgID, digest, len(content), contentType, content).Scan(&storedSize)
-		switch {
-		case insertErr == nil:
-			inserted = true
-		case errors.Is(insertErr, sql.ErrNoRows):
-			storedSize = int64(len(content))
-		default:
-			return insertErr
-		}
-		if inserted {
-			if used > quota || storedSize > quota-used {
-				return fmt.Errorf("%w: used=%d size=%d quota=%d", ErrAttachmentQuotaExceeded, used, storedSize, quota)
-			}
-			if _, err := scoped.q.ExecContext(ctx, `
-				UPDATE org_attachment_usage
-				SET bytes_used = bytes_used + $2, updated_at = now()
-				WHERE org_id = $1
-			`, orgID, storedSize); err != nil {
-				return err
-			}
-		}
-
-		result, err := scoped.q.ExecContext(ctx, `
-			UPDATE message_attachments
-			SET size_bytes = $4, content_type = $5, availability = 'available',
-			    blob_sha256 = $6, mirrored_at = now(), last_error = NULL,
-			    locked_at = NULL, locked_by = NULL
-			WHERE org_id = $1 AND id = $2
-			  AND availability = 'pending'
-			  AND locked_by = $3 AND locked_at = $7
-		`, orgID, attachmentID, workerID, len(content), contentType, digest, leaseAcquiredAt)
-		if err != nil {
-			return err
-		}
-		updated, err := result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if updated != 1 {
-			return ErrAttachmentLeaseLost
-		}
-		return nil
-	})
-	return digest, err
-}
-
 // RequeueMessageAttachment records a transient failure. The sixth claimed
 // attempt is terminal, matching the mirror worker contract in the rollout.
 func (s *Store) RequeueMessageAttachment(
@@ -493,6 +398,55 @@ func (s *Store) MarkMessageAttachmentAvailable(
 		  AND locked_by = $2
 		  AND locked_at = $3
 	`, digest, mirroredAt)
+}
+
+// StoreMirroredMessageAttachment commits content/quota accounting and the
+// leased message_attachments reference as one transaction. A lost lease rolls
+// the blob insert and usage charge back with the reference update.
+func (s *Store) StoreMirroredMessageAttachment(
+	ctx context.Context,
+	orgID string,
+	attachmentID string,
+	workerID string,
+	leaseAcquiredAt time.Time,
+	contentType string,
+	content []byte,
+	mirroredAt time.Time,
+) (digest string, err error) {
+	err = s.withTx(ctx, func(scoped *Store) error {
+		var storeErr error
+		digest, _, storeErr = scoped.StoreAttachmentBlob(ctx, orgID, contentType, content)
+		if storeErr != nil {
+			return storeErr
+		}
+		result, updateErr := scoped.q.ExecContext(ctx, `
+			UPDATE message_attachments
+			SET size_bytes = $5,
+			    content_type = coalesce(nullif($6, ''), content_type)
+			WHERE org_id = $1 AND id = $2
+			  AND availability = 'pending'
+			  AND locked_by = $3 AND locked_at = $4
+		`, orgID, attachmentID, workerID, leaseAcquiredAt, len(content), strings.TrimSpace(contentType))
+		if updateErr != nil {
+			return updateErr
+		}
+		updated, updateErr := result.RowsAffected()
+		if updateErr != nil {
+			return updateErr
+		}
+		if updated != 1 {
+			return ErrAttachmentLeaseLost
+		}
+		return scoped.MarkMessageAttachmentAvailable(
+			ctx,
+			attachmentID,
+			workerID,
+			leaseAcquiredAt,
+			digest,
+			mirroredAt,
+		)
+	})
+	return digest, err
 }
 
 func (s *Store) MarkMessageAttachmentTerminal(

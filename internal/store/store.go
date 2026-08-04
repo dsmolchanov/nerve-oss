@@ -132,6 +132,7 @@ type Message struct {
 	InboxID           string
 	ThreadID          string
 	Direction         string
+	AttachmentsState  string
 	Subject           string
 	Text              string
 	HTML              string
@@ -143,11 +144,10 @@ type Message struct {
 	To                []Participant
 	CC                []Participant
 
-	InReplyTo        string
-	References       []string
-	ReceivedEmailID  string
-	AttachmentsState string
-	Attachments      []MessageAttachment
+	InReplyTo       string
+	References      []string
+	ReceivedEmailID string
+	Attachments     []MessageAttachment
 }
 
 type Participant struct {

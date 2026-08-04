@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func (s *Store) ListThreads(ctx context.Context, inboxID string, status string, limit int) ([]Thread, error) {
@@ -53,7 +54,7 @@ func (s *Store) GetThread(ctx context.Context, threadID string) (Thread, []Messa
 	}
 	_ = json.Unmarshal(participantsJSON, &t.Participants)
 
-	rows, err := s.q.QueryContext(ctx, `SELECT id, inbox_id, thread_id, direction, coalesce(subject,''), coalesce(text,''), coalesce(html,''), created_at, coalesce(provider_message_id,''), coalesce(internet_message_id,''), coalesce(from_json,'{}'), coalesce(to_json,'[]'), coalesce(cc_json,'[]'), attachments_state, org_id::text FROM messages WHERE thread_id = $1 ORDER BY created_at ASC`, threadID)
+	rows, err := s.q.QueryContext(ctx, `SELECT message.id, message.inbox_id, message.thread_id, message.direction, coalesce(to_jsonb(message)->>'attachments_state','known'), coalesce(message.subject,''), coalesce(message.text,''), coalesce(message.html,''), message.created_at, coalesce(message.provider_message_id,''), coalesce(message.internet_message_id,''), coalesce(message.from_json,'{}'), coalesce(message.to_json,'[]'), coalesce(message.cc_json,'[]'), message.org_id::text FROM messages message WHERE message.thread_id = $1 ORDER BY message.created_at ASC`, threadID)
 	if err != nil {
 		return t, nil, err
 	}
@@ -63,7 +64,7 @@ func (s *Store) GetThread(ctx context.Context, threadID string) (Thread, []Messa
 		var m Message
 		var fromJSON, toJSON, ccJSON []byte
 		var orgID string
-		if err := rows.Scan(&m.ID, &m.InboxID, &m.ThreadID, &m.Direction, &m.Subject, &m.Text, &m.HTML, &m.CreatedAt, &m.ProviderMessageID, &m.InternetMessageID, &fromJSON, &toJSON, &ccJSON, &m.AttachmentsState, &orgID); err != nil {
+		if err := rows.Scan(&m.ID, &m.InboxID, &m.ThreadID, &m.Direction, &m.AttachmentsState, &m.Subject, &m.Text, &m.HTML, &m.CreatedAt, &m.ProviderMessageID, &m.InternetMessageID, &fromJSON, &toJSON, &ccJSON, &orgID); err != nil {
 			rows.Close()
 			return t, nil, err
 		}
@@ -79,7 +80,7 @@ func (s *Store) GetThread(ctx context.Context, threadID string) (Thread, []Messa
 	}
 	rows.Close()
 	for i := range messages {
-		attachments, err := s.ListMessageAttachments(ctx, messageOrgIDs[i], messages[i].ID)
+		attachments, err := s.listMessageAttachmentsCompatible(ctx, messageOrgIDs[i], messages[i].ID)
 		if err != nil {
 			return t, nil, err
 		}
@@ -100,20 +101,32 @@ func (s *Store) GetThreadInboxID(ctx context.Context, threadID string) (string, 
 func (s *Store) GetMessage(ctx context.Context, messageID string) (Message, error) {
 	var m Message
 	var fromJSON, toJSON, ccJSON []byte
-	row := s.q.QueryRowContext(ctx, `SELECT id, inbox_id, thread_id, direction, subject, text, html, created_at, provider_message_id, internet_message_id, from_json, to_json, cc_json, coalesce(received_email_id, ''), attachments_state, org_id::text FROM messages WHERE id = $1`, messageID)
+	row := s.q.QueryRowContext(ctx, `SELECT message.id, message.inbox_id, message.thread_id, message.direction, coalesce(to_jsonb(message)->>'attachments_state','known'), message.subject, message.text, message.html, message.created_at, message.provider_message_id, message.internet_message_id, message.from_json, message.to_json, message.cc_json, coalesce(message.received_email_id, ''), message.org_id::text FROM messages message WHERE message.id = $1`, messageID)
 	var orgID string
-	if err := row.Scan(&m.ID, &m.InboxID, &m.ThreadID, &m.Direction, &m.Subject, &m.Text, &m.HTML, &m.CreatedAt, &m.ProviderMessageID, &m.InternetMessageID, &fromJSON, &toJSON, &ccJSON, &m.ReceivedEmailID, &m.AttachmentsState, &orgID); err != nil {
+	if err := row.Scan(&m.ID, &m.InboxID, &m.ThreadID, &m.Direction, &m.AttachmentsState, &m.Subject, &m.Text, &m.HTML, &m.CreatedAt, &m.ProviderMessageID, &m.InternetMessageID, &fromJSON, &toJSON, &ccJSON, &m.ReceivedEmailID, &orgID); err != nil {
 		return m, err
 	}
 	_ = json.Unmarshal(fromJSON, &m.From)
 	_ = json.Unmarshal(toJSON, &m.To)
 	_ = json.Unmarshal(ccJSON, &m.CC)
-	attachments, err := s.ListMessageAttachments(ctx, orgID, m.ID)
+	attachments, err := s.listMessageAttachmentsCompatible(ctx, orgID, m.ID)
 	if err != nil {
 		return Message{}, err
 	}
 	m.Attachments = attachments
 	return m, nil
+}
+
+func (s *Store) listMessageAttachmentsCompatible(ctx context.Context, orgID, messageID string) ([]MessageAttachment, error) {
+	attachments, err := s.ListMessageAttachments(ctx, orgID, messageID)
+	if err == nil {
+		return attachments, nil
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
+		return nil, nil
+	}
+	return nil, err
 }
 
 func (s *Store) SearchInboxFTS(ctx context.Context, inboxID string, query string, limit int) ([]SearchResult, error) {

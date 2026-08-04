@@ -198,7 +198,7 @@ func TestAuthenticateRequestServiceJWTRejectsRevokedToken(t *testing.T) {
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	if _, err := svc.AuthenticateRequest(req); !errors.Is(err, ErrUnauthorized) {
+	if _, err := svc.AuthenticateRequest(req); !errors.Is(err, ErrUnauthenticated) || !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("expected revoked service token to be unauthorized, got %v", err)
 	}
 }

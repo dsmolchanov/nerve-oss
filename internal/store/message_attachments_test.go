@@ -47,6 +47,67 @@ func TestInsertMessageClassifiesProviderlessAttachmentState(t *testing.T) {
 	})
 }
 
+func TestMessageReadsExposeAttachmentState(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		orgID, inboxID, threadID := seedAttachmentMessageParents(t, ctx, db, "read-state")
+		messageID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO messages
+			  (id, org_id, inbox_id, thread_id, direction, received_email_id, attachments_state,
+			   subject, text, html, provider_message_id, internet_message_id, from_json, to_json, cc_json)
+			VALUES ($1, $2, $3, $4, 'inbound', 'received-read-state', 'unknown_metadata_expired',
+			        '', '', '', '', '', '{}', '[]', '[]')
+		`, messageID, orgID, inboxID, threadID); err != nil {
+			t.Fatal(err)
+		}
+
+		message, err := st.GetMessage(ctx, messageID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if message.AttachmentsState != "unknown_metadata_expired" {
+			t.Fatalf("GetMessage attachments_state=%q", message.AttachmentsState)
+		}
+
+		_, messages, err := st.GetThread(ctx, threadID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(messages) != 1 || messages[0].AttachmentsState != "unknown_metadata_expired" {
+			t.Fatalf("GetThread messages=%+v", messages)
+		}
+	})
+}
+
+func TestMessageReadsRemainCompatibleBeforeAttachmentStateMigration(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToVersion(t, ctx, db, 22)
+		st := &Store{db: db, q: db}
+		orgID, inboxID, threadID := seedAttachmentMessageParents(t, ctx, db, "read-state-core22")
+		messageID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO messages
+			  (id, org_id, inbox_id, thread_id, direction, received_email_id,
+			   subject, text, html, provider_message_id, internet_message_id, from_json, to_json, cc_json)
+			VALUES ($1, $2, $3, $4, 'inbound', 'received-core22',
+			        '', '', '', '', '', '{}', '[]', '[]')
+		`, messageID, orgID, inboxID, threadID); err != nil {
+			t.Fatal(err)
+		}
+
+		message, err := st.GetMessage(ctx, messageID)
+		if err != nil || message.AttachmentsState != "known" {
+			t.Fatalf("GetMessage message=%+v err=%v", message, err)
+		}
+		_, messages, err := st.GetThread(ctx, threadID)
+		if err != nil || len(messages) != 1 || messages[0].AttachmentsState != "known" {
+			t.Fatalf("GetThread messages=%+v err=%v", messages, err)
+		}
+	})
+}
+
 func TestSetMessageAttachmentsKnownPersistsMetadataAndIsReplaySafe(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToLatest(t, ctx, db)
@@ -84,6 +145,13 @@ func TestSetMessageAttachmentsKnownPersistsMetadataAndIsReplaySafe(t *testing.T)
 		}
 		if attachments[1].Ordinal != 1 || attachments[1].ContentType != "application/octet-stream" {
 			t.Fatalf("second attachment=%+v", attachments[1])
+		}
+		attachment, err := st.GetMessageAttachment(ctx, orgID, messageID, attachments[0].ID)
+		if err != nil || attachment.ProviderAttachmentID != "provider-1" {
+			t.Fatalf("GetMessageAttachment attachment=%+v err=%v", attachment, err)
+		}
+		if _, err := st.GetMessageAttachment(ctx, uuid.NewString(), messageID, attachments[0].ID); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("cross-org GetMessageAttachment err=%v, want sql.ErrNoRows", err)
 		}
 		var state string
 		if err := db.QueryRowContext(ctx, `SELECT attachments_state FROM messages WHERE id = $1`, messageID).Scan(&state); err != nil {
