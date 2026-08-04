@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,6 +42,9 @@ func TestClaimMessageAttachmentsHonorsScheduleAndLeaseExpiry(t *testing.T) {
 			if attachment.AttemptCount != 1 || !attachment.LockedBy.Valid || attachment.LockedBy.String != "worker-a" {
 				t.Fatalf("claimed attachment=%+v", attachment)
 			}
+			if attachment.ReceivedEmailID != "received-"+messageID {
+				t.Fatalf("received email id=%q, want queue source", attachment.ReceivedEmailID)
+			}
 		}
 
 		claimed, err = st.ClaimMessageAttachments(ctx, 10, "worker-b", now, 5*time.Minute)
@@ -65,7 +69,7 @@ func TestRequeueMessageAttachmentBacksOffAndFailsSixthAttempt(t *testing.T) {
 			t.Fatalf("first claim=%v err=%v", claimed, err)
 		}
 		next := now.Add(time.Minute)
-		terminal, err := st.RequeueMessageAttachment(ctx, claimed[0].ID, "worker-a", next, "temporary")
+		terminal, err := st.RequeueMessageAttachment(ctx, claimed[0].ID, "worker-a", claimed[0].LockedAt.Time, next, "temporary")
 		if err != nil || terminal {
 			t.Fatalf("first retry terminal=%v err=%v", terminal, err)
 		}
@@ -84,7 +88,7 @@ func TestRequeueMessageAttachmentBacksOffAndFailsSixthAttempt(t *testing.T) {
 		if err != nil || len(claimed) != 1 || claimed[0].AttemptCount != MaxMessageAttachmentAttempts {
 			t.Fatalf("sixth claim=%v err=%v", claimed, err)
 		}
-		terminal, err = st.RequeueMessageAttachment(ctx, claimed[0].ID, "worker-b", next, "exhausted")
+		terminal, err = st.RequeueMessageAttachment(ctx, claimed[0].ID, "worker-b", claimed[0].LockedAt.Time, next, "exhausted")
 		if err != nil || !terminal {
 			t.Fatalf("sixth retry terminal=%v err=%v", terminal, err)
 		}
@@ -98,6 +102,44 @@ func TestRequeueMessageAttachmentBacksOffAndFailsSixthAttempt(t *testing.T) {
 		}
 		if availability != "failed" || lastError != "exhausted" || locked {
 			t.Fatalf("availability=%q last_error=%q locked=%v", availability, lastError, locked)
+		}
+	})
+}
+
+func TestClaimMessageAttachmentsTerminalizesExpiredSixthLease(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		st, _, _ := seedMessageAttachmentQueue(t, ctx, db, []string{"crashed-sixth"})
+		now := time.Now().UTC()
+		var attachmentID string
+		if err := db.QueryRowContext(ctx, `
+			UPDATE message_attachments
+			SET attempt_count = $1
+			WHERE provider_attachment_id = 'crashed-sixth'
+			RETURNING id::text
+		`, MaxMessageAttachmentAttempts-1).Scan(&attachmentID); err != nil {
+			t.Fatal(err)
+		}
+		claimed, err := st.ClaimMessageAttachments(ctx, 1, "worker", now, 5*time.Minute)
+		if err != nil || len(claimed) != 1 || claimed[0].AttemptCount != MaxMessageAttachmentAttempts {
+			t.Fatalf("sixth claim=%v err=%v", claimed, err)
+		}
+
+		claimed, err = st.ClaimMessageAttachments(ctx, 1, "worker", now.Add(6*time.Minute), 5*time.Minute)
+		if err != nil || len(claimed) != 0 {
+			t.Fatalf("expired sixth reclaim=%v err=%v, want no work", claimed, err)
+		}
+		var availability, lastError string
+		var attempts int
+		var locked bool
+		if err := db.QueryRowContext(ctx, `
+			SELECT availability, attempt_count, last_error,
+			       locked_at IS NOT NULL OR locked_by IS NOT NULL
+			FROM message_attachments WHERE id = $1
+		`, attachmentID).Scan(&availability, &attempts, &lastError, &locked); err != nil {
+			t.Fatal(err)
+		}
+		if availability != "failed" || attempts != MaxMessageAttachmentAttempts || locked || !strings.Contains(lastError, "retry budget exhausted") {
+			t.Fatalf("availability=%q attempts=%d locked=%v last_error=%q", availability, attempts, locked, lastError)
 		}
 	})
 }
@@ -118,10 +160,10 @@ func TestCompleteMessageAttachmentMirrorUpdatesAvailabilityAndRefCount(t *testin
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := st.MarkMessageAttachmentAvailable(ctx, byProvider["available"].ID, "worker", digest, now); err != nil {
+		if err := st.MarkMessageAttachmentAvailable(ctx, byProvider["available"].ID, "worker", byProvider["available"].LockedAt.Time, digest, now); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.MarkMessageAttachmentTerminal(ctx, byProvider["expired"].ID, "worker", "expired", "provider returned 404"); err != nil {
+		if err := st.MarkMessageAttachmentTerminal(ctx, byProvider["expired"].ID, "worker", byProvider["expired"].LockedAt.Time, "expired", "provider returned 404"); err != nil {
 			t.Fatal(err)
 		}
 		assertBlobRefCount(t, ctx, db, orgID, digest, 1)
@@ -142,22 +184,25 @@ func TestCompleteMessageAttachmentMirrorUpdatesAvailabilityAndRefCount(t *testin
 	})
 }
 
-func TestMessageAttachmentCompletionRejectsStaleWorker(t *testing.T) {
+func TestMessageAttachmentCompletionRejectsStaleLeaseFromSameWorker(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		st, _, _ := seedMessageAttachmentQueue(t, ctx, db, []string{"lease"})
 		now := time.Now().UTC()
-		first, err := st.ClaimMessageAttachments(ctx, 1, "worker-a", now, 5*time.Minute)
+		first, err := st.ClaimMessageAttachments(ctx, 1, "worker", now, 5*time.Minute)
 		if err != nil || len(first) != 1 {
 			t.Fatalf("first claim=%v err=%v", first, err)
 		}
-		second, err := st.ClaimMessageAttachments(ctx, 1, "worker-b", now.Add(6*time.Minute), 5*time.Minute)
+		second, err := st.ClaimMessageAttachments(ctx, 1, "worker", now.Add(6*time.Minute), 5*time.Minute)
 		if err != nil || len(second) != 1 {
 			t.Fatalf("second claim=%v err=%v", second, err)
 		}
-		if err := st.MarkMessageAttachmentTerminal(ctx, first[0].ID, "worker-a", "expired", "stale"); !errors.Is(err, ErrAttachmentLeaseLost) {
+		if err := st.MarkMessageAttachmentTerminal(ctx, first[0].ID, "worker", first[0].LockedAt.Time, "expired", "stale"); !errors.Is(err, ErrAttachmentLeaseLost) {
 			t.Fatalf("stale completion err=%v, want lease lost", err)
 		}
-		if err := st.MarkMessageAttachmentTerminal(ctx, second[0].ID, "worker-b", "expired", "current"); err != nil {
+		if _, err := st.RequeueMessageAttachment(ctx, first[0].ID, "worker", first[0].LockedAt.Time, now.Add(time.Hour), "stale"); !errors.Is(err, ErrAttachmentLeaseLost) {
+			t.Fatalf("stale requeue err=%v, want lease lost", err)
+		}
+		if err := st.MarkMessageAttachmentTerminal(ctx, second[0].ID, "worker", second[0].LockedAt.Time, "expired", "current"); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -165,7 +210,7 @@ func TestMessageAttachmentCompletionRejectsStaleWorker(t *testing.T) {
 
 func TestMarkMessageAttachmentTerminalRejectsInvalidStateBeforeSQL(t *testing.T) {
 	st := &Store{}
-	if err := st.MarkMessageAttachmentTerminal(context.Background(), uuid.NewString(), "worker", "available", ""); err == nil {
+	if err := st.MarkMessageAttachmentTerminal(context.Background(), uuid.NewString(), "worker", time.Now(), "available", ""); err == nil {
 		t.Fatal("non-terminal availability unexpectedly accepted")
 	}
 }
