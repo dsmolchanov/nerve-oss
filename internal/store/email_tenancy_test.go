@@ -246,6 +246,54 @@ func TestEnsureOrgWebhookConcurrentReplay(t *testing.T) {
 	})
 }
 
+func TestEnsureOrgWebhookSerializesWithOrgDeletion(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		orgID, err := st.CreateOrg(ctx, "serialized-webhook-owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "org:"+orgID); err != nil {
+			t.Fatal(err)
+		}
+		ensureResult := make(chan error, 1)
+		go func() {
+			_, _, ensureErr := st.EnsureOrgWebhook(
+				ctx, orgID, "https://example.com/inbound", []string{"email.received"}, "serialized:webhook",
+			)
+			ensureResult <- ensureErr
+		}()
+
+		select {
+		case err := <-ensureResult:
+			t.Fatalf("webhook ensure did not wait for reconciliation lock: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE orgs SET deleted_at = now() WHERE id = $1`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-ensureResult; !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("webhook ensure after serialized deletion error=%v, want no rows", err)
+		}
+		var webhooks int
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM org_webhooks WHERE org_id = $1`, orgID).Scan(&webhooks); err != nil {
+			t.Fatal(err)
+		}
+		if webhooks != 0 {
+			t.Fatalf("deleted org received %d webhooks", webhooks)
+		}
+	})
+}
+
 func TestDomainGrantCreationSerializesWithOrgDeletion(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToLatest(t, ctx, db)

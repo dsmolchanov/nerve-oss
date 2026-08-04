@@ -265,6 +265,22 @@ func (s *Store) lockReconciliationResources(ctx context.Context, resources ...st
 	return nil
 }
 
+func (s *Store) lockActiveOrgForReconciliation(ctx context.Context, orgID string) error {
+	if err := s.lockReconciliationResources(ctx, "org:"+orgID); err != nil {
+		return err
+	}
+	var active bool
+	if err := s.q.QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM orgs WHERE id = $1 AND deleted_at IS NULL)
+	`, orgID).Scan(&active); err != nil {
+		return err
+	}
+	if !active {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (s *Store) GetOrgDomainGrantByExternalRef(ctx context.Context, externalRef string) (OrgDomainGrant, error) {
 	var rec OrgDomainGrant
 	row := s.q.QueryRowContext(ctx, `

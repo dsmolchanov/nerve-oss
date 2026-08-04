@@ -113,6 +113,20 @@ func (s *Store) EnsureOrgWebhook(ctx context.Context, orgID, url string, events 
 	if orgID == "" || url == "" {
 		return OrgWebhook{}, false, errors.New("missing org_id or url")
 	}
+	var rec OrgWebhook
+	created := false
+	err := s.withTx(ctx, func(scoped *Store) error {
+		if err := scoped.lockActiveOrgForReconciliation(ctx, orgID); err != nil {
+			return err
+		}
+		var ensureErr error
+		rec, created, ensureErr = scoped.ensureOrgWebhookLocked(ctx, orgID, url, events, externalRef)
+		return ensureErr
+	})
+	return rec, created, err
+}
+
+func (s *Store) ensureOrgWebhookLocked(ctx context.Context, orgID, url string, events []string, externalRef string) (OrgWebhook, bool, error) {
 	secret, err := generateWebhookSecret()
 	if err != nil {
 		return OrgWebhook{}, false, fmt.Errorf("generate secret: %w", err)
