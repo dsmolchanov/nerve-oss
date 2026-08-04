@@ -152,6 +152,60 @@ func TestCoreMigration16DownRefusesNullProviderMessageID(t *testing.T) {
 	})
 }
 
+func TestCoreMigration14DownRemovesOutboxNotificationObjects(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToVersion(t, ctx, db, 14)
+
+		var triggerExists, functionExists bool
+		if err := db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_trigger
+				WHERE tgname = 'trg_outbox_notify'
+				  AND tgrelid = 'outbox_messages'::regclass
+				  AND NOT tgisinternal
+			)
+		`).Scan(&triggerExists); err != nil {
+			t.Fatalf("inspect outbox notification trigger: %v", err)
+		}
+		if err := db.QueryRowContext(ctx, `SELECT to_regprocedure('notify_outbox_insert()') IS NOT NULL`).Scan(&functionExists); err != nil {
+			t.Fatalf("inspect outbox notification function: %v", err)
+		}
+		if !triggerExists || !functionExists {
+			t.Fatalf("migration 14 objects missing before rollback: trigger=%t function=%t", triggerExists, functionExists)
+		}
+
+		if err := MigrateDownCore(ctx, db); err != nil {
+			t.Fatalf("roll back core migration 14: %v", err)
+		}
+		version, err := CurrentVersionCore(ctx, db)
+		if err != nil {
+			t.Fatalf("read core version after migration 14 rollback: %v", err)
+		}
+		if version != 13 {
+			t.Fatalf("core version after migration 14 rollback = %d, want 13", version)
+		}
+
+		if err := db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_trigger
+				WHERE tgname = 'trg_outbox_notify'
+				  AND tgrelid = 'outbox_messages'::regclass
+				  AND NOT tgisinternal
+			)
+		`).Scan(&triggerExists); err != nil {
+			t.Fatalf("inspect trigger after rollback: %v", err)
+		}
+		if err := db.QueryRowContext(ctx, `SELECT to_regprocedure('notify_outbox_insert()') IS NOT NULL`).Scan(&functionExists); err != nil {
+			t.Fatalf("inspect function after rollback: %v", err)
+		}
+		if triggerExists || functionExists {
+			t.Fatalf("migration 14 objects survived rollback: trigger=%t function=%t", triggerExists, functionExists)
+		}
+	})
+}
+
 func TestCloudControlPlaneMigrationFromLegacyStateBackfillsOrgID(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToVersion(t, ctx, db, 1)

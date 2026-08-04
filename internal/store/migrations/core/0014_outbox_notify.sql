@@ -18,3 +18,7 @@ CREATE TRIGGER trg_outbox_notify
   AFTER INSERT ON outbox_messages
   FOR EACH ROW
   EXECUTE FUNCTION notify_outbox_insert();
+
+-- +goose Down
+DROP TRIGGER IF EXISTS trg_outbox_notify ON outbox_messages;
+DROP FUNCTION IF EXISTS notify_outbox_insert();
