@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -12,6 +14,16 @@ import (
 const MaxMessageAttachmentAttempts = 6
 
 var ErrAttachmentLeaseLost = errors.New("attachment mirror lease lost")
+
+// InboundAttachmentMetadata is the provider envelope shape used by inbound
+// adapters that do not receive an authoritative size with the webhook.
+type InboundAttachmentMetadata struct {
+	ProviderAttachmentID string
+	Filename             string
+	ContentType          string
+	ContentDisposition   string
+	ContentID            string
+}
 
 type MessageAttachmentMetadata struct {
 	ProviderAttachmentID string
@@ -43,6 +55,23 @@ type MessageAttachment struct {
 	LastError            sql.NullString
 	MirroredAt           sql.NullTime
 	CreatedAt            time.Time
+}
+
+// PersistInboundAttachmentMetadata is the size-optional adapter used by
+// inbound provider handlers. SetMessageAttachmentsKnown remains the canonical
+// store contract.
+func (s *Store) PersistInboundAttachmentMetadata(ctx context.Context, orgID, messageID string, attachments []InboundAttachmentMetadata) error {
+	metadata := make([]MessageAttachmentMetadata, 0, len(attachments))
+	for _, attachment := range attachments {
+		metadata = append(metadata, MessageAttachmentMetadata{
+			ProviderAttachmentID: attachment.ProviderAttachmentID,
+			Filename:             attachment.Filename,
+			ContentType:          attachment.ContentType,
+			ContentDisposition:   attachment.ContentDisposition,
+			ContentID:            attachment.ContentID,
+		})
+	}
+	return s.SetMessageAttachmentsKnown(ctx, orgID, messageID, metadata)
 }
 
 // SetMessageAttachmentsKnown persists the provider envelope before declaring
@@ -177,6 +206,25 @@ func (s *Store) ListMessageAttachments(ctx context.Context, orgID, messageID str
 	return attachments, rows.Err()
 }
 
+func (s *Store) GetMessageAttachment(ctx context.Context, orgID, messageID, attachmentID string) (MessageAttachment, error) {
+	row := s.q.QueryRowContext(ctx, `
+		SELECT attachment.id::text, attachment.org_id::text, attachment.message_id::text, attachment.ordinal,
+		       attachment.provider_attachment_id, coalesce(message.received_email_id, ''),
+		       attachment.filename, attachment.content_type,
+		       attachment.content_disposition, attachment.content_id,
+		       attachment.size_bytes, attachment.availability,
+		       attachment.blob_sha256, attachment.attempt_count,
+		       attachment.next_attempt_at, attachment.locked_at,
+		       attachment.locked_by, attachment.last_error,
+		       attachment.mirrored_at, attachment.created_at
+		FROM message_attachments attachment
+		JOIN messages message
+		  ON message.org_id = attachment.org_id AND message.id = attachment.message_id
+		WHERE attachment.org_id = $1 AND attachment.message_id = $2 AND attachment.id = $3
+	`, orgID, messageID, attachmentID)
+	return scanMessageAttachment(row)
+}
+
 // ClaimMessageAttachments leases due mirror work. A pending row with an
 // expired lock is reclaimable; fresh locks and future retries are left alone.
 func (s *Store) ClaimMessageAttachments(
@@ -279,6 +327,101 @@ func (s *Store) ClaimMessageAttachments(
 		attachments = append(attachments, attachment)
 	}
 	return attachments, rows.Err()
+}
+
+// StoreMirroredMessageAttachment stores content and links the metadata row in
+// one transaction. The exact worker/timestamp lease pair prevents a reclaimed
+// stale worker from overwriting a newer result or charging orphaned bytes.
+func (s *Store) StoreMirroredMessageAttachment(
+	ctx context.Context,
+	orgID string,
+	attachmentID string,
+	workerID string,
+	leaseAcquiredAt time.Time,
+	contentType string,
+	content []byte,
+) (string, error) {
+	workerID = strings.TrimSpace(workerID)
+	if strings.TrimSpace(orgID) == "" || strings.TrimSpace(attachmentID) == "" || workerID == "" || leaseAcquiredAt.IsZero() {
+		return "", errors.New("missing attachment mirror lease owner")
+	}
+	if len(content) == 0 {
+		return "", errors.New("attachment content is empty")
+	}
+	contentType = strings.TrimSpace(contentType)
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	digestBytes := sha256.Sum256(content)
+	digest := hex.EncodeToString(digestBytes[:])
+	err := s.withTx(ctx, func(scoped *Store) error {
+		if _, err := scoped.q.ExecContext(ctx, `
+			INSERT INTO org_attachment_usage (org_id, bytes_used)
+			SELECT $1, COALESCE(sum(size_bytes), 0) FROM attachment_blobs WHERE org_id = $1
+			ON CONFLICT (org_id) DO NOTHING
+		`, orgID); err != nil {
+			return err
+		}
+		var used, quota int64
+		if err := scoped.q.QueryRowContext(ctx, `
+			SELECT bytes_used, bytes_quota FROM org_attachment_usage
+			WHERE org_id = $1 FOR UPDATE
+		`, orgID).Scan(&used, &quota); err != nil {
+			return err
+		}
+
+		inserted := false
+		var storedSize int64
+		insertErr := scoped.q.QueryRowContext(ctx, `
+			INSERT INTO attachment_blobs (org_id, sha256, size_bytes, content_type, content)
+			VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (org_id, sha256) DO NOTHING
+			RETURNING size_bytes
+		`, orgID, digest, len(content), contentType, content).Scan(&storedSize)
+		switch {
+		case insertErr == nil:
+			inserted = true
+		case errors.Is(insertErr, sql.ErrNoRows):
+			storedSize = int64(len(content))
+		default:
+			return insertErr
+		}
+		if inserted {
+			if used > quota || storedSize > quota-used {
+				return fmt.Errorf("%w: used=%d size=%d quota=%d", ErrAttachmentQuotaExceeded, used, storedSize, quota)
+			}
+			if _, err := scoped.q.ExecContext(ctx, `
+				UPDATE org_attachment_usage
+				SET bytes_used = bytes_used + $2, updated_at = now()
+				WHERE org_id = $1
+			`, orgID, storedSize); err != nil {
+				return err
+			}
+		}
+
+		result, err := scoped.q.ExecContext(ctx, `
+			UPDATE message_attachments
+			SET size_bytes = $4, content_type = $5, availability = 'available',
+			    blob_sha256 = $6, mirrored_at = now(), last_error = NULL,
+			    locked_at = NULL, locked_by = NULL
+			WHERE org_id = $1 AND id = $2
+			  AND availability = 'pending'
+			  AND locked_by = $3 AND locked_at = $7
+		`, orgID, attachmentID, workerID, len(content), contentType, digest, leaseAcquiredAt)
+		if err != nil {
+			return err
+		}
+		updated, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if updated != 1 {
+			return ErrAttachmentLeaseLost
+		}
+		return nil
+	})
+	return digest, err
 }
 
 // RequeueMessageAttachment records a transient failure. The sixth claimed
@@ -403,4 +546,62 @@ func (s *Store) updateClaimedMessageAttachment(
 		return ErrAttachmentLeaseLost
 	}
 	return nil
+}
+
+func (s *Store) LoadMessageAttachmentContent(ctx context.Context, orgID, messageID, attachmentID string) (MessageAttachment, []byte, error) {
+	row := s.q.QueryRowContext(ctx, `
+		SELECT attachment.id::text, attachment.org_id::text, attachment.message_id::text, attachment.ordinal,
+		       attachment.provider_attachment_id, coalesce(message.received_email_id, ''),
+		       attachment.filename, attachment.content_type,
+		       attachment.content_disposition, attachment.content_id,
+		       attachment.size_bytes, attachment.availability,
+		       attachment.blob_sha256, attachment.attempt_count,
+		       attachment.next_attempt_at, attachment.locked_at,
+		       attachment.locked_by, attachment.last_error,
+		       attachment.mirrored_at, attachment.created_at, blob.content
+		FROM message_attachments attachment
+		JOIN messages message
+		  ON message.org_id = attachment.org_id AND message.id = attachment.message_id
+		JOIN attachment_blobs blob
+		  ON blob.org_id = attachment.org_id AND blob.sha256 = attachment.blob_sha256
+		WHERE attachment.org_id = $1 AND attachment.message_id = $2 AND attachment.id = $3
+		  AND attachment.availability = 'available'
+	`, orgID, messageID, attachmentID)
+	var content []byte
+	attachment, err := scanMessageAttachment(row, &content)
+	return attachment, content, err
+}
+
+type attachmentRowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanMessageAttachment(row attachmentRowScanner, content ...*[]byte) (MessageAttachment, error) {
+	var attachment MessageAttachment
+	destinations := []any{
+		&attachment.ID,
+		&attachment.OrgID,
+		&attachment.MessageID,
+		&attachment.Ordinal,
+		&attachment.ProviderAttachmentID,
+		&attachment.ReceivedEmailID,
+		&attachment.Filename,
+		&attachment.ContentType,
+		&attachment.ContentDisposition,
+		&attachment.ContentID,
+		&attachment.SizeBytes,
+		&attachment.Availability,
+		&attachment.BlobSHA256,
+		&attachment.AttemptCount,
+		&attachment.NextAttemptAt,
+		&attachment.LockedAt,
+		&attachment.LockedBy,
+		&attachment.LastError,
+		&attachment.MirroredAt,
+		&attachment.CreatedAt,
+	}
+	if len(content) > 0 {
+		destinations = append(destinations, content[0])
+	}
+	return attachment, row.Scan(destinations...)
 }

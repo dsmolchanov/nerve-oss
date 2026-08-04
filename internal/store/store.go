@@ -26,13 +26,14 @@ type queryer interface {
 // Types: credentials
 
 type CloudAPIKey struct {
-	ID        string
-	OrgID     string
-	KeyPrefix string
-	Label     string
-	Scopes    []string
-	CreatedAt time.Time
-	RevokedAt sql.NullTime
+	ID          string
+	OrgID       string
+	ExternalRef sql.NullString
+	KeyPrefix   string
+	Label       string
+	Scopes      []string
+	CreatedAt   time.Time
+	RevokedAt   sql.NullTime
 }
 
 type ServiceToken struct {
@@ -142,9 +143,11 @@ type Message struct {
 	To                []Participant
 	CC                []Participant
 
-	InReplyTo       string
-	References      []string
-	ReceivedEmailID string
+	InReplyTo        string
+	References       []string
+	ReceivedEmailID  string
+	AttachmentsState string
+	Attachments      []MessageAttachment
 }
 
 type Participant struct {

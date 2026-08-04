@@ -14,13 +14,14 @@ import (
 
 // OrgWebhook is a customer subscription to outbound delivery events.
 type OrgWebhook struct {
-	ID         string
-	OrgID      string
-	URL        string
-	Secret     string
-	Events     []string // empty means "all event types"
-	CreatedAt  time.Time
-	DisabledAt sql.NullTime
+	ID          string
+	OrgID       string
+	ExternalRef sql.NullString
+	URL         string
+	Secret      string
+	Events      []string // empty means "all event types"
+	CreatedAt   time.Time
+	DisabledAt  sql.NullTime
 }
 
 // WebhookDelivery is one dispatch attempt targeting a specific
@@ -30,8 +31,8 @@ type WebhookDelivery struct {
 	ID             string
 	OrgID          string
 	WebhookID      string
-	OutboxEventID  string
-	OrgEventID     string
+	OutboxEventID  sql.NullString
+	OrgEventID     sql.NullString
 	EventType      string
 	Payload        json.RawMessage
 	Status         string
@@ -63,6 +64,10 @@ func generateWebhookSecret() (string, error) {
 // secret. Returns the persisted row including the secret so the
 // caller can show it once in the admin UI.
 func (s *Store) CreateOrgWebhook(ctx context.Context, orgID, url string, events []string) (OrgWebhook, error) {
+	return s.createOrgWebhook(ctx, orgID, url, events, "")
+}
+
+func (s *Store) createOrgWebhook(ctx context.Context, orgID, url string, events []string, externalRef string) (OrgWebhook, error) {
 	if orgID == "" || url == "" {
 		return OrgWebhook{}, errors.New("missing org_id or url")
 	}
@@ -76,15 +81,48 @@ func (s *Store) CreateOrgWebhook(ctx context.Context, orgID, url string, events 
 	var w OrgWebhook
 	var eventsText string
 	row := s.q.QueryRowContext(ctx, `
-		INSERT INTO org_webhooks (org_id, url, secret, events)
-		VALUES ($1, $2, $3, $4)
-		RETURNING id::text, org_id::text, url, secret, events::text, created_at, disabled_at
-	`, orgID, url, secret, events)
-	if err := row.Scan(&w.ID, &w.OrgID, &w.URL, &w.Secret, &eventsText, &w.CreatedAt, &w.DisabledAt); err != nil {
+		INSERT INTO org_webhooks (org_id, url, secret, events, external_ref)
+		VALUES ($1, $2, $3, $4, nullif($5, ''))
+		RETURNING id::text, org_id::text, external_ref, url, secret, events::text, created_at, disabled_at
+	`, orgID, url, secret, events, strings.TrimSpace(externalRef))
+	if err := row.Scan(&w.ID, &w.OrgID, &w.ExternalRef, &w.URL, &w.Secret, &eventsText, &w.CreatedAt, &w.DisabledAt); err != nil {
 		return OrgWebhook{}, err
 	}
 	w.Events = parseTextArray(eventsText)
 	return w, nil
+}
+
+func (s *Store) GetOrgWebhookByExternalRef(ctx context.Context, externalRef string) (OrgWebhook, error) {
+	var w OrgWebhook
+	var eventsText string
+	err := s.q.QueryRowContext(ctx, `
+		SELECT id::text, org_id::text, external_ref, url, secret, events::text, created_at, disabled_at
+		FROM org_webhooks WHERE external_ref = $1
+	`, strings.TrimSpace(externalRef)).Scan(
+		&w.ID, &w.OrgID, &w.ExternalRef, &w.URL, &w.Secret, &eventsText, &w.CreatedAt, &w.DisabledAt,
+	)
+	w.Events = parseTextArray(eventsText)
+	return w, err
+}
+
+func (s *Store) EnsureOrgWebhook(ctx context.Context, orgID, url string, events []string, externalRef string) (OrgWebhook, bool, error) {
+	externalRef = strings.TrimSpace(externalRef)
+	if externalRef == "" {
+		return OrgWebhook{}, false, errors.New("missing external_ref")
+	}
+	existing, err := s.GetOrgWebhookByExternalRef(ctx, externalRef)
+	if err == nil {
+		if existing.OrgID != orgID || existing.URL != url || !equalStrings(existing.Events, events) || existing.DisabledAt.Valid {
+			return OrgWebhook{}, false, ErrIdempotencyConflict
+		}
+		existing.Secret = ""
+		return existing, false, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return OrgWebhook{}, false, err
+	}
+	created, err := s.createOrgWebhook(ctx, orgID, url, events, externalRef)
+	return created, true, err
 }
 
 // ListOrgWebhooks returns all webhooks for an org, newest first.
@@ -94,7 +132,7 @@ func (s *Store) ListOrgWebhooks(ctx context.Context, orgID string) ([]OrgWebhook
 		return nil, errors.New("missing org_id")
 	}
 	rows, err := s.q.QueryContext(ctx, `
-		SELECT id::text, org_id::text, url, secret, events::text, created_at, disabled_at
+		SELECT id::text, org_id::text, external_ref, url, secret, events::text, created_at, disabled_at
 		FROM org_webhooks
 		WHERE org_id = $1
 		ORDER BY created_at DESC
@@ -107,7 +145,7 @@ func (s *Store) ListOrgWebhooks(ctx context.Context, orgID string) ([]OrgWebhook
 	for rows.Next() {
 		var w OrgWebhook
 		var eventsText string
-		if err := rows.Scan(&w.ID, &w.OrgID, &w.URL, &w.Secret, &eventsText, &w.CreatedAt, &w.DisabledAt); err != nil {
+		if err := rows.Scan(&w.ID, &w.OrgID, &w.ExternalRef, &w.URL, &w.Secret, &eventsText, &w.CreatedAt, &w.DisabledAt); err != nil {
 			return nil, err
 		}
 		w.Events = parseTextArray(eventsText)
@@ -124,15 +162,27 @@ func (s *Store) GetOrgWebhook(ctx context.Context, orgID, id string) (OrgWebhook
 	var w OrgWebhook
 	var eventsText string
 	row := s.q.QueryRowContext(ctx, `
-		SELECT id::text, org_id::text, url, secret, events::text, created_at, disabled_at
+		SELECT id::text, org_id::text, external_ref, url, secret, events::text, created_at, disabled_at
 		FROM org_webhooks
 		WHERE org_id = $1 AND id = $2
 	`, orgID, id)
-	if err := row.Scan(&w.ID, &w.OrgID, &w.URL, &w.Secret, &eventsText, &w.CreatedAt, &w.DisabledAt); err != nil {
+	if err := row.Scan(&w.ID, &w.OrgID, &w.ExternalRef, &w.URL, &w.Secret, &eventsText, &w.CreatedAt, &w.DisabledAt); err != nil {
 		return OrgWebhook{}, err
 	}
 	w.Events = parseTextArray(eventsText)
 	return w, nil
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // DeleteOrgWebhook removes a subscription entirely. Pending deliveries
@@ -186,19 +236,37 @@ func (s *Store) EnqueueWebhookDelivery(ctx context.Context, orgID, webhookID, ou
 	if orgID == "" || webhookID == "" || outboxEventID == "" || eventType == "" {
 		return "", errors.New("missing enqueue webhook delivery field")
 	}
+	return s.enqueueWebhookDelivery(ctx, orgID, webhookID, outboxEventID, "", eventType, payload)
+}
+
+func (s *Store) EnqueueOrgWebhookDelivery(ctx context.Context, orgID, webhookID, orgEventID, eventType string, payload json.RawMessage) (string, error) {
+	if orgID == "" || webhookID == "" || orgEventID == "" || eventType == "" {
+		return "", errors.New("missing enqueue org webhook delivery field")
+	}
+	return s.enqueueWebhookDelivery(ctx, orgID, webhookID, "", orgEventID, eventType, payload)
+}
+
+func (s *Store) enqueueWebhookDelivery(ctx context.Context, orgID, webhookID, outboxEventID, orgEventID, eventType string, payload json.RawMessage) (string, error) {
 	var id string
 	row := s.q.QueryRowContext(ctx, `
 		INSERT INTO org_webhook_deliveries
-		    (org_id, webhook_id, outbox_event_id, event_type, payload)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (webhook_id, outbox_event_id)
-		DO UPDATE SET webhook_id = org_webhook_deliveries.webhook_id
+		    (org_id, webhook_id, outbox_event_id, org_event_id, event_type, payload)
+		VALUES ($1, $2, nullif($3, '')::uuid, nullif($4, '')::uuid, $5, $6)
+		ON CONFLICT DO NOTHING
 		RETURNING id::text
-	`, orgID, webhookID, outboxEventID, eventType, []byte(payload))
-	if err := row.Scan(&id); err != nil {
+	`, orgID, webhookID, outboxEventID, orgEventID, eventType, []byte(payload))
+	if err := row.Scan(&id); err == nil {
+		return id, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
 	}
-	return id, nil
+	err := s.q.QueryRowContext(ctx, `
+		SELECT id::text FROM org_webhook_deliveries
+		WHERE webhook_id = $1
+		  AND (($2 <> '' AND outbox_event_id = nullif($2, '')::uuid)
+		       OR ($3 <> '' AND org_event_id = nullif($3, '')::uuid))
+	`, webhookID, outboxEventID, orgEventID).Scan(&id)
+	return id, err
 }
 
 // FanOutWebhookDeliveries enqueues a delivery job for each active
@@ -225,7 +293,7 @@ func (s *Store) FanOutWebhookDeliveries(ctx context.Context, orgID, outboxEventI
 
 func (s *Store) matchingOrgWebhookIDs(ctx context.Context, orgID, eventType string) ([]string, error) {
 	// Empty events arrays are wildcards only for non-sensitive events. PII-
-	// bearing events such as email.received require explicit consent.
+	// bearing events such as email.received require explicit consent and HTTPS.
 	rows, err := s.q.QueryContext(ctx, `
 		SELECT id::text FROM org_webhooks
 		WHERE org_id = $1
@@ -295,8 +363,7 @@ func (s *Store) ClaimWebhookDeliveries(ctx context.Context, limit int, workerID 
 		FROM picked
 		WHERE d.id = picked.id
 		RETURNING d.id::text, d.org_id::text, d.webhook_id::text,
-		          COALESCE(d.outbox_event_id::text, ''),
-		          COALESCE(to_jsonb(d)->>'org_event_id', ''),
+		          d.outbox_event_id::text, d.org_event_id::text,
 		          d.event_type, d.payload, d.status, d.attempt_count,
 		          d.next_attempt_at, d.last_attempt_at, d.last_status_code, d.last_error,
 		          d.locked_at, d.locked_by, d.delivered_at, d.created_at

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -52,25 +53,39 @@ func (s *Store) GetThread(ctx context.Context, threadID string) (Thread, []Messa
 	}
 	_ = json.Unmarshal(participantsJSON, &t.Participants)
 
-	rows, err := s.q.QueryContext(ctx, `SELECT id, inbox_id, thread_id, direction, coalesce(subject,''), coalesce(text,''), coalesce(html,''), created_at, coalesce(provider_message_id,''), coalesce(internet_message_id,''), coalesce(from_json,'{}'), coalesce(to_json,'[]'), coalesce(cc_json,'[]') FROM messages WHERE thread_id = $1 ORDER BY created_at ASC`, threadID)
+	rows, err := s.q.QueryContext(ctx, `SELECT id, inbox_id, thread_id, direction, coalesce(subject,''), coalesce(text,''), coalesce(html,''), created_at, coalesce(provider_message_id,''), coalesce(internet_message_id,''), coalesce(from_json,'{}'), coalesce(to_json,'[]'), coalesce(cc_json,'[]'), attachments_state, org_id::text FROM messages WHERE thread_id = $1 ORDER BY created_at ASC`, threadID)
 	if err != nil {
 		return t, nil, err
 	}
-	defer rows.Close()
-
 	var messages []Message
+	var messageOrgIDs []string
 	for rows.Next() {
 		var m Message
 		var fromJSON, toJSON, ccJSON []byte
-		if err := rows.Scan(&m.ID, &m.InboxID, &m.ThreadID, &m.Direction, &m.Subject, &m.Text, &m.HTML, &m.CreatedAt, &m.ProviderMessageID, &m.InternetMessageID, &fromJSON, &toJSON, &ccJSON); err != nil {
+		var orgID string
+		if err := rows.Scan(&m.ID, &m.InboxID, &m.ThreadID, &m.Direction, &m.Subject, &m.Text, &m.HTML, &m.CreatedAt, &m.ProviderMessageID, &m.InternetMessageID, &fromJSON, &toJSON, &ccJSON, &m.AttachmentsState, &orgID); err != nil {
+			rows.Close()
 			return t, nil, err
 		}
 		_ = json.Unmarshal(fromJSON, &m.From)
 		_ = json.Unmarshal(toJSON, &m.To)
 		_ = json.Unmarshal(ccJSON, &m.CC)
 		messages = append(messages, m)
+		messageOrgIDs = append(messageOrgIDs, orgID)
 	}
-	return t, messages, rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return t, nil, err
+	}
+	rows.Close()
+	for i := range messages {
+		attachments, err := s.ListMessageAttachments(ctx, messageOrgIDs[i], messages[i].ID)
+		if err != nil {
+			return t, nil, err
+		}
+		messages[i].Attachments = attachments
+	}
+	return t, messages, nil
 }
 
 func (s *Store) GetThreadInboxID(ctx context.Context, threadID string) (string, error) {
@@ -85,13 +100,19 @@ func (s *Store) GetThreadInboxID(ctx context.Context, threadID string) (string, 
 func (s *Store) GetMessage(ctx context.Context, messageID string) (Message, error) {
 	var m Message
 	var fromJSON, toJSON, ccJSON []byte
-	row := s.q.QueryRowContext(ctx, `SELECT id, inbox_id, thread_id, direction, subject, text, html, created_at, provider_message_id, internet_message_id, from_json, to_json, cc_json, coalesce(received_email_id, '') FROM messages WHERE id = $1`, messageID)
-	if err := row.Scan(&m.ID, &m.InboxID, &m.ThreadID, &m.Direction, &m.Subject, &m.Text, &m.HTML, &m.CreatedAt, &m.ProviderMessageID, &m.InternetMessageID, &fromJSON, &toJSON, &ccJSON, &m.ReceivedEmailID); err != nil {
+	row := s.q.QueryRowContext(ctx, `SELECT id, inbox_id, thread_id, direction, subject, text, html, created_at, provider_message_id, internet_message_id, from_json, to_json, cc_json, coalesce(received_email_id, ''), attachments_state, org_id::text FROM messages WHERE id = $1`, messageID)
+	var orgID string
+	if err := row.Scan(&m.ID, &m.InboxID, &m.ThreadID, &m.Direction, &m.Subject, &m.Text, &m.HTML, &m.CreatedAt, &m.ProviderMessageID, &m.InternetMessageID, &fromJSON, &toJSON, &ccJSON, &m.ReceivedEmailID, &m.AttachmentsState, &orgID); err != nil {
 		return m, err
 	}
 	_ = json.Unmarshal(fromJSON, &m.From)
 	_ = json.Unmarshal(toJSON, &m.To)
 	_ = json.Unmarshal(ccJSON, &m.CC)
+	attachments, err := s.ListMessageAttachments(ctx, orgID, m.ID)
+	if err != nil {
+		return Message{}, err
+	}
+	m.Attachments = attachments
 	return m, nil
 }
 
@@ -209,14 +230,43 @@ func (s *Store) UpdateThreadSignals(ctx context.Context, threadID string, sentim
 }
 
 func (s *Store) InsertMessageWithThread(ctx context.Context, inboxID string, providerThreadID string, msg Message) (string, string, error) {
-	threadID, err := s.EnsureThread(ctx, inboxID, providerThreadID, msg.Subject, append([]Participant{msg.From}, msg.To...))
-	if err != nil {
-		return "", "", err
-	}
-	msg.ThreadID = threadID
-	msg.InboxID = inboxID
-	msgID, err := s.InsertMessage(ctx, msg)
-	return threadID, msgID, err
+	var threadID, messageID string
+	err := s.withTx(ctx, func(txStore *Store) error {
+		// Serialize concurrent deliveries of the same provider message. This is
+		// transaction-scoped, so a crash cannot strand a lock.
+		if msg.ProviderMessageID != "" {
+			if _, err := txStore.q.ExecContext(ctx, `
+				SELECT pg_advisory_xact_lock(hashtextextended($1, 0))
+			`, inboxID+":"+msg.ProviderMessageID); err != nil {
+				return err
+			}
+			// Inbound providers may retry after the first transaction committed
+			// but before the webhook was acknowledged. Resolve the replay before
+			// creating a thread, especially when providerThreadID is empty.
+			err := txStore.q.QueryRowContext(ctx, `
+				SELECT thread_id::text, id::text
+				FROM messages
+				WHERE inbox_id = $1 AND provider_message_id = $2
+			`, inboxID, msg.ProviderMessageID).Scan(&threadID, &messageID)
+			if err == nil {
+				return nil
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+		}
+
+		var err error
+		threadID, err = txStore.EnsureThread(ctx, inboxID, providerThreadID, msg.Subject, append([]Participant{msg.From}, msg.To...))
+		if err != nil {
+			return err
+		}
+		msg.ThreadID = threadID
+		msg.InboxID = inboxID
+		messageID, err = txStore.InsertMessage(ctx, msg)
+		return err
+	})
+	return threadID, messageID, err
 }
 
 func (s *Store) MessageCount(ctx context.Context) (int, error) {
