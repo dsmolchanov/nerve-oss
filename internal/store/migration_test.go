@@ -41,7 +41,7 @@ func TestCloudControlPlaneMigrationFromEmptyDatabase(t *testing.T) {
 	})
 }
 
-func TestCoreMigrationUpgradeFrom15To17(t *testing.T) {
+func TestCoreMigrationUpgradeFrom15To18(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToVersion(t, ctx, db, 15)
 
@@ -57,8 +57,8 @@ func TestCoreMigrationUpgradeFrom15To17(t *testing.T) {
 		`).Scan(&version); err != nil {
 			t.Fatalf("query core migration version: %v", err)
 		}
-		if version != 17 {
-			t.Fatalf("expected core migration version 17, got %d", version)
+		if version != 18 {
+			t.Fatalf("expected core migration version 18, got %d", version)
 		}
 
 		for _, table := range []string{"suppressions", "org_webhooks", "org_webhook_deliveries"} {
@@ -242,6 +242,105 @@ func TestCoreMigration17PreventsDuplicateActiveWebhookURLs(t *testing.T) {
 		if err := insertWebhook(true); err != nil {
 			t.Fatalf("insert disabled duplicate webhook: %v", err)
 		}
+	})
+}
+
+func TestCoreMigration18RepairsLegacyVersion17(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 17); err != nil {
+			t.Fatalf("migrate core to 17: %v", err)
+		}
+
+		// Recreate the schema recorded by databases that applied version 17
+		// before the historical 0016/0017 files were corrected.
+		for _, table := range []string{"outbox_events", "inbox_smtp_configs", "suppressions"} {
+			policy := "tenant_isolation_" + table
+			if _, err := db.ExecContext(ctx, fmt.Sprintf(`DROP POLICY IF EXISTS %s ON %s`, policy, table)); err != nil {
+				t.Fatalf("drop legacy %s policy: %v", table, err)
+			}
+			if _, err := db.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE %s NO FORCE ROW LEVEL SECURITY`, table)); err != nil {
+				t.Fatalf("remove legacy %s forced RLS: %v", table, err)
+			}
+			if _, err := db.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE %s DISABLE ROW LEVEL SECURITY`, table)); err != nil {
+				t.Fatalf("disable legacy %s RLS: %v", table, err)
+			}
+		}
+		if _, err := db.ExecContext(ctx, `
+			DROP INDEX IF EXISTS idx_org_webhooks_org_active;
+			CREATE INDEX idx_org_webhooks_org_active
+			  ON org_webhooks (org_id)
+			  WHERE disabled_at IS NULL;
+		`); err != nil {
+			t.Fatalf("restore legacy webhook index: %v", err)
+		}
+
+		orgID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'legacy-webhook-repair')`, orgID); err != nil {
+			t.Fatalf("insert repair org: %v", err)
+		}
+		var duplicateID string
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO org_webhooks (org_id, url, secret)
+			VALUES ($1, 'https://example.com/events', 'first')
+		`, orgID); err != nil {
+			t.Fatalf("insert first legacy webhook: %v", err)
+		}
+		if err := db.QueryRowContext(ctx, `
+			INSERT INTO org_webhooks (org_id, url, secret)
+			VALUES ($1, 'https://example.com/events', 'duplicate')
+			RETURNING id
+		`, orgID).Scan(&duplicateID); err != nil {
+			t.Fatalf("insert duplicate legacy webhook: %v", err)
+		}
+
+		err := MigrateUpToCore(ctx, db, 18)
+		if err == nil || !strings.Contains(err.Error(), "duplicate active org_webhooks") {
+			t.Fatalf("expected migration 18 duplicate guard, got %v", err)
+		}
+		version, versionErr := CurrentVersionCore(ctx, db)
+		if versionErr != nil {
+			t.Fatalf("current version after refused repair: %v", versionErr)
+		}
+		if version != 17 {
+			t.Fatalf("refused repair changed core version: got %d, want 17", version)
+		}
+		for _, table := range []string{"outbox_events", "inbox_smtp_configs", "suppressions"} {
+			assertTenantRLSState(t, db, table, false)
+		}
+		assertIndexUnique(t, db, "idx_org_webhooks_org_active", false)
+
+		if _, err := db.ExecContext(ctx, `UPDATE org_webhooks SET disabled_at = now() WHERE id = $1`, duplicateID); err != nil {
+			t.Fatalf("disable duplicate legacy webhook: %v", err)
+		}
+		if err := MigrateUpToCore(ctx, db, 18); err != nil {
+			t.Fatalf("apply migration 18 after resolving duplicates: %v", err)
+		}
+		for _, table := range []string{"outbox_events", "inbox_smtp_configs", "suppressions"} {
+			assertTenantRLSState(t, db, table, true)
+		}
+		assertIndexUnique(t, db, "idx_org_webhooks_org_active", true)
+
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO org_webhooks (org_id, url, secret)
+			VALUES ($1, 'https://example.com/events', 'third-active')
+		`, orgID); err == nil {
+			t.Fatal("expected repaired unique index to reject another active endpoint")
+		}
+
+		if err := MigrateDownCore(ctx, db); err != nil {
+			t.Fatalf("roll migration 18 marker back to corrected version 17: %v", err)
+		}
+		version, err = CurrentVersionCore(ctx, db)
+		if err != nil {
+			t.Fatalf("current version after repair rollback: %v", err)
+		}
+		if version != 17 {
+			t.Fatalf("repair rollback version = %d; want 17", version)
+		}
+		for _, table := range []string{"outbox_events", "inbox_smtp_configs", "suppressions"} {
+			assertTenantRLSState(t, db, table, true)
+		}
+		assertIndexUnique(t, db, "idx_org_webhooks_org_active", true)
 	})
 }
 
@@ -810,6 +909,24 @@ func assertTenantRLSState(t *testing.T, db *sql.DB, table string, enabled bool) 
 			policyExists,
 			enabled,
 		)
+	}
+}
+
+func assertIndexUnique(t *testing.T, db *sql.DB, index string, unique bool) {
+	t.Helper()
+	var got bool
+	if err := db.QueryRow(`
+		SELECT i.indisunique
+		FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'public'
+		  AND c.relname = $1
+	`, index).Scan(&got); err != nil {
+		t.Fatalf("inspect index %s uniqueness: %v", index, err)
+	}
+	if got != unique {
+		t.Fatalf("index %s unique = %t; want %t", index, got, unique)
 	}
 }
 

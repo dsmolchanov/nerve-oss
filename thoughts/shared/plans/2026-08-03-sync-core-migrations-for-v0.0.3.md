@@ -28,6 +28,18 @@ support from `v0.0.2`.
 - Correct `0017` OSS-first so active webhook endpoint identity is unique on
   `(org_id, url)` while disabled historical rows remain allowed. Without that
   partial uniqueness, fan-out sends the same event more than once to a URL.
+- Add forward-repair migration `0018` OSS-first for databases that already
+  recorded version `17` before the historical files were corrected. It
+  standardizes the three RLS policies and replaces the legacy non-unique
+  webhook index, refusing with an operator-actionable error when duplicate
+  active endpoints must be resolved first. Its down path keeps the corrected
+  version-17 security state rather than recreating the legacy gap.
+- Reserve `0018` for this production repair. The inbound-events and attachments
+  rollout was not yet implemented, so its planned core versions shift together:
+  event expand/relax become `0019`/`0020`, attachment blobs and message metadata
+  become `0021`/`0022`, and the remaining additive flag/outbox migrations end at
+  `0024`. This prevents Goose from skipping later-added migrations below the
+  already-recorded repair version.
 - Normalize the non-executable `0017` subscription comment to `Webhook
   endpoints` in both repositories so the OSS migration-ownership gate does
   not misclassify it as a billing table reference.
@@ -44,13 +56,14 @@ support from `v0.0.2`.
 - Core migrations `0001` through `0010` are already byte-identical between
   `nerve-oss` and `nerve-cloud`.
 - The synchronized core-schema hash, including the corrected `0014` and
-  guarded `0016` down paths, is
-  `fd453d13e1b8083e7ede7a3a42711383010dd146fdd14dfeb49c6ea8b876ab73`.
+  guarded `0016` down paths plus the `0018` forward repair, is
+  `6769aa3196226cdb8089984511c0c03782c9f7fbf4c318ff855ccbbe424a77d8`.
 - The MCP contract hash remains
   `1eb62111fc593ec9bc9a8ab7d5a9f52a1f3b4e661ee0dffafe4c60495f5b678b`.
-- Migrations `0011` through `0017` are additive on the production upgrade
+- Migrations `0011` through `0018` are additive on the production upgrade
   path. Production currently reports core migration version `15`, so the
-  new runtime may apply `0016` and `0017` before serving.
+  new runtime may apply `0016` through `0018` before serving. Databases already
+  at `17` receive the same guarantees from `0018`.
 
 ## Verification
 
@@ -66,12 +79,16 @@ support from `v0.0.2`.
   `0016` back restores the prior RLS state on the surviving tables.
 - [x] Migration `0017` rejects a duplicate active `(org_id, url)` and permits a
   disabled historical duplicate.
-- [ ] The corrected `0014`, corrected `0016`, and normalized `0017` comment are
-  synced to `nerve-cloud`, restoring full core-tree byte identity before
-  runtime publication.
+- [x] Migration `0018` refuses a legacy version-17 schema with duplicate active
+  endpoints without changing its version or partial RLS state, then repairs
+  RLS/index state after the duplicate is explicitly disabled. Rolling its
+  marker back keeps the corrected version-17 guarantees.
+- [ ] The corrected `0014`, corrected `0016`/`0017`, and new `0018` are synced
+  to `nerve-cloud`, restoring full core-tree byte identity before runtime
+  publication.
 - [x] A canonical `v0.0.3` manifest reports the expected MCP and core hashes.
-- [x] Fresh PostgreSQL migration succeeds through core version `17`.
-- [x] Upgrade from core version `15` succeeds through version `17`.
+- [x] Fresh PostgreSQL migration succeeds through core version `18`.
+- [x] Upgrade from core version `15` succeeds through version `18`.
 - [x] `go test ./... -count=1` passes against PostgreSQL.
 - [x] `go vet ./...` passes.
 - [x] `git diff --check` passes.
