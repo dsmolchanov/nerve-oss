@@ -6,8 +6,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+
+	"neuralmail/internal/startup"
 )
 
 func repositoryRoot(t *testing.T) string {
@@ -43,13 +46,19 @@ func TestGenerateRuntimeManifestScript(t *testing.T) {
 		t.Fatalf("parse manifest json: %v", err)
 	}
 
-	for _, key := range []string{"runtime_version", "mcp_contract_hash", "core_schema_hash", "build_commit", "build_time"} {
+	for _, key := range []string{"runtime_version", "mcp_contract_hash", "core_schema_hash", "core_schema_min_required", "core_schema_max_supported", "build_commit", "build_time"} {
 		if manifest[key] == "" {
 			t.Fatalf("manifest missing %s", key)
 		}
 	}
 	if manifest["runtime_version"] != "v0.0.0-test" {
 		t.Fatalf("unexpected runtime version: %s", manifest["runtime_version"])
+	}
+	if manifest["core_schema_min_required"] != strconv.FormatInt(startup.CoreMinRequired, 10) {
+		t.Fatalf("manifest core minimum %q differs from compiled value %d", manifest["core_schema_min_required"], startup.CoreMinRequired)
+	}
+	if manifest["core_schema_max_supported"] != strconv.FormatInt(startup.CoreMaxSupported, 10) {
+		t.Fatalf("manifest core maximum %q differs from compiled value %d", manifest["core_schema_max_supported"], startup.CoreMaxSupported)
 	}
 
 	// Compact the JSON before extraction so this regression test is not coupled
@@ -74,10 +83,12 @@ func TestGenerateRuntimeManifestScript(t *testing.T) {
 		t.Fatalf("read exported outputs: %v", err)
 	}
 	for key, value := range map[string]string{
-		"runtime_version":   manifest["runtime_version"],
-		"mcp_contract_hash": manifest["mcp_contract_hash"],
-		"core_schema_hash":  manifest["core_schema_hash"],
-		"build_time":        manifest["build_time"],
+		"runtime_version":           manifest["runtime_version"],
+		"mcp_contract_hash":         manifest["mcp_contract_hash"],
+		"core_schema_hash":          manifest["core_schema_hash"],
+		"core_schema_min_required":  manifest["core_schema_min_required"],
+		"core_schema_max_supported": manifest["core_schema_max_supported"],
+		"build_time":                manifest["build_time"],
 	} {
 		if !strings.Contains(string(exported), key+"="+value+"\n") {
 			t.Fatalf("exported outputs missing %s", key)
@@ -94,12 +105,17 @@ func TestGenerateRuntimeManifestScript(t *testing.T) {
 		{name: "missing runtime version", key: "runtime_version", remove: true},
 		{name: "missing MCP hash", key: "mcp_contract_hash", remove: true},
 		{name: "missing core hash", key: "core_schema_hash", remove: true},
+		{name: "missing core minimum", key: "core_schema_min_required", remove: true},
+		{name: "missing core maximum", key: "core_schema_max_supported", remove: true},
 		{name: "missing build time", key: "build_time", remove: true},
 		{name: "unexpected runtime version", key: "runtime_version", value: "v0.0.1"},
 		{name: "empty MCP hash", key: "mcp_contract_hash", value: ""},
 		{name: "uppercase MCP hash", key: "mcp_contract_hash", value: strings.Repeat("A", 64)},
 		{name: "invalid core hash", key: "core_schema_hash", value: "not-a-sha256"},
 		{name: "uppercase core hash", key: "core_schema_hash", value: strings.Repeat("B", 64)},
+		{name: "invalid core minimum", key: "core_schema_min_required", value: "-1"},
+		{name: "inverted core window", key: "core_schema_min_required", value: "19"},
+		{name: "invalid core maximum", key: "core_schema_max_supported", value: "latest"},
 		{name: "invalid timestamp", key: "build_time", value: "not-a-timestamp"},
 		{name: "noncanonical UTC timestamp", key: "build_time", value: "2026-02-17T00:00:00+00:00"},
 		{

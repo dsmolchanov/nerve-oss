@@ -8,6 +8,8 @@ GIT_COMMIT="${GIT_COMMIT:-$(git rev-parse --short=12 HEAD 2>/dev/null || echo un
 BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 MCP_CONTRACT_PATH="${MCP_CONTRACT_PATH:-docs/MCP_Contract.md}"
 CORE_MIGRATIONS_PATH="${CORE_MIGRATIONS_PATH:-internal/store/migrations/core}"
+CORE_SCHEMA_MIN_REQUIRED="18"
+CORE_SCHEMA_MAX_SUPPORTED="18"
 
 hash_file() {
   local path="$1"
@@ -48,6 +50,8 @@ cat > "$OUT_PATH" <<JSON
   "runtime_version": "$RUNTIME_VERSION",
   "mcp_contract_hash": "$MCP_CONTRACT_HASH",
   "core_schema_hash": "$CORE_SCHEMA_HASH",
+  "core_schema_min_required": "$CORE_SCHEMA_MIN_REQUIRED",
+  "core_schema_max_supported": "$CORE_SCHEMA_MAX_SUPPORTED",
   "build_commit": "$GIT_COMMIT",
   "build_time": "$BUILD_TIME"
 }

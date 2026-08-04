@@ -1396,3 +1396,181 @@ func tableExists(ctx context.Context, t *testing.T, db *sql.DB, name string) boo
 	}
 	return exists
 }
+
+func TestParseStartupMigrationMode(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     string
+		cloudMode bool
+		want      StartupMigrationMode
+		wantErr   bool
+	}{
+		{name: "cloud default", cloudMode: true, want: StartupMigrationVerify},
+		{name: "local default", want: StartupMigrationApplyToMax},
+		{name: "explicit verify", value: " verify ", want: StartupMigrationVerify},
+		{name: "explicit apply", value: "apply-to-max", cloudMode: true, want: StartupMigrationApplyToMax},
+		{name: "explicit off", value: "off", cloudMode: true, want: StartupMigrationOff},
+		{name: "invalid", value: "up", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseStartupMigrationMode(tt.value, tt.cloudMode)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ParseStartupMigrationMode(%q) succeeded, want error", tt.value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseStartupMigrationMode(%q): %v", tt.value, err)
+			}
+			if got != tt.want {
+				t.Fatalf("ParseStartupMigrationMode(%q) = %q, want %q", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMigrateOnStartVerifyIsReadOnly(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 17); err != nil {
+			t.Fatalf("migrate core to 17: %v", err)
+		}
+
+		window := MigrationWindow{
+			CoreMinRequired:   18,
+			CoreMaxSupported:  18,
+			IncludeCloud:      true,
+			CloudMinRequired:  3,
+			CloudMaxSupported: 3,
+		}
+		err := MigrateOnStart(ctx, db, StartupMigrationVerify, window)
+		if err == nil || !strings.Contains(err.Error(), "core schema version 17") {
+			t.Fatalf("verify error = %v, want core version refusal", err)
+		}
+
+		coreVersion, err := CurrentVersionCore(ctx, db)
+		if err != nil {
+			t.Fatalf("read core version: %v", err)
+		}
+		if coreVersion != 17 {
+			t.Fatalf("verify mutated core schema to %d, want 17", coreVersion)
+		}
+		cloudVersion, err := CurrentVersionCloud(ctx, db)
+		if err != nil {
+			t.Fatalf("read cloud version: %v", err)
+		}
+		if cloudVersion != 0 {
+			t.Fatalf("verify mutated cloud schema to %d, want 0", cloudVersion)
+		}
+	})
+}
+
+func TestMigrateOnStartVerifyAcceptsWindowAndRejectsNewerSchema(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 18); err != nil {
+			t.Fatalf("migrate core to 18: %v", err)
+		}
+		if err := MigrateUpToCloud(ctx, db, 3); err != nil {
+			t.Fatalf("migrate cloud to 3: %v", err)
+		}
+		coreOnlyWindow := MigrationWindow{
+			CoreMinRequired:  18,
+			CoreMaxSupported: 18,
+		}
+		if err := MigrateOnStart(ctx, db, StartupMigrationVerify, coreOnlyWindow); err != nil {
+			t.Fatalf("verify runtime core-only schema window: %v", err)
+		}
+
+		currentWindow := MigrationWindow{
+			CoreMinRequired:   18,
+			CoreMaxSupported:  18,
+			IncludeCloud:      true,
+			CloudMinRequired:  3,
+			CloudMaxSupported: 3,
+		}
+		if err := MigrateOnStart(ctx, db, StartupMigrationVerify, currentWindow); err != nil {
+			t.Fatalf("verify current schema: %v", err)
+		}
+
+		oldBinaryWindow := currentWindow
+		oldBinaryWindow.CoreMinRequired = 17
+		oldBinaryWindow.CoreMaxSupported = 17
+		err := MigrateOnStart(ctx, db, StartupMigrationVerify, oldBinaryWindow)
+		if err == nil || !strings.Contains(err.Error(), "outside binary compatibility window [17,17]") {
+			t.Fatalf("newer schema error = %v, want maxSupported refusal", err)
+		}
+	})
+}
+
+func TestMigrateOnStartApplyToMaxIsBounded(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		window := MigrationWindow{
+			CoreMinRequired:   17,
+			CoreMaxSupported:  17,
+			IncludeCloud:      true,
+			CloudMinRequired:  3,
+			CloudMaxSupported: 3,
+		}
+		if err := MigrateOnStart(ctx, db, StartupMigrationApplyToMax, window); err != nil {
+			t.Fatalf("apply bounded startup migrations: %v", err)
+		}
+
+		coreVersion, err := CurrentVersionCore(ctx, db)
+		if err != nil {
+			t.Fatalf("read core version: %v", err)
+		}
+		cloudVersion, err := CurrentVersionCloud(ctx, db)
+		if err != nil {
+			t.Fatalf("read cloud version: %v", err)
+		}
+		if coreVersion != 17 || cloudVersion != 3 {
+			t.Fatalf("bounded migration versions = core %d, cloud %d; want 17 and 3", coreVersion, cloudVersion)
+		}
+	})
+}
+
+func TestMigrateOnStartOffDoesNotCreateMigrationTables(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		window := MigrationWindow{
+			CoreMinRequired:   18,
+			CoreMaxSupported:  18,
+			IncludeCloud:      true,
+			CloudMinRequired:  3,
+			CloudMaxSupported: 3,
+		}
+		if err := MigrateOnStart(ctx, db, StartupMigrationOff, window); err != nil {
+			t.Fatalf("startup migrations off: %v", err)
+		}
+
+		for _, table := range []string{migrationTableCore, migrationTableCloud} {
+			exists, err := migrationTableExists(ctx, db, table)
+			if err != nil {
+				t.Fatalf("inspect %s: %v", table, err)
+			}
+			if exists {
+				t.Fatalf("off mode created %s", table)
+			}
+		}
+	})
+}
+
+func TestMigrateOnStartRejectsInvalidPolicy(t *testing.T) {
+	validWindow := MigrationWindow{
+		CoreMinRequired:   18,
+		CoreMaxSupported:  18,
+		IncludeCloud:      true,
+		CloudMinRequired:  3,
+		CloudMaxSupported: 3,
+	}
+	if err := MigrateOnStart(context.Background(), nil, StartupMigrationMode("up"), validWindow); err == nil {
+		t.Fatal("invalid startup migration mode succeeded")
+	}
+
+	invalidWindow := validWindow
+	invalidWindow.CoreMinRequired = 19
+	if err := MigrateOnStart(context.Background(), nil, StartupMigrationOff, invalidWindow); err == nil {
+		t.Fatal("invalid migration window succeeded")
+	}
+}
