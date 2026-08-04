@@ -34,6 +34,27 @@ This document defines the MCP interface for NeuralMail: resources, tools, and JS
         "email": {"type": "string", "format": "email"}
       },
       "required": ["email"]
+    },
+    "outbound_attachment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "filename": {"type": "string", "minLength": 1, "maxLength": 255},
+        "content_type": {
+          "type": "string",
+          "enum": [
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "application/pdf",
+            "text/plain",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+          ]
+        },
+        "content_base64": {"type": "string", "contentEncoding": "base64"}
+      },
+      "required": ["filename", "content_type", "content_base64"]
     }
   }
 }
@@ -365,7 +386,12 @@ Input schema:
     "body_or_draft_id": {"type": "string"},
     "idempotency_key": {"type": "string"},
     "html": {"type": "string"},
-    "needs_human_approval": {"type": "boolean", "default": false}
+    "needs_human_approval": {"type": "boolean", "default": false},
+    "attachments": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {"$ref": "neuralmail/types.json#/definitions/outbound_attachment"}
+    }
   },
   "required": ["thread_id", "body_or_draft_id"]
 }
@@ -403,7 +429,12 @@ Input schema:
     "from_name": {"type": "string", "description": "Optional display name for the sender; the sender address remains the selected inbox address"},
     "idempotency_key": {"type": "string"},
     "body": {"type": "string"},
-    "html": {"type": "string"}
+    "html": {"type": "string"},
+    "attachments": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {"$ref": "neuralmail/types.json#/definitions/outbound_attachment"}
+    }
   },
   "required": ["inbox_id", "to", "subject"],
   "anyOf": [
@@ -429,6 +460,17 @@ Output schema:
   "required": ["thread_id", "message_id", "status"]
 }
 ```
+
+The `attachments` input is available only when the org-scoped `attachments`
+feature flag is enabled. When disabled, `tools/list` omits the property and a
+producer that still sends it receives `attachment_feature_disabled`.
+Decoded attachment content must be non-empty, at most 10 MiB per file and 10
+MiB in total. Filenames are trimmed server-side, limited to 255 UTF-8 bytes,
+and cannot contain path separators, NUL, or control characters. Base64 decoding
+is strict. Validation errors use the stable codes
+`attachment_count_exceeded`, `attachment_too_large`, `attachment_empty`,
+`attachment_total_too_large`, `attachment_invalid_filename`,
+`attachment_type_not_allowed`, and `attachment_invalid_encoding`.
 
 ## Error Shape
 All tools should return errors in a consistent shape when possible.
