@@ -17,6 +17,7 @@ import (
 	smtptransport "neuralmail/internal/emailtransport/providers/smtp"
 	"neuralmail/internal/embed"
 	"neuralmail/internal/entitlements"
+	"neuralmail/internal/featureflags"
 	"neuralmail/internal/jmap"
 	"neuralmail/internal/llm"
 	"neuralmail/internal/mcp"
@@ -104,6 +105,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	entitlementObserver := observability.NewEntitlementObserver(log.Default())
 	entitlementSvc := entitlements.NewService(cfg, st, entitlementObserver)
 	mcpServer := mcp.NewServer(cfg, toolSvc, authSvc, entitlementSvc)
+	mcpServer.FeatureFlags = featureflags.New(cfg.Cloud.Mode, st)
 
 	return &App{
 		Config:   cfg,

@@ -22,6 +22,16 @@ type FeatureFlag struct {
 	UpdatedBy string
 }
 
+func (s *Store) LookupFeatureFlagForOrg(ctx context.Context, orgID string, flag string) (FeatureFlagValues, error) {
+	var values FeatureFlagValues
+	err := s.RunAsOrg(ctx, orgID, func(scoped *Store) error {
+		resolved, err := scoped.LookupFeatureFlag(ctx, orgID, flag)
+		values = resolved
+		return err
+	})
+	return values, err
+}
+
 // LookupFeatureFlag returns the org-specific and global values separately so
 // callers can apply precedence without losing the distinction between an
 // explicit false and an absent row.
