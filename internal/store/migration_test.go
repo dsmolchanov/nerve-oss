@@ -717,6 +717,155 @@ func TestCurrentVersionDoesNotInitializeMigrationTables(t *testing.T) {
 	})
 }
 
+func TestMigrationStatusOnFreshDatabaseIsReadOnly(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		core, err := MigrationStatusCore(ctx, db)
+		core = requireMigrationStatus(t, core, err)
+		cloud, err := MigrationStatusCloud(ctx, db)
+		cloud = requireMigrationStatus(t, cloud, err)
+
+		assertMigrationStatus(t, core, 0, migrationVersions(t, "core"))
+		assertMigrationStatus(t, cloud, 0, []int64{1, 3})
+		if tableExists(ctx, t, db, migrationTableCore) || tableExists(ctx, t, db, migrationTableCloud) {
+			t.Fatal("read-only migration status created a migration table")
+		}
+	})
+}
+
+func TestMigrationStatusCoreReportsActualPendingVersions(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		const target = int64(5)
+		if err := MigrateUpToCore(ctx, db, target); err != nil {
+			t.Fatalf("migrate core to %d: %v", target, err)
+		}
+
+		versions := migrationVersions(t, "core")
+		status, err := MigrationStatusCore(ctx, db)
+		status = requireMigrationStatus(t, status, err)
+		assertMigrationStatus(t, status, target, versionsAfter(versions, target))
+
+		if err := MigrateCore(ctx, db); err != nil {
+			t.Fatalf("migrate core to head: %v", err)
+		}
+		atHead, err := MigrationStatusCore(ctx, db)
+		atHead = requireMigrationStatus(t, atHead, err)
+		assertMigrationStatus(t, atHead, versions[len(versions)-1], []int64{})
+	})
+}
+
+func TestMigrationStatusCloudPreservesSparsePendingVersions(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateCore(ctx, db); err != nil {
+			t.Fatalf("migrate core prerequisite: %v", err)
+		}
+		if err := MigrateUpToCloud(ctx, db, 1); err != nil {
+			t.Fatalf("migrate cloud to 1: %v", err)
+		}
+
+		status, err := MigrationStatusCloud(ctx, db)
+		status = requireMigrationStatus(t, status, err)
+		assertMigrationStatus(t, status, 1, []int64{3})
+	})
+}
+
+func TestMigrationStatusRejectsUnknownCurrentVersion(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateCore(ctx, db); err != nil {
+			t.Fatalf("migrate core prerequisite: %v", err)
+		}
+		if err := MigrateUpToCloud(ctx, db, 1); err != nil {
+			t.Fatalf("migrate cloud to 1: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO schema_migrations_cloud (version_id, is_applied) VALUES (2, true)`); err != nil {
+			t.Fatalf("inject unknown cloud migration version: %v", err)
+		}
+
+		_, err := MigrationStatusCloud(ctx, db)
+		if err == nil || !strings.Contains(err.Error(), "current migration version 2 is not available") {
+			t.Fatalf("expected unknown-current error, got %v", err)
+		}
+	})
+}
+
+func TestMigrationStatusRejectsCurrentVersionAheadOfHead(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateCore(ctx, db); err != nil {
+			t.Fatalf("migrate core to head: %v", err)
+		}
+		versions := migrationVersions(t, "core")
+		head := versions[len(versions)-1]
+		if _, err := db.ExecContext(ctx, `INSERT INTO schema_migrations_core (version_id, is_applied) VALUES ($1, true)`, head+1); err != nil {
+			t.Fatalf("inject core migration version ahead of head: %v", err)
+		}
+
+		_, err := MigrationStatusCore(ctx, db)
+		want := fmt.Sprintf("current migration version %d is ahead of migration head %d", head+1, head)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected ahead-of-head error %q, got %v", want, err)
+		}
+	})
+}
+
+func requireMigrationStatus(t *testing.T, status MigrationStatus, err error) MigrationStatus {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("migration status: %v", err)
+	}
+	return status
+}
+
+func assertMigrationStatus(t *testing.T, status MigrationStatus, current int64, pending []int64) {
+	t.Helper()
+	if status.Current != current {
+		t.Fatalf("current migration version = %d; want %d", status.Current, current)
+	}
+	if status.Pending == nil {
+		t.Fatal("pending migration versions are nil; want a non-nil slice")
+	}
+	if len(status.Pending) != len(pending) {
+		t.Fatalf("pending migration versions = %v; want %v", status.Pending, pending)
+	}
+	for i := range pending {
+		if status.Pending[i] != pending[i] {
+			t.Fatalf("pending migration versions = %v; want %v", status.Pending, pending)
+		}
+	}
+
+	wantHead := int64(0)
+	allVersions := append([]int64{current}, pending...)
+	for _, version := range allVersions {
+		if version > wantHead {
+			wantHead = version
+		}
+	}
+	if status.Head != wantHead {
+		t.Fatalf("migration head = %d; want %d", status.Head, wantHead)
+	}
+}
+
+func migrationVersions(t *testing.T, scope string) []int64 {
+	t.Helper()
+	migrations, err := goose.CollectMigrations(migrationDir(scope), 0, goose.MaxVersion)
+	if err != nil {
+		t.Fatalf("collect %s migrations: %v", scope, err)
+	}
+	versions := make([]int64, 0, len(migrations))
+	for _, migration := range migrations {
+		versions = append(versions, migration.Version)
+	}
+	return versions
+}
+
+func versionsAfter(versions []int64, current int64) []int64 {
+	pending := make([]int64, 0, len(versions))
+	for _, version := range versions {
+		if version > current {
+			pending = append(pending, version)
+		}
+	}
+	return pending
+}
+
 func TestWithGooseSerializesConfigurationAndOperation(t *testing.T) {
 	firstEntered := make(chan struct{})
 	releaseFirst := make(chan struct{})

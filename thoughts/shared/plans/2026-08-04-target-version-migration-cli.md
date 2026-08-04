@@ -2,11 +2,12 @@
 
 ## Overview
 
-Provide bounded, scope-aware migration primitives in nerve-oss before wiring a
-dedicated migration command and bounded startup policy. A staged schema rollout
-must be able to stop at an exact version, deploy compatible readers, and only
-then apply a later relaxation migration. Applying every pending migration at
-process startup collapses those stages and can make a safe rollout impossible.
+Complete the OSS side of Phase 0 §5 with bounded, scope-aware migration status
+and a dedicated operational command. A staged schema rollout must be able to
+inspect real pending versions, stop at an exact version, deploy compatible
+readers, and only then apply a later relaxation migration. Applying every
+pending migration at process startup collapses those stages and can make a safe
+rollout impossible.
 
 This is the OSS-local plan for Phase 0 §5. Shared store migration code is owned
 here and mirrored into nerve-cloud. The dedicated `nerve-migrate` command must
@@ -17,7 +18,7 @@ exact-mirror path.
 ## Current State
 
 - `internal/store/migrate.go` exposes unbounded core, cloud, and combined
-  migration functions. This branch adds target-version `MigrateUpToCore` and
+  migration functions plus target-version `MigrateUpToCore` and
   `MigrateUpToCloud`, one-step `MigrateDownCore` and `MigrateDownCloud`, and
   `CurrentVersionCore` and `CurrentVersionCloud`.
 - Goose's legacy API stores the dialect and migration table name in package
@@ -48,9 +49,9 @@ exact-mirror path.
 4. Existing migration aliases remain compatible until callers and deployment
    scripts have moved to `nerve-migrate`.
 
-## Scope of This Branch: Store Primitives
+## Scope of This Branch: Status API and Dedicated CLI
 
-### Changes Required
+### Existing Store Primitives
 
 - Add `MigrateUpToCore` and `MigrateUpToCloud` over `goose.UpToContext`.
   Validate that the target exists (or is already current) before applying
@@ -66,6 +67,48 @@ exact-mirror path.
 - Keep `Migrate`, `MigrateAll`, `MigrateCore`, and `MigrateCloud` behavior and
   signatures unchanged.
 
+These primitives are already merged and remain the foundation for the command.
+
+### Changes Required
+
+- Add `MigrationStatusCore` and `MigrationStatusCloud`, returning current
+  version, available head, and the sorted pending versions collected from the
+  actual scoped Goose migration files. Sparse versions must stay sparse; for
+  example cloud at version `0001` reports `[0003]`, never a synthetic `0002`.
+- Reject a database whose current version is ahead of the available head or is
+  a non-zero version absent from the scoped migration files. Status inspection
+  must stay read-only on a fresh database and run under the shared Goose lock.
+- Add `cmd/nerve-migrate` as the canonical operational interface:
+
+  ```text
+  nerve-migrate up     [--scope core|cloud|all] [--to <version>]
+  nerve-migrate down   --scope core --steps 1
+  nerve-migrate status [--scope core|cloud|all]
+  ```
+
+- Parse and validate the complete command before loading configuration or
+  opening the database. `up` and `status` default to `all`; `down` requires the
+  explicit core scope and exactly one step. Versions are non-empty ASCII base-10
+  digits, so `0018` is accepted while signs, whitespace, overflow, and a
+  command-local DSN flag are rejected.
+- For `up --scope all --to N`, read and validate both scoped statuses before
+  mutating either scope. A target is valid only when it equals the current
+  version or is one of that scope's real pending versions; zero is therefore a
+  no-op only for a fresh scope. Apply core before cloud after the complete
+  preflight succeeds.
+- Print stable status lines after `status`, successful `up`, and successful
+  `down`, with four-digit versions and no synthetic gaps:
+
+  ```text
+  core current=0005 head=0010 pending=5 pending_versions=[0006,0007,0008,0009,0010]
+  cloud current=0001 head=0003 pending=1 pending_versions=[0003]
+  ```
+
+- Build `/app/nerve-migrate` into the OSS runtime image without changing its
+  existing entrypoint, and smoke-test the packaged binary with `--help` in CI.
+- Keep the existing `cmd/neuralmail` and `cmd/neuralmaild` migration aliases
+  unchanged until their callers move to the dedicated command.
+
 ### Automated Verification
 
 - A PostgreSQL-backed test proves `MigrateUpToCore` stops at its target, a later
@@ -76,26 +119,18 @@ exact-mirror path.
   initializing migration bookkeeping.
 - A concurrency regression test proves a cloud operation cannot replace the
   goose table configuration while a core operation is still running.
-- Run focused store tests, the race-enabled concurrency test, `gofmt`, and
-  `git diff --check`.
-
-## Follow-up: Dedicated CLI
-
-Add `cmd/nerve-migrate` and make it the canonical interface for migration jobs.
-The command will:
-
-- accept `up` with `--scope core|cloud|all` and optional `--to`; for `all`,
-  apply core first and then cloud, honoring the target independently per scope;
-- accept a deliberately narrow one-step core rollback command;
-- report current and pending versions per selected scope through `status`;
-- validate commands, scopes, step counts, and non-negative target versions at
-  the CLI boundary before opening or mutating the database;
-- return a non-zero exit status on invalid input, incompatible state, or any
-  migration failure.
-
-Migrate the existing `cmd/neuralmail` and `cmd/neuralmaild` aliases and cloud
-deployment scripts in follow-up changes after the dedicated command is tested.
-Do not remove an alias until its in-repository callers have moved.
+- PostgreSQL-backed status tests cover a fresh database without bookkeeping
+  tables, a partial core scope, sparse cloud versions, an unknown current
+  version, and a current version ahead of head.
+- Parser and no-I/O tests cover defaults, all valid scopes, help, invalid input,
+  version edge cases, and prove configuration/database access happens only
+  after parsing succeeds.
+- Command orchestration tests prove both statuses are validated before an
+  `all --to` mutation, core runs before cloud, a cloud target gap prevents core
+  mutation, rollback is exactly one core step, output is buffered until every
+  selected status succeeds, and resources close on success and failure.
+- Run focused store and CLI tests, the race-enabled store/JMAP suites, the full
+  Go suite, `go vet`, image build and CLI smoke, `gofmt`, and `git diff --check`.
 
 ## Follow-up: Bounded Startup
 
@@ -116,14 +151,14 @@ replacement for the deployment migration job.
 
 ## Not in This Branch
 
-- No new command binary or command-line flag parsing.
 - No startup environment mode or compiled compatibility constants.
-- No changes to cloud deployment scripts, workflow files, or image contents.
+- No changes to cloud deployment scripts or cloud startup wiring.
 - No schema migrations or data changes.
 - No multi-step or automatic rollback policy.
 
 ## Rollback
 
-Revert the store primitive change. Existing unbounded migration entry points
-retain their prior signatures, so callers do not need a compatibility shim.
-The plan-only follow-ups have no runtime effect until implemented separately.
+Revert the status API, dedicated command, and image/CI wiring. Existing bounded
+and unbounded migration entry points retain their prior signatures, the runtime
+image entrypoint is unchanged, and existing aliases remain available, so
+callers do not need a compatibility shim.
