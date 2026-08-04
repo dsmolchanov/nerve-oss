@@ -54,7 +54,7 @@ func (s *Store) GetThread(ctx context.Context, threadID string) (Thread, []Messa
 	}
 	_ = json.Unmarshal(participantsJSON, &t.Participants)
 
-	rows, err := s.q.QueryContext(ctx, `SELECT message.id, message.inbox_id, message.thread_id, message.direction, coalesce(to_jsonb(message)->>'attachments_state','known'), coalesce(message.subject,''), coalesce(message.text,''), coalesce(message.html,''), message.created_at, coalesce(message.provider_message_id,''), coalesce(message.internet_message_id,''), coalesce(message.from_json,'{}'), coalesce(message.to_json,'[]'), coalesce(message.cc_json,'[]'), message.org_id::text FROM messages message WHERE message.thread_id = $1 ORDER BY message.created_at ASC`, threadID)
+	rows, err := s.q.QueryContext(ctx, `SELECT message.id, message.inbox_id, message.thread_id, message.direction, coalesce(to_jsonb(message)->>'attachments_state', CASE WHEN message.direction = 'inbound' AND coalesce(message.received_email_id, '') <> '' THEN CASE WHEN message.created_at < now() - interval '30 days' THEN 'unknown_metadata_expired' ELSE 'pending_backfill' END ELSE 'known' END), coalesce(message.subject,''), coalesce(message.text,''), coalesce(message.html,''), message.created_at, coalesce(message.provider_message_id,''), coalesce(message.internet_message_id,''), coalesce(message.from_json,'{}'), coalesce(message.to_json,'[]'), coalesce(message.cc_json,'[]'), message.org_id::text FROM messages message WHERE message.thread_id = $1 ORDER BY message.created_at ASC`, threadID)
 	if err != nil {
 		return t, nil, err
 	}
@@ -101,7 +101,7 @@ func (s *Store) GetThreadInboxID(ctx context.Context, threadID string) (string, 
 func (s *Store) GetMessage(ctx context.Context, messageID string) (Message, error) {
 	var m Message
 	var fromJSON, toJSON, ccJSON []byte
-	row := s.q.QueryRowContext(ctx, `SELECT message.id, message.inbox_id, message.thread_id, message.direction, coalesce(to_jsonb(message)->>'attachments_state','known'), message.subject, message.text, message.html, message.created_at, message.provider_message_id, message.internet_message_id, message.from_json, message.to_json, message.cc_json, coalesce(message.received_email_id, ''), message.org_id::text FROM messages message WHERE message.id = $1`, messageID)
+	row := s.q.QueryRowContext(ctx, `SELECT message.id, message.inbox_id, message.thread_id, message.direction, coalesce(to_jsonb(message)->>'attachments_state', CASE WHEN message.direction = 'inbound' AND coalesce(message.received_email_id, '') <> '' THEN CASE WHEN message.created_at < now() - interval '30 days' THEN 'unknown_metadata_expired' ELSE 'pending_backfill' END ELSE 'known' END), message.subject, message.text, message.html, message.created_at, message.provider_message_id, message.internet_message_id, message.from_json, message.to_json, message.cc_json, coalesce(message.received_email_id, ''), message.org_id::text FROM messages message WHERE message.id = $1`, messageID)
 	var orgID string
 	if err := row.Scan(&m.ID, &m.InboxID, &m.ThreadID, &m.Direction, &m.AttachmentsState, &m.Subject, &m.Text, &m.HTML, &m.CreatedAt, &m.ProviderMessageID, &m.InternetMessageID, &fromJSON, &toJSON, &ccJSON, &m.ReceivedEmailID, &orgID); err != nil {
 		return m, err
