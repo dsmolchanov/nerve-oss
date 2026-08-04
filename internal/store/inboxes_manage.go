@@ -3,9 +3,11 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type InboxRecord struct {
@@ -177,6 +179,10 @@ func (s *Store) CreateInboxForOrg(ctx context.Context, orgID string, address str
 		RETURNING created_at
 	`, rec.ID, rec.OrgID, domainRef, rec.Address, outboundProvider)
 	if err := row.Scan(&rec.CreatedAt); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "uq_inboxes_canonical_address" {
+			return InboxRecord{}, ErrResourceConflict
+		}
 		return InboxRecord{}, err
 	}
 	return rec, nil

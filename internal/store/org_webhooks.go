@@ -8,8 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // OrgWebhook is a customer subscription to outbound delivery events.
@@ -127,6 +130,7 @@ func (s *Store) EnsureOrgWebhook(ctx context.Context, orgID, url string, events 
 }
 
 func (s *Store) ensureOrgWebhookLocked(ctx context.Context, orgID, url string, events []string, externalRef string) (OrgWebhook, bool, error) {
+	events = canonicalWebhookEvents(events)
 	secret, err := generateWebhookSecret()
 	if err != nil {
 		return OrgWebhook{}, false, fmt.Errorf("generate secret: %w", err)
@@ -154,6 +158,10 @@ func (s *Store) ensureOrgWebhookLocked(ctx context.Context, orgID, url string, e
 		return created, true, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "idx_org_webhooks_org_active" {
+			return OrgWebhook{}, false, ErrResourceConflict
+		}
 		return OrgWebhook{}, false, err
 	}
 
@@ -166,6 +174,21 @@ func (s *Store) ensureOrgWebhookLocked(ctx context.Context, orgID, url string, e
 	}
 	existing.Secret = ""
 	return existing, false, nil
+}
+
+func canonicalWebhookEvents(events []string) []string {
+	if len(events) == 0 {
+		return []string{}
+	}
+	canonical := append([]string(nil), events...)
+	sort.Strings(canonical)
+	out := canonical[:0]
+	for _, event := range canonical {
+		if len(out) == 0 || out[len(out)-1] != event {
+			out = append(out, event)
+		}
+	}
+	return out
 }
 
 // ListOrgWebhooks returns all webhooks for an org, newest first.

@@ -246,6 +246,64 @@ func TestEnsureOrgWebhookConcurrentReplay(t *testing.T) {
 	})
 }
 
+func TestEnsureOrgWebhookCanonicalReplayAndURLConflict(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		orgID, err := st.CreateOrg(ctx, "canonical-webhook-owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		created, wasCreated, err := st.EnsureOrgWebhook(
+			ctx, orgID, "https://example.com/inbound",
+			[]string{"email.received", "email.delivered", "email.received"}, "webhook:canonical",
+		)
+		if err != nil || !wasCreated {
+			t.Fatalf("initial ensure: created=%v err=%v", wasCreated, err)
+		}
+		replayed, wasCreated, err := st.EnsureOrgWebhook(
+			ctx, orgID, "https://example.com/inbound",
+			[]string{"email.delivered", "email.received"}, "webhook:canonical",
+		)
+		if err != nil || wasCreated || replayed.ID != created.ID {
+			t.Fatalf("canonical replay: webhook=%+v created=%v err=%v", replayed, wasCreated, err)
+		}
+		if replayed.Secret != "" {
+			t.Fatal("canonical replay exposed the existing signing secret")
+		}
+
+		_, _, err = st.EnsureOrgWebhook(
+			ctx, orgID, "https://example.com/inbound",
+			[]string{"email.received"}, "webhook:different-ref",
+		)
+		if !errors.Is(err, ErrResourceConflict) {
+			t.Fatalf("URL collision error=%v, want resource conflict", err)
+		}
+	})
+}
+
+func TestCreateInboxCanonicalAddressConflict(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		firstOrgID, err := st.CreateOrg(ctx, "first-inbox-owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+		secondOrgID, err := st.CreateOrg(ctx, "second-inbox-owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.CreateInboxForOrg(ctx, firstOrgID, "family@abrolia.com", ""); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.CreateInboxForOrg(ctx, secondOrgID, "Family@Abrolia.com", ""); !errors.Is(err, ErrResourceConflict) {
+			t.Fatalf("duplicate inbox error=%v, want resource conflict", err)
+		}
+	})
+}
+
 func TestEnsureOrgWebhookSerializesWithOrgDeletion(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToLatest(t, ctx, db)

@@ -1329,6 +1329,10 @@ func (h *Handler) handleCreateInbox(w http.ResponseWriter, r *http.Request) {
 		return err
 	})
 	if err != nil {
+		if errors.Is(err, store.ErrResourceConflict) {
+			http.Error(w, "inbox already exists", http.StatusConflict)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
