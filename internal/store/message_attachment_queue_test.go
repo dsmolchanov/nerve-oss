@@ -215,6 +215,73 @@ func TestMarkMessageAttachmentTerminalRejectsInvalidStateBeforeSQL(t *testing.T)
 	}
 }
 
+func TestStoreMirroredMessageAttachmentCommitsBlobAndReferenceAtomically(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		st, orgID, _ := seedMessageAttachmentQueue(t, ctx, db, []string{"success", "lost-lease"})
+		now := time.Now().UTC()
+		claimed, err := st.ClaimMessageAttachments(ctx, 2, "worker-a", now, 5*time.Minute)
+		if err != nil || len(claimed) != 2 {
+			t.Fatalf("claimed=%v err=%v", claimed, err)
+		}
+		byProviderID := make(map[string]MessageAttachment, len(claimed))
+		for _, attachment := range claimed {
+			byProviderID[attachment.ProviderAttachmentID] = attachment
+		}
+
+		content := []byte("atomic content")
+		digest, err := st.StoreMirroredMessageAttachment(
+			ctx,
+			orgID,
+			byProviderID["success"].ID,
+			"worker-a",
+			byProviderID["success"].LockedAt.Time,
+			"text/plain",
+			content,
+			now,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := st.GetAttachmentBlobInfo(ctx, orgID, digest)
+		if err != nil || info.RefCount != 1 || info.SizeBytes != int64(len(content)) {
+			t.Fatalf("blob info=%+v err=%v", info, err)
+		}
+		var availability, referencedDigest string
+		if err := db.QueryRowContext(ctx, `
+			SELECT availability, blob_sha256 FROM message_attachments WHERE id = $1
+		`, byProviderID["success"].ID).Scan(&availability, &referencedDigest); err != nil {
+			t.Fatal(err)
+		}
+		if availability != "available" || referencedDigest != digest {
+			t.Fatalf("availability=%q digest=%q", availability, referencedDigest)
+		}
+
+		orphanDigest, err := st.StoreMirroredMessageAttachment(
+			ctx,
+			orgID,
+			byProviderID["lost-lease"].ID,
+			"wrong-worker",
+			byProviderID["lost-lease"].LockedAt.Time,
+			"text/plain",
+			[]byte("must roll back"),
+			now,
+		)
+		if !errors.Is(err, ErrAttachmentLeaseLost) {
+			t.Fatalf("lost lease err=%v", err)
+		}
+		var orphanCount int
+		if err := db.QueryRowContext(ctx, `
+			SELECT count(*) FROM attachment_blobs WHERE org_id = $1 AND sha256 = $2
+		`, orgID, orphanDigest).Scan(&orphanCount); err != nil {
+			t.Fatal(err)
+		}
+		if orphanCount != 0 {
+			t.Fatalf("lost lease committed %d orphan blobs", orphanCount)
+		}
+		assertAttachmentUsage(t, ctx, db, orgID, int64(len(content)), 1)
+	})
+}
+
 func seedMessageAttachmentQueue(
 	t *testing.T,
 	ctx context.Context,

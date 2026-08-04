@@ -18,7 +18,10 @@ import (
 )
 
 var (
-	ErrUnauthorized = errors.New("unauthorized")
+	ErrUnauthenticated = errors.New("unauthorized")
+	// ErrUnauthorized is retained as an API-compatible alias. New HTTP
+	// boundaries should classify this condition as unauthenticated (401).
+	ErrUnauthorized = ErrUnauthenticated
 	ErrForbidden    = errors.New("forbidden")
 )
 
