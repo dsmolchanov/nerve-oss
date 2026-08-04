@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"neuralmail/internal/emailtransport"
+	"neuralmail/internal/store"
 )
 
 func TestEnvelopeAddressUsesBareMailbox(t *testing.T) {
@@ -52,5 +53,42 @@ func TestBuildMIMEMessagePreservesDisplayName(t *testing.T) {
 	}
 	if parsed.Name != "Агата AI" || parsed.Address != "support@ahata.ai" {
 		t.Fatalf("unexpected MIME From header: %#v", parsed)
+	}
+}
+
+func TestBuildMIMEMessageAttachmentGolden(t *testing.T) {
+	msg := emailtransport.OutboundMessage{
+		From:     "sender@example.com",
+		To:       []string{"recipient@example.com"},
+		Subject:  "Résumé",
+		TextBody: "Body",
+		Attachments: []store.OutboundAttachment{
+			{Filename: "résumé 2026.pdf", ContentType: "application/pdf", Content: []byte("PDF")},
+		},
+	}
+	boundary := mimeBoundary("mixed", msg)
+	if boundary != "nerve_mixed_0ee2f6f3dece62e765368ccf" {
+		t.Fatalf("boundary=%q", boundary)
+	}
+	payload, err := buildMIMEMessage(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "From: sender@example.com\r\n" +
+		"To: recipient@example.com\r\n" +
+		"Subject: Résumé\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/mixed; boundary=\"" + boundary + "\"\r\n\r\n" +
+		"--" + boundary + "\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n\r\n" +
+		"Body\r\n" +
+		"--" + boundary + "\r\n" +
+		"Content-Type: application/pdf; filename*=UTF-8''r%C3%A9sum%C3%A9%202026.pdf\r\n" +
+		"Content-Disposition: attachment; filename*=UTF-8''r%C3%A9sum%C3%A9%202026.pdf\r\n" +
+		"Content-Transfer-Encoding: base64\r\n\r\n" +
+		"UERG\r\n" +
+		"--" + boundary + "--\r\n"
+	if payload != want {
+		t.Fatalf("MIME payload mismatch\n--- got ---\n%q\n--- want ---\n%q", payload, want)
 	}
 }

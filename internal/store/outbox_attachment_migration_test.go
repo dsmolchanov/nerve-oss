@@ -10,9 +10,9 @@ import (
 	"github.com/google/uuid"
 )
 
-func TestMigration24CreatesOutboxAttachmentLifecycle(t *testing.T) {
+func TestMigration25CreatesOutboxAttachmentLifecycle(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
-		if err := MigrateUpToCore(ctx, db, 23); err != nil {
+		if err := MigrateUpToCore(ctx, db, 24); err != nil {
 			t.Fatal(err)
 		}
 		orgID, inboxID, _ := seedAttachmentMessageParents(t, ctx, db, "outbox-attachment-schema")
@@ -26,13 +26,13 @@ func TestMigration24CreatesOutboxAttachmentLifecycle(t *testing.T) {
 				INSERT INTO outbox_messages
 				  (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject, status)
 				VALUES ($1, $2, $3, 'smtp', $4, 'to@example.com', 'from@example.com', 'subject', $5)
-			`, id, orgID, inboxID, "migration-24-"+status, status); err != nil {
+			`, id, orgID, inboxID, "migration-25-"+status, status); err != nil {
 				t.Fatal(err)
 			}
 		}
 
 		migrationStartedAt := time.Now().UTC().Add(-time.Second)
-		if err := MigrateUpToCore(ctx, db, 24); err != nil {
+		if err := MigrateUpToCore(ctx, db, 25); err != nil {
 			t.Fatal(err)
 		}
 		assertTableExists(t, db, "outbox_attachments")
@@ -90,7 +90,7 @@ func TestMigration24CreatesOutboxAttachmentLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 		version, err := CurrentVersionCore(ctx, db)
-		if err != nil || version != 23 {
+		if err != nil || version != 24 {
 			t.Fatalf("version=%d err=%v after migration down", version, err)
 		}
 		var tableName sql.NullString

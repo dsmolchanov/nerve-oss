@@ -3,6 +3,7 @@ package resend
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -91,6 +92,16 @@ func (a *OutboundAdapter) SendMessage(ctx context.Context, msg emailtransport.Ou
 	}
 	if len(msg.Headers) > 0 {
 		payload["headers"] = msg.Headers
+	}
+	if len(msg.Attachments) > 0 {
+		attachments := make([]map[string]string, 0, len(msg.Attachments))
+		for _, attachment := range msg.Attachments {
+			attachments = append(attachments, map[string]string{
+				"filename": attachment.Filename,
+				"content":  base64.StdEncoding.EncodeToString(attachment.Content),
+			})
+		}
+		payload["attachments"] = attachments
 	}
 
 	body, err := json.Marshal(payload)

@@ -59,7 +59,7 @@ FOR EACH ROW EXECUTE FUNCTION update_attachment_blob_ref_count();
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM outbox_attachments) THEN
-    RAISE EXCEPTION 'cannot roll back core migration 0024: outbox attachment metadata exists';
+    RAISE EXCEPTION 'cannot roll back core migration 0025: outbox attachment metadata exists';
   END IF;
 END $$;
 -- +goose StatementEnd

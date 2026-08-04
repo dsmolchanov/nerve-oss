@@ -2,16 +2,17 @@ package smtp
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
 	"net/mail"
 	"net/smtp"
 	"net/textproto"
+	"sort"
 	"strings"
-
-	"github.com/google/uuid"
 
 	"neuralmail/internal/emailtransport"
 )
@@ -93,7 +94,13 @@ func buildMIMEMessage(msg emailtransport.OutboundMessage) (string, error) {
 		"Subject: " + subject,
 		"MIME-Version: 1.0",
 	}
-	for k, v := range msg.Headers {
+	headerKeys := make([]string, 0, len(msg.Headers))
+	for key := range msg.Headers {
+		headerKeys = append(headerKeys, key)
+	}
+	sort.Strings(headerKeys)
+	for _, k := range headerKeys {
+		v := msg.Headers[k]
 		key := strings.TrimSpace(k)
 		val := strings.TrimSpace(v)
 		if key == "" || containsNewline(key) || containsNewline(val) {
@@ -106,41 +113,130 @@ func buildMIMEMessage(msg emailtransport.OutboundMessage) (string, error) {
 		headers = append(headers, key+": "+val)
 	}
 
-	// Default to plain text if no HTML is provided.
-	if strings.TrimSpace(htmlBody) == "" {
+	// Keep the simple body-only shape unchanged when no attachments exist.
+	if len(msg.Attachments) == 0 && strings.TrimSpace(htmlBody) == "" {
 		headers = append(headers, "Content-Type: text/plain; charset=utf-8")
 		return strings.Join(append(headers, "", textBody), "\r\n"), nil
 	}
 
-	// multipart/alternative with both text/plain and text/html.
-	// If caller didn't provide a plain text part, send a minimal one.
-	if strings.TrimSpace(textBody) == "" {
-		textBody = "This message contains HTML content. Use an HTML-capable email client to view it."
+	if len(msg.Attachments) == 0 {
+		boundary := mimeBoundary("alternative", msg)
+		headers = append(headers, fmt.Sprintf("Content-Type: multipart/alternative; boundary=\"%s\"", boundary))
+		return strings.Join(headers, "\r\n") + "\r\n\r\n" + buildAlternativeBody(textBody, htmlBody, boundary), nil
 	}
 
-	boundary := "nerve_" + uuid.NewString()
-	headers = append(headers, fmt.Sprintf("Content-Type: multipart/alternative; boundary=\"%s\"", boundary))
-
+	mixedBoundary := mimeBoundary("mixed", msg)
+	headers = append(headers, fmt.Sprintf("Content-Type: multipart/mixed; boundary=\"%s\"", mixedBoundary))
 	var b strings.Builder
 	b.WriteString(strings.Join(headers, "\r\n"))
 	b.WriteString("\r\n\r\n")
+	b.WriteString("--" + mixedBoundary + "\r\n")
+	if strings.TrimSpace(htmlBody) == "" {
+		b.WriteString("Content-Type: text/plain; charset=utf-8\r\n\r\n")
+		b.WriteString(textBody)
+		b.WriteString("\r\n")
+	} else {
+		alternativeBoundary := mimeBoundary("alternative", msg)
+		b.WriteString(fmt.Sprintf("Content-Type: multipart/alternative; boundary=\"%s\"\r\n\r\n", alternativeBoundary))
+		b.WriteString(buildAlternativeBody(textBody, htmlBody, alternativeBoundary))
+	}
 
-	// text/plain part
+	for _, attachment := range msg.Attachments {
+		filename := strings.TrimSpace(attachment.Filename)
+		contentType := strings.TrimSpace(attachment.ContentType)
+		if filename == "" || containsNewline(filename) || containsNewline(contentType) {
+			return "", errors.New("invalid attachment header")
+		}
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
+		filenameParam := mimeFilenameParameter(filename)
+		b.WriteString("--" + mixedBoundary + "\r\n")
+		b.WriteString("Content-Type: " + contentType + "; " + filenameParam + "\r\n")
+		b.WriteString("Content-Disposition: attachment; " + filenameParam + "\r\n")
+		b.WriteString("Content-Transfer-Encoding: base64\r\n\r\n")
+		b.WriteString(wrapBase64(attachment.Content))
+		b.WriteString("\r\n")
+	}
+	b.WriteString("--" + mixedBoundary + "--\r\n")
+	return b.String(), nil
+}
+
+func buildAlternativeBody(textBody, htmlBody, boundary string) string {
+	if strings.TrimSpace(textBody) == "" {
+		textBody = "This message contains HTML content. Use an HTML-capable email client to view it."
+	}
+	var b strings.Builder
 	b.WriteString("--" + boundary + "\r\n")
-	b.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
-	b.WriteString("\r\n")
+	b.WriteString("Content-Type: text/plain; charset=utf-8\r\n\r\n")
 	b.WriteString(textBody)
 	b.WriteString("\r\n")
-
-	// text/html part
 	b.WriteString("--" + boundary + "\r\n")
-	b.WriteString("Content-Type: text/html; charset=utf-8\r\n")
-	b.WriteString("\r\n")
+	b.WriteString("Content-Type: text/html; charset=utf-8\r\n\r\n")
 	b.WriteString(htmlBody)
 	b.WriteString("\r\n")
-
 	b.WriteString("--" + boundary + "--\r\n")
-	return b.String(), nil
+	return b.String()
+}
+
+func mimeBoundary(kind string, msg emailtransport.OutboundMessage) string {
+	h := sha256.New()
+	for _, field := range []string{msg.From, strings.Join(msg.To, ","), msg.Subject, msg.TextBody, msg.HTMLBody, kind} {
+		h.Write([]byte(field))
+		h.Write([]byte{0})
+	}
+	for _, attachment := range msg.Attachments {
+		h.Write([]byte(attachment.Filename))
+		h.Write([]byte{0})
+		h.Write([]byte(attachment.ContentType))
+		h.Write([]byte{0})
+		h.Write(attachment.Content)
+		h.Write([]byte{0})
+	}
+	return fmt.Sprintf("nerve_%s_%x", kind, h.Sum(nil)[:12])
+}
+
+func mimeFilenameParameter(filename string) string {
+	ascii := true
+	for _, r := range filename {
+		if r < 0x20 || r > 0x7e {
+			ascii = false
+			break
+		}
+	}
+	if ascii {
+		escaped := strings.NewReplacer("\\", "\\\\", "\"", "\\\"").Replace(filename)
+		return "filename=\"" + escaped + "\""
+	}
+	const hexDigits = "0123456789ABCDEF"
+	var encoded strings.Builder
+	for _, value := range []byte(filename) {
+		if (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||
+			(value >= '0' && value <= '9') || strings.ContainsRune("!#$&+-.^_`|~", rune(value)) {
+			encoded.WriteByte(value)
+			continue
+		}
+		encoded.WriteByte('%')
+		encoded.WriteByte(hexDigits[value>>4])
+		encoded.WriteByte(hexDigits[value&0x0f])
+	}
+	return "filename*=UTF-8''" + encoded.String()
+}
+
+func wrapBase64(content []byte) string {
+	encoded := base64.StdEncoding.EncodeToString(content)
+	if len(encoded) <= 76 {
+		return encoded
+	}
+	var lines []string
+	for len(encoded) > 76 {
+		lines = append(lines, encoded[:76])
+		encoded = encoded[76:]
+	}
+	if encoded != "" {
+		lines = append(lines, encoded)
+	}
+	return strings.Join(lines, "\r\n")
 }
 
 func (a *OutboundAdapter) SendMessage(ctx context.Context, msg emailtransport.OutboundMessage, key string) (string, error) {
