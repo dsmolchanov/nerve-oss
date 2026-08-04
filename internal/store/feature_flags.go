@@ -2,10 +2,15 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type FeatureFlagValues struct {
@@ -116,6 +121,51 @@ func (s *Store) SetFeatureFlag(ctx context.Context, orgID *string, flag string, 
 	}
 	changed, err := result.RowsAffected()
 	return changed > 0, err
+}
+
+// SetFeatureFlagAudited atomically applies an idempotent flag write and
+// records the operator action. A repeated value leaves the flag row unchanged
+// but still records that the command was issued.
+func (s *Store) SetFeatureFlagAudited(ctx context.Context, orgID *string, flag string, enabled bool, actor string) (bool, string, error) {
+	replayID := uuid.NewString()
+	var changed bool
+	err := s.withTx(ctx, func(scoped *Store) error {
+		var err error
+		changed, err = scoped.SetFeatureFlag(ctx, orgID, flag, enabled, actor)
+		if err != nil {
+			return err
+		}
+		inputsHash, err := featureFlagAuditHash(map[string]any{
+			"org_id":  orgID,
+			"flag":    strings.TrimSpace(flag),
+			"enabled": enabled,
+		})
+		if err != nil {
+			return err
+		}
+		outputsHash, err := featureFlagAuditHash(map[string]any{"changed": changed})
+		if err != nil {
+			return err
+		}
+		_, err = scoped.q.ExecContext(ctx, `
+			INSERT INTO audit_log (tool_call_id, actor, inputs_hash, outputs_hash, replay_id)
+			VALUES (NULL, $1, $2, $3, $4)
+		`, strings.TrimSpace(actor), inputsHash, outputsHash, replayID)
+		return err
+	})
+	if err != nil {
+		return false, "", err
+	}
+	return changed, replayID, nil
+}
+
+func featureFlagAuditHash(value any) (string, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func (s *Store) ListFeatureFlags(ctx context.Context, orgID *string) ([]FeatureFlag, error) {

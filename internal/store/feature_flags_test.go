@@ -116,6 +116,54 @@ func TestFeatureFlagStoreIsIdempotentAndPreservesExplicitFalse(t *testing.T) {
 	})
 }
 
+func TestSetFeatureFlagAuditedIsAtomicAndAuditsIdempotentCalls(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		orgID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'feature-audit')`, orgID); err != nil {
+			t.Fatal(err)
+		}
+
+		for call := 0; call < 2; call++ {
+			changed, replayID, err := st.SetFeatureFlagAudited(ctx, &orgID, "attachments", true, "ci@example.com")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if changed != (call == 0) {
+				t.Fatalf("call %d changed=%t", call, changed)
+			}
+			if replayID == "" {
+				t.Fatalf("call %d returned empty replay id", call)
+			}
+		}
+
+		var flagRows, auditRows, nullToolCallRows int
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM org_feature_flags WHERE org_id = $1 AND flag = 'attachments'`, orgID).Scan(&flagRows); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.QueryRowContext(ctx, `
+			SELECT count(*), count(*) FILTER (WHERE tool_call_id IS NULL)
+			FROM audit_log WHERE actor = 'ci@example.com'
+		`).Scan(&auditRows, &nullToolCallRows); err != nil {
+			t.Fatal(err)
+		}
+		if flagRows != 1 || auditRows != 2 || nullToolCallRows != 2 {
+			t.Fatalf("flag rows=%d audit rows=%d null-tool-call rows=%d", flagRows, auditRows, nullToolCallRows)
+		}
+
+		if _, _, err := st.SetFeatureFlagAudited(ctx, &orgID, "rollback-check", true, ""); err == nil {
+			t.Fatal("empty actor unexpectedly succeeded")
+		}
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM org_feature_flags WHERE org_id = $1 AND flag = 'rollback-check'`, orgID).Scan(&flagRows); err != nil {
+			t.Fatal(err)
+		}
+		if flagRows != 0 {
+			t.Fatalf("failed audited write left %d flag rows", flagRows)
+		}
+	})
+}
+
 func TestFeatureFlagRLSExposesGlobalAndCurrentOrgOnly(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToLatest(t, ctx, db)
