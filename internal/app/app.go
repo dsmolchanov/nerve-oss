@@ -151,6 +151,7 @@ func (a *App) Serve(ctx context.Context) error {
 		_, _ = w.Write([]byte("ready"))
 	})
 	mux.HandleFunc("/debug", a.handleDebug)
+	mux.Handle(featureflags.EffectiveStatePathPrefix, featureflags.EffectiveStateHandler(a.MCP.Auth, a.MCP.FeatureFlags))
 	mux.HandleFunc("/mcp", a.MCP.HandleHTTP)
 	mux.HandleFunc("/mcp/sse", a.MCP.HandleSSEStub)
 	mux.HandleFunc("/jmap/push", a.handleJMAPPush)
