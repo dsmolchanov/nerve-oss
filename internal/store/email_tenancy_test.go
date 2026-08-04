@@ -82,6 +82,113 @@ func TestMigration24DownRefusesExternalReferences(t *testing.T) {
 	})
 }
 
+func TestDeleteOrgIfEmptyBlocksActiveServiceTokens(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		orgID, err := st.CreateOrg(ctx, "service-token-owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.CreateServiceToken(
+			ctx, "00000000-0000-0000-0000-000000000024", orgID, "test-agent",
+			[]string{"nerve:admin.billing"}, time.Now().UTC().Add(time.Hour),
+		); err != nil {
+			t.Fatalf("create service token: %v", err)
+		}
+
+		deleted, err := st.DeleteOrgIfEmpty(ctx, orgID)
+		if err != nil {
+			t.Fatalf("delete org with active service token: %v", err)
+		}
+		if deleted {
+			t.Fatal("org with an active service token was deleted")
+		}
+		var tombstoned bool
+		if err := db.QueryRowContext(ctx, `SELECT deleted_at IS NOT NULL FROM orgs WHERE id = $1`, orgID).Scan(&tombstoned); err != nil {
+			t.Fatal(err)
+		}
+		if tombstoned {
+			t.Fatal("org tombstone was written while an active service token existed")
+		}
+
+		if err := st.RevokeActiveServiceTokens(ctx, orgID); err != nil {
+			t.Fatalf("revoke service token: %v", err)
+		}
+		deleted, err = st.DeleteOrgIfEmpty(ctx, orgID)
+		if err != nil || !deleted {
+			t.Fatalf("delete org after token revocation = %t, err=%v", deleted, err)
+		}
+		if err := st.CreateServiceToken(
+			ctx, "00000000-0000-0000-0000-000000000025", orgID, "late-agent",
+			nil, time.Now().UTC().Add(time.Hour),
+		); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("create token for deleted org error = %v, want sql.ErrNoRows", err)
+		}
+	})
+}
+
+func TestRotateServiceTokenIsAtomic(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		orgID, err := st.CreateOrg(ctx, "service-token-rotation")
+		if err != nil {
+			t.Fatal(err)
+		}
+		oldTokenID := "00000000-0000-0000-0000-000000000026"
+		if err := st.CreateServiceToken(
+			ctx, oldTokenID, orgID, "test-agent", []string{"nerve:admin.billing"}, time.Now().UTC().Add(time.Hour),
+		); err != nil {
+			t.Fatalf("create old service token: %v", err)
+		}
+
+		// A duplicate id makes the replacement insert fail after the transaction
+		// has attempted to revoke the old token. The revocation must roll back.
+		err = st.CreateServiceTokenWithRotation(
+			ctx, oldTokenID, orgID, "replacement-agent", []string{"nerve:admin.billing"}, time.Now().UTC().Add(time.Hour), true,
+		)
+		if err == nil {
+			t.Fatal("rotation with duplicate token id succeeded")
+		}
+		oldToken, err := st.GetServiceToken(ctx, oldTokenID)
+		if err != nil {
+			t.Fatalf("get old service token after failed rotation: %v", err)
+		}
+		if oldToken.RevokedAt.Valid {
+			t.Fatal("failed rotation revoked the old service token")
+		}
+
+		newTokenID := "00000000-0000-0000-0000-000000000027"
+		if err := st.CreateServiceTokenWithRotation(
+			ctx, newTokenID, orgID, "replacement-agent", []string{"nerve:admin.billing"}, time.Now().UTC().Add(time.Hour), true,
+		); err != nil {
+			t.Fatalf("rotate service token: %v", err)
+		}
+		oldToken, err = st.GetServiceToken(ctx, oldTokenID)
+		if err != nil {
+			t.Fatalf("get old service token after rotation: %v", err)
+		}
+		if !oldToken.RevokedAt.Valid {
+			t.Fatal("successful rotation left the old service token active")
+		}
+		newToken, err := st.GetServiceToken(ctx, newTokenID)
+		if err != nil {
+			t.Fatalf("get new service token after rotation: %v", err)
+		}
+		if newToken.RevokedAt.Valid {
+			t.Fatal("successful rotation created a revoked replacement token")
+		}
+		deleted, err := st.DeleteOrgIfEmpty(ctx, orgID)
+		if err != nil {
+			t.Fatalf("delete org after rotation: %v", err)
+		}
+		if deleted {
+			t.Fatal("org with the rotated active service token was deleted")
+		}
+	})
+}
+
 func TestEnsureOrgDomainConcurrentReplay(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToLatest(t, ctx, db)

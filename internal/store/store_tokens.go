@@ -25,14 +25,37 @@ func (s *Store) LookupCloudAPIKey(ctx context.Context, keyHash string) (CloudAPI
 }
 
 func (s *Store) CreateServiceToken(ctx context.Context, tokenID string, orgID string, actor string, scopes []string, expiresAt time.Time) error {
+	return s.CreateServiceTokenWithRotation(ctx, tokenID, orgID, actor, scopes, expiresAt, false)
+}
+
+func (s *Store) CreateServiceTokenWithRotation(ctx context.Context, tokenID string, orgID string, actor string, scopes []string, expiresAt time.Time, rotate bool) error {
 	if tokenID == "" {
 		tokenID = uuid.NewString()
 	}
-	_, err := s.q.ExecContext(ctx, `
-		INSERT INTO service_tokens (id, org_id, actor, scopes, expires_at)
-		VALUES ($1, $2, $3, $4, $5)
-	`, tokenID, orgID, actor, scopes, expiresAt)
-	return err
+	return s.withTx(ctx, func(scoped *Store) error {
+		// Token issuance and org deletion share the same reconciliation lock.
+		// This prevents a token from being inserted after the emptiness check
+		// but before the org tombstone commits.
+		if err := scoped.lockActiveOrgForReconciliation(ctx, orgID); err != nil {
+			return err
+		}
+		if rotate {
+			if _, err := scoped.q.ExecContext(ctx, `
+				UPDATE service_tokens
+				SET revoked_at = now()
+				WHERE org_id = $1
+				  AND revoked_at IS NULL
+				  AND expires_at > now()
+			`, orgID); err != nil {
+				return err
+			}
+		}
+		_, err := scoped.q.ExecContext(ctx, `
+			INSERT INTO service_tokens (id, org_id, actor, scopes, expires_at)
+			VALUES ($1, $2, $3, $4, $5)
+		`, tokenID, orgID, actor, scopes, expiresAt)
+		return err
+	})
 }
 
 func (s *Store) RevokeActiveServiceTokens(ctx context.Context, orgID string) error {

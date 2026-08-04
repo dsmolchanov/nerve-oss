@@ -82,12 +82,7 @@ func (s *TokenService) IssueServiceToken(ctx context.Context, orgID string, acto
 		return issued, err
 	}
 
-	if rotate {
-		if err := s.Store.RevokeActiveServiceTokens(ctx, orgID); err != nil {
-			return issued, err
-		}
-	}
-	if err := s.Store.CreateServiceToken(ctx, tokenID, orgID, actor, scopes, expiresAt); err != nil {
+	if err := s.Store.CreateServiceTokenWithRotation(ctx, tokenID, orgID, actor, scopes, expiresAt, rotate); err != nil {
 		return issued, err
 	}
 
