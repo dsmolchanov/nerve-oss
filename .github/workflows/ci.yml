@@ -26,6 +26,10 @@ jobs:
         run: ./scripts/ci/verify_runtime_boundaries.sh
       - name: Verify migration ownership
         run: ./scripts/ci/verify_migration_ownership.sh
+      - name: Validate sync manifest
+        run: |
+          ./scripts/sync/verify_exact_mirror.sh sync-manifest.yaml . .
+          ./scripts/ci/test_sync_manifest.sh
       - name: Docker build
         run: docker build -t nerve-oss-ci:test -f deploy/docker/cortex/Dockerfile .
       - name: Migration CLI image smoke
