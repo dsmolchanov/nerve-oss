@@ -165,4 +165,23 @@ func TestGenerateRuntimeManifestScript(t *testing.T) {
 	if output, err := cmd.CombinedOutput(); err == nil {
 		t.Fatalf("expected multi-document manifest to fail; output:\n%s", string(output))
 	}
+
+	invalidDocuments := []struct {
+		name string
+		data []byte
+	}{
+		{name: "empty document", data: nil},
+		{name: "non-object document", data: []byte(`[]`)},
+		{name: "malformed document", data: []byte(`{"runtime_version"`)},
+	}
+	for _, invalid := range invalidDocuments {
+		if err := os.WriteFile(outPath, invalid.data, 0o600); err != nil {
+			t.Fatalf("write %s: %v", invalid.name, err)
+		}
+		cmd = exec.Command("bash", exportScript, outPath, "v0.0.0-test", filepath.Join(t.TempDir(), "github-output"))
+		cmd.Dir = repoRoot
+		if output, err := cmd.CombinedOutput(); err == nil {
+			t.Fatalf("expected %s to fail; output:\n%s", invalid.name, string(output))
+		}
+	}
 }
