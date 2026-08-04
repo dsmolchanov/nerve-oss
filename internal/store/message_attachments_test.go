@@ -87,23 +87,44 @@ func TestMessageReadsRemainCompatibleBeforeAttachmentStateMigration(t *testing.T
 		st := &Store{db: db, q: db}
 		orgID, inboxID, threadID := seedAttachmentMessageParents(t, ctx, db, "read-state-core22")
 		messageID := uuid.NewString()
+		expiredMessageID := uuid.NewString()
+		outboundMessageID := uuid.NewString()
 		if _, err := db.ExecContext(ctx, `
 			INSERT INTO messages
 			  (id, org_id, inbox_id, thread_id, direction, received_email_id,
-			   subject, text, html, provider_message_id, internet_message_id, from_json, to_json, cc_json)
+			   subject, text, html, provider_message_id, internet_message_id, from_json, to_json, cc_json, created_at)
 			VALUES ($1, $2, $3, $4, 'inbound', 'received-core22',
-			        '', '', '', '', '', '{}', '[]', '[]')
-		`, messageID, orgID, inboxID, threadID); err != nil {
+			        '', '', '', 'provider-core22-current', '', '{}', '[]', '[]', now()),
+			       ($5, $2, $3, $4, 'inbound', 'received-core22-expired',
+			        '', '', '', 'provider-core22-expired', '', '{}', '[]', '[]', now() - interval '31 days'),
+			       ($6, $2, $3, $4, 'outbound', '',
+			        '', '', '', 'provider-core22-outbound', '', '{}', '[]', '[]', now() - interval '1 day')
+		`, messageID, orgID, inboxID, threadID, expiredMessageID, outboundMessageID); err != nil {
 			t.Fatal(err)
 		}
 
 		message, err := st.GetMessage(ctx, messageID)
-		if err != nil || message.AttachmentsState != "known" {
+		if err != nil || message.AttachmentsState != "pending_backfill" {
 			t.Fatalf("GetMessage message=%+v err=%v", message, err)
 		}
+		expiredMessage, err := st.GetMessage(ctx, expiredMessageID)
+		if err != nil || expiredMessage.AttachmentsState != "unknown_metadata_expired" {
+			t.Fatalf("expired GetMessage message=%+v err=%v", expiredMessage, err)
+		}
+		outboundMessage, err := st.GetMessage(ctx, outboundMessageID)
+		if err != nil || outboundMessage.AttachmentsState != "known" {
+			t.Fatalf("outbound GetMessage message=%+v err=%v", outboundMessage, err)
+		}
 		_, messages, err := st.GetThread(ctx, threadID)
-		if err != nil || len(messages) != 1 || messages[0].AttachmentsState != "known" {
+		if err != nil || len(messages) != 3 {
 			t.Fatalf("GetThread messages=%+v err=%v", messages, err)
+		}
+		states := make(map[string]string, len(messages))
+		for _, message := range messages {
+			states[message.ID] = message.AttachmentsState
+		}
+		if states[messageID] != "pending_backfill" || states[expiredMessageID] != "unknown_metadata_expired" || states[outboundMessageID] != "known" {
+			t.Fatalf("GetThread attachment states=%v", states)
 		}
 	})
 }
