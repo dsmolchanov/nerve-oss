@@ -123,8 +123,12 @@ CREATE POLICY tenant_write_org_domains ON org_domains
 -- +goose StatementBegin
 DO $$
 BEGIN
-  IF EXISTS (SELECT 1 FROM org_domain_grants) THEN
-    RAISE EXCEPTION 'cannot roll back core migration 0024: organization domain grants exist';
+  IF EXISTS (SELECT 1 FROM org_domain_grants)
+     OR EXISTS (SELECT 1 FROM orgs WHERE external_ref IS NOT NULL OR deleted_at IS NOT NULL)
+     OR EXISTS (SELECT 1 FROM org_domains WHERE external_ref IS NOT NULL)
+     OR EXISTS (SELECT 1 FROM inboxes WHERE external_ref IS NOT NULL)
+     OR EXISTS (SELECT 1 FROM org_webhooks WHERE external_ref IS NOT NULL) THEN
+    RAISE EXCEPTION 'cannot roll back core migration 0024: email tenancy reconciliation state exists';
   END IF;
 END $$;
 -- +goose StatementEnd

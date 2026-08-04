@@ -52,6 +52,35 @@ func TestMigration24DownRefusesDomainGrants(t *testing.T) {
 	})
 }
 
+func TestMigration24DownRefusesExternalReferences(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 24); err != nil {
+			t.Fatal(err)
+		}
+		st := &Store{db: db, q: db}
+		org, _, err := st.EnsureOrg(ctx, "referenced-family", "org:referenced-family")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = MigrateDownCore(ctx, db)
+		if err == nil || !strings.Contains(err.Error(), "cannot roll back core migration 0024") {
+			t.Fatalf("down error=%v, want external reference refusal", err)
+		}
+		version, versionErr := CurrentVersionCore(ctx, db)
+		if versionErr != nil || version != 24 {
+			t.Fatalf("version=%d err=%v after refused down", version, versionErr)
+		}
+
+		if _, err := db.ExecContext(ctx, `UPDATE orgs SET external_ref = NULL, deleted_at = NULL WHERE id = $1`, org.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := MigrateDownCore(ctx, db); err != nil {
+			t.Fatalf("clean migration 24 down: %v", err)
+		}
+	})
+}
+
 func TestEnsureOrgDomainConcurrentReplay(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToLatest(t, ctx, db)
