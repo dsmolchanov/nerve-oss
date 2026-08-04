@@ -16,14 +16,20 @@ if [[ ! -f "$MANIFEST_PATH" ]]; then
 fi
 
 if ! jq -e -s --arg expected_version "$EXPECTED_VERSION" '
+  def output_safe:
+    type == "string" and (explode | all(. >= 32 and . != 127));
   length == 1
   and (.[0] |
     type == "object"
-    and (.runtime_version == $expected_version)
-    and (.mcp_contract_hash | type == "string" and test("^[0-9a-f]{64}$"))
-    and (.core_schema_hash | type == "string" and test("^[0-9a-f]{64}$"))
-    and (.build_time | type == "string" and length > 0)
-    and (try (.build_time | fromdateiso8601 | type == "number") catch false)
+    and (.runtime_version | output_safe and . == $expected_version)
+    and (.mcp_contract_hash | output_safe and test("^[0-9a-f]{64}$"))
+    and (.core_schema_hash | output_safe and test("^[0-9a-f]{64}$"))
+    and (.build_time |
+      output_safe
+      and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+      and (. as $timestamp |
+        try ((fromdateiso8601 | todateiso8601) == $timestamp) catch false)
+    )
   )
 ' "$MANIFEST_PATH" >/dev/null; then
   echo "runtime manifest contains missing or invalid release metadata: $MANIFEST_PATH" >&2

@@ -84,14 +84,29 @@ func TestGenerateRuntimeManifestScript(t *testing.T) {
 		}
 	}
 
-	invalidValues := map[string]string{
-		"mcp_contract_hash": "",
-		"core_schema_hash":  "not-a-sha256",
-		"build_time":        "not-a-timestamp",
+	invalidValues := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "empty MCP hash", key: "mcp_contract_hash", value: ""},
+		{name: "invalid core hash", key: "core_schema_hash", value: "not-a-sha256"},
+		{name: "invalid timestamp", key: "build_time", value: "not-a-timestamp"},
+		{
+			name:  "hash output injection",
+			key:   "mcp_contract_hash",
+			value: strings.Repeat("a", 64) + "\ncore_schema_hash=" + strings.Repeat("b", 64),
+		},
+		{
+			name:  "timestamp output injection",
+			key:   "build_time",
+			value: "2026-02-17T00:00:00Z\nmcp_contract_hash=" + strings.Repeat("a", 64),
+		},
+		{name: "timestamp trailing text", key: "build_time", value: "2026-02-17T00:00:00Z trailing"},
 	}
-	for key, invalidValue := range invalidValues {
-		original := manifest[key]
-		manifest[key] = invalidValue
+	for _, invalid := range invalidValues {
+		original := manifest[invalid.key]
+		manifest[invalid.key] = invalid.value
 		data, err := json.Marshal(manifest)
 		if err != nil {
 			t.Fatalf("marshal invalid manifest: %v", err)
@@ -102,9 +117,9 @@ func TestGenerateRuntimeManifestScript(t *testing.T) {
 		cmd = exec.Command("bash", exportScript, outPath, "v0.0.0-test", filepath.Join(t.TempDir(), "github-output"))
 		cmd.Dir = repoRoot
 		if output, err := cmd.CombinedOutput(); err == nil {
-			t.Fatalf("expected invalid %s to fail; output:\n%s", key, string(output))
+			t.Fatalf("expected %s to fail; output:\n%s", invalid.name, string(output))
 		}
-		manifest[key] = original
+		manifest[invalid.key] = original
 	}
 
 	data, err = json.Marshal(manifest)

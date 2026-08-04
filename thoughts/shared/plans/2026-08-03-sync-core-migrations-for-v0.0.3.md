@@ -53,6 +53,14 @@ support from `v0.0.2`.
   green functional CI. Cloud Codex requires the matching immutable artifact
   to exist before its lock update can merge, so publication precedes the final
   Cloud review/merge but never precedes verified mirror content.
+- Harden the tag-triggered Docker Publish boundary that exports generated
+  manifest fields into `$GITHUB_OUTPUT`: parse exactly one JSON object with
+  `jq`, require the expected release version, lowercase SHA-256 values, a
+  canonical UTC timestamp, and reject every control character before export.
+  Cover compact JSON, missing/invalid metadata, multiple JSON documents,
+  trailing timestamp text, and newline output-injection attempts. This
+  workflow/script validation is authorized as part of making the `v0.0.3`
+  promotion gate trustworthy.
 
 ## Compatibility Evidence
 
@@ -102,6 +110,8 @@ support from `v0.0.2`.
 - [x] Migration tests leave zero `nerve_test_*` databases and zero
   `rls_app_*` roles behind.
 - [ ] GitHub CI and Codex review pass.
-- [ ] Docker Publish creates the `v0.0.3` image and release artifacts.
+- [x] Docker Publish creates the `v0.0.3` image and release artifacts.
+- [x] Docker Publish manifest extraction rejects malformed metadata and every
+  newline/control-character output-injection attempt before image build.
 
 No live email is sent during verification.
