@@ -9,7 +9,7 @@ BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 MCP_CONTRACT_PATH="${MCP_CONTRACT_PATH:-docs/MCP_Contract.md}"
 CORE_MIGRATIONS_PATH="${CORE_MIGRATIONS_PATH:-internal/store/migrations/core}"
 CORE_SCHEMA_MIN_REQUIRED="19"
-CORE_SCHEMA_MAX_SUPPORTED="19"
+CORE_SCHEMA_MAX_SUPPORTED="23"
 
 hash_file() {
   local path="$1"

@@ -41,7 +41,7 @@ func TestCloudControlPlaneMigrationFromEmptyDatabase(t *testing.T) {
 	})
 }
 
-func TestCoreMigrationUpgradeFrom15To21(t *testing.T) {
+func TestCoreMigrationUpgradeFrom15To23(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToVersion(t, ctx, db, 15)
 
@@ -57,11 +57,11 @@ func TestCoreMigrationUpgradeFrom15To21(t *testing.T) {
 		`).Scan(&version); err != nil {
 			t.Fatalf("query core migration version: %v", err)
 		}
-		if version != 21 {
-			t.Fatalf("expected core migration version 21, got %d", version)
+		if version != 23 {
+			t.Fatalf("expected core migration version 23, got %d", version)
 		}
 
-		for _, table := range []string{"suppressions", "org_webhooks", "org_webhook_deliveries", "org_events"} {
+		for _, table := range []string{"suppressions", "org_webhooks", "org_webhook_deliveries", "org_events", "attachment_blobs", "org_attachment_usage", "message_attachments"} {
 			assertTableExists(t, db, table)
 		}
 		for _, table := range []string{"outbox_events", "inbox_smtp_configs", "suppressions"} {
