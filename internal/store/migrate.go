@@ -19,6 +19,15 @@ const (
 
 var gooseMu sync.Mutex
 
+// MigrationStatus describes the current and available migration versions for
+// one scope. Pending contains the actual unapplied migration versions in
+// ascending order; it is non-nil even when the scope is at head.
+type MigrationStatus struct {
+	Current int64
+	Head    int64
+	Pending []int64
+}
+
 // Migrate is a compatibility wrapper used by existing entrypoints.
 // It applies core migrations first, then cloud migrations.
 func Migrate(ctx context.Context, db *sql.DB) error {
@@ -73,6 +82,17 @@ func CurrentVersionCore(ctx context.Context, db *sql.DB) (int64, error) {
 // CurrentVersionCloud reports the highest applied cloud migration version.
 func CurrentVersionCloud(ctx context.Context, db *sql.DB) (int64, error) {
 	return currentVersion(ctx, db, migrationTableCloud)
+}
+
+// MigrationStatusCore reports the read-only migration status for the core
+// scope without creating or changing its migration table.
+func MigrationStatusCore(ctx context.Context, db *sql.DB) (MigrationStatus, error) {
+	return migrationStatus(ctx, db, migrationTableCore, migrationDir("core"))
+}
+
+// MigrationStatusCloud is MigrationStatusCore for the cloud scope.
+func MigrationStatusCloud(ctx context.Context, db *sql.DB) (MigrationStatus, error) {
+	return migrationStatus(ctx, db, migrationTableCloud, migrationDir("cloud"))
 }
 
 func migrateScope(ctx context.Context, db *sql.DB, tableName string, dir string) error {
@@ -176,6 +196,43 @@ func currentVersion(ctx context.Context, db *sql.DB, tableName string) (int64, e
 		return 0, err
 	}
 	return 0, nil
+}
+
+func migrationStatus(ctx context.Context, db *sql.DB, tableName string, dir string) (MigrationStatus, error) {
+	status := MigrationStatus{Pending: make([]int64, 0)}
+	err := withGoose(tableName, func() error {
+		migrations, err := goose.CollectMigrations(dir, 0, goose.MaxVersion)
+		if err != nil {
+			return fmt.Errorf("collect migrations: %w", err)
+		}
+		if len(migrations) > 0 {
+			status.Head = migrations[len(migrations)-1].Version
+			status.Pending = make([]int64, 0, len(migrations))
+		}
+
+		status.Current, err = currentVersion(ctx, db, tableName)
+		if err != nil {
+			return fmt.Errorf("read current migration version: %w", err)
+		}
+		if status.Current > status.Head {
+			return fmt.Errorf("current migration version %d is ahead of migration head %d", status.Current, status.Head)
+		}
+
+		currentAvailable := status.Current == 0
+		for _, migration := range migrations {
+			if migration.Version == status.Current {
+				currentAvailable = true
+			}
+			if migration.Version > status.Current {
+				status.Pending = append(status.Pending, migration.Version)
+			}
+		}
+		if !currentAvailable {
+			return fmt.Errorf("current migration version %d is not available", status.Current)
+		}
+		return nil
+	})
+	return status, err
 }
 
 func migrationTableExists(ctx context.Context, db *sql.DB, tableName string) (bool, error) {
