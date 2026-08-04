@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 
 	"github.com/pressly/goose/v3"
 )
@@ -15,6 +16,8 @@ const (
 	migrationTableCore  = "schema_migrations_core"
 	migrationTableCloud = "schema_migrations_cloud"
 )
+
+var gooseMu sync.Mutex
 
 // Migrate is a compatibility wrapper used by existing entrypoints.
 // It applies core migrations first, then cloud migrations.
@@ -37,16 +40,16 @@ func MigrateCloud(ctx context.Context, db *sql.DB) error {
 	return migrateScope(ctx, db, migrationTableCloud, migrationDir("cloud"))
 }
 
-// MigrateCoreTo applies core migrations up to and including version, leaving
+// MigrateUpToCore applies core migrations up to and including version, leaving
 // anything later pending. Required by the expand -> dual-read -> relax rollout:
 // a plain Up would apply the relax step in the same run as the expand step,
 // which is what the staged rollout exists to prevent.
-func MigrateCoreTo(ctx context.Context, db *sql.DB, version int64) error {
+func MigrateUpToCore(ctx context.Context, db *sql.DB, version int64) error {
 	return migrateScopeTo(ctx, db, migrationTableCore, migrationDir("core"), version)
 }
 
-// MigrateCloudTo is MigrateCoreTo for the cloud scope.
-func MigrateCloudTo(ctx context.Context, db *sql.DB, version int64) error {
+// MigrateUpToCloud is MigrateUpToCore for the cloud scope.
+func MigrateUpToCloud(ctx context.Context, db *sql.DB, version int64) error {
 	return migrateScopeTo(ctx, db, migrationTableCloud, migrationDir("cloud"), version)
 }
 
@@ -73,31 +76,45 @@ func CurrentVersionCloud(ctx context.Context, db *sql.DB) (int64, error) {
 }
 
 func migrateScope(ctx context.Context, db *sql.DB, tableName string, dir string) error {
-	setGoose(tableName)
-	return goose.UpContext(ctx, db, dir)
+	return withGoose(tableName, func() error {
+		return goose.UpContext(ctx, db, dir)
+	})
 }
 
 func migrateScopeTo(ctx context.Context, db *sql.DB, tableName string, dir string, version int64) error {
-	setGoose(tableName)
-	return goose.UpToContext(ctx, db, dir, version)
+	return withGoose(tableName, func() error {
+		return goose.UpToContext(ctx, db, dir, version)
+	})
 }
 
 func migrateScopeDown(ctx context.Context, db *sql.DB, tableName string, dir string) error {
-	setGoose(tableName)
-	return goose.DownContext(ctx, db, dir)
+	return withGoose(tableName, func() error {
+		return goose.DownContext(ctx, db, dir)
+	})
 }
 
 func currentVersion(ctx context.Context, db *sql.DB, tableName string, dir string) (int64, error) {
-	setGoose(tableName)
-	return goose.GetDBVersionContext(ctx, db)
+	var version int64
+	err := withGoose(tableName, func() error {
+		var err error
+		version, err = goose.GetDBVersionContext(ctx, db)
+		return err
+	})
+	return version, err
 }
 
-// setGoose configures the shared goose globals. goose keeps dialect and table
-// name in package state, so every entry point must set both before use --
-// otherwise a call inherits whichever scope ran last.
-func setGoose(tableName string) {
-	goose.SetDialect("postgres")
+// withGoose serializes configuration and execution of goose's legacy API.
+// Goose reads its dialect and table name from package globals throughout an
+// operation, so another scope must not replace them until the operation ends.
+func withGoose(tableName string, operation func() error) error {
+	gooseMu.Lock()
+	defer gooseMu.Unlock()
+
+	if err := goose.SetDialect("postgres"); err != nil {
+		return fmt.Errorf("configure goose dialect: %w", err)
+	}
 	goose.SetTableName(tableName)
+	return operation()
 }
 
 func migrationDir(scope string) string {

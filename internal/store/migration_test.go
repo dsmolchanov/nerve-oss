@@ -590,15 +590,15 @@ func coreMigrationDir(t *testing.T) string {
 	return filepath.Join(filepath.Dir(currentFile), "migrations", "core")
 }
 
-// TestMigrateCoreTo_StopsAtTarget is the guard for the staged rollout: the
+// TestMigrateUpToCore_StopsAtTarget is the guard for the staged rollout: the
 // expand step must be able to land without dragging the relax step in behind
 // it. A plain MigrateCore applies everything, so a target-version path is the
 // only way to deploy readers between two migrations.
-func TestMigrateCoreTo_StopsAtTarget(t *testing.T) {
+func TestMigrateUpToCore_StopsAtTarget(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		const target = int64(5)
 
-		if err := MigrateCoreTo(ctx, db, target); err != nil {
+		if err := MigrateUpToCore(ctx, db, target); err != nil {
 			t.Fatalf("migrate core to %d: %v", target, err)
 		}
 		got, err := CurrentVersionCore(ctx, db)
@@ -641,6 +641,61 @@ func TestMigrateCoreTo_StopsAtTarget(t *testing.T) {
 			t.Fatalf("expected version below %d after down, got %d", head, afterDown)
 		}
 	})
+}
+
+func TestWithGooseSerializesConfigurationAndOperation(t *testing.T) {
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+
+	go func() {
+		firstDone <- withGoose(migrationTableCore, func() error {
+			close(firstEntered)
+			<-releaseFirst
+			if got := goose.TableName(); got != migrationTableCore {
+				return fmt.Errorf("first operation inherited table %q", got)
+			}
+			return nil
+		})
+	}()
+	<-firstEntered
+
+	secondStarted := make(chan struct{})
+	secondEntered := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		close(secondStarted)
+		secondDone <- withGoose(migrationTableCloud, func() error {
+			close(secondEntered)
+			if got := goose.TableName(); got != migrationTableCloud {
+				return fmt.Errorf("second operation inherited table %q", got)
+			}
+			return nil
+		})
+	}()
+	<-secondStarted
+
+	select {
+	case <-secondEntered:
+		close(releaseFirst)
+		<-firstDone
+		<-secondDone
+		t.Fatal("second goose operation entered before the first completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-secondEntered:
+	case <-time.After(time.Second):
+		t.Fatal("second goose operation did not enter after the first completed")
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
 }
 
 func tableExists(ctx context.Context, t *testing.T, db *sql.DB, name string) bool {
