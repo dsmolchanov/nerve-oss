@@ -18,15 +18,12 @@ jobs:
         id: manifest
         run: |
           mkdir -p dist/runtime
-          VERSION="${GITHUB_REF_NAME}"
+          VERSION="${GITHUB_REF_NAME:?GITHUB_REF_NAME is required}"
           ./scripts/release/generate_runtime_manifest.sh "$VERSION" "dist/runtime/runtime-manifest.json"
-          MCP_HASH="$(sed -n 's/.*\"mcp_contract_hash\": \"\\([^\"]*\\)\".*/\\1/p' dist/runtime/runtime-manifest.json)"
-          CORE_HASH="$(sed -n 's/.*\"core_schema_hash\": \"\\([^\"]*\\)\".*/\\1/p' dist/runtime/runtime-manifest.json)"
-          BUILD_TIME="$(sed -n 's/.*\"build_time\": \"\\([^\"]*\\)\".*/\\1/p' dist/runtime/runtime-manifest.json)"
-          echo "runtime_version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "mcp_contract_hash=$MCP_HASH" >> "$GITHUB_OUTPUT"
-          echo "core_schema_hash=$CORE_HASH" >> "$GITHUB_OUTPUT"
-          echo "build_time=$BUILD_TIME" >> "$GITHUB_OUTPUT"
+          ./scripts/release/export_runtime_manifest_outputs.sh \
+            "dist/runtime/runtime-manifest.json" \
+            "$VERSION" \
+            "$GITHUB_OUTPUT"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
