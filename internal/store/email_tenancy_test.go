@@ -4,9 +4,53 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 )
+
+func TestMigration24DownRefusesDomainGrants(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 24); err != nil {
+			t.Fatal(err)
+		}
+		st := &Store{db: db, q: db}
+		ownerID, err := st.CreateOrg(ctx, "rollback-owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+		granteeID, err := st.CreateOrg(ctx, "rollback-grantee")
+		if err != nil {
+			t.Fatal(err)
+		}
+		domainID, err := st.CreateOrgDomain(ctx, ownerID, "abrolia.com", "verify", "selector", "private", "public", "cname")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.UpdateOrgDomainStatus(ctx, domainID, "active"); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := st.EnsureOrgDomainGrant(ctx, ownerID, domainID, granteeID, "rollback:grant"); err != nil {
+			t.Fatal(err)
+		}
+
+		err = MigrateDownCore(ctx, db)
+		if err == nil || !strings.Contains(err.Error(), "cannot roll back core migration 0024") {
+			t.Fatalf("down error=%v, want domain grant refusal", err)
+		}
+		version, versionErr := CurrentVersionCore(ctx, db)
+		if versionErr != nil || version != 24 {
+			t.Fatalf("version=%d err=%v after refused down", version, versionErr)
+		}
+
+		if _, err := db.ExecContext(ctx, `DELETE FROM org_domain_grants`); err != nil {
+			t.Fatal(err)
+		}
+		if err := MigrateDownCore(ctx, db); err != nil {
+			t.Fatalf("clean migration 24 down: %v", err)
+		}
+	})
+}
 
 func TestEnsureOrgDomainConcurrentReplay(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {

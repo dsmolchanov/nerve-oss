@@ -120,6 +120,15 @@ CREATE POLICY tenant_write_org_domains ON org_domains
 
 -- +goose Down
 
+-- +goose StatementBegin
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM org_domain_grants) THEN
+    RAISE EXCEPTION 'cannot roll back core migration 0024: organization domain grants exist';
+  END IF;
+END $$;
+-- +goose StatementEnd
+
 DROP POLICY tenant_write_org_domains ON org_domains;
 DROP POLICY tenant_read_org_domains ON org_domains;
 CREATE POLICY tenant_isolation_org_domains ON org_domains
