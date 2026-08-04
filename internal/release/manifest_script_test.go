@@ -95,9 +95,13 @@ func TestGenerateRuntimeManifestScript(t *testing.T) {
 		{name: "missing MCP hash", key: "mcp_contract_hash", remove: true},
 		{name: "missing core hash", key: "core_schema_hash", remove: true},
 		{name: "missing build time", key: "build_time", remove: true},
+		{name: "unexpected runtime version", key: "runtime_version", value: "v0.0.1"},
 		{name: "empty MCP hash", key: "mcp_contract_hash", value: ""},
+		{name: "uppercase MCP hash", key: "mcp_contract_hash", value: strings.Repeat("A", 64)},
 		{name: "invalid core hash", key: "core_schema_hash", value: "not-a-sha256"},
+		{name: "uppercase core hash", key: "core_schema_hash", value: strings.Repeat("B", 64)},
 		{name: "invalid timestamp", key: "build_time", value: "not-a-timestamp"},
+		{name: "noncanonical UTC timestamp", key: "build_time", value: "2026-02-17T00:00:00+00:00"},
 		{
 			name:  "hash output injection",
 			key:   "mcp_contract_hash",
