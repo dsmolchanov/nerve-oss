@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -15,14 +16,40 @@ import (
 	"neuralmail/internal/store"
 )
 
-const mailCapability = "urn:ietf:params:jmap:mail"
+const (
+	coreCapability          = "urn:ietf:params:jmap:core"
+	mailCapability          = "urn:ietf:params:jmap:mail"
+	initialEmailQueryLimit  = 50
+	recoveryQueryPageSize   = 50
+	recoveryQueryMaxRetries = 3
+)
+
+type JMAPMethodError struct {
+	Method      string
+	Type        string
+	Description string
+}
+
+func (e *JMAPMethodError) Error() string {
+	if e.Type != "" && e.Description != "" {
+		return fmt.Sprintf("jmap method %s failed with %s: %s", e.Method, e.Type, e.Description)
+	}
+	if e.Type != "" {
+		return fmt.Sprintf("jmap method %s failed with %s", e.Method, e.Type)
+	}
+	if e.Description != "" {
+		return fmt.Sprintf("jmap method %s failed: %s", e.Method, e.Description)
+	}
+	return fmt.Sprintf("jmap method %s returned an error response", e.Method)
+}
 
 type JMAPClient struct {
-	cfg            config.Config
-	httpClient     *http.Client
-	apiURL         string
-	accountID      string
-	inboxMailboxID string
+	cfg             config.Config
+	httpClient      *http.Client
+	apiURL          string
+	accountID       string
+	inboxMailboxID  string
+	maxObjectsInGet int
 }
 
 func NewJMAPClient(cfg config.Config) (*JMAPClient, error) {
@@ -54,11 +81,17 @@ func (c *JMAPClient) FetchChanges(ctx context.Context, sinceState string) ([]Ema
 		ids = queryIDs
 		newState = queryState
 	} else {
-		state, createdIDs, err := c.emailChanges(ctx, sinceState)
+		state, addedIDs, err := c.emailQueryChanges(ctx, sinceState)
 		if err != nil {
-			return nil, sinceState, err
+			if !invalidQueryCheckpoint(err) {
+				return nil, sinceState, err
+			}
+			state, addedIDs, err = c.emailQueryAll(ctx)
+			if err != nil {
+				return nil, sinceState, err
+			}
 		}
-		ids = createdIDs
+		ids = addedIDs
 		newState = state
 	}
 	if len(ids) == 0 {
@@ -66,13 +99,13 @@ func (c *JMAPClient) FetchChanges(ctx context.Context, sinceState string) ([]Ema
 	}
 	emails, err := c.emailGet(ctx, ids)
 	if err != nil {
-		return nil, newState, err
+		return nil, sinceState, err
 	}
 	return emails, newState, nil
 }
 
 func (c *JMAPClient) ensureSession(ctx context.Context) error {
-	if c.apiURL != "" && c.accountID != "" {
+	if c.apiURL != "" && c.accountID != "" && c.maxObjectsInGet > 0 {
 		return nil
 	}
 	sessionURL := c.cfg.JMAP.SessionURL
@@ -98,8 +131,9 @@ func (c *JMAPClient) ensureSession(ctx context.Context) error {
 	}
 
 	var session struct {
-		APIURL          string            `json:"apiUrl"`
-		PrimaryAccounts map[string]string `json:"primaryAccounts"`
+		APIURL          string                     `json:"apiUrl"`
+		Capabilities    map[string]json.RawMessage `json:"capabilities"`
+		PrimaryAccounts map[string]string          `json:"primaryAccounts"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&session); err != nil {
 		return err
@@ -111,8 +145,22 @@ func (c *JMAPClient) ensureSession(ctx context.Context) error {
 	if accountID == "" {
 		return errors.New("missing mail account id")
 	}
+	coreRaw, ok := session.Capabilities[coreCapability]
+	if !ok {
+		return errors.New("missing JMAP core capability")
+	}
+	var core struct {
+		MaxObjectsInGet int `json:"maxObjectsInGet"`
+	}
+	if err := json.Unmarshal(coreRaw, &core); err != nil {
+		return fmt.Errorf("decode JMAP core capability: %w", err)
+	}
+	if core.MaxObjectsInGet <= 0 {
+		return errors.New("invalid JMAP core maxObjectsInGet: must be positive")
+	}
 	c.apiURL = resolveURL(sessionURL, session.APIURL)
 	c.accountID = accountID
+	c.maxObjectsInGet = core.MaxObjectsInGet
 	return nil
 }
 
@@ -148,47 +196,206 @@ func (c *JMAPClient) ensureInboxMailbox(ctx context.Context) error {
 }
 
 func (c *JMAPClient) emailQuery(ctx context.Context) (string, []string, error) {
+	filter, sort := c.emailQuerySpec()
 	args := map[string]any{
 		"accountId": c.accountID,
-		"filter": map[string]any{
-			"inMailbox": c.inboxMailboxID,
-		},
-		"sort": []map[string]any{{
-			"property":    "receivedAt",
-			"isAscending": false,
-		}},
-		"position": 0,
-		"limit":    50,
+		"filter":    filter,
+		"sort":      sort,
+		"position":  0,
+		"limit":     initialEmailQueryLimit,
 	}
 	resp, err := c.call(ctx, "Email/query", args)
 	if err != nil {
 		return "", nil, err
 	}
 	queryState := getString(resp, "queryState")
-	ids := toStringSlice(resp["ids"])
+	if queryState == "" {
+		return "", nil, errors.New("invalid Email/query response: missing queryState")
+	}
+	if err := requireCanCalculateChanges(resp); err != nil {
+		return "", nil, err
+	}
+	ids, err := strictStringSlice(resp["ids"])
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid Email/query response: %w", err)
+	}
 	return queryState, ids, nil
 }
 
-func (c *JMAPClient) emailChanges(ctx context.Context, sinceState string) (string, []string, error) {
+func (c *JMAPClient) emailQueryAll(ctx context.Context) (string, []string, error) {
+	for attempt := 1; attempt <= recoveryQueryMaxRetries; attempt++ {
+		queryState, ids, drifted, err := c.emailQueryAllAttempt(ctx)
+		if err != nil {
+			return "", nil, err
+		}
+		if !drifted {
+			return queryState, ids, nil
+		}
+	}
+	return "", nil, fmt.Errorf("Email/query recovery state changed during all %d attempts", recoveryQueryMaxRetries)
+}
+
+func (c *JMAPClient) emailQueryAllAttempt(ctx context.Context) (string, []string, bool, error) {
+	filter, sort := c.emailQuerySpec()
+	position := 0
+	expectedState := ""
+	expectedTotal := -1
+	seen := make(map[string]struct{})
+	var allIDs []string
+
+	for {
+		args := map[string]any{
+			"accountId":      c.accountID,
+			"filter":         filter,
+			"sort":           sort,
+			"position":       position,
+			"limit":          recoveryQueryPageSize,
+			"calculateTotal": true,
+		}
+		resp, err := c.call(ctx, "Email/query", args)
+		if err != nil {
+			return "", nil, false, err
+		}
+		queryState := getString(resp, "queryState")
+		if queryState == "" {
+			return "", nil, false, errors.New("invalid recovery Email/query response: missing queryState")
+		}
+		if err := requireCanCalculateChanges(resp); err != nil {
+			return "", nil, false, fmt.Errorf("invalid recovery Email/query response: %w", err)
+		}
+		total, err := nonNegativeInt(resp, "total")
+		if err != nil {
+			return "", nil, false, fmt.Errorf("invalid recovery Email/query response: %w", err)
+		}
+		if expectedState != "" && (queryState != expectedState || total != expectedTotal) {
+			return "", nil, true, nil
+		}
+		responsePosition, err := nonNegativeInt(resp, "position")
+		if err != nil {
+			return "", nil, false, fmt.Errorf("invalid recovery Email/query response: %w", err)
+		}
+		if responsePosition != position {
+			return "", nil, false, fmt.Errorf("invalid recovery Email/query response: position %d does not match requested position %d", responsePosition, position)
+		}
+
+		if expectedState == "" {
+			expectedState = queryState
+			expectedTotal = total
+		}
+
+		ids, err := strictStringSlice(resp["ids"])
+		if err != nil {
+			return "", nil, false, fmt.Errorf("invalid recovery Email/query response: %w", err)
+		}
+		if len(ids) > recoveryQueryPageSize {
+			return "", nil, false, fmt.Errorf("invalid recovery Email/query response: page contains %d ids, limit is %d", len(ids), recoveryQueryPageSize)
+		}
+		if position+len(ids) > expectedTotal {
+			return "", nil, false, fmt.Errorf("invalid recovery Email/query response: page exceeds total %d", expectedTotal)
+		}
+		if len(ids) == 0 && position < expectedTotal {
+			return "", nil, false, fmt.Errorf("invalid recovery Email/query response: empty page at position %d before total %d", position, expectedTotal)
+		}
+		for _, id := range ids {
+			if _, duplicate := seen[id]; duplicate {
+				return "", nil, false, fmt.Errorf("invalid recovery Email/query response: duplicate id %q", id)
+			}
+			seen[id] = struct{}{}
+			allIDs = append(allIDs, id)
+		}
+		position += len(ids)
+		if position == expectedTotal {
+			return expectedState, allIDs, false, nil
+		}
+	}
+}
+
+func (c *JMAPClient) emailQueryChanges(ctx context.Context, sinceQueryState string) (string, []string, error) {
+	filter, sort := c.emailQuerySpec()
 	args := map[string]any{
-		"accountId":  c.accountID,
-		"sinceState": sinceState,
-		"maxChanges": 50,
+		"accountId":       c.accountID,
+		"filter":          filter,
+		"sort":            sort,
+		"sinceQueryState": sinceQueryState,
 	}
-	resp, err := c.call(ctx, "Email/changes", args)
+	resp, err := c.call(ctx, "Email/queryChanges", args)
 	if err != nil {
-		return sinceState, nil, err
+		return sinceQueryState, nil, err
 	}
-	newState := getString(resp, "newState")
-	created := toStringSlice(resp["created"])
-	updated := toStringSlice(resp["updated"])
-	return newState, append(created, updated...), nil
+	newQueryState := getString(resp, "newQueryState")
+	if newQueryState == "" {
+		return sinceQueryState, nil, errors.New("invalid Email/queryChanges response: missing newQueryState")
+	}
+	oldQueryState := getString(resp, "oldQueryState")
+	if oldQueryState != sinceQueryState {
+		return sinceQueryState, nil, fmt.Errorf("invalid Email/queryChanges response: oldQueryState %q does not match requested state %q", oldQueryState, sinceQueryState)
+	}
+	added, ok := resp["added"]
+	if !ok {
+		return sinceQueryState, nil, errors.New("invalid Email/queryChanges response: missing added")
+	}
+	addedIDs, err := strictQueryAddedIDs(added)
+	if err != nil {
+		return sinceQueryState, nil, fmt.Errorf("invalid Email/queryChanges response: %w", err)
+	}
+	return newQueryState, addedIDs, nil
+}
+
+func invalidQueryCheckpoint(err error) bool {
+	var methodErr *JMAPMethodError
+	if !errors.As(err, &methodErr) {
+		return false
+	}
+	return methodErr.Type == "cannotCalculateChanges" || methodErr.Type == "tooManyChanges"
+}
+
+func (c *JMAPClient) emailQuerySpec() (map[string]any, []map[string]any) {
+	return map[string]any{
+			"inMailbox": c.inboxMailboxID,
+		}, []map[string]any{{
+			"property":    "receivedAt",
+			"isAscending": false,
+		}}
 }
 
 func (c *JMAPClient) emailGet(ctx context.Context, ids []string) ([]Email, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if c.maxObjectsInGet <= 0 {
+		return nil, errors.New("invalid JMAP core maxObjectsInGet: must be positive")
+	}
+	seenIDs := make(map[string]struct{}, len(ids))
+	for index, id := range ids {
+		if id == "" {
+			return nil, fmt.Errorf("Email/get ids[%d] must be non-empty", index)
+		}
+		if _, duplicate := seenIDs[id]; duplicate {
+			return nil, fmt.Errorf("Email/get ids contain duplicate %q", id)
+		}
+		seenIDs[id] = struct{}{}
+	}
+	allEmails := make([]Email, 0, len(ids))
+	for start := 0; start < len(ids); start += c.maxObjectsInGet {
+		end := start + c.maxObjectsInGet
+		if end > len(ids) {
+			end = len(ids)
+		}
+		emails, err := c.emailGetBatch(ctx, ids[start:end])
+		if err != nil {
+			return nil, err
+		}
+		allEmails = append(allEmails, emails...)
+	}
+	return allEmails, nil
+}
+
+func (c *JMAPClient) emailGetBatch(ctx context.Context, ids []string) ([]Email, error) {
 	args := map[string]any{
-		"accountId": c.accountID,
-		"ids":       ids,
+		"accountId":           c.accountID,
+		"ids":                 ids,
+		"fetchTextBodyValues": true,
+		"fetchHTMLBodyValues": true,
 		"properties": []string{
 			"id", "threadId", "subject", "from", "to", "cc", "receivedAt", "bodyValues", "textBody", "htmlBody", "messageId",
 		},
@@ -201,12 +408,28 @@ func (c *JMAPClient) emailGet(ctx context.Context, ids []string) ([]Email, error
 	if !ok {
 		return nil, errors.New("invalid email list")
 	}
-	var emails []Email
-	for _, item := range list {
+	requested := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		requested[id] = struct{}{}
+	}
+	accounted := make(map[string]struct{}, len(ids))
+	emailsByID := make(map[string]Email, len(list))
+	for index, item := range list {
 		emailMap, ok := item.(map[string]any)
 		if !ok {
-			continue
+			return nil, fmt.Errorf("invalid Email/get response: list[%d] must be an object", index)
 		}
+		id := getString(emailMap, "id")
+		if id == "" {
+			return nil, fmt.Errorf("invalid Email/get response: list[%d].id must be a non-empty string", index)
+		}
+		if _, ok := requested[id]; !ok {
+			return nil, fmt.Errorf("invalid Email/get response: unrequested id %q in list", id)
+		}
+		if _, duplicate := accounted[id]; duplicate {
+			return nil, fmt.Errorf("invalid Email/get response: duplicate id %q", id)
+		}
+		accounted[id] = struct{}{}
 		received := time.Now().UTC()
 		if raw := getString(emailMap, "receivedAt"); raw != "" {
 			if parsed, err := time.Parse(time.RFC3339, raw); err == nil {
@@ -214,8 +437,8 @@ func (c *JMAPClient) emailGet(ctx context.Context, ids []string) ([]Email, error
 			}
 		}
 		text, html := extractBodies(emailMap)
-		emails = append(emails, Email{
-			ID:          getString(emailMap, "id"),
+		emailsByID[id] = Email{
+			ID:          id,
 			ThreadID:    getString(emailMap, "threadId"),
 			Subject:     getString(emailMap, "subject"),
 			Text:        text,
@@ -223,15 +446,43 @@ func (c *JMAPClient) emailGet(ctx context.Context, ids []string) ([]Email, error
 			From:        firstParticipant(emailMap["from"]),
 			To:          parseParticipants(emailMap["to"]),
 			ReceivedAt:  received,
-			InternetMsg: getString(emailMap, "messageId"),
-		})
+			InternetMsg: firstString(emailMap["messageId"]),
+		}
+	}
+	if rawNotFound, present := resp["notFound"]; present && rawNotFound != nil {
+		notFound, err := strictStringSlice(rawNotFound)
+		if err != nil {
+			return nil, fmt.Errorf("invalid Email/get response: notFound %w", err)
+		}
+		for _, id := range notFound {
+			if _, ok := requested[id]; !ok {
+				return nil, fmt.Errorf("invalid Email/get response: unrequested id %q in notFound", id)
+			}
+			if _, duplicate := accounted[id]; duplicate {
+				return nil, fmt.Errorf("invalid Email/get response: duplicate id %q", id)
+			}
+			accounted[id] = struct{}{}
+		}
+	}
+	if len(accounted) != len(requested) {
+		for _, id := range ids {
+			if _, ok := accounted[id]; !ok {
+				return nil, fmt.Errorf("invalid Email/get response: requested id %q is missing from list and notFound", id)
+			}
+		}
+	}
+	emails := make([]Email, 0, len(emailsByID))
+	for _, id := range ids {
+		if email, ok := emailsByID[id]; ok {
+			emails = append(emails, email)
+		}
 	}
 	return emails, nil
 }
 
 func (c *JMAPClient) call(ctx context.Context, method string, args map[string]any) (map[string]any, error) {
 	payload := map[string]any{
-		"using": []string{mailCapability},
+		"using": []string{coreCapability, mailCapability},
 		"methodCalls": []any{
 			[]any{method, args, "c1"},
 		},
@@ -265,7 +516,12 @@ func (c *JMAPClient) call(ctx context.Context, method string, args map[string]an
 		}
 		name, _ := arr[0].(string)
 		if name == "error" {
-			return nil, errors.New("jmap error response")
+			details, _ := arr[1].(map[string]any)
+			return nil, &JMAPMethodError{
+				Method:      method,
+				Type:        getString(details, "type"),
+				Description: getString(details, "description"),
+			}
 		}
 		if name == method {
 			if argsMap, ok := arr[1].(map[string]any); ok {
@@ -319,6 +575,89 @@ func toStringSlice(raw any) []string {
 	return out
 }
 
+func strictStringSlice(raw any) ([]string, error) {
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil, errors.New("ids must be an array")
+	}
+	ids := make([]string, 0, len(arr))
+	for index, item := range arr {
+		id, ok := item.(string)
+		if !ok || id == "" {
+			return nil, fmt.Errorf("ids[%d] must be a non-empty string", index)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func requireCanCalculateChanges(response map[string]any) error {
+	canCalculate, ok := response["canCalculateChanges"].(bool)
+	if !ok {
+		return errors.New("missing canCalculateChanges")
+	}
+	if !canCalculate {
+		return errors.New("canCalculateChanges is false")
+	}
+	return nil
+}
+
+func nonNegativeInt(response map[string]any, key string) (int, error) {
+	value, ok := response[key].(float64)
+	if !ok || value < 0 || math.Trunc(value) != value || value > float64(int(^uint(0)>>1)) {
+		return 0, fmt.Errorf("%s must be a non-negative integer", key)
+	}
+	return int(value), nil
+}
+
+func strictQueryAddedIDs(raw any) ([]string, error) {
+	// RFC 8620 types this as AddedItem[], but its queryChanges example uses
+	// null when there are no additions. Treat that explicit form as empty.
+	if raw == nil {
+		return nil, nil
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil, errors.New("added must be an array")
+	}
+	ids := make([]string, 0, len(arr))
+	seen := make(map[string]struct{}, len(arr))
+	previousIndex := -1
+	for index, item := range arr {
+		added, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("added[%d] must be an object", index)
+		}
+		id := getString(added, "id")
+		if id == "" {
+			return nil, fmt.Errorf("added[%d].id must be a non-empty string", index)
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return nil, fmt.Errorf("added contains duplicate id %q", id)
+		}
+		addedIndex, err := nonNegativeInt(added, "index")
+		if err != nil {
+			return nil, fmt.Errorf("added[%d].%w", index, err)
+		}
+		if addedIndex <= previousIndex {
+			return nil, fmt.Errorf("added[%d].index %d must be greater than previous index %d", index, addedIndex, previousIndex)
+		}
+		previousIndex = addedIndex
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func firstString(raw any) string {
+	values, ok := raw.([]any)
+	if !ok || len(values) == 0 {
+		return ""
+	}
+	value, _ := values[0].(string)
+	return value
+}
+
 func parseParticipants(raw any) []store.Participant {
 	arr, ok := raw.([]any)
 	if !ok {
@@ -348,30 +687,34 @@ func firstParticipant(raw any) store.Participant {
 
 func extractBodies(email map[string]any) (string, string) {
 	bodyValues, _ := email["bodyValues"].(map[string]any)
-	textBody := extractBodyValue(bodyValues, email["textBody"])
-	htmlBody := extractBodyValue(bodyValues, email["htmlBody"])
+	textBody := extractBodyValues(bodyValues, email["textBody"])
+	htmlBody := extractBodyValues(bodyValues, email["htmlBody"])
 	return textBody, htmlBody
 }
 
-func extractBodyValue(values map[string]any, raw any) string {
+func extractBodyValues(values map[string]any, raw any) string {
 	if values == nil {
 		return ""
 	}
 	parts, ok := raw.([]any)
-	if !ok || len(parts) == 0 {
-		return ""
-	}
-	part, ok := parts[0].(map[string]any)
 	if !ok {
 		return ""
 	}
-	partID := getString(part, "partId")
-	if partID == "" {
-		return ""
+	var body strings.Builder
+	for _, rawPart := range parts {
+		part, ok := rawPart.(map[string]any)
+		if !ok {
+			continue
+		}
+		partID := getString(part, "partId")
+		if partID == "" {
+			continue
+		}
+		valueRaw, ok := values[partID].(map[string]any)
+		if !ok {
+			continue
+		}
+		body.WriteString(getString(valueRaw, "value"))
 	}
-	valueRaw, ok := values[partID].(map[string]any)
-	if !ok {
-		return ""
-	}
-	return getString(valueRaw, "value")
+	return body.String()
 }
