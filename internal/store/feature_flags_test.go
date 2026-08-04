@@ -25,7 +25,32 @@ func TestMigration26FeatureFlagUniquenessAndDownGuard(t *testing.T) {
 			t.Fatal(err)
 		}
 		assertTableExists(t, db, "org_feature_flags")
-		assertTenantRLSState(t, db, "org_feature_flags", true)
+		var rowSecurity, forceRowSecurity bool
+		var policyCount int
+		if err := db.QueryRowContext(ctx, `
+			SELECT c.relrowsecurity,
+			       c.relforcerowsecurity,
+			       count(p.policyname)
+			FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			LEFT JOIN pg_policies p
+			  ON p.schemaname = n.nspname
+			 AND p.tablename = c.relname
+			 AND p.policyname IN (
+			   'tenant_read_org_feature_flags',
+			   'tenant_insert_org_feature_flags',
+			   'tenant_update_org_feature_flags',
+			   'tenant_delete_org_feature_flags'
+			 )
+			WHERE n.nspname = 'public'
+			  AND c.relname = 'org_feature_flags'
+			GROUP BY c.relrowsecurity, c.relforcerowsecurity
+		`).Scan(&rowSecurity, &forceRowSecurity, &policyCount); err != nil {
+			t.Fatal(err)
+		}
+		if !rowSecurity || !forceRowSecurity || policyCount != 4 {
+			t.Fatalf("feature flag RLS enabled=%t forced=%t policies=%d, want true/true/4", rowSecurity, forceRowSecurity, policyCount)
+		}
 
 		if _, err := db.ExecContext(ctx, `
 			INSERT INTO org_feature_flags (org_id, flag, enabled, updated_by)
@@ -185,6 +210,13 @@ func TestFeatureFlagRLSExposesGlobalAndCurrentOrgOnly(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO org_feature_flags (org_id, flag, enabled, updated_by)
+			VALUES (NULL, 'global-update', false, 'seed'),
+			       (NULL, 'global-delete', false, 'seed')
+		`); err != nil {
+			t.Fatal(err)
+		}
 
 		roleName := "feature_flag_rls_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 		if _, err := db.ExecContext(ctx, fmt.Sprintf(`CREATE ROLE %s LOGIN PASSWORD 'rls_feature_flag'`, roleName)); err != nil {
@@ -225,8 +257,8 @@ func TestFeatureFlagRLSExposesGlobalAndCurrentOrgOnly(t *testing.T) {
 			if err := scoped.q.QueryRowContext(ctx, `SELECT count(*) FROM org_feature_flags`).Scan(&visible); err != nil {
 				return err
 			}
-			if visible != 2 {
-				t.Fatalf("tenant A sees %d flag rows, want global + own", visible)
+			if visible != 4 {
+				t.Fatalf("tenant A sees %d flag rows, want three global + own", visible)
 			}
 			values, err := scoped.LookupFeatureFlag(ctx, orgA, "attachments")
 			if err != nil {
@@ -254,6 +286,52 @@ func TestFeatureFlagRLSExposesGlobalAndCurrentOrgOnly(t *testing.T) {
 		})
 		if err == nil {
 			t.Fatal("tenant unexpectedly wrote another org flag")
+		}
+
+		err = st.RunAsOrg(ctx, orgA, func(scoped *Store) error {
+			result, innerErr := scoped.q.ExecContext(ctx, `
+				UPDATE org_feature_flags
+				SET org_id = $1, updated_by = 'tenant'
+				WHERE org_id IS NULL AND flag = 'global-update'
+			`, orgA)
+			if innerErr != nil {
+				return innerErr
+			}
+			changed, innerErr := result.RowsAffected()
+			if innerErr == nil && changed != 0 {
+				t.Fatalf("tenant moved %d global rows into its org, want 0", changed)
+			}
+			return innerErr
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = st.RunAsOrg(ctx, orgA, func(scoped *Store) error {
+			result, innerErr := scoped.q.ExecContext(ctx, `
+				DELETE FROM org_feature_flags
+				WHERE org_id IS NULL AND flag = 'global-delete'
+			`)
+			if innerErr != nil {
+				return innerErr
+			}
+			changed, innerErr := result.RowsAffected()
+			if innerErr == nil && changed != 0 {
+				t.Fatalf("tenant deleted %d global rows, want 0", changed)
+			}
+			return innerErr
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var protectedGlobals int
+		if err := db.QueryRowContext(ctx, `
+			SELECT count(*) FROM org_feature_flags
+			WHERE org_id IS NULL AND flag IN ('global-update', 'global-delete')
+		`).Scan(&protectedGlobals); err != nil {
+			t.Fatal(err)
+		}
+		if protectedGlobals != 2 {
+			t.Fatalf("protected global rows=%d, want 2", protectedGlobals)
 		}
 	})
 }

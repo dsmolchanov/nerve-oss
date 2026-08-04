@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"neuralmail/internal/auth"
@@ -68,6 +69,8 @@ func TestEffectiveStateHandlerRejectsUnsafeOrUnavailableRequests(t *testing.T) {
 	}{
 		{name: "method", method: http.MethodPost, path: "attachments", scopes: []string{"nerve:email.read"}, key: "key", gate: &probeGate{}, wantStatus: http.StatusMethodNotAllowed},
 		{name: "invalid flag", method: http.MethodGet, path: "Attachments", scopes: []string{"nerve:email.read"}, key: "key", gate: &probeGate{}, wantStatus: http.StatusBadRequest},
+		{name: "unknown flag", method: http.MethodGet, path: "unknown_flag", scopes: []string{"nerve:email.read"}, key: "key", gate: &probeGate{}, wantStatus: http.StatusBadRequest},
+		{name: "flag too long", method: http.MethodGet, path: "a" + strings.Repeat("b", maxFlagNameLength), scopes: []string{"nerve:email.read"}, key: "key", gate: &probeGate{}, wantStatus: http.StatusBadRequest},
 		{name: "unauthenticated", method: http.MethodGet, path: "attachments", scopes: []string{"nerve:email.read"}, gate: &probeGate{}, wantStatus: http.StatusUnauthorized},
 		{name: "missing scope", method: http.MethodGet, path: "attachments", scopes: []string{"nerve:email.send"}, key: "key", gate: &probeGate{}, wantStatus: http.StatusForbidden},
 		{name: "resolver failure", method: http.MethodGet, path: "attachments", scopes: []string{"nerve:email.read"}, key: "key", gate: &probeGate{err: errors.New("lookup failed")}, wantStatus: http.StatusServiceUnavailable},
@@ -86,6 +89,23 @@ func TestEffectiveStateHandlerRejectsUnsafeOrUnavailableRequests(t *testing.T) {
 				t.Fatalf("status=%d body=%s, want %d", recorder.Code, recorder.Body.String(), test.wantStatus)
 			}
 		})
+	}
+}
+
+func TestEffectiveStateHandlerRejectsUnknownFlagBeforeResolver(t *testing.T) {
+	gate := &probeGate{}
+	handler := EffectiveStateHandler(probeAuthService([]string{"nerve:email.read"}), gate)
+	request := httptest.NewRequest(http.MethodGet, EffectiveStatePathPrefix+"unique_cache_key", nil)
+	request.Header.Set("X-Nerve-Cloud-Key", "key")
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if gate.flag != "" || gate.orgID != "" {
+		t.Fatalf("resolver called for unknown flag: flag=%q org=%q", gate.flag, gate.orgID)
 	}
 }
 

@@ -12,6 +12,12 @@ import (
 
 const EffectiveStatePathPrefix = "/internal/feature-flags/"
 
+const maxFlagNameLength = 64
+
+var knownProbeFlags = map[string]struct{}{
+	"attachments": {},
+}
+
 type Gate interface {
 	Enabled(ctx context.Context, flag string, orgID string) (bool, error)
 }
@@ -65,7 +71,7 @@ func EffectiveStateHandler(authService *auth.Service, gate Gate) http.Handler {
 }
 
 func validFlagName(flag string) bool {
-	if flag == "" {
+	if flag == "" || len(flag) > maxFlagNameLength {
 		return false
 	}
 	for _, character := range flag {
@@ -74,5 +80,6 @@ func validFlagName(flag string) bool {
 			return false
 		}
 	}
-	return true
+	_, known := knownProbeFlags[flag]
+	return known
 }
