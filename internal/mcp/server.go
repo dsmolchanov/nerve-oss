@@ -20,6 +20,7 @@ import (
 	"neuralmail/internal/entitlements"
 	"neuralmail/internal/memguard"
 	"neuralmail/internal/observability"
+	"neuralmail/internal/store"
 	"neuralmail/internal/tools"
 )
 
@@ -28,12 +29,17 @@ type EntitlementGate interface {
 	FinalizeToolExecution(ctx context.Context, reservation entitlements.Reservation, toolName string, replayID string, auditID string, status string, idempotencyKey string, result any) error
 }
 
+type FeatureGate interface {
+	Enabled(ctx context.Context, flag string, orgID string) (bool, error)
+}
+
 type Server struct {
 	Config       config.Config
 	Auth         *auth.Service
 	Entitlements EntitlementGate
 	Tools        *tools.Service
 	MemoryBudget *memguard.Budget
+	FeatureFlags FeatureGate
 	mu           sync.Mutex
 	sessions     map[string]time.Time
 }
@@ -259,7 +265,7 @@ func (s *Server) dispatch(ctx context.Context, req Request) (any, error) {
 			},
 		}, nil
 	case "tools/list":
-		return ListTools(), nil
+		return ListTools(s.attachmentsEnabled(ctx)), nil
 	case "tools/call":
 		return s.callTool(ctx, req)
 	case "resources/list":
@@ -343,13 +349,14 @@ func (s *Server) callTool(ctx context.Context, req Request) (any, error) {
 }
 
 type composeEmailInput struct {
-	InboxID        string `json:"inbox_id"`
-	To             string `json:"to"`
-	Subject        string `json:"subject"`
-	Body           string `json:"body"`
-	HTML           string `json:"html,omitempty"`
-	FromName       string `json:"from_name,omitempty"`
-	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	InboxID        string                  `json:"inbox_id"`
+	To             string                  `json:"to"`
+	Subject        string                  `json:"subject"`
+	Body           string                  `json:"body"`
+	HTML           string                  `json:"html,omitempty"`
+	FromName       string                  `json:"from_name,omitempty"`
+	IdempotencyKey string                  `json:"idempotency_key,omitempty"`
+	Attachments    []tools.AttachmentInput `json:"attachments,omitempty"`
 }
 
 func (s *Server) toolExecutor(params ToolCallParams, defaultIdempotencyKey string) (func(context.Context) (any, error), error) {
@@ -422,21 +429,26 @@ func (s *Server) toolExecutor(params ToolCallParams, defaultIdempotencyKey strin
 		}, nil
 	case "send_reply":
 		var input struct {
-			ThreadID       string `json:"thread_id"`
-			Body           string `json:"body_or_draft_id"`
-			HTML           string `json:"html,omitempty"`
-			IdempotencyKey string `json:"idempotency_key,omitempty"`
-			NeedsApproval  bool   `json:"needs_human_approval"`
+			ThreadID       string                  `json:"thread_id"`
+			Body           string                  `json:"body_or_draft_id"`
+			HTML           string                  `json:"html,omitempty"`
+			IdempotencyKey string                  `json:"idempotency_key,omitempty"`
+			NeedsApproval  bool                    `json:"needs_human_approval"`
+			Attachments    []tools.AttachmentInput `json:"attachments,omitempty"`
 		}
 		if err := json.Unmarshal(params.Arguments, &input); err != nil {
 			return nil, err
 		}
 		return func(ctx context.Context) (any, error) {
+			attachments, err := s.decodeAttachments(ctx, input.Attachments)
+			if err != nil {
+				return nil, err
+			}
 			key := strings.TrimSpace(input.IdempotencyKey)
 			if key == "" {
 				key = defaultIdempotencyKey
 			}
-			return s.Tools.SendReply(ctx, input.ThreadID, input.Body, input.HTML, input.NeedsApproval, key)
+			return s.Tools.SendReplyWithAttachments(ctx, input.ThreadID, input.Body, input.HTML, input.NeedsApproval, key, attachments)
 		}, nil
 	case "compose_email":
 		var input composeEmailInput
@@ -444,17 +456,41 @@ func (s *Server) toolExecutor(params ToolCallParams, defaultIdempotencyKey strin
 			return nil, err
 		}
 		return func(ctx context.Context) (any, error) {
+			attachments, err := s.decodeAttachments(ctx, input.Attachments)
+			if err != nil {
+				return nil, err
+			}
 			key := strings.TrimSpace(input.IdempotencyKey)
 			if key == "" {
 				key = defaultIdempotencyKey
 			}
 			return s.Tools.ComposeEmailWithOptions(ctx, input.InboxID, input.To, input.Subject, input.Body, input.HTML, key, tools.ComposeEmailOptions{
-				FromName: input.FromName,
+				FromName:    input.FromName,
+				Attachments: attachments,
 			})
 		}, nil
 	default:
 		return nil, fmt.Errorf("unknown tool: %s", params.Name)
 	}
+}
+
+func (s *Server) attachmentsEnabled(ctx context.Context) bool {
+	if s.FeatureFlags == nil {
+		return false
+	}
+	principal, _ := auth.PrincipalFromContext(ctx)
+	enabled, err := s.FeatureFlags.Enabled(ctx, "attachments", principal.OrgID)
+	return err == nil && enabled
+}
+
+func (s *Server) decodeAttachments(ctx context.Context, inputs []tools.AttachmentInput) ([]store.OutboundAttachment, error) {
+	if len(inputs) == 0 {
+		return nil, nil
+	}
+	if !s.attachmentsEnabled(ctx) {
+		return nil, &tools.AttachmentInputError{Code: "attachment_feature_disabled", Ordinal: -1}
+	}
+	return tools.DecodeOutboundAttachments(inputs)
 }
 
 func (s *Server) recordToolCall(ctx context.Context, toolName string, idempotencyKey string, inputsHash string, result any, start time.Time, replayID string) string {
@@ -618,7 +654,10 @@ func (s *Server) requiredScope(req Request) string {
 func (s *Server) writeDispatchError(w http.ResponseWriter, id any, err error) {
 	var rateErr *entitlements.RateLimitError
 	var inProgressErr *entitlements.IdempotencyInProgressError
+	var attachmentErr *tools.AttachmentInputError
 	switch {
+	case errors.As(err, &attachmentErr):
+		writeErrorWithData(w, id, -32602, attachmentErr.Code, map[string]any{"retryable": false, "ordinal": attachmentErr.Ordinal})
 	case errors.Is(err, entitlements.ErrQuotaExceeded):
 		writeErrorWithData(w, id, -32040, "quota_exceeded", map[string]any{"retryable": false})
 	case errors.Is(err, entitlements.ErrSubscriptionInactive):

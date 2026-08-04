@@ -316,6 +316,7 @@ func TestAttachmentTablesEnforceTenantRLSAndLegacyDenyAll(t *testing.T) {
 		type tenant struct {
 			orgID     string
 			messageID string
+			outboxID  string
 		}
 		tenants := make([]tenant, 0, 2)
 		for _, suffix := range []string{"rls-a", "rls-b"} {
@@ -340,7 +341,22 @@ func TestAttachmentTablesEnforceTenantRLSAndLegacyDenyAll(t *testing.T) {
 			`, orgID, messageID, "provider-"+suffix, "blob-"+suffix); err != nil {
 				t.Fatal(err)
 			}
-			tenants = append(tenants, tenant{orgID: orgID, messageID: messageID})
+			outboxID := uuid.NewString()
+			if _, err := db.ExecContext(ctx, `
+				INSERT INTO outbox_messages
+				  (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject)
+				VALUES ($1, $2, $3, 'smtp', $4, 'to@example.com', 'from@example.com', 'subject')
+			`, outboxID, orgID, inboxID, "outbox-"+suffix); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.ExecContext(ctx, `
+				INSERT INTO outbox_attachments
+				  (org_id, outbox_message_id, ordinal, filename, content_type, size_bytes, sha256, blob_sha256)
+				VALUES ($1, $2, 0, $3, 'application/octet-stream', 1, $4, $4)
+			`, orgID, outboxID, suffix+".bin", "blob-"+suffix); err != nil {
+				t.Fatal(err)
+			}
+			tenants = append(tenants, tenant{orgID: orgID, messageID: messageID, outboxID: outboxID})
 		}
 		for _, tenant := range tenants {
 			if _, err := db.ExecContext(ctx, `
@@ -365,7 +381,7 @@ func TestAttachmentTablesEnforceTenantRLSAndLegacyDenyAll(t *testing.T) {
 		}
 		if _, err := db.ExecContext(ctx, fmt.Sprintf(`
 			GRANT SELECT, INSERT, UPDATE, DELETE
-			ON attachment_blobs, org_attachment_usage, message_attachments, attachments
+			ON attachment_blobs, org_attachment_usage, message_attachments, outbox_attachments, attachments
 			TO %s
 		`, roleName)); err != nil {
 			t.Fatal(err)
@@ -398,7 +414,7 @@ func TestAttachmentTablesEnforceTenantRLSAndLegacyDenyAll(t *testing.T) {
 		})
 
 		st := &Store{db: appDB, q: appDB}
-		for _, table := range []string{"attachment_blobs", "org_attachment_usage", "message_attachments"} {
+		for _, table := range []string{"attachment_blobs", "org_attachment_usage", "message_attachments", "outbox_attachments"} {
 			var visible int
 			if err := st.RunAsOrg(ctx, tenants[0].orgID, func(scoped *Store) error {
 				return scoped.q.QueryRowContext(ctx, `SELECT count(*) FROM `+table).Scan(&visible)
@@ -429,6 +445,18 @@ func TestAttachmentTablesEnforceTenantRLSAndLegacyDenyAll(t *testing.T) {
 		})
 		if err == nil {
 			t.Fatal("cross-org blob insert unexpectedly passed RLS")
+		}
+
+		err = st.RunAsOrg(ctx, tenants[0].orgID, func(scoped *Store) error {
+			_, innerErr := scoped.q.ExecContext(ctx, `
+				INSERT INTO outbox_attachments
+				  (org_id, outbox_message_id, ordinal, filename, content_type, size_bytes, sha256, blob_sha256)
+				VALUES ($1, $2, 1, 'cross-org.bin', 'application/octet-stream', 1, $3, $3)
+			`, tenants[1].orgID, tenants[1].outboxID, "blob-rls-b")
+			return innerErr
+		})
+		if err == nil {
+			t.Fatal("cross-org outbox attachment insert unexpectedly passed RLS")
 		}
 	})
 }

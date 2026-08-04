@@ -43,7 +43,8 @@ type ToolContext struct {
 }
 
 type ComposeEmailOptions struct {
-	FromName string
+	FromName    string
+	Attachments []store.OutboundAttachment
 }
 
 func NewService(cfg config.Config, store *store.Store, llmProvider llm.Provider, vectorStore vector.Store, policyObj policy.Policy, embedder embed.Provider, transport *emailtransport.Registry) *Service {
@@ -283,6 +284,10 @@ func (s *Service) DraftReply(ctx context.Context, threadID string, goal string) 
 }
 
 func (s *Service) SendReply(ctx context.Context, threadID string, body string, bodyHTML string, needsApproval bool, idempotencyKey string) (any, error) {
+	return s.SendReplyWithAttachments(ctx, threadID, body, bodyHTML, needsApproval, idempotencyKey, nil)
+}
+
+func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string, body string, bodyHTML string, needsApproval bool, idempotencyKey string, attachments []store.OutboundAttachment) (any, error) {
 	if needsApproval {
 		if !s.Config.Cloud.Mode {
 			if !s.Config.Security.AllowSendWithWarnings {
@@ -366,6 +371,7 @@ func (s *Service) SendReply(ctx context.Context, threadID string, body string, b
 			Subject:        subject,
 			TextBody:       body,
 			HTMLBody:       bodyHTML,
+			Attachments:    attachments,
 		})
 		if err != nil {
 			return nil, err
@@ -474,6 +480,7 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 			Subject:        subject,
 			TextBody:       body,
 			HTMLBody:       bodyHTML,
+			Attachments:    options.Attachments,
 		})
 		if err != nil {
 			return nil, err

@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +24,12 @@ const MaxOutboxRetries = 5
 // should surface this as a 4xx to the end user rather than enqueueing
 // a message that would fail every retry.
 var ErrDomainNotVerified = errors.New("domain not verified")
+
+var (
+	ErrOutboxIdempotencyConflict = errors.New("outbox idempotency conflict")
+	ErrAttachmentEmpty           = errors.New("attachment empty")
+	ErrAttachmentsReleased       = errors.New("outbox attachments released")
+)
 
 // OutboundAttachment is the shared provider-facing attachment shape. Content
 // is populated only immediately before delivery and is never stored on the
@@ -46,6 +54,7 @@ type OutboxMessage struct {
 	TextBody          string
 	HTMLBody          string
 	ContentHash       string
+	Attachments       []OutboundAttachment
 
 	// Threading headers for reply-chain continuity (RFC 5322).
 	// Set when replying to an inbound message so the recipient's
@@ -108,7 +117,7 @@ type OutboxEventRecord struct {
 	CreatedAt         time.Time
 }
 
-func contentHash(to, subject, textBody, htmlBody string) string {
+func contentHash(to, subject, textBody, htmlBody string, attachments []OutboundAttachment) string {
 	h := sha256.New()
 	h.Write([]byte(to))
 	h.Write([]byte{0})
@@ -117,7 +126,30 @@ func contentHash(to, subject, textBody, htmlBody string) string {
 	h.Write([]byte(textBody))
 	h.Write([]byte{0})
 	h.Write([]byte(htmlBody))
+	for ordinal, attachment := range attachments {
+		h.Write([]byte{0})
+		h.Write([]byte(strconv.Itoa(ordinal)))
+		h.Write([]byte{0})
+		h.Write([]byte(attachment.Filename))
+		h.Write([]byte{0})
+		h.Write([]byte(attachment.ContentType))
+		h.Write([]byte{0})
+		h.Write([]byte(attachment.SHA256))
+	}
 	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func normalizeOutboundAttachments(attachments []OutboundAttachment) ([]OutboundAttachment, error) {
+	normalized := make([]OutboundAttachment, len(attachments))
+	for ordinal, attachment := range attachments {
+		if len(attachment.Content) == 0 {
+			return nil, fmt.Errorf("%w: ordinal=%d", ErrAttachmentEmpty, ordinal)
+		}
+		sum := sha256.Sum256(attachment.Content)
+		attachment.SHA256 = hex.EncodeToString(sum[:])
+		normalized[ordinal] = attachment
+	}
+	return normalized, nil
 }
 
 func (s *Store) EnqueueOutboxMessage(ctx context.Context, msg OutboxMessage) (string, error) {
@@ -143,6 +175,11 @@ func (s *Store) enqueueOutboxMessage(ctx context.Context, msg OutboxMessage, aft
 	if msg.Subject == "" {
 		return "", errors.New("missing subject")
 	}
+	attachments, err := normalizeOutboundAttachments(msg.Attachments)
+	if err != nil {
+		return "", err
+	}
+	msg.Attachments = attachments
 	id := msg.ID
 	if id == "" {
 		id = uuid.NewString()
@@ -166,42 +203,126 @@ func (s *Store) enqueueOutboxMessage(ctx context.Context, msg OutboxMessage, aft
 	if err != nil {
 		return "", fmt.Errorf("check suppression: %w", err)
 	}
-	if suppressed {
-		return s.enqueueSuppressedMessage(ctx, id, msg, suppressReason)
-	}
 
-	hash := contentHash(msg.To, msg.Subject, msg.TextBody, msg.HTMLBody)
+	hash := contentHash(msg.To, msg.Subject, msg.TextBody, msg.HTMLBody, msg.Attachments)
+	var outID string
+	err = s.withTx(ctx, func(scoped *Store) error {
+		resolvedID, inserted, resolveErr := scoped.resolveOrInsertOutboxParent(
+			ctx, id, msg, hash, suppressed, suppressReason, afterConflict,
+		)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		outID = resolvedID
+		if !inserted {
+			return nil
+		}
+
+		for ordinal, attachment := range msg.Attachments {
+			digest, _, storeErr := scoped.StoreAttachmentBlob(ctx, msg.OrgID, attachment.ContentType, attachment.Content)
+			if storeErr != nil {
+				return fmt.Errorf("store outbox attachment ordinal=%d: %w", ordinal, storeErr)
+			}
+			if digest != attachment.SHA256 {
+				return fmt.Errorf("outbox attachment ordinal=%d digest mismatch", ordinal)
+			}
+			if _, storeErr = scoped.q.ExecContext(ctx, `
+				INSERT INTO outbox_attachments
+				  (org_id, outbox_message_id, ordinal, filename, content_type, size_bytes, sha256, blob_sha256)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+			`, msg.OrgID, outID, ordinal, attachment.Filename, attachment.ContentType,
+				len(attachment.Content), digest); storeErr != nil {
+				return fmt.Errorf("insert outbox attachment ordinal=%d: %w", ordinal, storeErr)
+			}
+		}
+
+		if suppressed {
+			payload, marshalErr := json.Marshal(map[string]any{
+				"event_type":      "suppressed_at_enqueue",
+				"reason":          suppressReason,
+				"recipient":       msg.To,
+				"idempotency_key": msg.IdempotencyKey,
+			})
+			if marshalErr != nil {
+				return marshalErr
+			}
+			if storeErr := scoped.InsertOutboxEvent(ctx, OutboxEvent{
+				OrgID:           msg.OrgID,
+				OutboxMessageID: outID,
+				EventType:       "suppressed_at_enqueue",
+				RawPayload:      payload,
+				Reason:          suppressReason,
+			}); storeErr != nil {
+				return fmt.Errorf("insert suppression event: %w", storeErr)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return outID, nil
+}
+
+func (s *Store) resolveOrInsertOutboxParent(
+	ctx context.Context,
+	id string,
+	msg OutboxMessage,
+	hash string,
+	suppressed bool,
+	suppressReason string,
+	afterConflict func() error,
+) (outID string, inserted bool, err error) {
+	status := "queued"
+	deliveryStatus := "unknown"
+	lastError := ""
+	if suppressed {
+		status = "failed"
+		deliveryStatus = "suppressed"
+		lastError = fmt.Sprintf("suppressed:%s", suppressReason)
+	}
 
 	const maxConflictRetries = 3
 	for attempt := 0; ; attempt++ {
 		row := s.q.QueryRowContext(ctx, `
-			INSERT INTO outbox_messages (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject, text_body, html_body, content_hash, in_reply_to_message_id, "references")
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, nullif($9, ''), nullif($10, ''), $11, nullif($12, ''), nullif($13, ''))
+			INSERT INTO outbox_messages (
+				id, org_id, inbox_id, provider, idempotency_key,
+				"to", "from", subject, text_body, html_body,
+				content_hash, in_reply_to_message_id, "references",
+				status, delivery_status, delivery_status_at, last_error,
+				last_attempt_at, terminal_at
+			)
+			VALUES (
+				$1, $2, $3, $4, $5,
+				$6, $7, $8, nullif($9, ''), nullif($10, ''),
+				$11, nullif($12, ''), nullif($13, ''),
+				$14, $15,
+				CASE WHEN $16 THEN now() END, nullif($17, ''),
+				CASE WHEN $16 THEN now() END, CASE WHEN $16 THEN now() END
+			)
 			ON CONFLICT DO NOTHING
-			RETURNING id
-		`, id, msg.OrgID, msg.InboxID, msg.Provider, msg.IdempotencyKey, msg.To, msg.From, msg.Subject, msg.TextBody, msg.HTMLBody, hash,
-			msg.InReplyToMessageID, msg.References)
-		var outID string
-		if err := row.Scan(&outID); err == nil {
-			return outID, nil
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return "", err
+			RETURNING id::text
+		`, id, msg.OrgID, msg.InboxID, msg.Provider, msg.IdempotencyKey,
+			msg.To, msg.From, msg.Subject, msg.TextBody, msg.HTMLBody, hash,
+			msg.InReplyToMessageID, msg.References, status, deliveryStatus,
+			suppressed, lastError)
+		if scanErr := row.Scan(&outID); scanErr == nil {
+			return outID, true, nil
+		} else if !errors.Is(scanErr, sql.ErrNoRows) {
+			return "", false, scanErr
 		}
 
 		if afterConflict != nil {
-			if err := afterConflict(); err != nil {
-				return "", fmt.Errorf("after outbox conflict: %w", err)
+			if hookErr := afterConflict(); hookErr != nil {
+				return "", false, fmt.Errorf("after outbox conflict: %w", hookErr)
 			}
 			afterConflict = nil
 		}
 
-		// ON CONFLICT DO NOTHING can wait for a concurrent insert that was not
-		// visible in the INSERT statement's snapshot. Resolve the winner in a
-		// separate statement so READ COMMITTED takes a fresh snapshot after that
-		// transaction commits. This covers both idempotency-key and partial
-		// content-hash conflicts without surfacing a uniqueness error to callers.
+		var storedHash sql.NullString
+		var storedKey string
 		row = s.q.QueryRowContext(ctx, `
-			SELECT id
+			SELECT id::text, content_hash, idempotency_key
 			FROM outbox_messages
 			WHERE org_id = $1
 			  AND (
@@ -215,17 +336,17 @@ func (s *Store) enqueueOutboxMessage(ctx context.Context, msg OutboxMessage, aft
 			  id DESC
 			LIMIT 1
 		`, msg.OrgID, msg.IdempotencyKey, msg.InboxID, hash)
-		if err := row.Scan(&outID); err == nil {
-			return outID, nil
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return "", err
+		if scanErr := row.Scan(&outID, &storedHash, &storedKey); scanErr == nil {
+			if storedKey == msg.IdempotencyKey && storedHash.Valid && storedHash.String != hash {
+				return "", false, fmt.Errorf("%w: key=%q", ErrOutboxIdempotencyConflict, msg.IdempotencyKey)
+			}
+			return outID, false, nil
+		} else if !errors.Is(scanErr, sql.ErrNoRows) {
+			return "", false, scanErr
 		}
 
-		// A content-hash winner may become terminal between the INSERT conflict
-		// and this lookup. It no longer blocks a legitimate resend, so retry the
-		// INSERT with a fresh statement snapshot instead of returning ErrNoRows.
 		if attempt >= maxConflictRetries {
-			return "", fmt.Errorf("enqueue outbox message: unresolved conflict after %d retries", maxConflictRetries)
+			return "", false, fmt.Errorf("enqueue outbox message: unresolved conflict after %d retries", maxConflictRetries)
 		}
 	}
 }
@@ -332,7 +453,8 @@ func (s *Store) MarkOutboxMessageSent(ctx context.Context, id string, providerMe
 		    provider_message_id = nullif($2, ''),
 		    last_error = null,
 		    locked_at = null,
-		    locked_by = null
+		    locked_by = null,
+		    terminal_at = now()
 		WHERE id = $1
 	`, id, providerMessageID)
 	return err
@@ -367,7 +489,8 @@ func (s *Store) MarkOutboxMessageFailed(ctx context.Context, id string, lastErro
 		SET status = 'failed',
 		    last_error = nullif($2, ''),
 		    locked_at = null,
-		    locked_by = null
+		    locked_by = null,
+		    terminal_at = now()
 		WHERE id = $1
 	`, id, lastError)
 	return err
@@ -726,83 +849,49 @@ func (s *Store) ReplayOutboxMessage(ctx context.Context, orgID, id string) (bool
 	if orgID == "" || id == "" {
 		return false, errors.New("missing org_id or id")
 	}
-	result, err := s.q.ExecContext(ctx, `
-		UPDATE outbox_messages
-		SET status = 'queued',
-		    attempt_count = 0,
-		    next_attempt_at = now(),
-		    last_attempt_at = null,
-		    last_error = null,
-		    locked_at = null,
-		    locked_by = null
-		WHERE org_id = $1 AND id = $2 AND status = 'failed'
-	`, orgID, id)
-	if err != nil {
-		return false, err
-	}
-	n, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return n > 0, nil
-}
-
-// enqueueSuppressedMessage inserts an outbox row directly in the
-// failed/suppressed terminal state and appends a matching outbox_events
-// row, without ever attempting provider delivery. The idempotency
-// contract is preserved — if the same (org_id, idempotency_key) was
-// previously enqueued, the existing row id is returned unchanged.
-func (s *Store) enqueueSuppressedMessage(ctx context.Context, id string, msg OutboxMessage, suppressReason string) (string, error) {
-	hash := contentHash(msg.To, msg.Subject, msg.TextBody, msg.HTMLBody)
-	lastError := fmt.Sprintf("suppressed:%s", suppressReason)
-
-	row := s.q.QueryRowContext(ctx, `
-		WITH inserted AS (
-			INSERT INTO outbox_messages (
-				id, org_id, inbox_id, provider, idempotency_key,
-				"to", "from", subject, text_body, html_body,
-				content_hash, in_reply_to_message_id, "references",
-				status, delivery_status, delivery_status_at, last_error, last_attempt_at
-			)
-			VALUES (
-				$1, $2, $3, $4, $5,
-				$6, $7, $8, nullif($9, ''), nullif($10, ''),
-				$11, nullif($12, ''), nullif($13, ''),
-				'failed', 'suppressed', now(), $14, now()
-			)
-			ON CONFLICT (org_id, idempotency_key)
-			DO UPDATE SET idempotency_key = outbox_messages.idempotency_key
-			RETURNING id, (xmax = 0) AS inserted
-		)
-		SELECT id, inserted FROM inserted
-	`,
-		id, msg.OrgID, msg.InboxID, msg.Provider, msg.IdempotencyKey,
-		msg.To, msg.From, msg.Subject, msg.TextBody, msg.HTMLBody,
-		hash, msg.InReplyToMessageID, msg.References,
-		lastError,
-	)
-	var outID string
-	var inserted bool
-	if err := row.Scan(&outID, &inserted); err != nil {
-		return "", fmt.Errorf("enqueue suppressed: %w", err)
-	}
-
-	// Append a suppression event to the audit timeline only on first
-	// insert; on idempotency replay we don't want to keep stacking events.
-	if inserted {
-		payload, _ := json.Marshal(map[string]any{
-			"event_type":      "suppressed_at_enqueue",
-			"reason":          suppressReason,
-			"recipient":       msg.To,
-			"idempotency_key": msg.IdempotencyKey,
-		})
-		_ = s.InsertOutboxEvent(ctx, OutboxEvent{
-			OrgID:           msg.OrgID,
-			OutboxMessageID: outID,
-			EventType:       "suppressed_at_enqueue",
-			RawPayload:      payload,
-			Reason:          suppressReason,
-		})
-	}
-	return outID, nil
+	var replayed bool
+	err := s.withTx(ctx, func(scoped *Store) error {
+		var status string
+		var released bool
+		if err := scoped.q.QueryRowContext(ctx, `
+			SELECT outbox.status,
+			       EXISTS (
+			         SELECT 1 FROM outbox_attachments attachment
+			         WHERE attachment.org_id = outbox.org_id
+			           AND attachment.outbox_message_id = outbox.id
+			           AND attachment.blob_sha256 IS NULL
+			       )
+			FROM outbox_messages outbox
+			WHERE outbox.org_id = $1 AND outbox.id = $2
+			FOR UPDATE
+		`, orgID, id).Scan(&status, &released); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+		if status != "failed" {
+			return nil
+		}
+		if released {
+			return ErrAttachmentsReleased
+		}
+		if _, err := scoped.q.ExecContext(ctx, `
+			UPDATE outbox_messages
+			SET status = 'queued',
+			    attempt_count = 0,
+			    next_attempt_at = now(),
+			    last_attempt_at = null,
+			    last_error = null,
+			    locked_at = null,
+			    locked_by = null,
+			    terminal_at = null
+			WHERE org_id = $1 AND id = $2
+		`, orgID, id); err != nil {
+			return err
+		}
+		replayed = true
+		return nil
+	})
+	return replayed, err
 }

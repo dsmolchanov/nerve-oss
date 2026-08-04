@@ -204,12 +204,29 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		textBody = ""
 	}
 
+	// Materialize only the message being delivered so attachment bytes do not
+	// accumulate across a claim batch. Released bytes are a permanent failure;
+	// transient store errors put the row back on the queue.
+	attachments, err := w.Store.LoadOutboxMessageAttachments(ctx, msg.OrgID, msg.ID)
+	if err != nil {
+		if errors.Is(err, store.ErrAttachmentsReleased) {
+			w.incDeliver(msg.Provider, "permanent")
+			w.incDLQ(msg.Provider, "attachments_released")
+			_ = w.Store.MarkOutboxMessageFailed(ctx, msg.ID, err.Error())
+			return err
+		}
+		next := time.Now().UTC().Add(w.BaseBackoff)
+		_ = w.Store.RequeueOutboxMessage(ctx, msg.ID, next, fmt.Sprintf("load attachments: %v", err))
+		return fmt.Errorf("load outbox attachments: %w", err)
+	}
+
 	out := OutboundMessage{
-		From:     msg.From,
-		To:       []string{msg.To},
-		Subject:  msg.Subject,
-		TextBody: textBody,
-		HTMLBody: htmlBody,
+		From:        msg.From,
+		To:          []string{msg.To},
+		Subject:     msg.Subject,
+		TextBody:    textBody,
+		HTMLBody:    htmlBody,
+		Attachments: attachments,
 		Tags: map[string]string{
 			"org_id":    msg.OrgID,
 			"inbox_id":  msg.InboxID,

@@ -2,12 +2,14 @@ package resend
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"neuralmail/internal/emailtransport"
+	"neuralmail/internal/store"
 )
 
 func TestResendOutboundAdapterSendsWithIdempotencyHeader(t *testing.T) {
@@ -44,6 +46,10 @@ func TestResendOutboundAdapterSendsWithIdempotencyHeader(t *testing.T) {
 		Subject:  "Hello",
 		TextBody: "Plain",
 		HTMLBody: "<p>HTML</p>",
+		Attachments: []store.OutboundAttachment{
+			{Filename: "first.txt", ContentType: "text/plain", Content: []byte("first bytes")},
+			{Filename: "second.pdf", ContentType: "application/pdf", Content: []byte{0, 1, 2, 3}},
+		},
 	}, "idem-1")
 	if err != nil {
 		t.Fatalf("send: %v", err)
@@ -73,6 +79,18 @@ func TestResendOutboundAdapterSendsWithIdempotencyHeader(t *testing.T) {
 	}
 	if gotBody["html"] != "<p>HTML</p>" {
 		t.Fatalf("expected html, got %#v", gotBody["html"])
+	}
+	attachments, _ := gotBody["attachments"].([]any)
+	if len(attachments) != 2 {
+		t.Fatalf("attachments=%#v, want two", gotBody["attachments"])
+	}
+	first, _ := attachments[0].(map[string]any)
+	second, _ := attachments[1].(map[string]any)
+	if first["filename"] != "first.txt" || first["content"] != base64.StdEncoding.EncodeToString([]byte("first bytes")) {
+		t.Fatalf("first attachment=%#v", first)
+	}
+	if second["filename"] != "second.pdf" || second["content"] != base64.StdEncoding.EncodeToString([]byte{0, 1, 2, 3}) {
+		t.Fatalf("second attachment=%#v", second)
 	}
 }
 
