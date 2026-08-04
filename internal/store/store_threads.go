@@ -52,7 +52,7 @@ func (s *Store) GetThread(ctx context.Context, threadID string) (Thread, []Messa
 	}
 	_ = json.Unmarshal(participantsJSON, &t.Participants)
 
-	rows, err := s.q.QueryContext(ctx, `SELECT id, inbox_id, thread_id, direction, coalesce(subject,''), coalesce(text,''), coalesce(html,''), created_at, coalesce(provider_message_id,''), coalesce(internet_message_id,''), coalesce(from_json,'{}'), coalesce(to_json,'[]'), coalesce(cc_json,'[]') FROM messages WHERE thread_id = $1 ORDER BY created_at ASC`, threadID)
+	rows, err := s.q.QueryContext(ctx, `SELECT message.id, message.inbox_id, message.thread_id, message.direction, coalesce(to_jsonb(message)->>'attachments_state','known'), coalesce(message.subject,''), coalesce(message.text,''), coalesce(message.html,''), message.created_at, coalesce(message.provider_message_id,''), coalesce(message.internet_message_id,''), coalesce(message.from_json,'{}'), coalesce(message.to_json,'[]'), coalesce(message.cc_json,'[]') FROM messages message WHERE message.thread_id = $1 ORDER BY message.created_at ASC`, threadID)
 	if err != nil {
 		return t, nil, err
 	}
@@ -62,7 +62,7 @@ func (s *Store) GetThread(ctx context.Context, threadID string) (Thread, []Messa
 	for rows.Next() {
 		var m Message
 		var fromJSON, toJSON, ccJSON []byte
-		if err := rows.Scan(&m.ID, &m.InboxID, &m.ThreadID, &m.Direction, &m.Subject, &m.Text, &m.HTML, &m.CreatedAt, &m.ProviderMessageID, &m.InternetMessageID, &fromJSON, &toJSON, &ccJSON); err != nil {
+		if err := rows.Scan(&m.ID, &m.InboxID, &m.ThreadID, &m.Direction, &m.AttachmentsState, &m.Subject, &m.Text, &m.HTML, &m.CreatedAt, &m.ProviderMessageID, &m.InternetMessageID, &fromJSON, &toJSON, &ccJSON); err != nil {
 			return t, nil, err
 		}
 		_ = json.Unmarshal(fromJSON, &m.From)
@@ -85,8 +85,8 @@ func (s *Store) GetThreadInboxID(ctx context.Context, threadID string) (string, 
 func (s *Store) GetMessage(ctx context.Context, messageID string) (Message, error) {
 	var m Message
 	var fromJSON, toJSON, ccJSON []byte
-	row := s.q.QueryRowContext(ctx, `SELECT id, inbox_id, thread_id, direction, subject, text, html, created_at, provider_message_id, internet_message_id, from_json, to_json, cc_json, coalesce(received_email_id, '') FROM messages WHERE id = $1`, messageID)
-	if err := row.Scan(&m.ID, &m.InboxID, &m.ThreadID, &m.Direction, &m.Subject, &m.Text, &m.HTML, &m.CreatedAt, &m.ProviderMessageID, &m.InternetMessageID, &fromJSON, &toJSON, &ccJSON, &m.ReceivedEmailID); err != nil {
+	row := s.q.QueryRowContext(ctx, `SELECT message.id, message.inbox_id, message.thread_id, message.direction, coalesce(to_jsonb(message)->>'attachments_state','known'), message.subject, message.text, message.html, message.created_at, message.provider_message_id, message.internet_message_id, message.from_json, message.to_json, message.cc_json, coalesce(message.received_email_id, '') FROM messages message WHERE message.id = $1`, messageID)
+	if err := row.Scan(&m.ID, &m.InboxID, &m.ThreadID, &m.Direction, &m.AttachmentsState, &m.Subject, &m.Text, &m.HTML, &m.CreatedAt, &m.ProviderMessageID, &m.InternetMessageID, &fromJSON, &toJSON, &ccJSON, &m.ReceivedEmailID); err != nil {
 		return m, err
 	}
 	_ = json.Unmarshal(fromJSON, &m.From)

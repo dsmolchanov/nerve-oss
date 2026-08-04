@@ -131,6 +131,7 @@ type Message struct {
 	InboxID           string
 	ThreadID          string
 	Direction         string
+	AttachmentsState  string
 	Subject           string
 	Text              string
 	HTML              string

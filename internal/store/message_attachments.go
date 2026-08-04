@@ -177,6 +177,49 @@ func (s *Store) ListMessageAttachments(ctx context.Context, orgID, messageID str
 	return attachments, rows.Err()
 }
 
+// GetMessageAttachment resolves an attachment only through its complete tenant
+// ownership tuple so callers cannot distinguish cross-org IDs from missing IDs.
+func (s *Store) GetMessageAttachment(ctx context.Context, orgID, messageID, attachmentID string) (MessageAttachment, error) {
+	var attachment MessageAttachment
+	err := s.q.QueryRowContext(ctx, `
+		SELECT attachment.id::text, attachment.org_id::text, attachment.message_id::text, attachment.ordinal,
+		       attachment.provider_attachment_id, coalesce(message.received_email_id, ''),
+		       attachment.filename, attachment.content_type,
+		       attachment.content_disposition, attachment.content_id,
+		       attachment.size_bytes, attachment.availability,
+		       attachment.blob_sha256, attachment.attempt_count,
+		       attachment.next_attempt_at, attachment.locked_at,
+		       attachment.locked_by, attachment.last_error,
+		       attachment.mirrored_at, attachment.created_at
+		FROM message_attachments attachment
+		JOIN messages message
+		  ON message.org_id = attachment.org_id AND message.id = attachment.message_id
+		WHERE attachment.org_id = $1 AND attachment.message_id = $2 AND attachment.id = $3
+	`, orgID, messageID, attachmentID).Scan(
+		&attachment.ID,
+		&attachment.OrgID,
+		&attachment.MessageID,
+		&attachment.Ordinal,
+		&attachment.ProviderAttachmentID,
+		&attachment.ReceivedEmailID,
+		&attachment.Filename,
+		&attachment.ContentType,
+		&attachment.ContentDisposition,
+		&attachment.ContentID,
+		&attachment.SizeBytes,
+		&attachment.Availability,
+		&attachment.BlobSHA256,
+		&attachment.AttemptCount,
+		&attachment.NextAttemptAt,
+		&attachment.LockedAt,
+		&attachment.LockedBy,
+		&attachment.LastError,
+		&attachment.MirroredAt,
+		&attachment.CreatedAt,
+	)
+	return attachment, err
+}
+
 // ClaimMessageAttachments leases due mirror work. A pending row with an
 // expired lock is reclaimable; fresh locks and future retries are left alone.
 func (s *Store) ClaimMessageAttachments(
@@ -350,6 +393,37 @@ func (s *Store) MarkMessageAttachmentAvailable(
 		  AND locked_by = $2
 		  AND locked_at = $3
 	`, digest, mirroredAt)
+}
+
+// StoreMirroredMessageAttachment commits content/quota accounting and the
+// leased message_attachments reference as one transaction. A lost lease rolls
+// the blob insert and usage charge back with the reference update.
+func (s *Store) StoreMirroredMessageAttachment(
+	ctx context.Context,
+	orgID string,
+	attachmentID string,
+	workerID string,
+	leaseAcquiredAt time.Time,
+	contentType string,
+	content []byte,
+	mirroredAt time.Time,
+) (digest string, err error) {
+	err = s.withTx(ctx, func(scoped *Store) error {
+		var storeErr error
+		digest, _, storeErr = scoped.StoreAttachmentBlob(ctx, orgID, contentType, content)
+		if storeErr != nil {
+			return storeErr
+		}
+		return scoped.MarkMessageAttachmentAvailable(
+			ctx,
+			attachmentID,
+			workerID,
+			leaseAcquiredAt,
+			digest,
+			mirroredAt,
+		)
+	})
+	return digest, err
 }
 
 func (s *Store) MarkMessageAttachmentTerminal(
