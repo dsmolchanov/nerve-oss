@@ -85,9 +85,10 @@ func TestGenerateRuntimeManifestScript(t *testing.T) {
 	}
 
 	invalidValues := []struct {
-		name  string
-		key   string
-		value string
+		name            string
+		key             string
+		value           string
+		expectedVersion string
 	}{
 		{name: "empty MCP hash", key: "mcp_contract_hash", value: ""},
 		{name: "invalid core hash", key: "core_schema_hash", value: "not-a-sha256"},
@@ -103,6 +104,12 @@ func TestGenerateRuntimeManifestScript(t *testing.T) {
 			value: "2026-02-17T00:00:00Z\nmcp_contract_hash=" + strings.Repeat("a", 64),
 		},
 		{name: "timestamp trailing text", key: "build_time", value: "2026-02-17T00:00:00Z trailing"},
+		{
+			name:            "C1 control",
+			key:             "runtime_version",
+			value:           "v0.0.0-test\u0085",
+			expectedVersion: "v0.0.0-test\u0085",
+		},
 	}
 	for _, invalid := range invalidValues {
 		original := manifest[invalid.key]
@@ -114,7 +121,11 @@ func TestGenerateRuntimeManifestScript(t *testing.T) {
 		if err := os.WriteFile(outPath, data, 0o600); err != nil {
 			t.Fatalf("write invalid manifest: %v", err)
 		}
-		cmd = exec.Command("bash", exportScript, outPath, "v0.0.0-test", filepath.Join(t.TempDir(), "github-output"))
+		expectedVersion := "v0.0.0-test"
+		if invalid.expectedVersion != "" {
+			expectedVersion = invalid.expectedVersion
+		}
+		cmd = exec.Command("bash", exportScript, outPath, expectedVersion, filepath.Join(t.TempDir(), "github-output"))
 		cmd.Dir = repoRoot
 		if output, err := cmd.CombinedOutput(); err == nil {
 			t.Fatalf("expected %s to fail; output:\n%s", invalid.name, string(output))

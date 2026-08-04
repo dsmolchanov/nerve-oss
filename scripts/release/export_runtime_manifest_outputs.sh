@@ -17,7 +17,7 @@ fi
 
 if ! jq -e -s --arg expected_version "$EXPECTED_VERSION" '
   def output_safe:
-    type == "string" and (explode | all(. >= 32 and . != 127));
+    type == "string" and (explode | all(. >= 32 and (. < 127 or . > 159)));
   length == 1
   and (.[0] |
     type == "object"
