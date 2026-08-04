@@ -45,6 +45,11 @@ func TestHandleHTTPRejectsBodyOverWireLimit(t *testing.T) {
 
 	cfg := config.Default()
 	server := NewServer(cfg, nil, nil, nil)
+	smallBudget, err := memguard.New(1)
+	if err != nil {
+		t.Fatalf("new small budget: %v", err)
+	}
+	server.MemoryBudget = smallBudget
 	body := `{"jsonrpc":"` + strings.Repeat("a", int(maxMCPBodyBytes)) + `"}`
 	request := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
 	recorder := httptest.NewRecorder()
@@ -55,6 +60,59 @@ func TestHandleHTTPRejectsBodyOverWireLimit(t *testing.T) {
 	}
 	if server.MemoryBudget.Used() != 0 {
 		t.Fatalf("oversized request leaked %d bytes", server.MemoryBudget.Used())
+	}
+}
+
+func TestHandleHTTPRejectsChunkedTrailingBodyOverWireLimit(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Default()
+	server := NewServer(cfg, nil, nil, nil)
+	body := `{"jsonrpc":"2.0","id":1,"method":"initialize"}` + strings.Repeat(" ", int(maxMCPBodyBytes))
+	request := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	request.ContentLength = -1
+	recorder := httptest.NewRecorder()
+	server.HandleHTTP(recorder, request)
+
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if server.MemoryBudget.Used() != 0 {
+		t.Fatalf("oversized chunked request leaked %d bytes", server.MemoryBudget.Used())
+	}
+}
+
+func TestHandleHTTPPrefersWireLimitOverExtraJSONValue(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(config.Default(), nil, nil, nil)
+	body := `{"jsonrpc":"2.0","id":1,"method":"initialize"} {}` + strings.Repeat(" ", int(maxMCPBodyBytes))
+	request := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	request.ContentLength = -1
+	recorder := httptest.NewRecorder()
+	server.HandleHTTP(recorder, request)
+
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 to take precedence over multiple JSON values, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if server.MemoryBudget.Used() != 0 {
+		t.Fatalf("oversized multi-value request leaked %d bytes", server.MemoryBudget.Used())
+	}
+}
+
+func TestHandleHTTPRejectsMultipleJSONValues(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(config.Default(), nil, nil, nil)
+	request := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize"} {}`))
+	recorder := httptest.NewRecorder()
+	server.HandleHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if server.MemoryBudget.Used() != 0 {
+		t.Fatalf("multi-value request leaked %d bytes", server.MemoryBudget.Used())
 	}
 }
 

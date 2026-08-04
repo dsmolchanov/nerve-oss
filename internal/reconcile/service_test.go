@@ -128,7 +128,7 @@ func withTempStore(t *testing.T, run func(ctx context.Context, st *store.Store))
 	if err != nil {
 		t.Fatalf("open admin db: %v", err)
 	}
-	defer adminDB.Close()
+	t.Cleanup(func() { _ = adminDB.Close() })
 
 	pingCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

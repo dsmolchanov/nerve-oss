@@ -29,8 +29,10 @@ then let the ownership manifest copy all exact-mirror packages into Cloud.
 4. Guard MCP request bodies with the shared budget and a 16 MiB wire cap.
    Understated or absent `Content-Length` is trued up from bytes actually read;
    exhaustion returns `503` plus `Retry-After`, wire overflow returns `413`,
-   and every exit releases its reservation. Set both server `ReadTimeout` and
-   a request deadline so trickling bodies cannot pin memory.
+   and every exit releases its reservation. Require EOF after the one accepted
+   JSON value so a valid prefix cannot hide an oversized chunked tail. Set both
+   server `ReadTimeout` and a request deadline so trickling bodies cannot pin
+   memory.
 5. Declare `store.OutboundAttachment` and attach it to the provider-facing
    `emailtransport.OutboundMessage`, avoiding a store/emailtransport import
    cycle. Actual blob loading begins only after the attachment schema exists.
@@ -51,19 +53,24 @@ they are not fabricated in the OSS PR.
 
 ## Verification
 
-- Dial-time rejection covers IPv4/IPv6 loopback, RFC1918, metadata link-local,
-  IPv6 link-local/unique-local, unspecified and multicast addresses; a
-  hostname resolving to loopback fails even when allowlisted, and redirects
-  are refused.
+- Dial-time rejection covers IPv4/IPv6 loopback, RFC1918, CGNAT, metadata
+  link-local, IPv6 link-local/unique-local, unspecified, multicast, benchmark,
+  documentation, translation/tunnelling, protocol-assignment and reserved
+  ranges; a hostname resolving to loopback fails even when allowlisted, and
+  redirects are refused.
 - Webhook responses larger than 64 KiB are not drained without bound.
 - Twenty concurrent one-byte reservations against a ten-byte budget admit
   exactly ten; success, error, timeout, cancellation, and double-release paths
   leave usage at zero.
 - A request declaring one byte but sending a larger JSON body exhausts the
-  real budget with `503`; a body over 16 MiB returns `413`.
+  real budget with `503`; a body over 16 MiB returns `413`, including a chunked
+  body with a valid first JSON value and an oversized trailing segment.
 - A slow body cannot outlive the configured read timeout or leak its prepaid
   reservation.
 - Bare `withTx` commit/rollback and nested `RunAsOrg` rollback are DB-backed;
   the nested callback receives the same transaction-scoped store.
+- The inherited OSS billing, cloudapi, entitlement, reconcile and webhook DB
+  helpers keep their admin connection alive through database-drop cleanup; a
+  full suite leaves zero `nerve_{bill,cloud,ent,rec,wh,test}_*` databases.
 - `go build ./...`, `go vet ./...`, both timezone suites, exact-mirror staged
   Cloud build/test, `actionlint`, and `shellcheck` pass.

@@ -9,12 +9,39 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"syscall"
 	"time"
 )
 
 var ErrUnsafeAddress = errors.New("unsafe network address")
+
+// specialUsePrefixes covers non-public ranges that Go deliberately still
+// classifies as global unicast. A webhook transport must be stricter than
+// IsGlobalUnicast: carrier-grade NAT, benchmarking, documentation,
+// translation/tunnelling and reserved ranges may be internally routed or map
+// to a non-public destination.
+var specialUsePrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001::/23"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("3fff::/20"),
+	netip.MustParsePrefix("5f00::/16"),
+	netip.MustParsePrefix("fec0::/10"),
+}
 
 type Config struct {
 	Timeout      time.Duration
@@ -45,6 +72,9 @@ func New(config Config) (*http.Client, error) {
 		},
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Environment proxies can resolve and fetch the request target themselves,
+	// bypassing this process's dial-time address check.
+	transport.Proxy = nil
 	transport.DialContext = dialer.DialContext
 
 	return &http.Client{
@@ -88,14 +118,24 @@ func validateDialAddress(address string) error {
 	if err != nil {
 		return fmt.Errorf("parse dial address: %w", err)
 	}
-	ip := net.ParseIP(strings.Trim(host, "[]"))
-	if ip == nil {
+	addr, err := netip.ParseAddr(strings.Trim(host, "[]"))
+	if err != nil {
 		return fmt.Errorf("%w: unresolved address %q", ErrUnsafeAddress, host)
 	}
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() ||
-		!ip.IsGlobalUnicast() {
-		return fmt.Errorf("%w: %s", ErrUnsafeAddress, ip.String())
+	addr = addr.Unmap()
+	if addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() ||
+		addr.IsUnspecified() || addr.IsMulticast() || !addr.IsGlobalUnicast() ||
+		isSpecialUse(addr) {
+		return fmt.Errorf("%w: %s", ErrUnsafeAddress, addr.String())
 	}
 	return nil
+}
+
+func isSpecialUse(addr netip.Addr) bool {
+	for _, prefix := range specialUsePrefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }

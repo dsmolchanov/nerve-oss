@@ -117,6 +117,11 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(readTimeout))
 	r.Body = http.MaxBytesReader(w, r.Body, maxMCPBodyBytes)
+	if r.ContentLength > maxMCPBodyBytes {
+		_ = r.Body.Close()
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
 	prepaid := r.ContentLength
 	if prepaid < 0 {
 		prepaid = 0
@@ -149,18 +154,18 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		ctx = auth.WithPrincipal(ctx, authenticated)
 	}
 
+	decoder := json.NewDecoder(r.Body)
 	var req Request
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
-			return
-		}
-		if errors.Is(err, memguard.ErrExhausted) {
-			writeMemoryBudgetError(w)
-			return
-		}
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	if err := decoder.Decode(&req); err != nil {
+		writeMCPDecodeError(w, err)
+		return
+	}
+	// A single Decode may stop after one valid JSON value without consuming a
+	// chunked request's trailing bytes. Require EOF and, after detecting an
+	// extra value or syntax error, drain the rest so an oversized tail still
+	// wins as 413 instead of being hidden behind an early 400.
+	if err := requireJSONEOF(decoder, r.Body); err != nil {
+		writeMCPDecodeError(w, err)
 		return
 	}
 	if s.Config.Cloud.Mode {
@@ -196,9 +201,41 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+func requireJSONEOF(decoder *json.Decoder, body io.Reader) error {
+	var extra json.RawMessage
+	err := decoder.Decode(&extra)
+	if errors.Is(err, io.EOF) {
+		return nil
+	}
+	if err == nil {
+		err = errors.New("multiple JSON values")
+	}
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) || errors.Is(err, memguard.ErrExhausted) {
+		return err
+	}
+	if _, drainErr := io.Copy(io.Discard, body); drainErr != nil {
+		return drainErr
+	}
+	return err
+}
+
 func writeMemoryBudgetError(w http.ResponseWriter) {
 	w.Header().Set("Retry-After", "1")
 	http.Error(w, "memory budget exhausted", http.StatusServiceUnavailable)
+}
+
+func writeMCPDecodeError(w http.ResponseWriter, err error) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if errors.Is(err, memguard.ErrExhausted) {
+		writeMemoryBudgetError(w)
+		return
+	}
+	http.Error(w, "invalid json", http.StatusBadRequest)
 }
 
 func (s *Server) HandleSSEStub(w http.ResponseWriter, r *http.Request) {
