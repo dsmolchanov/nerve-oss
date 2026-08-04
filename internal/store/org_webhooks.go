@@ -83,11 +83,20 @@ func (s *Store) createOrgWebhook(ctx context.Context, orgID, url string, events 
 	}
 	var w OrgWebhook
 	var eventsText string
-	row := s.q.QueryRowContext(ctx, `
-		INSERT INTO org_webhooks (org_id, url, secret, events, external_ref)
-		VALUES ($1, $2, $3, $4, nullif($5, ''))
-		RETURNING id::text, org_id::text, external_ref, url, secret, events::text, created_at, disabled_at
-	`, orgID, url, secret, events, strings.TrimSpace(externalRef))
+	var row *sql.Row
+	if strings.TrimSpace(externalRef) == "" {
+		row = s.q.QueryRowContext(ctx, `
+			INSERT INTO org_webhooks (org_id, url, secret, events)
+			VALUES ($1, $2, $3, $4)
+			RETURNING id::text, org_id::text, null::text, url, secret, events::text, created_at, disabled_at
+		`, orgID, url, secret, events)
+	} else {
+		row = s.q.QueryRowContext(ctx, `
+			INSERT INTO org_webhooks (org_id, url, secret, events, external_ref)
+			VALUES ($1, $2, $3, $4, $5)
+			RETURNING id::text, org_id::text, external_ref, url, secret, events::text, created_at, disabled_at
+		`, orgID, url, secret, events, strings.TrimSpace(externalRef))
+	}
 	if err := row.Scan(&w.ID, &w.OrgID, &w.ExternalRef, &w.URL, &w.Secret, &eventsText, &w.CreatedAt, &w.DisabledAt); err != nil {
 		return OrgWebhook{}, err
 	}
@@ -99,7 +108,7 @@ func (s *Store) GetOrgWebhookByExternalRef(ctx context.Context, externalRef stri
 	var w OrgWebhook
 	var eventsText string
 	err := s.q.QueryRowContext(ctx, `
-		SELECT id::text, org_id::text, external_ref, url, secret, events::text, created_at, disabled_at
+		SELECT id::text, org_id::text, to_jsonb(org_webhooks)->>'external_ref', url, secret, events::text, created_at, disabled_at
 		FROM org_webhooks WHERE external_ref = $1
 	`, strings.TrimSpace(externalRef)).Scan(
 		&w.ID, &w.OrgID, &w.ExternalRef, &w.URL, &w.Secret, &eventsText, &w.CreatedAt, &w.DisabledAt,
@@ -198,7 +207,7 @@ func (s *Store) ListOrgWebhooks(ctx context.Context, orgID string) ([]OrgWebhook
 		return nil, errors.New("missing org_id")
 	}
 	rows, err := s.q.QueryContext(ctx, `
-		SELECT id::text, org_id::text, external_ref, url, secret, events::text, created_at, disabled_at
+		SELECT id::text, org_id::text, to_jsonb(org_webhooks)->>'external_ref', url, secret, events::text, created_at, disabled_at
 		FROM org_webhooks
 		WHERE org_id = $1
 		ORDER BY created_at DESC
@@ -228,7 +237,7 @@ func (s *Store) GetOrgWebhook(ctx context.Context, orgID, id string) (OrgWebhook
 	var w OrgWebhook
 	var eventsText string
 	row := s.q.QueryRowContext(ctx, `
-		SELECT id::text, org_id::text, external_ref, url, secret, events::text, created_at, disabled_at
+		SELECT id::text, org_id::text, to_jsonb(org_webhooks)->>'external_ref', url, secret, events::text, created_at, disabled_at
 		FROM org_webhooks
 		WHERE org_id = $1 AND id = $2
 	`, orgID, id)

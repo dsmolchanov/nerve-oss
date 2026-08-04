@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func (s *Store) ListThreads(ctx context.Context, inboxID string, status string, limit int) ([]Thread, error) {
@@ -118,15 +117,16 @@ func (s *Store) GetMessage(ctx context.Context, messageID string) (Message, erro
 }
 
 func (s *Store) listMessageAttachmentsCompatible(ctx context.Context, orgID, messageID string) ([]MessageAttachment, error) {
-	attachments, err := s.ListMessageAttachments(ctx, orgID, messageID)
-	if err == nil {
-		return attachments, nil
+	var exists bool
+	if err := s.q.QueryRowContext(ctx, `
+		SELECT to_regclass('public.message_attachments') IS NOT NULL
+	`).Scan(&exists); err != nil {
+		return nil, err
 	}
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
+	if !exists {
 		return nil, nil
 	}
-	return nil, err
+	return s.ListMessageAttachments(ctx, orgID, messageID)
 }
 
 func (s *Store) SearchInboxFTS(ctx context.Context, inboxID string, query string, limit int) ([]SearchResult, error) {
