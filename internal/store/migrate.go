@@ -83,7 +83,18 @@ func migrateScope(ctx context.Context, db *sql.DB, tableName string, dir string)
 
 func migrateScopeTo(ctx context.Context, db *sql.DB, tableName string, dir string, version int64) error {
 	return withGoose(tableName, func() error {
-		return goose.UpToContext(ctx, db, dir, version)
+		if err := goose.UpToContext(ctx, db, dir, version); err != nil {
+			return err
+		}
+
+		current, err := goose.GetDBVersionContext(ctx, db)
+		if err != nil {
+			return fmt.Errorf("verify migration target %d: %w", version, err)
+		}
+		if current != version {
+			return fmt.Errorf("migration target %d not reached: current version is %d", version, current)
+		}
+		return nil
 	})
 }
 

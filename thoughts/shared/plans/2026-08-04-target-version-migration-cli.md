@@ -53,6 +53,8 @@ exact-mirror path.
 ### Changes Required
 
 - Add `MigrateUpToCore` and `MigrateUpToCloud` over `goose.UpToContext`.
+  After applying, read the scope's database version under the same Goose lock
+  and reject the operation unless it exactly matches the requested target.
 - Add one-step `MigrateDownCore` and `MigrateDownCloud` over
   `goose.DownContext`.
 - Add `CurrentVersionCore` and `CurrentVersionCloud`.
@@ -64,8 +66,9 @@ exact-mirror path.
 ### Automated Verification
 
 - A PostgreSQL-backed test proves `MigrateUpToCore` stops at its target, a later
-  migration remains pending, migration to head completes, and one down call
-  rolls back one version.
+  migration remains pending, migration to head completes, unavailable and
+  already-passed targets fail, and one down call rolls back to the exact
+  previous migration version.
 - A concurrency regression test proves a cloud operation cannot replace the
   goose table configuration while a core operation is still running.
 - Run focused store tests, the race-enabled concurrency test, `gofmt`, and

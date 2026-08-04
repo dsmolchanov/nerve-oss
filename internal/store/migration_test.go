@@ -629,6 +629,28 @@ func TestMigrateUpToCore_StopsAtTarget(t *testing.T) {
 			t.Fatal("outbox_messages missing after migrating to head")
 		}
 
+		// UpToContext itself treats both an already-passed target and a target
+		// beyond the available migrations as successful no-ops. The store API
+		// must reject both because its contract is to reach the exact target.
+		for _, invalidTarget := range []int64{head - 1, head + 1} {
+			err := MigrateUpToCore(ctx, db, invalidTarget)
+			if err == nil {
+				t.Fatalf("expected exact-target migration to %d to fail from version %d", invalidTarget, head)
+			}
+			if !strings.Contains(err.Error(), fmt.Sprintf("migration target %d not reached", invalidTarget)) {
+				t.Fatalf("unexpected exact-target error for %d: %v", invalidTarget, err)
+			}
+		}
+
+		migrations, err := goose.CollectMigrations(coreMigrationDir(t), 0, head)
+		if err != nil {
+			t.Fatalf("collect core migrations through head: %v", err)
+		}
+		if len(migrations) < 2 || migrations[len(migrations)-1].Version != head {
+			t.Fatalf("expected at least two core migrations ending at head %d, got %v", head, migrations)
+		}
+		previous := migrations[len(migrations)-2].Version
+
 		// Down must undo exactly one step.
 		if err := MigrateDownCore(ctx, db); err != nil {
 			t.Fatalf("migrate down core: %v", err)
@@ -637,8 +659,8 @@ func TestMigrateUpToCore_StopsAtTarget(t *testing.T) {
 		if err != nil {
 			t.Fatalf("current core version after down: %v", err)
 		}
-		if afterDown >= head {
-			t.Fatalf("expected version below %d after down, got %d", head, afterDown)
+		if afterDown != previous {
+			t.Fatalf("expected one-step rollback from %d to %d, got %d", head, previous, afterDown)
 		}
 	})
 }
