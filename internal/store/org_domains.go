@@ -50,6 +50,16 @@ func (s *Store) CreateOrgDomain(ctx context.Context, orgID, domain, verification
 
 func (s *Store) createOrgDomain(ctx context.Context, orgID, domain, verificationToken, dkimSelector, dkimPrivateKeyEnc, dkimPublicKey, dkimMethod, externalRef string) (string, error) {
 	id := uuid.NewString()
+	if strings.TrimSpace(externalRef) == "" {
+		_, err := s.q.ExecContext(ctx, `
+			INSERT INTO org_domains (id, org_id, domain, verification_token, dkim_selector, dkim_private_key_enc, dkim_public_key, dkim_method, expires_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now() + interval '7 days')
+		`, id, orgID, strings.ToLower(domain), verificationToken, dkimSelector, nullIfEmpty(dkimPrivateKeyEnc), nullIfEmpty(dkimPublicKey), dkimMethod)
+		if err != nil {
+			return "", err
+		}
+		return id, nil
+	}
 	_, err := s.q.ExecContext(ctx, `
 		INSERT INTO org_domains (id, org_id, domain, verification_token, dkim_selector, dkim_private_key_enc, dkim_public_key, dkim_method, expires_at, external_ref)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now() + interval '7 days', nullif($9, ''))
@@ -150,7 +160,7 @@ func (s *Store) GetOrgDomainByExternalRef(ctx context.Context, externalRef strin
 		       dkim_method, last_check_at, verified_at, expires_at,
 		       resend_domain_id, resend_domain_status, resend_dns_records,
 		       resend_receiving_enabled, catch_all_enabled, forward_to,
-		       created_at, updated_at, external_ref
+		       created_at, updated_at, to_jsonb(org_domains)->>'external_ref'
 		FROM org_domains WHERE external_ref = $1
 	`, strings.TrimSpace(externalRef))
 	return d, scanOrgDomain(row, &d)
@@ -168,7 +178,7 @@ func (s *Store) GetOrgDomain(ctx context.Context, domain string) (OrgDomain, err
 		       resend_domain_id, resend_domain_status, resend_dns_records,
 		       resend_receiving_enabled, catch_all_enabled,
 		       forward_to,
-		       created_at, updated_at, external_ref
+		       created_at, updated_at, to_jsonb(org_domains)->>'external_ref'
 		FROM org_domains
 		WHERE lower(domain) = lower($1)
 		ORDER BY created_at DESC
@@ -191,7 +201,7 @@ func (s *Store) GetOrgDomainByID(ctx context.Context, id string) (OrgDomain, err
 		       resend_domain_id, resend_domain_status, resend_dns_records,
 		       resend_receiving_enabled, catch_all_enabled,
 		       forward_to,
-		       created_at, updated_at, external_ref
+		       created_at, updated_at, to_jsonb(org_domains)->>'external_ref'
 		FROM org_domains
 		WHERE id = $1
 	`, id)
@@ -212,7 +222,7 @@ func (s *Store) GetOrgDomainByIDForOrg(ctx context.Context, orgID, id string) (O
 		       resend_domain_id, resend_domain_status, resend_dns_records,
 		       resend_receiving_enabled, catch_all_enabled,
 		       forward_to,
-		       created_at, updated_at, external_ref
+		       created_at, updated_at, to_jsonb(org_domains)->>'external_ref'
 		FROM org_domains
 		WHERE id = $1 AND org_id = $2
 	`, id, orgID)
@@ -232,7 +242,7 @@ func (s *Store) ListOrgDomains(ctx context.Context, orgID string) ([]OrgDomain, 
 		       resend_domain_id, resend_domain_status, resend_dns_records,
 		       resend_receiving_enabled, catch_all_enabled,
 		       forward_to,
-		       created_at, updated_at, external_ref
+		       created_at, updated_at, to_jsonb(org_domains)->>'external_ref'
 		FROM org_domains
 		WHERE org_id = $1
 		   OR EXISTS (
@@ -323,7 +333,7 @@ func (s *Store) GetOrgDomainForSending(ctx context.Context, domain string) (OrgD
 		       resend_domain_id, resend_domain_status, resend_dns_records,
 		       resend_receiving_enabled, catch_all_enabled,
 		       forward_to,
-		       created_at, updated_at, external_ref
+		       created_at, updated_at, to_jsonb(org_domains)->>'external_ref'
 		FROM org_domains
 		WHERE lower(domain) = lower($1) AND status = 'active'
 		LIMIT 1
@@ -408,7 +418,7 @@ func (s *Store) GetReceivingOrgDomainByDomain(ctx context.Context, domain string
 		       resend_domain_id, resend_domain_status, resend_dns_records,
 		       resend_receiving_enabled, catch_all_enabled,
 		       forward_to,
-		       created_at, updated_at, external_ref
+		       created_at, updated_at, to_jsonb(org_domains)->>'external_ref'
 		FROM org_domains
 		WHERE lower(domain) = lower($1)
 		  AND status = 'active'
