@@ -12,8 +12,8 @@ import (
 )
 
 const (
-	CoreMinRequired          int64 = 26
-	CoreMaxSupported         int64 = 26
+	CoreMinRequired          int64 = 27
+	CoreMaxSupported         int64 = 27
 	RuntimeCloudMinRequired  int64 = 3
 	RuntimeCloudMaxSupported int64 = 3
 )
