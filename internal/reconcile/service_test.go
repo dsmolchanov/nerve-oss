@@ -211,6 +211,80 @@ func TestRunSeedsMissingAttachmentUsage(t *testing.T) {
 	})
 }
 
+func TestRunReleasesSentOutboxAttachmentsThenGarbageCollectsAfterGrace(t *testing.T) {
+	withTempStore(t, func(ctx context.Context, st *store.Store) {
+		now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+		orgID, err := st.CreateOrg(ctx, "outbox-retention-reconcile")
+		if err != nil {
+			t.Fatal(err)
+		}
+		inboxID := uuid.NewString()
+		if _, err := st.DB().ExecContext(ctx, `
+			INSERT INTO inboxes (id, org_id, address, status)
+			VALUES ($1, $2, 'retention-reconcile@local.nerve.email', 'active')
+		`, inboxID, orgID); err != nil {
+			t.Fatal(err)
+		}
+		content := []byte("old retained bytes")
+		outboxID, err := st.EnqueueOutboxMessage(ctx, store.OutboxMessage{
+			OrgID: orgID, InboxID: inboxID, Provider: "smtp",
+			IdempotencyKey: "retention-reconcile-key",
+			To:             "to@example.com", From: "from@example.com", Subject: "retention", TextBody: "body",
+			Attachments: []store.OutboundAttachment{{Filename: "old.txt", ContentType: "text/plain", Content: content}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.MarkOutboxMessageSent(ctx, outboxID, "provider-id"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.DB().ExecContext(ctx, `
+			UPDATE outbox_messages SET terminal_at = $2 WHERE id = $1
+		`, outboxID, now.Add(-91*24*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+
+		svc := NewService(st)
+		svc.Now = func() time.Time { return now }
+		report, err := svc.Run(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if report.OutboxAttachmentsReleased != 1 || report.AttachmentBlobsDeleted != 0 || report.AttachmentBytesReleased != 0 {
+			t.Fatalf("release report=%+v", report)
+		}
+
+		if _, err := st.DB().ExecContext(ctx, `
+			UPDATE attachment_blobs SET last_ref_at = $2 WHERE org_id = $1
+		`, orgID, now.Add(-8*24*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.DB().ExecContext(ctx, `
+			UPDATE org_attachment_usage SET bytes_used = 999 WHERE org_id = $1
+		`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		report, err = svc.Run(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if report.OutboxAttachmentsReleased != 0 || report.AttachmentBlobsDeleted != 1 || report.AttachmentBytesReleased != int64(len(content)) || report.AttachmentUsageRepaired != 1 {
+			t.Fatalf("GC report=%+v", report)
+		}
+		var blobs int
+		var bytesUsed int64
+		if err := st.DB().QueryRowContext(ctx, `SELECT count(*) FROM attachment_blobs WHERE org_id = $1`, orgID).Scan(&blobs); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.DB().QueryRowContext(ctx, `SELECT bytes_used FROM org_attachment_usage WHERE org_id = $1`, orgID).Scan(&bytesUsed); err != nil {
+			t.Fatal(err)
+		}
+		if blobs != 0 || bytesUsed != 0 {
+			t.Fatalf("post-reconcile blobs=%d bytes_used=%d", blobs, bytesUsed)
+		}
+	})
+}
+
 func insertOrgAndEntitlement(t *testing.T, ctx context.Context, st *store.Store, orgID string, periodStart, periodEnd time.Time) {
 	t.Helper()
 	if _, err := st.DB().ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'reconcile-org')`, orgID); err != nil {

@@ -31,3 +31,69 @@ func (s *Store) SeedMissingOrgAttachmentUsage(ctx context.Context) (int, error) 
 	`).Scan(&seeded)
 	return seeded, err
 }
+
+// ReconcileOrgAttachmentUsage repairs quota accounting from the durable blob
+// rows. The usage row is locked before the sum is read, matching the lock order
+// used by blob insert/reuse and GC so a concurrent charge cannot be overwritten
+// by a stale snapshot.
+func (s *Store) ReconcileOrgAttachmentUsage(ctx context.Context) (int, error) {
+	repaired := 0
+	err := s.withTx(ctx, func(scoped *Store) error {
+		rows, err := scoped.q.QueryContext(ctx, `
+			SELECT org_id::text
+			FROM org_attachment_usage
+			ORDER BY org_id
+		`)
+		if err != nil {
+			return err
+		}
+		var orgIDs []string
+		for rows.Next() {
+			var orgID string
+			if err := rows.Scan(&orgID); err != nil {
+				rows.Close()
+				return err
+			}
+			orgIDs = append(orgIDs, orgID)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		for _, orgID := range orgIDs {
+			var current int64
+			if err := scoped.q.QueryRowContext(ctx, `
+				SELECT bytes_used
+				FROM org_attachment_usage
+				WHERE org_id = $1
+				FOR UPDATE
+			`, orgID).Scan(&current); err != nil {
+				return err
+			}
+			var actual int64
+			if err := scoped.q.QueryRowContext(ctx, `
+				SELECT COALESCE(sum(size_bytes), 0)::bigint
+				FROM attachment_blobs
+				WHERE org_id = $1
+			`, orgID).Scan(&actual); err != nil {
+				return err
+			}
+			if current == actual {
+				continue
+			}
+			if _, err := scoped.q.ExecContext(ctx, `
+				UPDATE org_attachment_usage
+				SET bytes_used = $2, updated_at = now()
+				WHERE org_id = $1
+			`, orgID, actual); err != nil {
+				return err
+			}
+			repaired++
+		}
+		return nil
+	})
+	return repaired, err
+}
