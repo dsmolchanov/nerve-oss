@@ -205,6 +205,58 @@ func TestOutboxWorkerFailsMessageThatCanNeverFitMemoryBudget(t *testing.T) {
 	})
 }
 
+func TestOutboxWorkerClassifiesReleasedAttachmentsBeforeMemoryLimit(t *testing.T) {
+	withOutboxWorkerDatabase(t, func(ctx context.Context, db *sql.DB, st *store.Store) {
+		orgID := uuid.NewString()
+		inboxID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'worker-released-before-limit')`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO inboxes (id, org_id, address, status)
+			VALUES ($1, $2, 'worker-released-before-limit@local.neuralmail', 'active')
+		`, inboxID, orgID); err != nil {
+			t.Fatal(err)
+		}
+		outboxID, err := st.EnqueueOutboxMessage(ctx, workerAttachmentMessage(orgID, inboxID, "released-before-limit", []store.OutboundAttachment{{
+			Filename: "released.txt", ContentType: "text/plain", Content: []byte("larger than limit"),
+		}}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			UPDATE outbox_attachments SET blob_sha256 = NULL WHERE outbox_message_id = $1
+		`, outboxID); err != nil {
+			t.Fatal(err)
+		}
+
+		budget, err := memguard.New(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		adapter := &captureOutboundAdapter{}
+		registry := NewRegistry()
+		if err := registry.RegisterOutbound(adapter); err != nil {
+			t.Fatal(err)
+		}
+		worker := NewOutboxWorker(st, registry, "released-before-limit-test", budget)
+		worker.ClaimLimit = 1
+		worker.claimAndDeliver(ctx)
+
+		if len(adapter.deliveries) != 0 {
+			t.Fatalf("provider called %d times for released attachments", len(adapter.deliveries))
+		}
+		var status string
+		var lastError sql.NullString
+		if err := db.QueryRowContext(ctx, `SELECT status, last_error FROM outbox_messages WHERE id = $1`, outboxID).Scan(&status, &lastError); err != nil {
+			t.Fatal(err)
+		}
+		if status != "failed" || !lastError.Valid || !strings.Contains(lastError.String, "attachments released") || strings.Contains(lastError.String, "memory budget") {
+			t.Fatalf("status=%q last_error=%q, want released-attachment failure", status, lastError.String)
+		}
+	})
+}
+
 func (a *captureOutboundAdapter) GetDeliveryStatus(context.Context, string) (DeliveryStatus, error) {
 	return DeliveryStatusUnknown, ErrNotSupported
 }
