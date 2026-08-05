@@ -8,6 +8,22 @@ import (
 	"strings"
 )
 
+// OutboxMessageAttachmentBytes returns the metadata-declared bytes that will
+// be materialized for one delivery. Callers use it to reserve aggregate memory
+// before LoadOutboxMessageAttachments executes its SELECT of blob content.
+func (s *Store) OutboxMessageAttachmentBytes(ctx context.Context, orgID, outboxMessageID string) (int64, error) {
+	if strings.TrimSpace(orgID) == "" || strings.TrimSpace(outboxMessageID) == "" {
+		return 0, errors.New("missing attachment org_id or outbox_message_id")
+	}
+	var size int64
+	err := s.q.QueryRowContext(ctx, `
+		SELECT COALESCE(sum(size_bytes), 0)::bigint
+		FROM outbox_attachments
+		WHERE org_id = $1 AND outbox_message_id = $2
+	`, orgID, outboxMessageID).Scan(&size)
+	return size, err
+}
+
 // LoadOutboxMessageAttachments materializes one outbox message's attachment
 // bytes immediately before delivery. Metadata remains readable after release,
 // but delivery must fail rather than silently omit released bytes.

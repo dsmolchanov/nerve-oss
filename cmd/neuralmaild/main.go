@@ -19,6 +19,7 @@ import (
 	smtptransport "neuralmail/internal/emailtransport/providers/smtp"
 	"neuralmail/internal/embed"
 	"neuralmail/internal/mcp"
+	"neuralmail/internal/memguard"
 	"neuralmail/internal/queue"
 	"neuralmail/internal/release"
 	"neuralmail/internal/startup"
@@ -143,7 +144,11 @@ func runWorker(ctx context.Context, cfg config.Config) {
 			BaseURL: cfg.Resend.BaseURL,
 		}))
 	}
-	outboxWorker := emailtransport.NewOutboxWorker(storeInstance, transportRegistry, "nerve-runtime-worker")
+	memoryBudget, err := memguard.New(cfg.Memory.BudgetBytes)
+	if err != nil {
+		log.Fatalf("memory budget error: %v", err)
+	}
+	outboxWorker := emailtransport.NewOutboxWorker(storeInstance, transportRegistry, "nerve-runtime-worker", memoryBudget)
 	go func() {
 		if err := outboxWorker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("outbox worker stopped: %v", err)
