@@ -269,6 +269,16 @@ func (s *Store) lockReconciliationResources(ctx context.Context, resources ...st
 	return nil
 }
 
+func (s *Store) lockOrgDomainGrantAccess(ctx context.Context, domainID, granteeOrgID string) error {
+	_, err := s.q.ExecContext(ctx, `
+		SELECT pg_advisory_xact_lock(hashtextextended(
+			'org-domain-grant:' || $1::uuid::text || ':' || $2::uuid::text,
+			0
+		))
+	`, domainID, granteeOrgID)
+	return err
+}
+
 func (s *Store) lockActiveOrgForReconciliation(ctx context.Context, orgID string) error {
 	return s.lockActiveOrgResourcesForReconciliation(ctx, orgID)
 }
@@ -360,14 +370,34 @@ func (s *Store) RevokeOrgDomainGrant(ctx context.Context, grantID string) (bool,
 				resultErr = errors.Join(resultErr, restoreErr)
 			}()
 
-			var ownerOrgID string
+			var ownerOrgID, domainID, granteeOrgID string
 			err := scoped.q.QueryRowContext(ctx, `
-				SELECT owner_org_id::text
+				SELECT owner_org_id::text, org_domain_id::text, grantee_org_id::text
 				FROM org_domain_grants
 				WHERE id = $1 AND status = 'active'
 				  AND (nullif($2, '') IS NULL OR owner_org_id = nullif($2, '')::uuid)
+			`, grantID, ownerConstraint).Scan(&ownerOrgID, &domainID, &granteeOrgID)
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if err := scoped.lockOrgDomainGrantAccess(ctx, domainID, granteeOrgID); err != nil {
+				return err
+			}
+
+			// Re-read after waiting for the pair lock. A concurrent revocation may
+			// have completed while this transaction was blocked.
+			err = scoped.q.QueryRowContext(ctx, `
+				SELECT owner_org_id::text
+				FROM org_domain_grants
+				WHERE id = $1 AND status = 'active'
+				  AND owner_org_id = $2::uuid
+				  AND org_domain_id = $3::uuid
+				  AND grantee_org_id = $4::uuid
 				FOR UPDATE
-			`, grantID, ownerConstraint).Scan(&ownerOrgID)
+			`, grantID, ownerOrgID, domainID, granteeOrgID).Scan(&ownerOrgID)
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil
 			}
