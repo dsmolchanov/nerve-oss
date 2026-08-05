@@ -193,8 +193,8 @@ func TestRunBoundedAllCloudGapPreventsEveryMutation(t *testing.T) {
 func TestRunWithoutTargetUsesCompiledRuntimeWindows(t *testing.T) {
 	backend := &fakeBackend{statuses: map[migrationScope][]statusResult{
 		scopeCore: {
-			{status: migrationStatus{Current: 18, Head: 27, Pending: []int64{19, 20, 21, 22, 23, 24, 25, 26, 27}}},
-			{status: migrationStatus{Current: 27, Head: 27}},
+			{status: migrationStatus{Current: 18, Head: 28, Pending: []int64{19, 20, 21, 22, 23, 24, 25, 26, 27, 28}}},
+			{status: migrationStatus{Current: 28, Head: 28}},
 		},
 		scopeCloud: {
 			{status: migrationStatus{Current: 2, Head: 7, Pending: []int64{3, 4, 5, 6, 7}}},
@@ -209,7 +209,7 @@ func TestRunWithoutTargetUsesCompiledRuntimeWindows(t *testing.T) {
 	wantCalls := []string{
 		"status:core",
 		"status:cloud",
-		"up:core:27",
+		"up:core:28",
 		"up:cloud:3",
 		"status:core",
 		"status:cloud",
@@ -240,11 +240,11 @@ func TestRunTargetAlreadyCurrentIsNoOp(t *testing.T) {
 
 func TestRunRejectsExplicitTargetAboveCompiledRuntimeWindow(t *testing.T) {
 	backend := &fakeBackend{statuses: map[migrationScope][]statusResult{
-		scopeCore: {{status: migrationStatus{Current: 27, Head: 27}}},
+		scopeCore: {{status: migrationStatus{Current: 28, Head: 28}}},
 	}}
 
-	output, err := runFake(t, []string{"up", "--scope", "core", "--to", "28"}, backend)
-	if err == nil || !strings.Contains(err.Error(), "target 28 exceeds compiled runtime maximum 27") {
+	output, err := runFake(t, []string{"up", "--scope", "core", "--to", "29"}, backend)
+	if err == nil || !strings.Contains(err.Error(), "target 29 exceeds compiled runtime maximum 28") {
 		t.Fatalf("run() error=%v, want compiled-window refusal", err)
 	}
 	if output != "" {
@@ -373,7 +373,7 @@ func TestRunClosesBackendOnOperationAndOpenErrors(t *testing.T) {
 		closeErr := errors.New("close failed")
 		backend := &fakeBackend{
 			statuses: map[migrationScope][]statusResult{
-				scopeCore: {{status: migrationStatus{Current: 18, Head: 27, Pending: []int64{19, 20, 21, 22, 23, 24, 25, 26, 27}}}},
+				scopeCore: {{status: migrationStatus{Current: 18, Head: 28, Pending: []int64{19, 20, 21, 22, 23, 24, 25, 26, 27, 28}}}},
 			},
 			upErrors:   map[migrationScope]error{scopeCore: operationErr},
 			closeError: closeErr,
