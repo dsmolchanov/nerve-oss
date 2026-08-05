@@ -78,8 +78,10 @@ func TestOutboxWorkerReservesSharedMemoryBeforeBlobLoad(t *testing.T) {
 		if err := registry.RegisterOutbound(adapter); err != nil {
 			t.Fatal(err)
 		}
-		worker := NewOutboxWorker(st, registry, "memory-held-test")
-		worker.MemoryBudget = budget
+		worker := NewOutboxWorker(st, registry, "memory-held-test", budget)
+		if worker.MemoryBudget != budget {
+			t.Fatal("worker did not retain the configured shared memory budget")
+		}
 		worker.ClaimLimit = 1
 		worker.claimAndDeliver(ctx)
 
@@ -119,6 +121,63 @@ func TestOutboxWorkerRequeuesBeforeBlobLoadWhenMemoryExhausted(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		attachmentBytes := int64(len("larger than budget"))
+		budget, err := memguard.New(attachmentBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		releaseHeld, err := budget.Acquire(ctx, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer releaseHeld()
+		adapter := &captureOutboundAdapter{}
+		registry := NewRegistry()
+		if err := registry.RegisterOutbound(adapter); err != nil {
+			t.Fatal(err)
+		}
+		worker := NewOutboxWorker(st, registry, "memory-exhausted-test", budget)
+		worker.ClaimLimit = 1
+		worker.BaseBackoff = time.Millisecond
+		worker.claimAndDeliver(ctx)
+
+		if len(adapter.deliveries) != 0 {
+			t.Fatalf("provider called %d times despite exhausted budget", len(adapter.deliveries))
+		}
+		if budget.Used() != 1 {
+			t.Fatalf("exhausted reservation changed pre-existing budget usage to %d", budget.Used())
+		}
+		var status string
+		var lastError sql.NullString
+		if err := db.QueryRowContext(ctx, `SELECT status, last_error FROM outbox_messages WHERE id = $1`, outboxID).Scan(&status, &lastError); err != nil {
+			t.Fatal(err)
+		}
+		if status != "queued" || !lastError.Valid || !strings.Contains(lastError.String, "memory budget exhausted") {
+			t.Fatalf("status=%q last_error=%q, want queued budget exhaustion", status, lastError.String)
+		}
+	})
+}
+
+func TestOutboxWorkerFailsMessageThatCanNeverFitMemoryBudget(t *testing.T) {
+	withOutboxWorkerDatabase(t, func(ctx context.Context, db *sql.DB, st *store.Store) {
+		orgID := uuid.NewString()
+		inboxID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, 'worker-memory-limit')`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO inboxes (id, org_id, address, status)
+			VALUES ($1, $2, 'worker-memory-limit@local.neuralmail', 'active')
+		`, inboxID, orgID); err != nil {
+			t.Fatal(err)
+		}
+		outboxID, err := st.EnqueueOutboxMessage(ctx, workerAttachmentMessage(orgID, inboxID, "memory-limit", []store.OutboundAttachment{{
+			Filename: "large.txt", ContentType: "text/plain", Content: []byte("larger than limit"),
+		}}))
+		if err != nil {
+			t.Fatal(err)
+		}
+
 		budget, err := memguard.New(1)
 		if err != nil {
 			t.Fatal(err)
@@ -128,25 +187,20 @@ func TestOutboxWorkerRequeuesBeforeBlobLoadWhenMemoryExhausted(t *testing.T) {
 		if err := registry.RegisterOutbound(adapter); err != nil {
 			t.Fatal(err)
 		}
-		worker := NewOutboxWorker(st, registry, "memory-exhausted-test")
-		worker.MemoryBudget = budget
+		worker := NewOutboxWorker(st, registry, "memory-limit-test", budget)
 		worker.ClaimLimit = 1
-		worker.BaseBackoff = time.Millisecond
 		worker.claimAndDeliver(ctx)
 
 		if len(adapter.deliveries) != 0 {
-			t.Fatalf("provider called %d times despite exhausted budget", len(adapter.deliveries))
-		}
-		if budget.Used() != 0 {
-			t.Fatalf("exhausted reservation changed budget usage to %d", budget.Used())
+			t.Fatalf("provider called %d times for a permanently oversized message", len(adapter.deliveries))
 		}
 		var status string
 		var lastError sql.NullString
 		if err := db.QueryRowContext(ctx, `SELECT status, last_error FROM outbox_messages WHERE id = $1`, outboxID).Scan(&status, &lastError); err != nil {
 			t.Fatal(err)
 		}
-		if status != "queued" || !lastError.Valid || !strings.Contains(lastError.String, "memory budget exhausted") {
-			t.Fatalf("status=%q last_error=%q, want queued budget exhaustion", status, lastError.String)
+		if status != "failed" || !lastError.Valid || !strings.Contains(lastError.String, "exceed configured memory budget") {
+			t.Fatalf("status=%q last_error=%q, want terminal memory-limit failure", status, lastError.String)
 		}
 	})
 }
@@ -195,7 +249,11 @@ func TestOutboxWorkerAttachmentRoundTripAndReleasedFailure(t *testing.T) {
 		if err := registry.RegisterOutbound(adapter); err != nil {
 			t.Fatal(err)
 		}
-		worker := NewOutboxWorker(st, registry, "attachment-test")
+		budget, err := memguard.New(64 << 20)
+		if err != nil {
+			t.Fatal(err)
+		}
+		worker := NewOutboxWorker(st, registry, "attachment-test", budget)
 		worker.BaseBackoff = time.Millisecond
 		worker.claimAndDeliver(ctx)
 

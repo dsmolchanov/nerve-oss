@@ -63,15 +63,14 @@ type MetricsSink interface {
 	SetQueueDepth(state string, count float64)
 }
 
-func NewOutboxWorker(st *store.Store, reg *Registry, workerID string) *OutboxWorker {
+func NewOutboxWorker(st *store.Store, reg *Registry, workerID string, memoryBudget *memguard.Budget) *OutboxWorker {
 	if workerID == "" {
 		workerID = "outbox-worker"
 	}
-	defaultBudget, _ := memguard.New(64 << 20)
 	return &OutboxWorker{
 		Store:          st,
 		Registry:       reg,
-		MemoryBudget:   defaultBudget,
+		MemoryBudget:   memoryBudget,
 		WorkerID:       workerID,
 		ClaimLimit:     10,
 		PollInterval:   500 * time.Millisecond,
@@ -87,6 +86,9 @@ func (w *OutboxWorker) Run(ctx context.Context) error {
 	}
 	if w.Registry == nil {
 		return errors.New("missing transport registry")
+	}
+	if w.MemoryBudget == nil {
+		return errors.New("missing memory budget")
 	}
 	if w.ClaimLimit <= 0 {
 		w.ClaimLimit = 10
@@ -220,6 +222,13 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		next := time.Now().UTC().Add(w.BaseBackoff)
 		_ = w.Store.RequeueOutboxMessage(ctx, msg.ID, next, fmt.Sprintf("load attachment metadata: %v", err))
 		return fmt.Errorf("load outbox attachment metadata: %w", err)
+	}
+	if attachmentBytes > w.MemoryBudget.Limit() {
+		err := fmt.Errorf("attachment bytes exceed configured memory budget: requested=%d limit=%d", attachmentBytes, w.MemoryBudget.Limit())
+		w.incDeliver(msg.Provider, "permanent")
+		w.incDLQ(msg.Provider, "attachment_memory_limit")
+		_ = w.Store.MarkOutboxMessageFailed(ctx, msg.ID, err.Error())
+		return err
 	}
 	releaseMemory, err := w.MemoryBudget.Acquire(ctx, attachmentBytes)
 	if err != nil {
