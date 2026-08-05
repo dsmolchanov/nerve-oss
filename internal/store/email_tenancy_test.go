@@ -648,19 +648,34 @@ func TestGranteeAppRoleCanCreateInboxWithDomainGrant(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToLatest(t, ctx, db)
 		adminStore := &Store{db: db, q: db}
-		_, granteeID, domainID, _ := createDomainGrantFixture(t, ctx, adminStore, "app-role")
+		ownerID, granteeID, domainID, _ := createDomainGrantFixture(t, ctx, adminStore, "app-role")
 		appStore := openDomainGrantAppStore(t, ctx, db)
 
 		var inbox InboxRecord
+		var cloudMode string
 		err := appStore.RunAsOrg(ctx, granteeID, func(scoped *Store) error {
 			var createErr error
 			inbox, createErr = scoped.CreateInboxForOrg(
 				ctx, granteeID, "app-role@abrolia.com", domainID, "resend",
 			)
-			return createErr
+			if createErr != nil {
+				return createErr
+			}
+			return scoped.q.QueryRowContext(ctx, `SELECT current_setting('app.cloud_mode', true)`).Scan(&cloudMode)
 		})
 		if err != nil {
 			t.Fatalf("create grantee inbox as app role: %v", err)
+		}
+		if cloudMode != "true" {
+			t.Fatalf("trigger restored app.cloud_mode=%q, want true", cloudMode)
+		}
+		if err := appStore.RunAsOrg(ctx, granteeID, func(scoped *Store) error {
+			_, createErr := scoped.CreateInboxForOrg(
+				ctx, ownerID, "cross-org@abrolia.com", domainID, "resend",
+			)
+			return createErr
+		}); err == nil {
+			t.Fatal("security-definer trigger bypassed inbox tenant RLS")
 		}
 
 		var rows int
@@ -677,7 +692,7 @@ func TestGranteeAppRoleCanCreateInboxWithDomainGrant(t *testing.T) {
 }
 
 func TestInboxCreationAndGrantRevocationSerialize(t *testing.T) {
-	t.Run("committed revocation rejects waiting inbox", func(t *testing.T) {
+	t.Run("legacy revocation row lock rejects waiting inbox", func(t *testing.T) {
 		withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 			migrateToLatest(t, ctx, db)
 			adminStore := &Store{db: db, q: db}
@@ -691,12 +706,10 @@ func TestInboxCreationAndGrantRevocationSerialize(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer tx.Rollback()
-			if _, err := tx.ExecContext(testCtx, `
-				SELECT pg_advisory_xact_lock(hashtextextended(
-					'org-domain-grant:' || $1::uuid::text || ':' || $2::uuid::text,
-					0
-				))
-			`, domainID, granteeID); err != nil {
+			var lockedGrantID string
+			if err := tx.QueryRowContext(testCtx, `
+				SELECT id::text FROM org_domain_grants WHERE id = $1 AND status = 'active' FOR UPDATE
+			`, grant.ID).Scan(&lockedGrantID); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := tx.ExecContext(testCtx, `
