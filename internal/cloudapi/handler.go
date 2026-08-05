@@ -23,6 +23,7 @@ import (
 	"neuralmail/internal/domains"
 	"neuralmail/internal/emailaddr"
 	resendprovider "neuralmail/internal/emailtransport/providers/resend"
+	"neuralmail/internal/featureflags"
 	"neuralmail/internal/store"
 )
 
@@ -50,16 +51,20 @@ type Handler struct {
 	Checkout BillingCheckoutProvider
 	Tokens   ServiceTokenIssuer
 	Domains  *domains.Verifier
+	// FeatureFlags is shared with the runtime's resolver so rollout probes
+	// observe the same org-scoped cache semantics in both apps.
+	FeatureFlags featureflags.Gate
 }
 
 func NewHandler(cfg config.Config, st *store.Store, authSvc *auth.Service, billingSvc BillingWebhookProcessor, tokenSvc ServiceTokenIssuer) *Handler {
 	h := &Handler{
-		Config:  cfg,
-		Store:   st,
-		Auth:    authSvc,
-		Billing: billingSvc,
-		Tokens:  tokenSvc,
-		Domains: domains.NewVerifier(nil),
+		Config:       cfg,
+		Store:        st,
+		Auth:         authSvc,
+		Billing:      billingSvc,
+		Tokens:       tokenSvc,
+		Domains:      domains.NewVerifier(nil),
+		FeatureFlags: featureflags.New(cfg.Cloud.Mode, st),
 	}
 	// If the billing service also implements checkout/portal, wire it up.
 	if cp, ok := billingSvc.(BillingCheckoutProvider); ok {
@@ -136,6 +141,7 @@ func resendComputeVerification(records []resendprovider.DomainRecord) (mxVerifie
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+	mux.Handle(featureflags.EffectiveStatePathPrefix, featureflags.EffectiveStateHandler(h.Auth, h.FeatureFlags))
 	mux.HandleFunc("/v1/orgs", h.handleCreateOrg)
 	mux.HandleFunc("/v1/orgs/runtime", h.handleOrgRuntime)
 	mux.HandleFunc("/v1/subscriptions/checkout", h.handleCheckout)
