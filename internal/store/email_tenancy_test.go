@@ -4,11 +4,41 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
+
+func TestMigration27DownRefusesDomainGrants(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 27); err != nil {
+			t.Fatal(err)
+		}
+		st := &Store{db: db, q: db}
+		_, _, _, grant := createDomainGrantFixture(t, ctx, st, "rollback-27")
+
+		err := MigrateDownCore(ctx, db)
+		if err == nil || !strings.Contains(err.Error(), "cannot roll back core migration 0027") {
+			t.Fatalf("down error=%v, want domain grant refusal", err)
+		}
+		version, versionErr := CurrentVersionCore(ctx, db)
+		if versionErr != nil || version != 27 {
+			t.Fatalf("version=%d err=%v after refused down", version, versionErr)
+		}
+
+		if _, err := db.ExecContext(ctx, `DELETE FROM org_domain_grants WHERE id = $1`, grant.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := MigrateDownCore(ctx, db); err != nil {
+			t.Fatalf("clean migration 27 down: %v", err)
+		}
+	})
+}
 
 func TestMigration24DownRefusesDomainGrants(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
@@ -51,6 +81,241 @@ func TestMigration24DownRefusesDomainGrants(t *testing.T) {
 			t.Fatalf("clean migration 24 down: %v", err)
 		}
 	})
+}
+
+func TestGranteeAppRoleCanCreateInboxWithDomainGrant(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		adminStore := &Store{db: db, q: db}
+		ownerID, granteeID, domainID, _ := createDomainGrantFixture(t, ctx, adminStore, "app-role")
+		appStore := openDomainGrantAppStore(t, ctx, db)
+
+		var inbox InboxRecord
+		var cloudMode string
+		err := appStore.RunAsOrg(ctx, granteeID, func(scoped *Store) error {
+			var createErr error
+			inbox, createErr = scoped.CreateInboxForOrg(
+				ctx, granteeID, "app-role@abrolia.com", domainID, "resend",
+			)
+			if createErr != nil {
+				return createErr
+			}
+			return scoped.q.QueryRowContext(ctx, `SELECT current_setting('app.cloud_mode', true)`).Scan(&cloudMode)
+		})
+		if err != nil {
+			t.Fatalf("create grantee inbox as app role: %v", err)
+		}
+		if cloudMode != "true" {
+			t.Fatalf("trigger restored app.cloud_mode=%q, want true", cloudMode)
+		}
+		if err := appStore.RunAsOrg(ctx, granteeID, func(scoped *Store) error {
+			_, createErr := scoped.CreateInboxForOrg(
+				ctx, ownerID, "cross-org@abrolia.com", domainID, "resend",
+			)
+			return createErr
+		}); err == nil {
+			t.Fatal("security-definer trigger bypassed inbox tenant RLS")
+		}
+
+		var rows int
+		if err := db.QueryRowContext(ctx, `
+			SELECT count(*) FROM inboxes
+			WHERE id = $1 AND org_id = $2 AND org_domain_id = $3 AND status = 'active'
+		`, inbox.ID, granteeID, domainID).Scan(&rows); err != nil {
+			t.Fatal(err)
+		}
+		if rows != 1 {
+			t.Fatalf("created inbox rows=%d, want 1", rows)
+		}
+	})
+}
+
+func TestInboxCreationAndGrantRevocationSerialize(t *testing.T) {
+	t.Run("legacy revocation row lock rejects waiting inbox", func(t *testing.T) {
+		withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+			migrateToLatest(t, ctx, db)
+			adminStore := &Store{db: db, q: db}
+			_, granteeID, domainID, grant := createDomainGrantFixture(t, ctx, adminStore, "revoke-first")
+			appStore := openDomainGrantAppStore(t, ctx, db)
+			testCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+
+			tx, err := db.BeginTx(testCtx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			var lockedGrantID string
+			if err := tx.QueryRowContext(testCtx, `
+				SELECT id::text FROM org_domain_grants WHERE id = $1 AND status = 'active' FOR UPDATE
+			`, grant.ID).Scan(&lockedGrantID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.ExecContext(testCtx, `
+				UPDATE org_domain_grants SET status = 'revoked', revoked_at = now() WHERE id = $1
+			`, grant.ID); err != nil {
+				t.Fatal(err)
+			}
+
+			createResult := make(chan error, 1)
+			go func() {
+				createResult <- appStore.RunAsOrg(testCtx, granteeID, func(scoped *Store) error {
+					_, createErr := scoped.CreateInboxForOrg(
+						testCtx, granteeID, "revoke-first@abrolia.com", domainID, "resend",
+					)
+					return createErr
+				})
+			}()
+
+			select {
+			case err := <-createResult:
+				t.Fatalf("inbox creation did not wait for grant lock: %v", err)
+			case <-time.After(100 * time.Millisecond):
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-createResult; err == nil || !strings.Contains(err.Error(), "no active access to domain") {
+				t.Fatalf("inbox error=%v, want inactive-grant rejection", err)
+			}
+			var rows int
+			if err := db.QueryRowContext(testCtx, `SELECT count(*) FROM inboxes WHERE org_id = $1`, granteeID).Scan(&rows); err != nil {
+				t.Fatal(err)
+			}
+			if rows != 0 {
+				t.Fatalf("revoked grantee received %d inboxes", rows)
+			}
+		})
+	})
+
+	t.Run("committed inbox makes waiting revocation fail", func(t *testing.T) {
+		withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+			migrateToLatest(t, ctx, db)
+			adminStore := &Store{db: db, q: db}
+			ownerID, granteeID, domainID, grant := createDomainGrantFixture(t, ctx, adminStore, "inbox-first")
+			appStore := openDomainGrantAppStore(t, ctx, db)
+			testCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+
+			inserted := make(chan struct{})
+			release := make(chan struct{})
+			createResult := make(chan error, 1)
+			go func() {
+				createResult <- appStore.RunAsOrg(testCtx, granteeID, func(scoped *Store) error {
+					if _, err := scoped.CreateInboxForOrg(
+						testCtx, granteeID, "inbox-first@abrolia.com", domainID, "resend",
+					); err != nil {
+						return err
+					}
+					close(inserted)
+					select {
+					case <-release:
+						return nil
+					case <-testCtx.Done():
+						return testCtx.Err()
+					}
+				})
+			}()
+			select {
+			case <-inserted:
+			case <-testCtx.Done():
+				t.Fatal(testCtx.Err())
+			}
+
+			revokeResult := make(chan error, 1)
+			go func() {
+				revokeResult <- adminStore.RunAsOrg(testCtx, ownerID, func(scoped *Store) error {
+					_, revokeErr := scoped.RevokeOrgDomainGrant(testCtx, grant.ID)
+					return revokeErr
+				})
+			}()
+			select {
+			case err := <-revokeResult:
+				t.Fatalf("grant revocation did not wait for inbox lock: %v", err)
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			close(release)
+			if err := <-createResult; err != nil {
+				t.Fatalf("commit inbox: %v", err)
+			}
+			if err := <-revokeResult; !errors.Is(err, ErrResourceConflict) {
+				t.Fatalf("revocation error=%v, want resource conflict", err)
+			}
+			current, err := adminStore.GetOrgDomainGrantByExternalRef(testCtx, grant.ExternalRef)
+			if err != nil || current.Status != "active" {
+				t.Fatalf("grant after refused revoke=%+v err=%v", current, err)
+			}
+		})
+	})
+}
+
+func createDomainGrantFixture(t *testing.T, ctx context.Context, st *Store, suffix string) (string, string, string, OrgDomainGrant) {
+	t.Helper()
+	ownerID, err := st.CreateOrg(ctx, "domain-owner-"+suffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	granteeID, err := st.CreateOrg(ctx, "domain-grantee-"+suffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	domainID, err := st.CreateOrgDomain(ctx, ownerID, suffix+".abrolia.com", "verify", "selector", "private", "public", "cname")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateOrgDomainStatus(ctx, domainID, "active"); err != nil {
+		t.Fatal(err)
+	}
+	grant, _, err := st.EnsureOrgDomainGrant(ctx, ownerID, domainID, granteeID, "grant:"+suffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ownerID, granteeID, domainID, grant
+}
+
+func openDomainGrantAppStore(t *testing.T, ctx context.Context, db *sql.DB) *Store {
+	t.Helper()
+	roleName := "email_grant_rls_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(`CREATE ROLE %s LOGIN PASSWORD 'rls_email_grant'`, roleName)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO %s`, roleName)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT SELECT ON org_domains, org_domain_grants TO %s`, roleName)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE ON inboxes TO %s`, roleName)); err != nil {
+		t.Fatal(err)
+	}
+
+	var databaseName string
+	if err := db.QueryRowContext(ctx, `SELECT current_database()`).Scan(&databaseName); err != nil {
+		t.Fatal(err)
+	}
+	baseDSN := os.Getenv("NM_TEST_DB_DSN")
+	if baseDSN == "" {
+		baseDSN = "postgres://neuralmail@127.0.0.1:54320/neuralmail?sslmode=disable"
+	}
+	appDSN, err := dsnWithDatabase(baseDSN, databaseName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appDSN, err = dsnWithCredentials(appDSN, roleName, "rls_email_grant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	appDB, err := sql.Open("pgx", appDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = appDB.Close()
+		_, _ = db.ExecContext(context.Background(), fmt.Sprintf(`DROP OWNED BY %s`, roleName))
+		_, _ = db.ExecContext(context.Background(), fmt.Sprintf(`DROP ROLE IF EXISTS %s`, roleName))
+	})
+	return &Store{db: appDB, q: appDB}
 }
 
 func TestMigration24DownRefusesExternalReferences(t *testing.T) {
