@@ -433,6 +433,14 @@ func (s *Store) ClaimOutboxMessages(ctx context.Context, limit int, workerID str
 				OR
 				(status = 'sending' AND locked_at <= $4)
 			)
+			AND NOT EXISTS (
+				SELECT 1
+				FROM outbox_delivery_holds hold
+				WHERE hold.org_id = outbox_messages.org_id
+				  AND hold.idempotency_key = outbox_messages.idempotency_key
+				  AND hold.released_at IS NULL
+				  AND hold.expires_at > $1
+			)
 			ORDER BY next_attempt_at ASC
 			LIMIT $2
 			FOR UPDATE SKIP LOCKED

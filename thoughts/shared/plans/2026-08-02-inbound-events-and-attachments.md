@@ -1,5 +1,18 @@
 # Nerve: Inbound Event Fan-out + Attachments (Both Directions)
 
+> **Revision 15 (2026-08-05)** — Phase 8's production rollback proof uses a
+> dedicated, bounded and audited delivery hold instead of modifying queue
+> timestamps or global feature state. Core migration
+> `0028_outbox_delivery_holds.sql` records an exact `(org_id,
+> idempotency_key)` hold before the synthetic attachment message is enqueued.
+> Claims exclude only that row while its hold is active; expiry is mandatory
+> (1–30 minutes) and automatically restores delivery. Hold, idempotent retry,
+> and release operations write replay IDs to `audit_log`; durable history is
+> retained and makes the down migration refuse. Runtime schema compatibility
+> advances to `[28,28]`. The operator drill must release the row after the
+> attachment flag has converged off, prove external delivery, and restore the
+> org flag in a finally-style cleanup path.
+>
 > **Revision 14 (2026-08-05)** — the production household canary exposed a
 > PostgreSQL RLS interaction that the superuser-backed integration test could
 > not reproduce: a grantee can read its active domain grant, but
@@ -1265,7 +1278,10 @@ Flag-off is not a general rollback, and revision 4 implied it was.
 #### Manual:
 - [ ] Canary org exists with a verified receiving subdomain, and inbound mail to it routes to that org
 - [ ] Full cutover run: rehearse → baseline `0019` gate → 1a (`0020`) → 1b → exact-digest gate → 1c (`0023`) → tenancy (`0024`) → `0026` → grant-lock repair (`0027`) → runtime → control-plane → backfill → canary on → contract green → pilot on
-- [ ] Flags off mid-pilot leaves queued attachment sends deliverable (the worker stays attachment-aware regardless of the producer flag)
+- [ ] Flags off mid-pilot leaves queued attachment sends deliverable: create a
+  bounded `0028` hold for the exact synthetic idempotency key, enqueue one
+  attachment message, converge the org flag off, release only that hold,
+  prove the external attachment delivery, and restore the org flag.
 
 ---
 
@@ -1274,6 +1290,13 @@ Flag-off is not a general rollback, and revision 4 implied it was.
 - hermes-cloud pins updated to the landed SHAs (`hermes-cloud/docs/source-pins.md`).
 - Runtime cold-start verified gone (first MCP call < 2s after idle).
 - Follow-ups filed: drop the legacy `attachments` table after `0023` has been live 30 days; sweep the remaining `401`/`403` call sites; re-evaluate `[[vm]] memory` against observed attachment traffic; backport or formally re-assign the cloud-only store files.
+- Deterministic rollback proof is OSS-first: `0028` and store APIs create,
+  inspect, expire, and release one exact outbox hold; the cloud-only operator
+  command exposes those APIs without ad-hoc SQL. Its TTL is required and
+  bounded to 1–30 minutes, so an abandoned drill cannot become an outage.
+- The Phase 8 production drill is complete only when evidence contains the
+  hold/release replay IDs, the synthetic outbox/message identity, flag-off
+  convergence, successful external attachment delivery, and flag restoration.
 
 ---
 
@@ -1298,7 +1321,7 @@ Flag-off is not a general rollback, and revision 4 implied it was.
 - **`0021` disables non-HTTPS webhooks carrying `email.received`** — deliberate and reversible, because `events` was never validated. Run the preflight and record the result before merging.
 - **`0023` leaves the rollout default at `pending_backfill`** and classifies existing rows (outbound and no-`received_email_id` → `known`; recoverable inbound → `pending_backfill`; past retention → `unknown_metadata_expired`). The new writer sets `known` explicitly, so a row created by an old writer during cutover stays visible to backfill. The activation gate is **zero `pending_backfill` in total**.
 - **D7: nothing is deleted.** `sent` rows release blob *bytes* 90 days (configurable) after `terminal_at`; `failed` rows retain bytes until explicit abandon via `POST /v1/admin/outbox/{id}/abandon`. Rows, timelines, webhook deliveries, attachment metadata + digests and idempotency tombstones are retained; `chk_outbox_status` is untouched. Pre-existing terminal rows get `terminal_at = now()` for a full grace window.
-- **Down-migrations**: `0018` down keeps the corrected version-17 security guarantees; `0019` down removes only the stable-created-time index/column; `0021` down is clean only with no `org_event_id` rows and refuses otherwise. `0022`–`0026` down remove only the new additive feature schema, `0024` additionally refuses while tenancy reconciliation state exists, and `0027` refuses while any domain grant exists rather than restoring the RLS-incompatible trigger under active tenancy.
+- **Down-migrations**: `0018` down keeps the corrected version-17 security guarantees; `0019` down removes only the stable-created-time index/column; `0021` down is clean only with no `org_event_id` rows and refuses otherwise. `0022`–`0026` down remove only the new additive feature schema, `0024` additionally refuses while tenancy reconciliation state exists, `0027` refuses while any domain grant exists rather than restoring the RLS-incompatible trigger under active tenancy, and `0028` refuses while any delivery-hold history exists.
 - **The `0011`–`0017` backport is a no-op for databases already at version `17`**, but `0018` is their required forward repair. The full tree through `0018` must be byte-identical for `CORE_SCHEMA_HASH` to converge — which requires D9 first.
 - **Legacy `attachments`** gets deny-all RLS in `0023`; the drop is a dated follow-up.
 
