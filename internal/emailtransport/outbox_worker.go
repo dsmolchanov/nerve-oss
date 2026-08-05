@@ -219,6 +219,12 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 	// transient metadata/store/budget errors put the row back on the queue.
 	attachmentBytes, err := w.Store.OutboxMessageAttachmentBytes(ctx, msg.OrgID, msg.ID)
 	if err != nil {
+		if errors.Is(err, store.ErrAttachmentsReleased) {
+			w.incDeliver(msg.Provider, "permanent")
+			w.incDLQ(msg.Provider, "attachments_released")
+			_ = w.Store.MarkOutboxMessageFailed(ctx, msg.ID, err.Error())
+			return err
+		}
 		next := time.Now().UTC().Add(w.BaseBackoff)
 		_ = w.Store.RequeueOutboxMessage(ctx, msg.ID, next, fmt.Sprintf("load attachment metadata: %v", err))
 		return fmt.Errorf("load outbox attachment metadata: %w", err)

@@ -10,18 +10,29 @@ import (
 
 // OutboxMessageAttachmentBytes returns the metadata-declared bytes that will
 // be materialized for one delivery. Callers use it to reserve aggregate memory
-// before LoadOutboxMessageAttachments executes its SELECT of blob content.
+// before LoadOutboxMessageAttachments executes its SELECT of blob content. It
+// reports released digests first because they require no blob allocation and
+// must retain their operator-facing terminal reason regardless of the budget.
 func (s *Store) OutboxMessageAttachmentBytes(ctx context.Context, orgID, outboxMessageID string) (int64, error) {
 	if strings.TrimSpace(orgID) == "" || strings.TrimSpace(outboxMessageID) == "" {
 		return 0, errors.New("missing attachment org_id or outbox_message_id")
 	}
 	var size int64
+	var releasedDigests string
 	err := s.q.QueryRowContext(ctx, `
-		SELECT COALESCE(sum(size_bytes), 0)::bigint
+		SELECT COALESCE(sum(size_bytes), 0)::bigint,
+		       COALESCE(string_agg(DISTINCT sha256, ',' ORDER BY sha256)
+		         FILTER (WHERE blob_sha256 IS NULL), '')
 		FROM outbox_attachments
 		WHERE org_id = $1 AND outbox_message_id = $2
-	`, orgID, outboxMessageID).Scan(&size)
-	return size, err
+	`, orgID, outboxMessageID).Scan(&size, &releasedDigests)
+	if err != nil {
+		return 0, err
+	}
+	if releasedDigests != "" {
+		return size, fmt.Errorf("%w: digests=%s", ErrAttachmentsReleased, releasedDigests)
+	}
+	return size, nil
 }
 
 // LoadOutboxMessageAttachments materializes one outbox message's attachment
