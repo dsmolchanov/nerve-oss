@@ -415,6 +415,11 @@ func TestReleaseSentOutboxAttachmentsRetainsHistoryAndGarbageCollectsBytes(t *te
 		`, outboxID, now.Add(-91*24*time.Hour)); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := db.ExecContext(ctx, `
+			UPDATE attachment_blobs SET last_ref_at = $2 WHERE org_id = $1
+		`, orgID, now.Add(-100*24*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
 
 		released, err := st.ReleaseSentOutboxAttachments(ctx, now.Add(-90*24*time.Hour), 100)
 		if err != nil || released != 1 {
@@ -457,13 +462,26 @@ func TestReleaseSentOutboxAttachmentsRetainsHistoryAndGarbageCollectsBytes(t *te
 		if digest == "" || blobDigest.Valid {
 			t.Fatalf("metadata digest=%q blob=%v after release", digest, blobDigest)
 		}
+		var lastRefAt time.Time
+		if err := db.QueryRowContext(ctx, `
+			SELECT last_ref_at FROM attachment_blobs WHERE org_id = $1 AND sha256 = $2
+		`, orgID, digest).Scan(&lastRefAt); err != nil {
+			t.Fatal(err)
+		}
+		if lastRefAt.Before(now) {
+			t.Fatalf("last_ref_at=%s was not refreshed when the final outbox reference was released", lastRefAt)
+		}
+		deleted, bytesReleased, err := st.DeleteUnreferencedAttachmentBlobs(ctx, now.Add(-7*24*time.Hour), 100)
+		if err != nil || deleted != 0 || bytesReleased != 0 {
+			t.Fatalf("grace-period GC deleted=%d bytes=%d err=%v, want 0/0", deleted, bytesReleased, err)
+		}
 		if _, err := db.ExecContext(ctx, `
 			UPDATE attachment_blobs SET last_ref_at = $3
 			WHERE org_id = $1 AND sha256 = $2
 		`, orgID, digest, now.Add(-8*24*time.Hour)); err != nil {
 			t.Fatal(err)
 		}
-		deleted, bytesReleased, err := st.DeleteUnreferencedAttachmentBlobs(ctx, now.Add(-7*24*time.Hour), 100)
+		deleted, bytesReleased, err = st.DeleteUnreferencedAttachmentBlobs(ctx, now.Add(-7*24*time.Hour), 100)
 		if err != nil || deleted != 1 || bytesReleased != int64(len(message.Attachments[0].Content)) {
 			t.Fatalf("deleted=%d bytes=%d err=%v", deleted, bytesReleased, err)
 		}

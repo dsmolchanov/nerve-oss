@@ -7,6 +7,9 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/google/uuid"
 )
 
 func TestStoreAttachmentBlobConcurrentDifferentContentHonorsQuota(t *testing.T) {
@@ -266,6 +269,98 @@ func TestStoreAttachmentBlobRollsBackWithRunAsOrg(t *testing.T) {
 			t.Fatalf("RunAsOrg err=%v, want sentinel", err)
 		}
 		assertAttachmentUsage(t, ctx, db, orgID, 0, 0)
+	})
+}
+
+func TestBlobReuseSerializesWithGarbageCollectionUntilReferenceExists(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		orgID, err := st.CreateOrg(ctx, "blob-reuse-gc-race")
+		if err != nil {
+			t.Fatal(err)
+		}
+		inboxID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO inboxes (id, org_id, address, status)
+			VALUES ($1, $2, 'blob-reuse-gc@local.nerve.email', 'active')
+		`, inboxID, orgID); err != nil {
+			t.Fatal(err)
+		}
+		outboxID, err := st.EnqueueOutboxMessage(ctx, OutboxMessage{
+			OrgID: orgID, InboxID: inboxID, Provider: "smtp", IdempotencyKey: "blob-reuse-gc-parent",
+			To: "to@example.com", From: "from@example.com", Subject: "race", TextBody: "body",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		content := []byte("reuse while GC waits")
+		digest, inserted, err := st.StoreAttachmentBlob(ctx, orgID, "text/plain", content)
+		if err != nil || !inserted {
+			t.Fatalf("seed blob inserted=%t err=%v", inserted, err)
+		}
+		now := time.Now().UTC()
+		if _, err := db.ExecContext(ctx, `
+			UPDATE attachment_blobs SET last_ref_at = $3
+			WHERE org_id = $1 AND sha256 = $2
+		`, orgID, digest, now.Add(-8*24*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+
+		blobLocked := make(chan struct{})
+		allowReference := make(chan struct{})
+		reuseDone := make(chan error, 1)
+		go func() {
+			reuseDone <- st.RunAsOrg(ctx, orgID, func(scoped *Store) error {
+				reused, wasInserted, err := scoped.StoreAttachmentBlob(ctx, orgID, "text/plain", content)
+				if err != nil {
+					return err
+				}
+				if wasInserted || reused != digest {
+					return errors.New("existing blob was not reused")
+				}
+				close(blobLocked)
+				<-allowReference
+				_, err = scoped.q.ExecContext(ctx, `
+					INSERT INTO outbox_attachments
+					  (org_id, outbox_message_id, ordinal, filename, content_type, size_bytes, sha256, blob_sha256)
+					VALUES ($1, $2, 0, 'race.txt', 'text/plain', $3, $4, $4)
+				`, orgID, outboxID, len(content), digest)
+				return err
+			})
+		}()
+		<-blobLocked
+
+		gcDone := make(chan error, 1)
+		go func() {
+			deleted, _, err := st.DeleteUnreferencedAttachmentBlobs(ctx, now.Add(-7*24*time.Hour), 100)
+			if err == nil && deleted != 0 {
+				err = errors.New("GC deleted a blob being reused")
+			}
+			gcDone <- err
+		}()
+		select {
+		case err := <-gcDone:
+			t.Fatalf("GC completed before reuse transaction created its reference: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+		close(allowReference)
+		if err := <-reuseDone; err != nil {
+			t.Fatal(err)
+		}
+		if err := <-gcDone; err != nil {
+			t.Fatal(err)
+		}
+
+		var refCount int
+		if err := db.QueryRowContext(ctx, `
+			SELECT ref_count FROM attachment_blobs WHERE org_id = $1 AND sha256 = $2
+		`, orgID, digest).Scan(&refCount); err != nil {
+			t.Fatal(err)
+		}
+		if refCount != 1 {
+			t.Fatalf("ref_count=%d, want 1", refCount)
+		}
 	})
 }
 

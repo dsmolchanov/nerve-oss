@@ -8,21 +8,29 @@ import (
 )
 
 type Service struct {
-	Store *store.Store
-	Now   func() time.Time
+	Store                       *store.Store
+	Now                         func() time.Time
+	OutboundAttachmentRetention time.Duration
+	AttachmentGCGrace           time.Duration
 }
 
 type Report struct {
-	CountersRepaired      int
-	PeriodsRolled         int
-	OrgEventsFannedOut    int
-	AttachmentUsageSeeded int
+	CountersRepaired          int
+	PeriodsRolled             int
+	OrgEventsFannedOut        int
+	AttachmentUsageSeeded     int
+	AttachmentUsageRepaired   int
+	OutboxAttachmentsReleased int
+	AttachmentBlobsDeleted    int
+	AttachmentBytesReleased   int64
 }
 
 func NewService(st *store.Store) *Service {
 	return &Service{
-		Store: st,
-		Now:   func() time.Time { return time.Now().UTC() },
+		Store:                       st,
+		Now:                         func() time.Time { return time.Now().UTC() },
+		OutboundAttachmentRetention: 90 * 24 * time.Hour,
+		AttachmentGCGrace:           7 * 24 * time.Hour,
 	}
 }
 
@@ -50,6 +58,10 @@ func (s *Service) Run(ctx context.Context) (Report, error) {
 	}
 
 	now := s.Now()
+	coreVersion, err := store.CurrentVersionCore(ctx, s.Store.DB())
+	if err != nil {
+		return report, err
+	}
 	expired, err := s.Store.ListExpiredOrgEntitlements(ctx, now)
 	if err != nil {
 		return report, err
@@ -92,6 +104,46 @@ func (s *Service) Run(ctx context.Context) (Report, error) {
 		return report, err
 	}
 	report.AttachmentUsageSeeded = seeded
+
+	if coreVersion >= 25 {
+		retention := s.OutboundAttachmentRetention
+		if retention <= 0 {
+			retention = 90 * 24 * time.Hour
+		}
+		for {
+			released, err := s.Store.ReleaseSentOutboxAttachments(ctx, now.Add(-retention), 100)
+			if err != nil {
+				return report, err
+			}
+			report.OutboxAttachmentsReleased += released
+			if released == 0 {
+				break
+			}
+		}
+
+		gcGrace := s.AttachmentGCGrace
+		if gcGrace <= 0 {
+			gcGrace = 7 * 24 * time.Hour
+		}
+		for {
+			deleted, bytesReleased, err := s.Store.DeleteUnreferencedAttachmentBlobs(ctx, now.Add(-gcGrace), 100)
+			if err != nil {
+				return report, err
+			}
+			report.AttachmentBlobsDeleted += deleted
+			report.AttachmentBytesReleased += bytesReleased
+			if deleted == 0 {
+				break
+			}
+		}
+	}
+	if coreVersion >= 22 {
+		repaired, err := s.Store.ReconcileOrgAttachmentUsage(ctx)
+		if err != nil {
+			return report, err
+		}
+		report.AttachmentUsageRepaired = repaired
+	}
 
 	return report, nil
 }

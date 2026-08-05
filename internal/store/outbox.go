@@ -923,35 +923,77 @@ func (s *Store) ReleaseSentOutboxAttachments(ctx context.Context, terminalBefore
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	var released int
-	err := s.q.QueryRowContext(ctx, `
-		WITH picked AS (
-		  SELECT id, org_id
-		  FROM outbox_messages
-		  WHERE status = 'sent'
-		    AND terminal_at <= $1
-		    AND attachments_released_at IS NULL
-		  ORDER BY terminal_at, id
-		  LIMIT $2
-		  FOR UPDATE SKIP LOCKED
-		), released_refs AS (
-		  UPDATE outbox_attachments attachment
-		  SET blob_sha256 = NULL
-		  FROM picked
-		  WHERE attachment.org_id = picked.org_id
-		    AND attachment.outbox_message_id = picked.id
-		    AND attachment.blob_sha256 IS NOT NULL
-		  RETURNING attachment.id
-		), stamped AS (
-		  UPDATE outbox_messages message
-		  SET attachments_released_at = now()
-		  FROM picked
-		  WHERE message.org_id = picked.org_id
-		    AND message.id = picked.id
-		  RETURNING message.id
-		)
-		SELECT count(*) FROM stamped
-	`, terminalBefore, limit).Scan(&released)
+	released := 0
+	err := s.withTx(ctx, func(scoped *Store) error {
+		type candidate struct {
+			id    string
+			orgID string
+		}
+		rows, err := scoped.q.QueryContext(ctx, `
+			SELECT id, org_id
+			FROM outbox_messages
+			WHERE status = 'sent'
+			  AND terminal_at <= $1
+			  AND attachments_released_at IS NULL
+			ORDER BY terminal_at, id
+			LIMIT $2
+			FOR UPDATE SKIP LOCKED
+		`, terminalBefore, limit)
+		if err != nil {
+			return err
+		}
+		var candidates []candidate
+		for rows.Next() {
+			var item candidate
+			if err := rows.Scan(&item.id, &item.orgID); err != nil {
+				rows.Close()
+				return err
+			}
+			candidates = append(candidates, item)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		for _, item := range candidates {
+			if _, err := scoped.q.ExecContext(ctx, `
+				UPDATE attachment_blobs blob
+				SET last_ref_at = now()
+				WHERE blob.org_id = $1
+				  AND EXISTS (
+				    SELECT 1
+				    FROM outbox_attachments attachment
+				    WHERE attachment.org_id = blob.org_id
+				      AND attachment.outbox_message_id = $2
+				      AND attachment.sha256 = blob.sha256
+				      AND attachment.blob_sha256 IS NOT NULL
+				  )
+			`, item.orgID, item.id); err != nil {
+				return err
+			}
+			if _, err := scoped.q.ExecContext(ctx, `
+				UPDATE outbox_attachments
+				SET blob_sha256 = NULL
+				WHERE org_id = $1
+				  AND outbox_message_id = $2
+				  AND blob_sha256 IS NOT NULL
+			`, item.orgID, item.id); err != nil {
+				return err
+			}
+			if _, err := scoped.q.ExecContext(ctx, `
+				UPDATE outbox_messages
+				SET attachments_released_at = now()
+				WHERE org_id = $1 AND id = $2
+			`, item.orgID, item.id); err != nil {
+				return err
+			}
+		}
+		released = len(candidates)
+		return nil
+	})
 	return released, err
 }
 
@@ -978,6 +1020,21 @@ func (s *Store) AbandonOutboxMessage(ctx context.Context, orgID, id string) erro
 		}
 		if releasedAt.Valid {
 			return nil
+		}
+		if _, err := scoped.q.ExecContext(ctx, `
+			UPDATE attachment_blobs blob
+			SET last_ref_at = now()
+			WHERE blob.org_id = $1
+			  AND EXISTS (
+			    SELECT 1
+			    FROM outbox_attachments attachment
+			    WHERE attachment.org_id = blob.org_id
+			      AND attachment.outbox_message_id = $2
+			      AND attachment.sha256 = blob.sha256
+			      AND attachment.blob_sha256 IS NOT NULL
+			  )
+		`, orgID, id); err != nil {
+			return err
 		}
 		if _, err := scoped.q.ExecContext(ctx, `
 			UPDATE outbox_attachments
