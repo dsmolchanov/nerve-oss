@@ -1,5 +1,25 @@
 # Nerve: Inbound Event Fan-out + Attachments (Both Directions)
 
+> **Revision 24 (2026-08-05)** — the production household canary exposed a
+> PostgreSQL RLS interaction that the superuser-backed integration test could
+> not reproduce: a grantee can read its active domain grant, but
+> `SELECT ... FOR KEY SHARE` also requires the owner-only mutation policy and
+> therefore made normal API inbox creation fail closed. New forward migration
+> `core/0027_email_tenancy_grant_lock.sql` adds a transaction advisory lock
+> keyed by `(org_domain_id, grantee_org_id)` and retains `FOR KEY SHARE`
+> through a narrow `SECURITY DEFINER` trigger with schema-qualified `public.*`
+> relations, `pg_temp` explicitly last in its fixed `search_path`, a restored-
+> in-function RLS bypass, and explicit domain/grantee predicates. The
+> compatibility row lock is required because a migration-first rollout may
+> still overlap an old revoker that does not take the advisory lock.
+> `RevokeOrgDomainGrant` takes the advisory lock before its row lock and active-
+> inbox guard. RLS policies are not relaxed. A real non-superuser app-role
+> regression, a legacy-revoker overlap, and the new transaction ordering are
+> mandatory. Runtime and control-plane schema windows advance to `[27,27]`;
+> OSS publishes the immutable runtime before Cloud mirrors the migration and
+> runs rehearsal/apply through `0027`. Rollback refuses while any domain grant
+> exists.
+>
 > **Revision 13 (2026-08-04)** — Phase 2.1 org tombstoning now treats active
 > service tokens as durable tenant resources. `DeleteOrgIfEmpty` refuses while
 > an unexpired, unrevoked token exists, and `CreateServiceToken` takes the same
@@ -860,6 +880,10 @@ never transferred.
 - Grant revocation performs its active-inbox guard through a narrowly scoped
   RLS-bypass query so an owner cannot revoke access while grantee inboxes still
   exist merely because owner-scoped RLS hid them.
+- Inbox activation and new grant revocation serialize on the same transaction
+  advisory lock keyed by domain and grantee. The grantee-side trigger retains
+  a compatibility row lock for old revokers through a schema-qualified,
+  temp-safe definer function and narrow temporary RLS bypass.
 - Existing attachment metadata and durable byte sizes remain stable when an
   envelope or reconciliation replay omits fields it no longer owns.
 
@@ -871,6 +895,10 @@ signed inbound webhook per household. Repeating the same provisioning request
 returns existing resources and never re-emits an existing key secret. Runtime
 startup pins core `[24,24]`; the control plane pins core `[24,24]` and cloud
 `[8,8]` before production activation.
+
+Forward repair `core/0027` advances runtime and control-plane core windows to
+`[27,27]`; no Cloud-owned schema migration is required for this serialization
+fix.
 
 ### Success Criteria
 
@@ -884,6 +912,10 @@ startup pins core `[24,24]`; the control plane pins core `[24,24]` and cloud
   cannot read another grantee's inbox or tenant messages.
 - [x] Revocation is refused while an active grantee inbox exists, including
   when invoked from an owner-scoped RLS transaction.
+- [x] A real non-superuser app role can create a granted-domain inbox; a legacy
+  revoker holding only the grant row lock rejects the waiting inbox; a
+  committed inbox blocks the advisory-lock revoker; and caller `pg_temp` spoof
+  tables cannot bypass the real grant check.
 - [x] Grant creation racing org deletion waits for the same advisory lock and
   then fails closed rather than creating a grant for a deleted org.
 - [x] Down migration refuses durable tenancy/reconciliation state instead of
@@ -1165,8 +1197,8 @@ Two partial unique indexes because a plain `UNIQUE (org_id, flag)` does not cons
 ### 4. Cutover
 
 0. `rehearse` replays the `0018` repair, the `0019` stable-created-time
-   baseline, and the `0020`, `0023`, `0024`, and `0026`
-   feature targets plus a backfill dry-run against a restored production
+   baseline, and the current `0020`, `0023`, `0024`, `0025`, `0026`, and
+   `0027` targets plus a backfill dry-run against a restored production
    snapshot and must be green.
 1. `up --to 0019` applies the shared converged baseline. **Gate**: status
    reports current core version `19`, the three repaired tables have forced RLS,
@@ -1177,19 +1209,22 @@ Two partial unique indexes because a plain `UNIQUE (org_id, flag)` does not cons
 2. `up --to 0020` (1a expand).
 3. 1b dual-reader digest deploys; **gate**: every control-plane Machine reports exactly the expected 1b digest (or a digest on the explicit compatible allowlist).
 4. `up --to 0023` (1c).
-5. With producer flags still off, `up --to 0026` lands the additive tenancy,
-   `outbox_attachments` and feature-flag schema required by the new binaries.
-6. Runtime deploys at its digest, flags off; `tools/list` omits `attachments`.
-7. Control plane + reconcile Machine deploy at the multi-binary digest.
-8. `backfill` runs to zero.
-9. `nerve-flags` enables the **canary org**; convergence gate passes.
-10. Contract suite runs against the canary org — real inbound mail, real attachment download, real `compose_email` with a PDF to an external mailbox. Pilot org is still off throughout.
-11. On green, `nerve-flags` enables the **pilot org**; convergence gate passes; smoke.
-12. **The promoted wheel** publishes after the production smoke.
+5. With producer flags still off, `up --to 0024` lands additive email tenancy.
+6. `up --to 0025` lands additive `outbox_attachments`.
+7. `up --to 0026` lands the feature-flag schema required by the new binaries.
+8. `up --to 0027` lands the domain-grant RLS/locking forward repair while
+   retaining row-lock compatibility with any old revoker still draining.
+9. Runtime deploys at its digest, flags off; `tools/list` omits `attachments`.
+10. Control plane + reconcile Machine deploy at the multi-binary digest.
+11. `backfill` runs to zero.
+12. `nerve-flags` enables the **canary org**; convergence gate passes.
+13. Contract suite runs against the canary org — real inbound mail, real attachment download, real `compose_email` with a PDF to an external mailbox. Pilot org is still off throughout.
+14. On green, `nerve-flags` enables the **pilot org**; convergence gate passes; smoke.
+15. **The promoted wheel** publishes after the production smoke.
 
-Steps 9–11 are the substitute for a staging chain: the same code, the same
+Steps 12–14 are the substitute for a staging chain: the same code, the same
 Resend account, the same schema, exercised end to end before the org that
-matters is switched on. If step 10 fails, the canary org is switched off and
+matters is switched on. If step 13 fails, the canary org is switched off and
 the pilot org was never on.
 
 ### 5. Rollback is bounded, not "flag off"
@@ -1228,7 +1263,7 @@ Flag-off is not a general rollback, and revision 4 implied it was.
 
 #### Manual:
 - [ ] Canary org exists with a verified receiving subdomain, and inbound mail to it routes to that org
-- [ ] Full cutover run: rehearse → baseline `0019` gate → 1a (`0020`) → 1b → exact-digest gate → 1c (`0023`) → tenancy (`0024`) → `0026` → runtime → control-plane → backfill → canary on → contract green → pilot on
+- [ ] Full cutover run: rehearse → baseline `0019` gate → 1a (`0020`) → 1b → exact-digest gate → 1c (`0023`) → tenancy (`0024`) → `0025` → `0026` → grant-lock repair (`0027`) → runtime → control-plane → backfill → canary on → contract green → pilot on
 - [ ] Flags off mid-pilot leaves queued attachment sends deliverable (the worker stays attachment-aware regardless of the producer flag)
 
 ---
@@ -1262,7 +1297,7 @@ Flag-off is not a general rollback, and revision 4 implied it was.
 - **`0021` disables non-HTTPS webhooks carrying `email.received`** — deliberate and reversible, because `events` was never validated. Run the preflight and record the result before merging.
 - **`0023` leaves the rollout default at `pending_backfill`** and classifies existing rows (outbound and no-`received_email_id` → `known`; recoverable inbound → `pending_backfill`; past retention → `unknown_metadata_expired`). The new writer sets `known` explicitly, so a row created by an old writer during cutover stays visible to backfill. The activation gate is **zero `pending_backfill` in total**.
 - **D7: nothing is deleted.** `sent` rows release blob *bytes* 90 days (configurable) after `terminal_at`; `failed` rows retain bytes until explicit abandon via `POST /v1/admin/outbox/{id}/abandon`. Rows, timelines, webhook deliveries, attachment metadata + digests and idempotency tombstones are retained; `chk_outbox_status` is untouched. Pre-existing terminal rows get `terminal_at = now()` for a full grace window.
-- **Down-migrations**: `0018` down keeps the corrected version-17 security guarantees; `0019` down removes only the stable-created-time index/column; `0021` down is clean only with no `org_event_id` rows and refuses otherwise. `0022`–`0026` down remove only the new additive feature schema, and `0024` additionally refuses while tenancy reconciliation state exists.
+- **Down-migrations**: `0018` down keeps the corrected version-17 security guarantees; `0019` down removes only the stable-created-time index/column; `0021` down is clean only with no `org_event_id` rows and refuses otherwise. `0022`–`0026` down remove only the new additive feature schema, `0024` additionally refuses while tenancy reconciliation state exists, and `0027` refuses while any domain grant exists rather than restoring the RLS-incompatible trigger under active tenancy.
 - **The `0011`–`0017` backport is a no-op for databases already at version `17`**, but `0018` is their required forward repair. The full tree through `0018` must be byte-identical for `CORE_SCHEMA_HASH` to converge — which requires D9 first.
 - **Legacy `attachments`** gets deny-all RLS in `0023`; the drop is a dated follow-up.
 
