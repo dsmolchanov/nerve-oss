@@ -1,7 +1,7 @@
 -- +goose Up
 
 -- +goose StatementBegin
-CREATE OR REPLACE FUNCTION enforce_inbox_domain_access() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION public.enforce_inbox_domain_access() RETURNS trigger AS $$
 DECLARE
   cloud_mode text;
   grant_active boolean;
@@ -12,7 +12,7 @@ BEGIN
   IF NEW.org_domain_id IS NULL THEN
     RETURN NEW;
   END IF;
-  PERFORM 1 FROM org_domains d
+  PERFORM 1 FROM public.org_domains d
   WHERE d.id = NEW.org_domain_id
     AND d.status = 'active'
     AND d.org_id = NEW.org_id;
@@ -37,8 +37,8 @@ BEGIN
     PERFORM set_config('app.cloud_mode', 'false', true);
   END IF;
   PERFORM 1
-  FROM org_domain_grants g
-  JOIN org_domains d ON d.id = g.org_domain_id
+  FROM public.org_domain_grants g
+  JOIN public.org_domains d ON d.id = g.org_domain_id
   WHERE d.id = NEW.org_domain_id
     AND d.status = 'active'
     AND g.grantee_org_id = NEW.org_id
@@ -56,7 +56,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 -- +goose StatementEnd
 
 -- +goose Down
@@ -64,14 +64,14 @@ SET search_path = pg_catalog, public;
 -- +goose StatementBegin
 DO $$
 BEGIN
-  IF EXISTS (SELECT 1 FROM org_domain_grants) THEN
+  IF EXISTS (SELECT 1 FROM public.org_domain_grants) THEN
     RAISE EXCEPTION 'cannot roll back core migration 0027: domain grants exist';
   END IF;
 END $$;
 -- +goose StatementEnd
 
 -- +goose StatementBegin
-CREATE OR REPLACE FUNCTION enforce_inbox_domain_access() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION public.enforce_inbox_domain_access() RETURNS trigger AS $$
 BEGIN
   IF NEW.status <> 'active' THEN
     RETURN NEW;
@@ -79,7 +79,7 @@ BEGIN
   IF NEW.org_domain_id IS NULL THEN
     RETURN NEW;
   END IF;
-  PERFORM 1 FROM org_domains d
+  PERFORM 1 FROM public.org_domains d
   WHERE d.id = NEW.org_domain_id
     AND d.status = 'active'
     AND d.org_id = NEW.org_id;
@@ -88,8 +88,8 @@ BEGIN
   END IF;
 
   PERFORM 1
-  FROM org_domain_grants g
-  JOIN org_domains d ON d.id = g.org_domain_id
+  FROM public.org_domain_grants g
+  JOIN public.org_domains d ON d.id = g.org_domain_id
   WHERE d.id = NEW.org_domain_id
     AND d.status = 'active'
     AND g.grantee_org_id = NEW.org_id

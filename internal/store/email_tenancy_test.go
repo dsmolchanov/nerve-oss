@@ -669,6 +669,44 @@ func TestGranteeAppRoleCanCreateInboxWithDomainGrant(t *testing.T) {
 		if cloudMode != "true" {
 			t.Fatalf("trigger restored app.cloud_mode=%q, want true", cloudMode)
 		}
+		ungrantedID, err := adminStore.CreateOrg(ctx, "domain-ungranted-app-role")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := appStore.RunAsOrg(ctx, ungrantedID, func(scoped *Store) error {
+			if _, createErr := scoped.q.ExecContext(ctx, `
+				CREATE TEMP TABLE org_domains (
+					id uuid, org_id uuid, status text
+				) ON COMMIT DROP
+			`); createErr != nil {
+				return createErr
+			}
+			if _, createErr := scoped.q.ExecContext(ctx, `
+				CREATE TEMP TABLE org_domain_grants (
+					org_domain_id uuid, grantee_org_id uuid, status text
+				) ON COMMIT DROP
+			`); createErr != nil {
+				return createErr
+			}
+			if _, createErr := scoped.q.ExecContext(ctx, `
+				INSERT INTO pg_temp.org_domains (id, org_id, status)
+				VALUES ($1, $2, 'active')
+			`, domainID, ownerID); createErr != nil {
+				return createErr
+			}
+			if _, createErr := scoped.q.ExecContext(ctx, `
+				INSERT INTO pg_temp.org_domain_grants (org_domain_id, grantee_org_id, status)
+				VALUES ($1, $2, 'active')
+			`, domainID, ungrantedID); createErr != nil {
+				return createErr
+			}
+			_, createErr := scoped.CreateInboxForOrg(
+				ctx, ungrantedID, "temp-spoof@abrolia.com", domainID, "resend",
+			)
+			return createErr
+		}); err == nil {
+			t.Fatal("security-definer trigger trusted caller pg_temp grant tables")
+		}
 		if err := appStore.RunAsOrg(ctx, granteeID, func(scoped *Store) error {
 			_, createErr := scoped.CreateInboxForOrg(
 				ctx, ownerID, "cross-org@abrolia.com", domainID, "resend",

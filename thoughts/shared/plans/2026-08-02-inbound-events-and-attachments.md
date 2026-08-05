@@ -7,8 +7,9 @@
 > therefore made normal API inbox creation fail closed. New forward migration
 > `core/0027_email_tenancy_grant_lock.sql` adds a transaction advisory lock
 > keyed by `(org_domain_id, grantee_org_id)` and retains `FOR KEY SHARE`
-> through a narrow `SECURITY DEFINER` trigger with a fixed `search_path`, a
-> restored-in-function RLS bypass, and explicit domain/grantee predicates. The
+> through a narrow `SECURITY DEFINER` trigger with schema-qualified `public.*`
+> relations, `pg_temp` explicitly last in its fixed `search_path`, a restored-
+> in-function RLS bypass, and explicit domain/grantee predicates. The
 > compatibility row lock is required because a migration-first rollout may
 > still overlap an old revoker that does not take the advisory lock.
 > `RevokeOrgDomainGrant` takes the advisory lock before its row lock and
@@ -880,9 +881,10 @@ never transferred.
   exist merely because owner-scoped RLS hid them.
 - Inbox activation and new grant revocation serialize on the same transaction
   advisory lock keyed by domain and grantee. The grantee-side trigger retains
-  a compatibility row lock for old revokers through a fixed-search-path
-  definer function and narrow temporary RLS bypass, captures the result, and
-  restores `app.cloud_mode` before inbox RLS evaluates the pending row.
+  a compatibility row lock for old revokers through a schema-qualified,
+  temp-safe definer function and narrow temporary RLS bypass, captures the
+  result, and restores `app.cloud_mode` before inbox RLS evaluates the pending
+  row.
 - Existing attachment metadata and durable byte sizes remain stable when an
   envelope or reconciliation replay omits fields it no longer owns.
 
@@ -914,7 +916,8 @@ required for this trigger/store serialization fix.
 - [x] A real non-superuser app role can create a granted-domain inbox; a
   legacy revoker holding only the grant row lock rejects the waiting inbox;
   a committed inbox blocks the new advisory-lock revoker; the trigger restores
-  tenant GUC state and does not bypass cross-tenant inbox RLS.
+  tenant GUC state, rejects caller `pg_temp` spoof tables, and does not bypass
+  cross-tenant inbox RLS.
 - [x] Grant creation racing org deletion waits for the same advisory lock and
   then fails closed rather than creating a grant for a deleted org.
 - [x] Down migration refuses durable tenancy/reconciliation state instead of
