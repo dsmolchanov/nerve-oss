@@ -1222,7 +1222,7 @@ Two partial unique indexes because a plain `UNIQUE (org_id, flag)` does not cons
 
 Steps 10–12 are the substitute for a staging chain: the same code, the same
 Resend account, the same schema, exercised end to end before the org that
-matters is switched on. If step 10 fails, the canary org is switched off and
+matters is switched on. If step 11 fails, the canary org is switched off and
 the pilot org was never on.
 
 ### 5. Rollback is bounded, not "flag off"
