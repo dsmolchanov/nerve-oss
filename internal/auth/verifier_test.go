@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/rsa"
 	"database/sql"
 	"errors"
 	"net/http"
@@ -54,8 +55,110 @@ func TestAuthenticateRequestJWT(t *testing.T) {
 	if principal.AuthMethod != "jwt" {
 		t.Fatalf("expected jwt auth method, got %s", principal.AuthMethod)
 	}
+	if principal.Kind != PrincipalLegacyJWT {
+		t.Fatalf("expected legacy principal kind, got %q", principal.Kind)
+	}
 	if len(principal.Scopes) != 2 {
 		t.Fatalf("expected 2 scopes, got %d", len(principal.Scopes))
+	}
+}
+
+func TestAuthenticateRequestM2MPrincipalKinds(t *testing.T) {
+	privateKey := mustRSAKey(t)
+	keys, err := ParseRSAPublicJWKS(mustJWKS(t, "access-key-1", &privateKey.PublicKey, "PS256"))
+	if err != nil {
+		t.Fatalf("parse access-token JWKS: %v", err)
+	}
+	svc := &Service{M2M: &M2MTokenVerifier{
+		Issuer: "https://auth.nerve.email", Audience: "https://api.nerve.email/mcp",
+		Keys: keys, Now: func() time.Time { return time.Unix(1000, 0) },
+	}}
+
+	tests := []struct {
+		name   string
+		kind   PrincipalKind
+		orgID  string
+		scopes string
+	}{
+		{name: "onboarding", kind: PrincipalM2MOnboarding, scopes: "nerve:onboarding"},
+		{name: "organization", kind: PrincipalM2MOrg, orgID: "org-1", scopes: "nerve:email.read"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			token := signedM2MJWT(t, privateKey, "access-key-1", jwt.SigningMethodPS256, jwt.MapClaims{
+				"iss": "https://auth.nerve.email", "aud": "https://api.nerve.email/mcp",
+				"exp": 1100, "nbf": 900, "iat": 1000, "jti": "token-1",
+				"sub": "client-1", "client_id": "client-1", "generation": 2,
+				"token_kind": string(test.kind), "org_id": test.orgID, "scope": test.scopes,
+			})
+			req, reqErr := http.NewRequest(http.MethodPost, "/mcp", nil)
+			if reqErr != nil {
+				t.Fatalf("create request: %v", reqErr)
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+			principal, authErr := svc.AuthenticateRequest(req)
+			if authErr != nil {
+				t.Fatalf("authenticate M2M request: %v", authErr)
+			}
+			if principal.Kind != test.kind || principal.ClientID != "client-1" || principal.Generation != 2 || principal.OrgID != test.orgID {
+				t.Fatalf("unexpected M2M principal: %+v", principal)
+			}
+		})
+	}
+}
+
+func TestAuthenticateRequestM2MRejectsAlgorithmAndClaimConfusion(t *testing.T) {
+	privateKey := mustRSAKey(t)
+	keys, err := ParseRSAPublicJWKS(mustJWKS(t, "access-key-1", &privateKey.PublicKey, "PS256"))
+	if err != nil {
+		t.Fatalf("parse access-token JWKS: %v", err)
+	}
+	svc := &Service{M2M: &M2MTokenVerifier{
+		Issuer: "https://auth.nerve.email", Audience: "https://api.nerve.email/mcp",
+		Keys: keys, Now: func() time.Time { return time.Unix(1000, 0) },
+	}}
+	base := jwt.MapClaims{
+		"iss": "https://auth.nerve.email", "aud": "https://api.nerve.email/mcp",
+		"exp": 1100, "nbf": 900, "jti": "token-1", "sub": "client-1",
+		"client_id": "client-1", "generation": 1, "token_kind": "m2m_onboarding",
+		"scope": "nerve:onboarding",
+	}
+	tests := map[string]struct {
+		method jwt.SigningMethod
+		kid    string
+		mutate func(jwt.MapClaims)
+	}{
+		"RS256 access token": {method: jwt.SigningMethodRS256, kid: "access-key-1"},
+		"unknown kid":        {method: jwt.SigningMethodPS256, kid: "unknown"},
+		"onboarding org": {method: jwt.SigningMethodPS256, kid: "access-key-1", mutate: func(claims jwt.MapClaims) {
+			claims["org_id"] = "org-1"
+		}},
+		"org without org": {method: jwt.SigningMethodPS256, kid: "access-key-1", mutate: func(claims jwt.MapClaims) {
+			claims["token_kind"] = "m2m_org"
+		}},
+		"subject mismatch": {method: jwt.SigningMethodPS256, kid: "access-key-1", mutate: func(claims jwt.MapClaims) {
+			claims["sub"] = "another-client"
+		}},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			claims := jwt.MapClaims{}
+			for key, value := range base {
+				claims[key] = value
+			}
+			if test.mutate != nil {
+				test.mutate(claims)
+			}
+			token := signedM2MJWT(t, privateKey, test.kid, test.method, claims)
+			req, reqErr := http.NewRequest(http.MethodPost, "/mcp", nil)
+			if reqErr != nil {
+				t.Fatalf("create request: %v", reqErr)
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+			if _, authErr := svc.AuthenticateRequest(req); !errors.Is(authErr, ErrUnauthenticated) {
+				t.Fatalf("expected fail-closed rejection, got %v", authErr)
+			}
+		})
 	}
 }
 
@@ -220,6 +323,17 @@ func signedJWT(t *testing.T, claims jwt.MapClaims) string {
 	signed, err := tok.SignedString([]byte(testSigningKey))
 	if err != nil {
 		t.Fatalf("sign jwt: %v", err)
+	}
+	return signed
+}
+
+func signedM2MJWT(t *testing.T, key *rsa.PrivateKey, kid string, method jwt.SigningMethod, claims jwt.MapClaims) string {
+	t.Helper()
+	token := jwt.NewWithClaims(method, claims)
+	token.Header["kid"] = kid
+	signed, err := token.SignedString(key)
+	if err != nil {
+		t.Fatalf("sign M2M JWT: %v", err)
 	}
 	return signed
 }

@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,6 +36,15 @@ type Service struct {
 	Now                func() time.Time
 	LookupCloudKey     CloudKeyLookupFunc
 	LookupServiceToken ServiceTokenLookupFunc
+	M2M                *M2MTokenVerifier
+}
+
+type M2MTokenVerifier struct {
+	Issuer   string
+	Audience string
+	Keys     *RSAPublicKeySet
+	Now      func() time.Time
+	Skew     time.Duration
 }
 
 func NewService(cfg config.Config, st *store.Store) *Service {
@@ -52,12 +63,34 @@ func NewService(cfg config.Config, st *store.Store) *Service {
 func (s *Service) AuthenticateRequest(r *http.Request) (Principal, error) {
 	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
 	if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
-		return s.VerifyJWT(r.Context(), authHeader)
+		return s.verifyBearer(r.Context(), authHeader)
 	}
 	if key := strings.TrimSpace(r.Header.Get("X-Nerve-Cloud-Key")); key != "" {
 		return s.VerifyCloudAPIKey(r.Context(), key)
 	}
 	return Principal{}, ErrUnauthorized
+}
+
+func (s *Service) verifyBearer(ctx context.Context, authHeader string) (Principal, error) {
+	headerParts := strings.Fields(authHeader)
+	if len(headerParts) != 2 || !strings.EqualFold(headerParts[0], "Bearer") {
+		return Principal{}, ErrUnauthenticated
+	}
+	unverified, _, err := jwt.NewParser().ParseUnverified(headerParts[1], jwt.MapClaims{})
+	if err != nil {
+		return Principal{}, ErrUnauthenticated
+	}
+	switch unverified.Method.Alg() {
+	case jwt.SigningMethodHS256.Alg():
+		return s.VerifyJWT(ctx, authHeader)
+	case jwt.SigningMethodPS256.Alg():
+		if s.M2M == nil {
+			return Principal{}, ErrUnauthenticated
+		}
+		return s.M2M.Verify(ctx, headerParts[1])
+	default:
+		return Principal{}, ErrUnauthenticated
+	}
 }
 
 func (s *Service) VerifyJWT(ctx context.Context, authHeader string) (Principal, error) {
@@ -114,6 +147,7 @@ func (s *Service) VerifyJWT(ctx context.Context, authHeader string) (Principal, 
 		ActorID:    claimString(claims["sub"]),
 		TokenID:    tokenID,
 		Scopes:     extractScopes(claims["scope"]),
+		Kind:       PrincipalLegacyJWT,
 		AuthMethod: "jwt",
 	}, nil
 }
@@ -138,6 +172,7 @@ func (s *Service) resolveServiceTokenPrincipal(ctx context.Context, tokenID stri
 		ActorID:    token.Actor,
 		TokenID:    token.ID,
 		Scopes:     token.Scopes,
+		Kind:       PrincipalLegacyJWT,
 		AuthMethod: "jwt",
 	}, true, nil
 }
@@ -162,8 +197,98 @@ func (s *Service) VerifyCloudAPIKey(ctx context.Context, key string) (Principal,
 		ActorID:    "cloud_api_key:" + record.ID,
 		TokenID:    record.ID,
 		Scopes:     record.Scopes,
+		Kind:       PrincipalCloudAPIKey,
 		AuthMethod: "cloud_api_key",
 	}, nil
+}
+
+func (v *M2MTokenVerifier) Verify(_ context.Context, rawToken string) (Principal, error) {
+	if v == nil || v.Keys == nil || strings.TrimSpace(v.Issuer) == "" || strings.TrimSpace(v.Audience) == "" {
+		return Principal{}, ErrUnauthenticated
+	}
+	now := v.Now
+	if now == nil {
+		now = func() time.Time { return time.Now().UTC() }
+	}
+	skew := v.Skew
+	if skew == 0 {
+		skew = 30 * time.Second
+	}
+	if skew < 0 || skew > time.Minute {
+		return Principal{}, ErrUnauthenticated
+	}
+	parsed, err := jwt.Parse(rawToken, func(token *jwt.Token) (any, error) {
+		if token.Method != jwt.SigningMethodPS256 {
+			return nil, ErrUnauthenticated
+		}
+		kid, ok := token.Header["kid"].(string)
+		if !ok || kid == "" {
+			return nil, ErrUnauthenticated
+		}
+		key, found := v.Keys.Lookup(kid)
+		if !found {
+			return nil, ErrUnauthenticated
+		}
+		return key, nil
+	}, jwt.WithValidMethods([]string{"PS256"}), jwt.WithIssuer(v.Issuer), jwt.WithAudience(v.Audience), jwt.WithTimeFunc(now), jwt.WithLeeway(skew))
+	if err != nil || !parsed.Valid {
+		return Principal{}, ErrUnauthenticated
+	}
+	claims, ok := parsed.Claims.(jwt.MapClaims)
+	if !ok {
+		return Principal{}, ErrUnauthenticated
+	}
+	clientID := claimString(claims["client_id"])
+	if clientID == "" || clientID != claimString(claims["sub"]) {
+		return Principal{}, ErrUnauthenticated
+	}
+	generation, ok := claimPositiveInt64(claims["generation"])
+	if !ok {
+		return Principal{}, ErrUnauthenticated
+	}
+	principal := Principal{
+		OrgID:      claimString(claims["org_id"]),
+		ActorID:    clientID,
+		TokenID:    claimString(claims["jti"]),
+		ClientID:   clientID,
+		Generation: generation,
+		Scopes:     extractScopes(claims["scope"]),
+		AuthMethod: "m2m_bearer",
+	}
+	if principal.TokenID == "" || len(principal.Scopes) == 0 {
+		return Principal{}, ErrUnauthenticated
+	}
+	switch claimString(claims["token_kind"]) {
+	case string(PrincipalM2MOnboarding):
+		if principal.OrgID != "" {
+			return Principal{}, ErrUnauthenticated
+		}
+		principal.Kind = PrincipalM2MOnboarding
+	case string(PrincipalM2MOrg):
+		if principal.OrgID == "" {
+			return Principal{}, ErrUnauthenticated
+		}
+		principal.Kind = PrincipalM2MOrg
+	default:
+		return Principal{}, ErrUnauthenticated
+	}
+	return principal, nil
+}
+
+func claimPositiveInt64(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		integer := int64(typed)
+		return integer, typed == float64(integer) && integer > 0
+	case json.Number:
+		integer, err := typed.Int64()
+		return integer, err == nil && integer > 0
+	case string:
+		integer, err := strconv.ParseInt(typed, 10, 64)
+		return integer, err == nil && integer > 0 && strconv.FormatInt(integer, 10) == typed
+	default:
+		return 0, false
+	}
 }
 
 func (s *Service) ValidateScopes(principal Principal, requiredScope string) error {
