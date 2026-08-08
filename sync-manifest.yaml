@@ -52,6 +52,7 @@
     "internal/webhooks/",
     "internal/httpsafe/",
     "internal/memguard/",
+    "internal/auth/",
     "docs/MCP_Contract.md"
   ],
   "patch-synced": [
