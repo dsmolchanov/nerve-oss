@@ -119,7 +119,7 @@ func TestAuthenticateRequestM2MRejectsAlgorithmAndClaimConfusion(t *testing.T) {
 	}}
 	base := jwt.MapClaims{
 		"iss": "https://auth.nerve.email", "aud": "https://api.nerve.email/mcp",
-		"exp": 1100, "nbf": 900, "jti": "token-1", "sub": "client-1",
+		"exp": 1100, "nbf": 900, "iat": 1000, "jti": "token-1", "sub": "client-1",
 		"client_id": "client-1", "generation": 1, "token_kind": "m2m_onboarding",
 		"scope": "nerve:onboarding",
 	}
