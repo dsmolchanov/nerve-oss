@@ -230,12 +230,18 @@ func (v *M2MTokenVerifier) Verify(_ context.Context, rawToken string) (Principal
 			return nil, ErrUnauthenticated
 		}
 		return key, nil
-	}, jwt.WithValidMethods([]string{"PS256"}), jwt.WithIssuer(v.Issuer), jwt.WithAudience(v.Audience), jwt.WithTimeFunc(now), jwt.WithLeeway(skew))
+	}, jwt.WithValidMethods([]string{"PS256"}), jwt.WithIssuer(v.Issuer), jwt.WithAudience(v.Audience), jwt.WithTimeFunc(now), jwt.WithLeeway(skew), jwt.WithExpirationRequired(), jwt.WithIssuedAt())
 	if err != nil || !parsed.Valid {
 		return Principal{}, ErrUnauthenticated
 	}
 	claims, ok := parsed.Claims.(jwt.MapClaims)
 	if !ok {
+		return Principal{}, ErrUnauthenticated
+	}
+	expiresAt, expErr := claims.GetExpirationTime()
+	issuedAt, iatErr := claims.GetIssuedAt()
+	notBefore, nbfErr := claims.GetNotBefore()
+	if expErr != nil || iatErr != nil || nbfErr != nil || expiresAt == nil || issuedAt == nil || notBefore == nil {
 		return Principal{}, ErrUnauthenticated
 	}
 	clientID := claimString(claims["client_id"])

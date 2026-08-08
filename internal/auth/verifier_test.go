@@ -139,6 +139,15 @@ func TestAuthenticateRequestM2MRejectsAlgorithmAndClaimConfusion(t *testing.T) {
 		"subject mismatch": {method: jwt.SigningMethodPS256, kid: "access-key-1", mutate: func(claims jwt.MapClaims) {
 			claims["sub"] = "another-client"
 		}},
+		"missing expiration": {method: jwt.SigningMethodPS256, kid: "access-key-1", mutate: func(claims jwt.MapClaims) {
+			delete(claims, "exp")
+		}},
+		"missing issued at": {method: jwt.SigningMethodPS256, kid: "access-key-1", mutate: func(claims jwt.MapClaims) {
+			delete(claims, "iat")
+		}},
+		"missing not before": {method: jwt.SigningMethodPS256, kid: "access-key-1", mutate: func(claims jwt.MapClaims) {
+			delete(claims, "nbf")
+		}},
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
