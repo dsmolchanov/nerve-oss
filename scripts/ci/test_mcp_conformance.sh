@@ -92,8 +92,27 @@ python3 - "$repo_root/scripts/ci/fixtures" <<'PY'
 import json
 import pathlib
 import sys
+import urllib.parse
 
 fixtures = pathlib.Path(sys.argv[1])
+
+CANONICAL_SCOPES = [
+    "nerve:onboarding",
+    "nerve:email.read",
+    "nerve:email.search",
+    "nerve:email.draft",
+    "nerve:email.reply",
+    "nerve:email.compose",
+    "nerve:billing.subscribe",
+]
+
+def require_https_url(document, member):
+    value = document.get(member)
+    if not isinstance(value, str):
+        raise ValueError(f"metadata must contain string {member}")
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError(f"metadata {member} must be an absolute HTTPS URL")
 
 def validate_nerve_errata_7793_profile(document):
     # RFC 8414's published text requires response_types_supported, but a
@@ -105,10 +124,16 @@ def validate_nerve_errata_7793_profile(document):
         raise ValueError("client-credentials metadata must omit authorization_endpoint")
     if "response_types_supported" in document:
         raise ValueError("client-credentials metadata must omit response_types_supported")
+    require_https_url(document, "issuer")
+    require_https_url(document, "token_endpoint")
     if document.get("grant_types_supported") != ["client_credentials"]:
         raise ValueError("metadata must advertise only client_credentials")
     if document.get("token_endpoint_auth_methods_supported") != ["private_key_jwt"]:
         raise ValueError("metadata must advertise private_key_jwt")
+    if document.get("token_endpoint_auth_signing_alg_values_supported") != ["PS256", "RS256"]:
+        raise ValueError("metadata must advertise PS256 and RS256 signing algorithms")
+    if document.get("scopes_supported") != CANONICAL_SCOPES:
+        raise ValueError("metadata must advertise the canonical autonomous-agent scopes")
 
 golden = json.loads((fixtures / "oauth-as-metadata-client-credentials.json").read_text())
 validate_nerve_errata_7793_profile(golden)
