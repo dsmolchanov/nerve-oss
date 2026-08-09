@@ -30,6 +30,16 @@ candidate publication, or runtime deployment.
    RFC 8414 client-credentials-only metadata fixtures.
 6. Run the proof in OSS CI.
 
+The metadata fixture deliberately follows the product decision already
+approved in the Cloud canonical plan: RFC 8414's published text requires a
+nonempty `response_types_supported`, but a client-credentials-only server has
+no truthful authorization response type. Reported Errata 7793 proposes
+omission for this case. Nerve therefore omits the member, rejects an empty
+array and the fabricated `client_credentials` value, and treats
+acceptance by the pinned executable SDK consumer as the compatibility gate.
+This OSS script pins the fixture invariants; it does not claim that the
+omission passes the uncorrected RFC 8414 document schema.
+
 ## Verification
 
 - `go test ./internal/release -count=1`

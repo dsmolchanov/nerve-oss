@@ -95,7 +95,12 @@ import sys
 
 fixtures = pathlib.Path(sys.argv[1])
 
-def validate_client_credentials_profile(document):
+def validate_nerve_errata_7793_profile(document):
+    # RFC 8414's published text requires response_types_supported, but a
+    # client-credentials-only AS has no truthful response type to advertise.
+    # The approved Nerve contract follows reported Errata 7793: omit the
+    # member, reject both an empty array and fabricated response types, and
+    # prove consumer compatibility in the Cloud SDK gate.
     if "authorization_endpoint" in document:
         raise ValueError("client-credentials metadata must omit authorization_endpoint")
     if "response_types_supported" in document:
@@ -106,14 +111,14 @@ def validate_client_credentials_profile(document):
         raise ValueError("metadata must advertise private_key_jwt")
 
 golden = json.loads((fixtures / "oauth-as-metadata-client-credentials.json").read_text())
-validate_client_credentials_profile(golden)
+validate_nerve_errata_7793_profile(golden)
 for filename in (
     "oauth-as-metadata-invalid-empty-response-types.json",
     "oauth-as-metadata-invalid-fabricated-response-type.json",
 ):
     document = json.loads((fixtures / filename).read_text())
     try:
-        validate_client_credentials_profile(document)
+        validate_nerve_errata_7793_profile(document)
     except ValueError as error:
         if "must omit response_types_supported" not in str(error):
             raise SystemExit(f"negative fixture {filename} failed for the wrong reason: {error}") from error
