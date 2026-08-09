@@ -5,6 +5,8 @@ WORKDIR /src
 ARG RUNTIME_VERSION=dev
 ARG MCP_CONTRACT_HASH=unknown
 ARG CORE_SCHEMA_HASH=unknown
+ARG OUTBOUND_POLICY_VERSION=unknown
+ARG OUTBOUND_POLICY_SHA256=unknown
 ARG BUILD_COMMIT=unknown
 ARG BUILD_TIME=unknown
 
@@ -17,6 +19,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -X neuralmail/internal/release.RuntimeVersion=${RUNTIME_VERSION} \
     -X neuralmail/internal/release.MCPContractHash=${MCP_CONTRACT_HASH} \
     -X neuralmail/internal/release.CoreSchemaHash=${CORE_SCHEMA_HASH} \
+    -X neuralmail/internal/release.OutboundPolicyVersion=${OUTBOUND_POLICY_VERSION} \
+    -X neuralmail/internal/release.OutboundPolicySHA256=${OUTBOUND_POLICY_SHA256} \
     -X neuralmail/internal/release.BuildCommit=${BUILD_COMMIT} \
   -X neuralmail/internal/release.BuildTime=${BUILD_TIME}" \
   -o /out/nerve-runtime ./cmd/neuralmaild
@@ -31,6 +35,8 @@ ARG MCP_CONTRACT_HASH=unknown
 ARG CORE_SCHEMA_HASH=unknown
 ARG CORE_SCHEMA_MIN_REQUIRED=unknown
 ARG CORE_SCHEMA_MAX_SUPPORTED=unknown
+ARG OUTBOUND_POLICY_VERSION=unknown
+ARG OUTBOUND_POLICY_SHA256=unknown
 ARG BUILD_COMMIT=unknown
 ARG BUILD_TIME=unknown
 
@@ -39,6 +45,8 @@ LABEL io.nerve.runtime.version="${RUNTIME_VERSION}" \
       io.nerve.runtime.core-schema-sha256="${CORE_SCHEMA_HASH}" \
       io.nerve.runtime.core-schema-min-required="${CORE_SCHEMA_MIN_REQUIRED}" \
       io.nerve.runtime.core-schema-max-supported="${CORE_SCHEMA_MAX_SUPPORTED}" \
+      io.nerve.runtime.outbound-policy-version="${OUTBOUND_POLICY_VERSION}" \
+      io.nerve.runtime.outbound-policy-sha256="${OUTBOUND_POLICY_SHA256}" \
       io.nerve.runtime.build-commit="${BUILD_COMMIT}" \
       io.nerve.runtime.build-time="${BUILD_TIME}"
 

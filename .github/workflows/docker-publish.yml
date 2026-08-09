@@ -77,21 +77,26 @@ jobs:
             CORE_SCHEMA_HASH=${{ steps.manifest.outputs.core_schema_hash }}
             CORE_SCHEMA_MIN_REQUIRED=${{ steps.manifest.outputs.core_schema_min_required }}
             CORE_SCHEMA_MAX_SUPPORTED=${{ steps.manifest.outputs.core_schema_max_supported }}
+            OUTBOUND_POLICY_VERSION=${{ steps.manifest.outputs.outbound_policy_version }}
+            OUTBOUND_POLICY_SHA256=${{ steps.manifest.outputs.outbound_policy_sha256 }}
             BUILD_COMMIT=${{ github.sha }}
             BUILD_TIME=${{ steps.manifest.outputs.build_time }}
       - name: Generate runtime release artifacts
         run: |
           mkdir -p dist/runtime
           cp docs/MCP_Contract.md dist/runtime/MCP_Contract.md
+          cp configs/policy/autonomous-outbound-v1.yaml dist/runtime/autonomous-outbound-v1.yaml
           tar -czf dist/runtime/core-migrations.tar.gz -C internal/store/migrations core
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum dist/runtime/runtime-manifest.json | awk '{print $1}' > dist/runtime/runtime-manifest.sha256
             sha256sum dist/runtime/MCP_Contract.md | awk '{print $1}' > dist/runtime/mcp-contract.sha256
             sha256sum dist/runtime/core-migrations.tar.gz | awk '{print $1}' > dist/runtime/core-migrations.sha256
+            sha256sum dist/runtime/autonomous-outbound-v1.yaml | awk '{print $1}' > dist/runtime/autonomous-outbound-v1.sha256
           else
             shasum -a 256 dist/runtime/runtime-manifest.json | awk '{print $1}' > dist/runtime/runtime-manifest.sha256
             shasum -a 256 dist/runtime/MCP_Contract.md | awk '{print $1}' > dist/runtime/mcp-contract.sha256
             shasum -a 256 dist/runtime/core-migrations.tar.gz | awk '{print $1}' > dist/runtime/core-migrations.sha256
+            shasum -a 256 dist/runtime/autonomous-outbound-v1.yaml | awk '{print $1}' > dist/runtime/autonomous-outbound-v1.sha256
           fi
       - name: Upload runtime release artifacts
         uses: actions/upload-artifact@v4

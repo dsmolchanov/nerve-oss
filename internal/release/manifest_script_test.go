@@ -46,7 +46,7 @@ func TestGenerateRuntimeManifestScript(t *testing.T) {
 		t.Fatalf("parse manifest json: %v", err)
 	}
 
-	for _, key := range []string{"runtime_version", "mcp_contract_hash", "core_schema_hash", "core_schema_min_required", "core_schema_max_supported", "build_commit", "build_time"} {
+	for _, key := range []string{"runtime_version", "mcp_contract_hash", "core_schema_hash", "core_schema_min_required", "core_schema_max_supported", "outbound_policy_version", "outbound_policy_sha256", "build_commit", "build_time"} {
 		if manifest[key] == "" {
 			t.Fatalf("manifest missing %s", key)
 		}
@@ -88,6 +88,8 @@ func TestGenerateRuntimeManifestScript(t *testing.T) {
 		"core_schema_hash":          manifest["core_schema_hash"],
 		"core_schema_min_required":  manifest["core_schema_min_required"],
 		"core_schema_max_supported": manifest["core_schema_max_supported"],
+		"outbound_policy_version":   manifest["outbound_policy_version"],
+		"outbound_policy_sha256":    manifest["outbound_policy_sha256"],
 		"build_time":                manifest["build_time"],
 	} {
 		if !strings.Contains(string(exported), key+"="+value+"\n") {
@@ -107,6 +109,8 @@ func TestGenerateRuntimeManifestScript(t *testing.T) {
 		{name: "missing core hash", key: "core_schema_hash", remove: true},
 		{name: "missing core minimum", key: "core_schema_min_required", remove: true},
 		{name: "missing core maximum", key: "core_schema_max_supported", remove: true},
+		{name: "missing outbound policy version", key: "outbound_policy_version", remove: true},
+		{name: "missing outbound policy hash", key: "outbound_policy_sha256", remove: true},
 		{name: "missing build time", key: "build_time", remove: true},
 		{name: "unexpected runtime version", key: "runtime_version", value: "v0.0.1"},
 		{name: "empty MCP hash", key: "mcp_contract_hash", value: ""},
@@ -116,6 +120,8 @@ func TestGenerateRuntimeManifestScript(t *testing.T) {
 		{name: "invalid core minimum", key: "core_schema_min_required", value: "-1"},
 		{name: "inverted core window", key: "core_schema_min_required", value: strconv.FormatInt(startup.CoreMaxSupported+1, 10)},
 		{name: "invalid core maximum", key: "core_schema_max_supported", value: "latest"},
+		{name: "invalid outbound policy version", key: "outbound_policy_version", value: "Autonomous Outbound V1"},
+		{name: "invalid outbound policy hash", key: "outbound_policy_sha256", value: "not-a-sha256"},
 		{name: "invalid timestamp", key: "build_time", value: "not-a-timestamp"},
 		{name: "noncanonical UTC timestamp", key: "build_time", value: "2026-02-17T00:00:00+00:00"},
 		{

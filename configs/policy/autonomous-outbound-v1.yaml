@@ -1,0 +1,44 @@
+version: autonomous-outbound-v1
+
+compose_profiles:
+  reply_only:
+    accepted_replies_per_utc_day: 20
+    accepted_replies_per_recipient_hash_per_utc_day: 5
+  compose:
+    accepted_sends_per_utc_day: 100
+    first_time_recipients_per_utc_day: 25
+    additional_limits_source: plan
+
+rate_windows:
+  bucket: utc_day
+  reset: next_utc_bucket
+
+evidence:
+  allowed_sources:
+    - paid_subscription
+    - verified_custom_domain
+    - abuse_suspension
+  forbidden_compose_sources:
+    - inbound_volume
+    - sender_diversity
+    - self_mail
+    - spf
+    - dkim
+    - dmarc
+  paid_subscription:
+    requires_successful_invoice_or_payment: true
+    requires_current_qualifying_subscription: true
+    trialing_is_paid: false
+  verified_custom_domain:
+    scope: domain
+    requires_selected_inbox_same_domain: true
+    requires_active_domain: true
+    requires_fully_ready_domain: true
+    requires_org_ownership: true
+
+abuse:
+  complaint_effect: deny_all
+  hard_bounce_suspension:
+    minimum_attempts_per_utc_day: 20
+    rate_gte: 0.05
+  suspension_clearance: audited_operator_only

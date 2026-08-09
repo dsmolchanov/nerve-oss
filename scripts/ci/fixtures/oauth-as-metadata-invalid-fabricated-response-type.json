@@ -1,0 +1,6 @@
+{
+  "issuer": "https://auth.nerve.email",
+  "token_endpoint": "https://auth.nerve.email/oauth/token",
+  "grant_types_supported": ["client_credentials"],
+  "response_types_supported": ["client_credentials"]
+}

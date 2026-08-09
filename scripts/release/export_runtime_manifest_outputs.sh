@@ -27,6 +27,8 @@ if ! jq -e -s --arg expected_version "$EXPECTED_VERSION" '
     and (.core_schema_min_required | output_safe and test("^(0|[1-9][0-9]*)$"))
     and (.core_schema_max_supported | output_safe and test("^(0|[1-9][0-9]*)$"))
     and ((.core_schema_min_required | tonumber) <= (.core_schema_max_supported | tonumber))
+    and (.outbound_policy_version | output_safe and test("^[a-z0-9][a-z0-9._-]*$"))
+    and (.outbound_policy_sha256 | output_safe and test("^[0-9a-f]{64}$"))
     and (.build_time |
       output_safe
       and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
@@ -44,6 +46,8 @@ MCP_HASH="$(jq -er -s '.[0].mcp_contract_hash' "$MANIFEST_PATH")"
 CORE_HASH="$(jq -er -s '.[0].core_schema_hash' "$MANIFEST_PATH")"
 CORE_MIN_REQUIRED="$(jq -er -s '.[0].core_schema_min_required' "$MANIFEST_PATH")"
 CORE_MAX_SUPPORTED="$(jq -er -s '.[0].core_schema_max_supported' "$MANIFEST_PATH")"
+OUTBOUND_POLICY_VERSION="$(jq -er -s '.[0].outbound_policy_version' "$MANIFEST_PATH")"
+OUTBOUND_POLICY_SHA256="$(jq -er -s '.[0].outbound_policy_sha256' "$MANIFEST_PATH")"
 BUILD_TIME="$(jq -er -s '.[0].build_time' "$MANIFEST_PATH")"
 
 {
@@ -52,5 +56,7 @@ BUILD_TIME="$(jq -er -s '.[0].build_time' "$MANIFEST_PATH")"
   printf 'core_schema_hash=%s\n' "$CORE_HASH"
   printf 'core_schema_min_required=%s\n' "$CORE_MIN_REQUIRED"
   printf 'core_schema_max_supported=%s\n' "$CORE_MAX_SUPPORTED"
+  printf 'outbound_policy_version=%s\n' "$OUTBOUND_POLICY_VERSION"
+  printf 'outbound_policy_sha256=%s\n' "$OUTBOUND_POLICY_SHA256"
   printf 'build_time=%s\n' "$BUILD_TIME"
 } >> "$OUTPUT_PATH"
