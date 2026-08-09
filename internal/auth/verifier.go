@@ -264,7 +264,7 @@ func (v *M2MTokenVerifier) Verify(_ context.Context, rawToken string) (Principal
 	if principal.TokenID == "" || len(principal.Scopes) == 0 {
 		return Principal{}, ErrUnauthenticated
 	}
-	switch claimString(claims["token_kind"]) {
+	switch claimString(claims["token_use"]) {
 	case string(PrincipalM2MOnboarding):
 		if principal.OrgID != "" {
 			return Principal{}, ErrUnauthenticated
