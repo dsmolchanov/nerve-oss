@@ -14,6 +14,25 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.23"
+      - name: Checkout pinned MCP conformance runner
+        uses: actions/checkout@v4
+        with:
+          repository: modelcontextprotocol/conformance
+          ref: 81eb1c3edaed87d7fd585d7b80186da7a2960660
+          path: _mcp_conformance
+      - name: Checkout pinned MCP ext-auth specification
+        uses: actions/checkout@v4
+        with:
+          repository: modelcontextprotocol/ext-auth
+          ref: ce15435bf4e35a0ec972dd7cd8ce4c81d609cc3e
+          path: _mcp_ext_auth
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: |
+            _mcp_conformance/package-lock.json
+            _mcp_ext_auth/package-lock.json
       - name: Go fmt
         run: |
           unformatted="$(git ls-files -z '*.go' | xargs -0 -r gofmt -l)"
@@ -30,7 +49,31 @@ jobs:
         run: |
           ./scripts/sync/verify_exact_mirror.sh sync-manifest.yaml . .
           ./scripts/ci/test_sync_manifest.sh
+      - name: Verify pinned MCP conformance tooling
+        env:
+          MCP_CONFORMANCE_DIR: ${{ github.workspace }}/_mcp_conformance
+          MCP_EXT_AUTH_DIR: ${{ github.workspace }}/_mcp_ext_auth
+        run: ./scripts/ci/test_mcp_conformance.sh
+      - name: Generate CI runtime manifest
+        id: runtime-manifest
+        run: |
+          mkdir -p dist/runtime
+          GIT_COMMIT="${GITHUB_SHA}" ./scripts/release/generate_runtime_manifest.sh ci "dist/runtime/runtime-manifest.json"
+          ./scripts/release/export_runtime_manifest_outputs.sh "dist/runtime/runtime-manifest.json" ci "$GITHUB_OUTPUT"
       - name: Docker build
-        run: docker build -t nerve-oss-ci:test -f deploy/docker/cortex/Dockerfile .
+        run: |
+          docker build -t nerve-oss-ci:test -f deploy/docker/cortex/Dockerfile \
+            --build-arg RUNTIME_VERSION=${{ steps.runtime-manifest.outputs.runtime_version }} \
+            --build-arg MCP_CONTRACT_HASH=${{ steps.runtime-manifest.outputs.mcp_contract_hash }} \
+            --build-arg CORE_SCHEMA_HASH=${{ steps.runtime-manifest.outputs.core_schema_hash }} \
+            --build-arg CORE_SCHEMA_MIN_REQUIRED=${{ steps.runtime-manifest.outputs.core_schema_min_required }} \
+            --build-arg CORE_SCHEMA_MAX_SUPPORTED=${{ steps.runtime-manifest.outputs.core_schema_max_supported }} \
+            --build-arg OUTBOUND_POLICY_VERSION=${{ steps.runtime-manifest.outputs.outbound_policy_version }} \
+            --build-arg OUTBOUND_POLICY_SHA256=${{ steps.runtime-manifest.outputs.outbound_policy_sha256 }} \
+            --build-arg BUILD_COMMIT=${{ github.sha }} \
+            --build-arg BUILD_TIME=${{ steps.runtime-manifest.outputs.build_time }} \
+            .
+      - name: Verify runtime policy artifact
+        run: ./scripts/ci/verify_runtime_policy_artifact.sh nerve-oss-ci:test dist/runtime/runtime-manifest.json
       - name: Migration CLI image smoke
         run: docker run --rm --entrypoint /app/nerve-migrate nerve-oss-ci:test --help

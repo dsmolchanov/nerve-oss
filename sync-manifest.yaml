@@ -53,6 +53,10 @@
     "internal/httpsafe/",
     "internal/memguard/",
     "internal/auth/",
+    "configs/policy/autonomous-outbound-v1.yaml",
+    "scripts/ci/fixtures/oauth-as-metadata-client-credentials.json",
+    "scripts/ci/fixtures/oauth-as-metadata-invalid-empty-response-types.json",
+    "scripts/ci/fixtures/oauth-as-metadata-invalid-fabricated-response-type.json",
     "docs/MCP_Contract.md"
   ],
   "patch-synced": [
