@@ -94,20 +94,31 @@ import pathlib
 import sys
 
 fixtures = pathlib.Path(sys.argv[1])
+
+def validate_client_credentials_profile(document):
+    if "authorization_endpoint" in document:
+        raise ValueError("client-credentials metadata must omit authorization_endpoint")
+    if "response_types_supported" in document:
+        raise ValueError("client-credentials metadata must omit response_types_supported")
+    if document.get("grant_types_supported") != ["client_credentials"]:
+        raise ValueError("metadata must advertise only client_credentials")
+    if document.get("token_endpoint_auth_methods_supported") != ["private_key_jwt"]:
+        raise ValueError("metadata must advertise private_key_jwt")
+
 golden = json.loads((fixtures / "oauth-as-metadata-client-credentials.json").read_text())
-if "authorization_endpoint" in golden or "response_types_supported" in golden:
-    raise SystemExit("golden client-credentials metadata must omit authorization response fields")
-if golden.get("grant_types_supported") != ["client_credentials"]:
-    raise SystemExit("golden metadata must advertise only client_credentials")
-if golden.get("token_endpoint_auth_methods_supported") != ["private_key_jwt"]:
-    raise SystemExit("golden metadata must advertise private_key_jwt")
+validate_client_credentials_profile(golden)
 for filename in (
     "oauth-as-metadata-invalid-empty-response-types.json",
     "oauth-as-metadata-invalid-fabricated-response-type.json",
 ):
     document = json.loads((fixtures / filename).read_text())
-    if "response_types_supported" not in document:
-        raise SystemExit(f"negative fixture {filename} does not exercise response_types_supported")
+    try:
+        validate_client_credentials_profile(document)
+    except ValueError as error:
+        if "must omit response_types_supported" not in str(error):
+            raise SystemExit(f"negative fixture {filename} failed for the wrong reason: {error}") from error
+    else:
+        raise SystemExit(f"negative fixture {filename} was accepted")
 PY
 
 echo "pinned MCP conformance and ext-auth proof passed"
