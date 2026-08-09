@@ -89,7 +89,7 @@ func TestAuthenticateRequestM2MPrincipalKinds(t *testing.T) {
 				"iss": "https://auth.nerve.email", "aud": "https://api.nerve.email/mcp",
 				"exp": 1100, "nbf": 900, "iat": 1000, "jti": "token-1",
 				"sub": "client-1", "client_id": "client-1", "generation": 2,
-				"token_kind": string(test.kind), "org_id": test.orgID, "scope": test.scopes,
+				"token_use": string(test.kind), "org_id": test.orgID, "scope": test.scopes,
 			})
 			req, reqErr := http.NewRequest(http.MethodPost, "/mcp", nil)
 			if reqErr != nil {
@@ -120,7 +120,7 @@ func TestAuthenticateRequestM2MRejectsAlgorithmAndClaimConfusion(t *testing.T) {
 	base := jwt.MapClaims{
 		"iss": "https://auth.nerve.email", "aud": "https://api.nerve.email/mcp",
 		"exp": 1100, "nbf": 900, "iat": 1000, "jti": "token-1", "sub": "client-1",
-		"client_id": "client-1", "generation": 1, "token_kind": "m2m_onboarding",
+		"client_id": "client-1", "generation": 1, "token_use": "m2m_onboarding",
 		"scope": "nerve:onboarding",
 	}
 	tests := map[string]struct {
@@ -134,7 +134,11 @@ func TestAuthenticateRequestM2MRejectsAlgorithmAndClaimConfusion(t *testing.T) {
 			claims["org_id"] = "org-1"
 		}},
 		"org without org": {method: jwt.SigningMethodPS256, kid: "access-key-1", mutate: func(claims jwt.MapClaims) {
-			claims["token_kind"] = "m2m_org"
+			claims["token_use"] = "m2m_org"
+		}},
+		"legacy token_kind claim": {method: jwt.SigningMethodPS256, kid: "access-key-1", mutate: func(claims jwt.MapClaims) {
+			delete(claims, "token_use")
+			claims["token_kind"] = "m2m_onboarding"
 		}},
 		"subject mismatch": {method: jwt.SigningMethodPS256, kid: "access-key-1", mutate: func(claims jwt.MapClaims) {
 			claims["sub"] = "another-client"
