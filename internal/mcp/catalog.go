@@ -92,7 +92,7 @@ func objectProperty() map[string]any {
 }
 
 func arrayProperty() map[string]any {
-	return map[string]any{"type": "array", "items": map[string]any{}}
+	return map[string]any{"type": []string{"array", "null"}, "items": map[string]any{}}
 }
 
 func outputObject(properties map[string]any, required ...string) map[string]any {

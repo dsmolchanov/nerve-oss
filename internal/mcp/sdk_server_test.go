@@ -181,6 +181,19 @@ func TestSDKHandlerEnforcesAndReleasesSharedMemoryBudget(t *testing.T) {
 	}
 }
 
+func TestModernOutputSchemasAcceptEmptySliceEncoding(t *testing.T) {
+	descriptors := modernToolCatalog(context.Background(), NewServer(config.Default(), nil, nil, nil), auth.Principal{})
+	for _, descriptor := range descriptors {
+		encoded, err := json.Marshal(descriptor.OutputShape)
+		if err != nil {
+			t.Fatalf("marshal %s output shape: %v", descriptor.Name, err)
+		}
+		if strings.Contains(string(encoded), `"type":"array"`) {
+			t.Fatalf("%s output rejects nil slices encoded as null: %s", descriptor.Name, encoded)
+		}
+	}
+}
+
 func TestSDKServerOnboardingProfileHasNoLifecycleToolsBeforePhase3(t *testing.T) {
 	cfg := hostedRouterConfig()
 	runtime := NewServer(cfg, nil, nil, nil)
