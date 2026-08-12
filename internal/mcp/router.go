@@ -15,7 +15,7 @@ import (
 const (
 	LegacyProtocolVersion        = "2025-11-25"
 	ModernProtocolVersion        = "2026-07-28"
-	protectedResourceMetadataURL = "https://nerve-runtime.fly.dev/.well-known/oauth-protected-resource/mcp"
+	protectedResourceMetadataURL = "https://nerve-runtime.fly.dev" + ProtectedResourceMetadataMCPPath
 )
 
 type RequestAuthenticator interface {

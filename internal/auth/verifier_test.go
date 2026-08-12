@@ -32,8 +32,6 @@ func TestNewServiceWiresConfiguredM2MVerifier(t *testing.T) {
 
 func TestAuthenticateRequestJWT(t *testing.T) {
 	cfg := config.Default()
-	cfg.Auth.Issuer = "https://auth.nerve.email"
-	cfg.Auth.Audience = "nerve-runtime"
 	cfg.Security.TokenSigningKey = testSigningKey
 
 	svc := &Service{
@@ -42,7 +40,7 @@ func TestAuthenticateRequestJWT(t *testing.T) {
 	}
 
 	token := signedJWT(t, jwt.MapClaims{
-		"iss":    "https://auth.nerve.email",
+		"iss":    "https://legacy.nerve.email",
 		"aud":    "nerve-runtime",
 		"exp":    2000,
 		"nbf":    500,
@@ -73,6 +71,29 @@ func TestAuthenticateRequestJWT(t *testing.T) {
 	}
 	if len(principal.Scopes) != 2 {
 		t.Fatalf("expected 2 scopes, got %d", len(principal.Scopes))
+	}
+}
+
+func TestM2MConfigDoesNotConstrainLegacyJWT(t *testing.T) {
+	cfg := config.Default()
+	cfg.Auth.Issuer = "https://auth.nerve.email"
+	cfg.Auth.Audience = "https://nerve-runtime.fly.dev/mcp"
+	cfg.Auth.JWKSURL = "https://auth.nerve.email/.well-known/jwks.json"
+	cfg.Security.TokenSigningKey = testSigningKey
+	service := NewService(cfg, nil)
+	service.Now = func() time.Time { return time.Unix(1000, 0) }
+
+	token := signedJWT(t, jwt.MapClaims{
+		"exp": 2000, "nbf": 500, "org_id": "org-1", "sub": "legacy-client",
+	})
+	request := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	principal, err := service.AuthenticateRequest(request)
+	if err != nil {
+		t.Fatalf("M2M config rejected legacy JWT: %v", err)
+	}
+	if principal.Kind != PrincipalLegacyJWT || principal.OrgID != "org-1" {
+		t.Fatalf("unexpected legacy principal: %+v", principal)
 	}
 }
 

@@ -170,12 +170,6 @@ func (s *Service) VerifyJWT(ctx context.Context, authHeader string) (Principal, 
 		jwt.WithValidMethods([]string{"HS256"}),
 		jwt.WithTimeFunc(s.Now),
 	}
-	if iss := strings.TrimSpace(s.Config.Auth.Issuer); iss != "" {
-		parserOpts = append(parserOpts, jwt.WithIssuer(iss))
-	}
-	if aud := strings.TrimSpace(s.Config.Auth.Audience); aud != "" {
-		parserOpts = append(parserOpts, jwt.WithAudience(aud))
-	}
 
 	parsed, err := jwt.Parse(rawToken, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {

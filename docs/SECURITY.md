@@ -14,6 +14,13 @@ refresh and fails closed if the refreshed set does not contain it. Current and
 next issuer keys may overlap during rotation. Registered client-assertion keys
 are separate authority data and are never loaded into this verifier.
 
+The runtime serves identical protected-resource metadata at
+`/.well-known/oauth-protected-resource` and
+`/.well-known/oauth-protected-resource/mcp`. Bearer challenges point to the
+versioned path; both representations advertise the canonical runtime resource,
+authorization server, scope order, and header-only bearer transport with a
+stable ETag and five-minute revalidation policy.
+
 Legacy HS256 tokens, Cloud API keys, and the explicitly configured bootstrap key
 remain distinct typed principals. Algorithm or header metadata never selects a
 different principal kind, and routed protocol metadata is checked against the
