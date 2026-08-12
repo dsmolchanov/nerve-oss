@@ -883,6 +883,7 @@ Upgrade nerve-oss to Go 1.25, isolate the frozen 2025 adapter from the 2026 Go S
 - `go.mod`, `go.sum`
 - `.github/workflows/ci.yml`
 - `.github/workflows/security.yml`
+- `.github/workflows/sync-to-cloud.yml`
 - `deploy/docker/cortex/Dockerfile`
 
 **Changes**
@@ -2149,6 +2150,12 @@ Preferred rollback is C→B with schema unchanged. Before any runtime rollback b
 - https://resend.com/docs/api-reference/emails/retrieve-received-email
 
 ## Enhancement History
+
+### Revision 10 — 2026-08-12
+
+**Trigger:** Phase 2.1 implementation review found that the OSS-to-Cloud validation workflow still selected Go 1.23 after the module, CI, security scan, and production image moved to Go 1.25.
+
+- Added `.github/workflows/sync-to-cloud.yml` to the Phase 2.1 OSS file list so every build/test workflow that validates the upgraded module uses the pinned Go 1.25 toolchain.
 
 ### Revision 9 — 2026-08-12
 
