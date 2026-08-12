@@ -31,6 +31,10 @@ type ResourceReadParams struct {
 	URI string `json:"uri"`
 }
 
+type InitializeParams struct {
+	ProtocolVersion string `json:"protocolVersion"`
+}
+
 func ListTools(attachmentsEnabled ...bool) map[string]any {
 	enabled := len(attachmentsEnabled) > 0 && attachmentsEnabled[0]
 	return map[string]any{

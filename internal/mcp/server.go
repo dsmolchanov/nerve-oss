@@ -193,6 +193,10 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, routed bool)
 		writeMCPDecodeError(w, err)
 		return
 	}
+	if err := validateRoutedProtocolVersion(ctx, req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if s.Config.Cloud.Mode {
 		requiredScope := s.requiredScope(req)
 		if requiredScope != "" {
@@ -224,6 +228,21 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, routed bool)
 	w.Header().Set("Content-Type", "application/json")
 	resp := Response{JSONRPC: "2.0", ID: req.ID, Result: result}
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func validateRoutedProtocolVersion(ctx context.Context, req Request) error {
+	trusted, routed := routedProtocolVersion(ctx)
+	if !routed || req.Method != "initialize" {
+		return nil
+	}
+	var params InitializeParams
+	if err := decodeParams(req.Params, &params); err != nil {
+		return errors.New("invalid initialize params")
+	}
+	if params.ProtocolVersion != "" && params.ProtocolVersion != trusted {
+		return errors.New("MCP protocol version mismatch")
+	}
+	return nil
 }
 
 func requireJSONEOF(decoder *json.Decoder, body io.Reader) error {

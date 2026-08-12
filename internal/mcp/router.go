@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"errors"
 	"net/http"
 
@@ -24,6 +25,17 @@ type Router struct {
 	auth   RequestAuthenticator
 	legacy http.Handler
 	modern http.Handler
+}
+
+type routedProtocolVersionKey struct{}
+
+func withRoutedProtocolVersion(ctx context.Context, version string) context.Context {
+	return context.WithValue(ctx, routedProtocolVersionKey{}, version)
+}
+
+func routedProtocolVersion(ctx context.Context) (string, bool) {
+	version, ok := ctx.Value(routedProtocolVersionKey{}).(string)
+	return version, ok
 }
 
 func NewRouter(cfg config.Config, authenticator RequestAuthenticator, legacy, modern http.Handler) *Router {
@@ -69,9 +81,9 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	request := r.WithContext(ctx)
 	switch r.Header.Get("MCP-Protocol-Version") {
 	case LegacyProtocolVersion:
-		router.serveAdapter(w, request, router.legacy)
+		router.serveAdapter(w, request.WithContext(withRoutedProtocolVersion(request.Context(), LegacyProtocolVersion)), router.legacy)
 	case ModernProtocolVersion:
-		router.serveAdapter(w, request, router.modern)
+		router.serveAdapter(w, request.WithContext(withRoutedProtocolVersion(request.Context(), ModernProtocolVersion)), router.modern)
 	default:
 		w.Header().Set("MCP-Supported-Protocol-Versions", LegacyProtocolVersion+", "+ModernProtocolVersion)
 		http.Error(w, "missing or unsupported MCP-Protocol-Version", http.StatusBadRequest)

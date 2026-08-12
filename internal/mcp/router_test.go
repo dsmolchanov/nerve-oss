@@ -3,6 +3,7 @@ package mcp
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"neuralmail/internal/auth"
@@ -163,6 +164,23 @@ func TestRouterAuthenticatesExactlyOnce(t *testing.T) {
 	router.ServeHTTP(recorder, routedRequest(LegacyProtocolVersion, ""))
 	if recorder.Code != 204 || calls != 1 {
 		t.Fatalf("expected one authentication, got status=%d calls=%d", recorder.Code, calls)
+	}
+}
+
+func TestLegacyAdapterRejectsHeaderBodyProtocolMismatchBeforeDispatch(t *testing.T) {
+	cfg := config.Default()
+	cfg.Cloud.Mode = false
+	server := NewServer(cfg, nil, nil, nil)
+	router := NewRouter(cfg, nil, http.HandlerFunc(server.HandleRoutedHTTP), nil)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28"}}`))
+	req.Header.Set("MCP-Protocol-Version", LegacyProtocolVersion)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Header().Get("MCP-Session-Id") != "" {
+		t.Fatal("mismatched initialize created a session")
 	}
 }
 
