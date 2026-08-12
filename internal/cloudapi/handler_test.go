@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -538,12 +539,16 @@ func TestOrgDomainsCreateListDNSVerifyAndDelete(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("expected delete success, got %d body=%s", rec.Code, rec.Body.String())
 		}
+		if _, err := st.GetOrgDomainByIDForOrg(ctx, orgID, created.Domain.ID); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("expected finalized domain deletion, got err=%v", err)
+		}
 	})
 }
 
 func TestOrgDomainsResendProvisioningAndVerification(t *testing.T) {
 	withTempStore(t, func(ctx context.Context, st *store.Store) {
 		var createdName string
+		var providerDeleted bool
 
 		resendSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Header.Get("Authorization") != "Bearer re_test_key" {
@@ -568,6 +573,10 @@ func TestOrgDomainsResendProvisioningAndVerification(t *testing.T) {
 			case r.Method == http.MethodGet && r.URL.Path == "/domains/d_abc":
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte(`{"data":{"id":"d_abc","name":"acme.com","status":"verified","records":[{"record":"SPF","name":"send","type":"MX","value":"feedback-smtp.us-east-1.amazonses.com","ttl":"Auto","status":"verified","priority":10},{"record":"SPF","name":"send","type":"TXT","value":"v=spf1 include:amazonses.com ~all","ttl":"Auto","status":"verified"},{"record":"DKIM","name":"dkim._domainkey","type":"CNAME","value":"dkim.resend.com","ttl":"Auto","status":"verified"}]}}`))
+				return
+			case r.Method == http.MethodDelete && r.URL.Path == "/domains/d_abc":
+				providerDeleted = true
+				w.WriteHeader(http.StatusNoContent)
 				return
 			default:
 				t.Fatalf("unexpected resend request: %s %s", r.Method, r.URL.Path)
@@ -663,6 +672,23 @@ func TestOrgDomainsResendProvisioningAndVerification(t *testing.T) {
 		}
 		if ok, _ := verified.Checks["resend_verified"].(bool); !ok {
 			t.Fatalf("expected resend_verified=true, got %+v", verified.Checks)
+		}
+
+		deleteReq, err := http.NewRequest(http.MethodDelete, "/v1/domains/"+created.Domain.ID+"?org_id="+url.QueryEscape(orgID), nil)
+		if err != nil {
+			t.Fatalf("build delete request: %v", err)
+		}
+		deleteReq.Header.Set("X-API-Key", "bootstrap-admin")
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, deleteReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected provider-backed delete success, got %d body=%s", rec.Code, rec.Body.String())
+		}
+		if !providerDeleted {
+			t.Fatal("expected Resend domain deletion before local finalization")
+		}
+		if _, err := st.GetOrgDomainByIDForOrg(ctx, orgID, created.Domain.ID); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("expected finalized provider-backed domain deletion, got err=%v", err)
 		}
 	})
 }
