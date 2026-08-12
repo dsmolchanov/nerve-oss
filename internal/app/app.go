@@ -31,14 +31,15 @@ import (
 )
 
 type App struct {
-	Config   config.Config
-	Store    *store.Store
-	Queue    *queue.Queue
-	Vector   vector.Store
-	Embedder embed.Provider
-	LLM      llm.Provider
-	Policy   policy.Policy
-	MCP      *mcp.Server
+	Config    config.Config
+	Store     *store.Store
+	Queue     *queue.Queue
+	Vector    vector.Store
+	Embedder  embed.Provider
+	LLM       llm.Provider
+	Policy    policy.Policy
+	MCP       *mcp.Server
+	MCPRouter *mcp.Router
 
 	EmailTransport *emailtransport.Registry
 }
@@ -106,16 +107,18 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	entitlementSvc := entitlements.NewService(cfg, st, entitlementObserver)
 	mcpServer := mcp.NewServer(cfg, toolSvc, authSvc, entitlementSvc)
 	mcpServer.FeatureFlags = featureflags.New(cfg.Cloud.Mode, st)
+	mcpRouter := mcp.NewRouter(cfg, authSvc, http.HandlerFunc(mcpServer.HandleRoutedHTTP), nil)
 
 	return &App{
-		Config:   cfg,
-		Store:    st,
-		Queue:    q,
-		Vector:   vectorStore,
-		Embedder: embedder,
-		LLM:      llmProvider,
-		Policy:   pol,
-		MCP:      mcpServer,
+		Config:    cfg,
+		Store:     st,
+		Queue:     q,
+		Vector:    vectorStore,
+		Embedder:  embedder,
+		LLM:       llmProvider,
+		Policy:    pol,
+		MCP:       mcpServer,
+		MCPRouter: mcpRouter,
 
 		EmailTransport: transportRegistry,
 	}, nil
@@ -150,9 +153,12 @@ func (a *App) Serve(ctx context.Context) error {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ready"))
 	})
+	protectedResourceMetadata := mcp.ProtectedResourceMetadataHandler()
+	mux.Handle(mcp.ProtectedResourceMetadataPath, protectedResourceMetadata)
+	mux.Handle(mcp.ProtectedResourceMetadataMCPPath, protectedResourceMetadata)
 	mux.HandleFunc("/debug", a.handleDebug)
 	mux.Handle(featureflags.EffectiveStatePathPrefix, featureflags.EffectiveStateHandler(a.MCP.Auth, a.MCP.FeatureFlags))
-	mux.HandleFunc("/mcp", a.MCP.HandleHTTP)
+	mux.Handle("/mcp", a.MCPRouter)
 	mux.HandleFunc("/mcp/sse", a.MCP.HandleSSEStub)
 	mux.HandleFunc("/jmap/push", a.handleJMAPPush)
 

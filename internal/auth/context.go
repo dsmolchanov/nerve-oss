@@ -9,6 +9,7 @@ type PrincipalKind string
 
 const (
 	PrincipalLegacyJWT     PrincipalKind = "legacy_jwt"
+	PrincipalBootstrap     PrincipalKind = "legacy_bootstrap"
 	PrincipalCloudAPIKey   PrincipalKind = "cloud_api_key"
 	PrincipalM2MOnboarding PrincipalKind = "m2m_onboarding"
 	PrincipalM2MOrg        PrincipalKind = "m2m_org"

@@ -6,6 +6,8 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 
@@ -17,10 +19,19 @@ import (
 
 const testSigningKey = "test-signing-key-for-unit-tests"
 
-func TestAuthenticateRequestJWT(t *testing.T) {
+func TestNewServiceWiresConfiguredM2MVerifier(t *testing.T) {
 	cfg := config.Default()
 	cfg.Auth.Issuer = "https://auth.nerve.email"
-	cfg.Auth.Audience = "nerve-runtime"
+	cfg.Auth.Audience = "https://api.nerve.email/mcp"
+	cfg.Auth.JWKSURL = "https://auth.nerve.email/.well-known/jwks.json"
+	service := NewService(cfg, nil)
+	if service.M2M == nil || service.M2M.Remote == nil {
+		t.Fatal("configured M2M verifier was not wired")
+	}
+}
+
+func TestAuthenticateRequestJWT(t *testing.T) {
+	cfg := config.Default()
 	cfg.Security.TokenSigningKey = testSigningKey
 
 	svc := &Service{
@@ -29,7 +40,7 @@ func TestAuthenticateRequestJWT(t *testing.T) {
 	}
 
 	token := signedJWT(t, jwt.MapClaims{
-		"iss":    "https://auth.nerve.email",
+		"iss":    "https://legacy.nerve.email",
 		"aud":    "nerve-runtime",
 		"exp":    2000,
 		"nbf":    500,
@@ -60,6 +71,29 @@ func TestAuthenticateRequestJWT(t *testing.T) {
 	}
 	if len(principal.Scopes) != 2 {
 		t.Fatalf("expected 2 scopes, got %d", len(principal.Scopes))
+	}
+}
+
+func TestM2MConfigDoesNotConstrainLegacyJWT(t *testing.T) {
+	cfg := config.Default()
+	cfg.Auth.Issuer = "https://auth.nerve.email"
+	cfg.Auth.Audience = "https://nerve-runtime.fly.dev/mcp"
+	cfg.Auth.JWKSURL = "https://auth.nerve.email/.well-known/jwks.json"
+	cfg.Security.TokenSigningKey = testSigningKey
+	service := NewService(cfg, nil)
+	service.Now = func() time.Time { return time.Unix(1000, 0) }
+
+	token := signedJWT(t, jwt.MapClaims{
+		"exp": 2000, "nbf": 500, "org_id": "org-1", "sub": "legacy-client",
+	})
+	request := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	principal, err := service.AuthenticateRequest(request)
+	if err != nil {
+		t.Fatalf("M2M config rejected legacy JWT: %v", err)
+	}
+	if principal.Kind != PrincipalLegacyJWT || principal.OrgID != "org-1" {
+		t.Fatalf("unexpected legacy principal: %+v", principal)
 	}
 }
 
@@ -456,6 +490,32 @@ func TestValidateScopes(t *testing.T) {
 	if err := svc.ValidateScopes(principal, "nerve:admin.billing"); err == nil {
 		t.Fatalf("expected admin scope to be denied")
 	}
+}
+
+func TestAuthenticateRequestLegacyBootstrap(t *testing.T) {
+	cfg := config.Default()
+	cfg.Security.APIKey = "bootstrap-secret"
+	service := NewService(cfg, nil)
+
+	t.Run("configured key", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+		req.Header.Set("X-API-Key", "bootstrap-secret")
+		principal, err := service.AuthenticateRequest(req)
+		if err != nil {
+			t.Fatalf("authenticate bootstrap: %v", err)
+		}
+		if principal.Kind != PrincipalBootstrap || principal.AuthMethod != "bootstrap_key" || !reflect.DeepEqual(principal.Scopes, []string{"*"}) {
+			t.Fatalf("unexpected bootstrap principal: %#v", principal)
+		}
+	})
+
+	t.Run("wrong key", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+		req.Header.Set("X-API-Key", "wrong")
+		if _, err := service.AuthenticateRequest(req); !errors.Is(err, ErrUnauthenticated) {
+			t.Fatalf("expected unauthenticated, got %v", err)
+		}
+	})
 }
 
 func signedJWT(t *testing.T, claims jwt.MapClaims) string {

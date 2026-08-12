@@ -107,13 +107,25 @@ func (r *budgetedReadCloser) Close() error {
 }
 
 func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
+	s.handleHTTP(w, r, false)
+}
+
+// HandleRoutedHTTP serves the frozen legacy adapter after the shared router
+// has completed Origin validation and authentication exactly once.
+func (s *Server) HandleRoutedHTTP(w http.ResponseWriter, r *http.Request) {
+	s.handleHTTP(w, r, true)
+}
+
+func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, routed bool) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	if err := s.validateOrigin(r); err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
+	if !routed {
+		if err := s.validateOrigin(r); err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
 	}
 	log.Printf("mcp request protocol_version=%q", strings.TrimSpace(r.Header.Get("MCP-Protocol-Version")))
 
@@ -146,18 +158,25 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	var principal auth.Principal
-	if s.Config.Cloud.Mode {
+	if s.Config.Cloud.Mode && !routed {
 		if s.Auth == nil {
 			http.Error(w, "cloud auth not configured", http.StatusInternalServerError)
 			return
 		}
 		authenticated, err := s.Auth.AuthenticateRequest(r)
 		if err != nil {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			writeInvalidToken(w)
 			return
 		}
 		principal = authenticated
 		ctx = auth.WithPrincipal(ctx, authenticated)
+	} else if s.Config.Cloud.Mode {
+		authenticated, ok := auth.PrincipalFromContext(ctx)
+		if !ok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		principal = authenticated
 	}
 
 	decoder := json.NewDecoder(r.Body)
@@ -174,11 +193,15 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		writeMCPDecodeError(w, err)
 		return
 	}
+	if err := validateRoutedProtocolVersion(ctx, req); err != nil {
+		writeHeaderMismatch(w, req.ID, err.Error())
+		return
+	}
 	if s.Config.Cloud.Mode {
 		requiredScope := s.requiredScope(req)
 		if requiredScope != "" {
 			if err := s.Auth.ValidateScopes(principal, requiredScope); err != nil {
-				http.Error(w, "forbidden", http.StatusForbidden)
+				writeInsufficientScope(w, requiredScope)
 				return
 			}
 		}
@@ -201,10 +224,32 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("MCP-Session-Id", sessionID)
 	}
-	w.Header().Set("MCP-Protocol-Version", s.Config.MCP.ProtocolVersion)
+	w.Header().Set("MCP-Protocol-Version", responseProtocolVersion(ctx, s.Config.MCP.ProtocolVersion))
 	w.Header().Set("Content-Type", "application/json")
 	resp := Response{JSONRPC: "2.0", ID: req.ID, Result: result}
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func validateRoutedProtocolVersion(ctx context.Context, req Request) error {
+	trusted, routed := routedProtocolVersion(ctx)
+	if !routed || req.Method != "initialize" {
+		return nil
+	}
+	var params InitializeParams
+	if err := decodeParams(req.Params, &params); err != nil {
+		return errors.New("invalid initialize params")
+	}
+	if params.ProtocolVersion != "" && params.ProtocolVersion != trusted {
+		return errors.New("MCP protocol version mismatch")
+	}
+	return nil
+}
+
+func responseProtocolVersion(ctx context.Context, fallback string) string {
+	if trusted, routed := routedProtocolVersion(ctx); routed {
+		return trusted
+	}
+	return fallback
 }
 
 func requireJSONEOF(decoder *json.Decoder, body io.Reader) error {
@@ -254,7 +299,7 @@ func (s *Server) dispatch(ctx context.Context, req Request) (any, error) {
 	switch req.Method {
 	case "initialize":
 		return map[string]any{
-			"protocolVersion": s.Config.MCP.ProtocolVersion,
+			"protocolVersion": responseProtocolVersion(ctx, s.Config.MCP.ProtocolVersion),
 			"serverInfo": map[string]any{
 				"name":    "nerve-runtime",
 				"version": "0.1.0",

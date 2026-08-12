@@ -34,6 +34,9 @@ func TestHandleHTTPCloudModeRequiresCredentials(t *testing.T) {
 	if recorder.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for missing credentials, got %d", recorder.Code)
 	}
+	if got := recorder.Header().Get("WWW-Authenticate"); got != `Bearer resource_metadata="https://nerve-runtime.fly.dev/.well-known/oauth-protected-resource/mcp", error="invalid_token"` {
+		t.Fatalf("unexpected bearer challenge: %q", got)
+	}
 }
 
 func TestHandleHTTPCloudModeRejectsInsufficientScope(t *testing.T) {
@@ -60,6 +63,9 @@ func TestHandleHTTPCloudModeRejectsInsufficientScope(t *testing.T) {
 	server.HandleHTTP(recorder, req)
 	if recorder.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for insufficient scopes, got %d", recorder.Code)
+	}
+	if got := recorder.Header().Get("WWW-Authenticate"); got != `Bearer error="insufficient_scope", scope="nerve:email.read"` {
+		t.Fatalf("unexpected insufficient-scope challenge: %q", got)
 	}
 }
 
