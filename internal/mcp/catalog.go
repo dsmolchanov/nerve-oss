@@ -107,11 +107,11 @@ func modernComposeEmailInputSchema(attachmentsEnabled bool) map[string]any {
 	properties["to"] = map[string]any{
 		"type": "string", "format": "email", "pattern": `^[^\s@]+@[^\s@]+\.[^\s@]+$`, "maxLength": 320,
 	}
-	properties["subject"] = boundedStringProperty(0, 998)
+	properties["subject"] = boundedStringProperty(1, 998)
 	properties["from_name"] = boundedStringProperty(0, 256)
 	properties["idempotency_key"] = boundedStringProperty(0, 128)
-	properties["body"] = boundedStringProperty(0, 10<<20)
-	properties["html"] = boundedStringProperty(0, 10<<20)
+	properties["body"] = boundedStringProperty(1, 10<<20)
+	properties["html"] = boundedStringProperty(1, 10<<20)
 	return modernInputSchema(schema)
 }
 

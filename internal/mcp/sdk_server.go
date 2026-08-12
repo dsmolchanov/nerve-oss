@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/google/uuid"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"neuralmail/internal/auth"
@@ -186,17 +187,8 @@ func validModernResourceURI(uri string) bool {
 			continue
 		}
 		id := strings.TrimPrefix(uri, prefix)
-		if len(id) == 0 || len(id) > 128 {
-			return false
-		}
-		for _, character := range id {
-			if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
-				(character >= '0' && character <= '9') || character == '-' || character == '_' {
-				continue
-			}
-			return false
-		}
-		return true
+		_, err := uuid.Parse(id)
+		return err == nil
 	}
 	return false
 }

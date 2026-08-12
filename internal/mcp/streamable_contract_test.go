@@ -355,27 +355,40 @@ func TestModernToolArgumentsFailSchemaBeforeInvokerSideEffects(t *testing.T) {
 	}
 }
 
-func TestModernEmptyReplyFailsSchemaBeforePolicy(t *testing.T) {
+func TestModernEmptyOutboundFieldsFailSchemaBeforePolicy(t *testing.T) {
 	cfg := hostedRouterConfig()
 	runtime := NewServer(cfg, nil, auth.NewService(cfg, nil), nil)
 	policyGate := &countingOutboundPolicyGate{}
 	runtime.OutboundPolicy = policyGate
-	principal := auth.Principal{
-		Kind: auth.PrincipalM2MOrg, OrgID: "org-1", ClientID: "client-1", Generation: 1,
-		Scopes: []string{"nerve:email.reply"}, AuthMethod: "m2m_bearer",
+	tests := []struct {
+		name      string
+		tool      string
+		scope     string
+		arguments map[string]any
+	}{
+		{name: "empty reply", tool: "send_reply", scope: "nerve:email.reply", arguments: map[string]any{"thread_id": "thread-1", "body_or_draft_id": ""}},
+		{name: "empty compose subject", tool: "compose_email", scope: "nerve:email.compose", arguments: map[string]any{"inbox_id": "inbox-1", "to": "recipient@example.net", "subject": "", "body": "body"}},
+		{name: "empty compose body", tool: "compose_email", scope: "nerve:email.compose", arguments: map[string]any{"inbox_id": "inbox-1", "to": "recipient@example.net", "subject": "subject", "body": ""}},
 	}
-	request := modernContractRequest(t, "tools/call", map[string]any{
-		"_meta": modernOAuthMeta(), "name": "send_reply",
-		"arguments": map[string]any{"thread_id": "thread-1", "body_or_draft_id": ""},
-	})
-	request.Header.Set("Mcp-Name", "send_reply")
-	request = request.WithContext(auth.WithPrincipal(request.Context(), principal))
-	recorder := httptest.NewRecorder()
-	NewSDKHandler(runtime, true).ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusOK ||
-		!bytes.Contains(recorder.Body.Bytes(), []byte(`"isError":true`)) ||
-		!bytes.Contains(recorder.Body.Bytes(), []byte(`validating`)) {
-		t.Fatalf("empty reply did not fail schema validation: status=%d body=%s", recorder.Code, recorder.Body.String())
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			principal := auth.Principal{
+				Kind: auth.PrincipalM2MOrg, OrgID: "org-1", ClientID: "client-1", Generation: 1,
+				Scopes: []string{test.scope}, AuthMethod: "m2m_bearer",
+			}
+			request := modernContractRequest(t, "tools/call", map[string]any{
+				"_meta": modernOAuthMeta(), "name": test.tool, "arguments": test.arguments,
+			})
+			request.Header.Set("Mcp-Name", test.tool)
+			request = request.WithContext(auth.WithPrincipal(request.Context(), principal))
+			recorder := httptest.NewRecorder()
+			NewSDKHandler(runtime, true).ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusOK ||
+				!bytes.Contains(recorder.Body.Bytes(), []byte(`"isError":true`)) ||
+				!bytes.Contains(recorder.Body.Bytes(), []byte(`validating`)) {
+				t.Fatalf("empty field did not fail schema validation: status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+		})
 	}
 	if policyGate.dispatchCalls.Load() != 0 {
 		t.Fatalf("empty reply reached outbound policy %d times", policyGate.dispatchCalls.Load())
@@ -459,19 +472,19 @@ func TestModernToolScopeFailureReturnsOAuth403BeforeInvoker(t *testing.T) {
 	}
 }
 
-func TestModernResourceIDsAreBoundedBeforeRead(t *testing.T) {
+func TestModernResourceIDsAreValidatedBeforeRead(t *testing.T) {
 	cfg := hostedRouterConfig()
 	runtime := NewServer(cfg, nil, auth.NewService(cfg, nil), nil)
 	principal := auth.Principal{Kind: auth.PrincipalM2MOrg, OrgID: "org-1", Scopes: []string{"nerve:email.read"}}
-	uri := "email://threads/" + strings.Repeat("i", 129)
-	request := modernContractRequest(t, "resources/read", map[string]any{"_meta": modernOAuthMeta(), "uri": uri})
-	request.Header.Set("Mcp-Name", uri)
-	request = request.WithContext(auth.WithPrincipal(request.Context(), principal))
-	recorder := httptest.NewRecorder()
-	NewSDKHandler(runtime, true).ServeHTTP(recorder, request)
-
-	if recorder.Code != http.StatusBadRequest || !bytes.Contains(recorder.Body.Bytes(), []byte(`"code":-32602`)) {
-		t.Fatalf("oversized resource ID status=%d body=%s", recorder.Code, recorder.Body.String())
+	for _, uri := range []string{"email://threads/" + strings.Repeat("i", 129), "email://messages/not-a-uuid"} {
+		request := modernContractRequest(t, "resources/read", map[string]any{"_meta": modernOAuthMeta(), "uri": uri})
+		request.Header.Set("Mcp-Name", uri)
+		request = request.WithContext(auth.WithPrincipal(request.Context(), principal))
+		recorder := httptest.NewRecorder()
+		NewSDKHandler(runtime, true).ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusBadRequest || !bytes.Contains(recorder.Body.Bytes(), []byte(`"code":-32602`)) {
+			t.Fatalf("invalid resource ID status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
 	}
 }
 
