@@ -232,6 +232,7 @@ func TestLegacyAdapterRejectsHeaderBodyProtocolMismatchBeforeDispatch(t *testing
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d body=%s", recorder.Code, recorder.Body.String())
 	}
+	assertRouterProtocolError(t, recorder, sdkmcp.CodeHeaderMismatch)
 	if recorder.Header().Get("MCP-Session-Id") != "" {
 		t.Fatal("mismatched initialize created a session")
 	}

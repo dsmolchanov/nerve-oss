@@ -85,7 +85,7 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	request := r.WithContext(ctx)
 	versions := r.Header.Values("MCP-Protocol-Version")
 	if len(versions) != 1 {
-		writeRouterProtocolError(w, sdkmcp.CodeHeaderMismatch, "MCP-Protocol-Version header is required exactly once", nil)
+		writeHeaderMismatch(w, nil, "MCP-Protocol-Version header is required exactly once")
 		return
 	}
 	requestedVersion := versions[0]
@@ -96,7 +96,7 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		router.serveAdapter(w, request.WithContext(withRoutedProtocolVersion(request.Context(), ModernProtocolVersion)), router.modern)
 	default:
 		w.Header().Set("MCP-Supported-Protocol-Versions", LegacyProtocolVersion+", "+ModernProtocolVersion)
-		writeRouterProtocolError(w, sdkmcp.CodeUnsupportedProtocolVersion, "unsupported protocol version", sdkmcp.UnsupportedProtocolVersionData{
+		writeProtocolError(w, nil, sdkmcp.CodeUnsupportedProtocolVersion, "unsupported protocol version", sdkmcp.UnsupportedProtocolVersionData{
 			Supported: []string{LegacyProtocolVersion, ModernProtocolVersion},
 			Requested: requestedVersion,
 		})
@@ -113,11 +113,16 @@ func writeInsufficientScope(w http.ResponseWriter, requiredScope string) {
 	http.Error(w, "forbidden", http.StatusForbidden)
 }
 
-func writeRouterProtocolError(w http.ResponseWriter, code int, message string, data any) {
+func writeHeaderMismatch(w http.ResponseWriter, id any, message string) {
+	writeProtocolError(w, id, sdkmcp.CodeHeaderMismatch, message, nil)
+}
+
+func writeProtocolError(w http.ResponseWriter, id any, code int, message string, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadRequest)
 	_ = json.NewEncoder(w).Encode(Response{
 		JSONRPC: "2.0",
+		ID:      id,
 		Error:   &ResponseError{Code: code, Message: message, Data: data},
 	})
 }

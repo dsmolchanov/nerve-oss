@@ -194,7 +194,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, routed bool)
 		return
 	}
 	if err := validateRoutedProtocolVersion(ctx, req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeHeaderMismatch(w, req.ID, err.Error())
 		return
 	}
 	if s.Config.Cloud.Mode {
