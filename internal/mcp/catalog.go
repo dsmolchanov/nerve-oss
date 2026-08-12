@@ -69,8 +69,8 @@ func modernToolDescriptors(ctx context.Context, server *Server, principal auth.P
 			"draft": stringProperty(0), "risk_flags": arrayProperty(), "cited_message_ids": map[string]any{"type": []string{"array", "null"}},
 			"needs_human_approval": map[string]any{"type": "boolean"}, "policy_blocked": map[string]any{"type": "boolean"}, "reason": stringProperty(0),
 		}, "draft", "risk_flags", "cited_message_ids", "needs_human_approval")},
-		{Name: "send_reply", Description: "Send a reply", InputSchema: modernInputSchema(sendReplyInputSchema(attachmentsEnabled)), OutputShape: queuedMessageOutput()},
-		{Name: "compose_email", Description: "Compose and send a new email (not a reply)", InputSchema: modernInputSchema(composeEmailInputSchema(attachmentsEnabled)), OutputShape: composeQueuedMessageOutput()},
+		{Name: "send_reply", Description: "Send a reply", InputSchema: modernSendReplyInputSchema(attachmentsEnabled), OutputShape: queuedMessageOutput()},
+		{Name: "compose_email", Description: "Compose and send a new email (not a reply)", InputSchema: modernComposeEmailInputSchema(attachmentsEnabled), OutputShape: composeQueuedMessageOutput()},
 	}
 	return tools
 }
@@ -88,6 +88,31 @@ func inputObject(properties map[string]any, required ...string) map[string]any {
 func modernInputSchema(schema map[string]any) map[string]any {
 	schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
 	return schema
+}
+
+func modernSendReplyInputSchema(attachmentsEnabled bool) map[string]any {
+	schema := sendReplyInputSchema(attachmentsEnabled)
+	properties := schema["properties"].(map[string]any)
+	properties["thread_id"] = boundedStringProperty(1, 128)
+	properties["body_or_draft_id"] = boundedStringProperty(1, 10<<20)
+	properties["idempotency_key"] = boundedStringProperty(0, 128)
+	properties["html"] = boundedStringProperty(0, 10<<20)
+	return modernInputSchema(schema)
+}
+
+func modernComposeEmailInputSchema(attachmentsEnabled bool) map[string]any {
+	schema := composeEmailInputSchema(attachmentsEnabled)
+	properties := schema["properties"].(map[string]any)
+	properties["inbox_id"] = boundedStringProperty(1, 128)
+	properties["to"] = map[string]any{
+		"type": "string", "format": "email", "pattern": `^[^\s@]+@[^\s@]+\.[^\s@]+$`, "maxLength": 320,
+	}
+	properties["subject"] = boundedStringProperty(0, 998)
+	properties["from_name"] = boundedStringProperty(0, 256)
+	properties["idempotency_key"] = boundedStringProperty(0, 128)
+	properties["body"] = boundedStringProperty(0, 10<<20)
+	properties["html"] = boundedStringProperty(0, 10<<20)
+	return modernInputSchema(schema)
 }
 
 func stringProperty(minLength int) map[string]any {

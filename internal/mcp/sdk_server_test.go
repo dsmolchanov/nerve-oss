@@ -273,6 +273,23 @@ func TestSDKServerM2MOrgUsesSplitReplyAndComposeScopes(t *testing.T) {
 	}
 }
 
+func TestSDKServerPhase2DoesNotRegisterFutureBillingTool(t *testing.T) {
+	cfg := hostedRouterConfig()
+	runtime := NewServer(cfg, nil, auth.NewService(cfg, nil), nil)
+	principal := auth.Principal{
+		Kind: auth.PrincipalM2MOrg, OrgID: "org-1", ClientID: "client-1", Generation: 1,
+		Scopes: []string{"nerve:billing.subscribe"}, AuthMethod: "m2m_bearer",
+	}
+	for _, descriptor := range modernToolDescriptors(context.Background(), runtime, principal) {
+		if descriptor.Name == "nerve_billing_subscribe" {
+			t.Fatal("Phase 7 billing tool registered during the Phase 2 adapter rollout")
+		}
+	}
+	// The Phase 2 success criterion intentionally keeps future lifecycle and
+	// billing dispatch absent. Phase 7 adds BillingProvisioner and registers
+	// nerve_billing_subscribe atomically with its live mandate enforcement.
+}
+
 type originRoundTripper struct {
 	base   http.RoundTripper
 	origin string

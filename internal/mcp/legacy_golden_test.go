@@ -49,6 +49,24 @@ func TestLegacyResourcesListWireGolden(t *testing.T) {
 	}
 }
 
+func TestLegacyToolsListWireGolden(t *testing.T) {
+	cfg := config.Default()
+	runtime := NewServer(cfg, nil, nil, nil)
+	runtime.sessions["frozen-session"] = time.Now().Add(time.Hour)
+	request := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewBufferString(
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`,
+	))
+	request.Header.Set("MCP-Protocol-Version", LegacyProtocolVersion)
+	request.Header.Set("MCP-Session-Id", "frozen-session")
+	recorder := httptest.NewRecorder()
+	NewRouter(cfg, nil, NewLegacyHandler(runtime), nil).ServeHTTP(recorder, request)
+
+	want := `{"jsonrpc":"2.0","id":2,"result":{"tools":[{"description":"List threads in an inbox","name":"list_threads"},{"description":"Fetch a thread with messages","name":"get_thread"},{"description":"Semantic search over an inbox","name":"search_inbox"},{"description":"Classify intent, urgency, sentiment","name":"triage_message"},{"description":"Extract structured data","name":"extract_to_schema"},{"description":"Draft a reply constrained by policy","name":"draft_reply_with_policy"},{"description":"Send a reply","inputSchema":{"additionalProperties":false,"properties":{"body_or_draft_id":{"type":"string"},"html":{"type":"string"},"idempotency_key":{"type":"string"},"needs_human_approval":{"default":false,"type":"boolean"},"thread_id":{"minLength":1,"type":"string"}},"required":["thread_id","body_or_draft_id"],"type":"object"},"name":"send_reply"},{"description":"Compose and send a new email (not a reply)","inputSchema":{"additionalProperties":false,"anyOf":[{"required":["body"]},{"required":["html"]}],"properties":{"body":{"type":"string"},"from_name":{"type":"string"},"html":{"type":"string"},"idempotency_key":{"type":"string"},"inbox_id":{"minLength":1,"type":"string"},"subject":{"type":"string"},"to":{"format":"email","type":"string"}},"required":["inbox_id","to","subject"],"type":"object"},"name":"compose_email"}]}}` + "\n"
+	if got := recorder.Body.String(); got != want {
+		t.Fatalf("legacy tools/list wire changed\n got: %s want: %s", got, want)
+	}
+}
+
 func TestLegacyBusinessErrorWireGolden(t *testing.T) {
 	server := &Server{}
 	tests := []struct {
