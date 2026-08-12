@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
+
+	"neuralmail/internal/domains"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -17,6 +20,7 @@ type InboxRecord struct {
 	Address     string
 	Status      string
 	CreatedAt   time.Time
+	ExternalRef sql.NullString
 
 	InboundProvider           string
 	OutboundProvider          string
@@ -32,7 +36,7 @@ func (s *Store) GetInboxRecordByID(ctx context.Context, inboxID string) (InboxRe
 		SELECT id, org_id, org_domain_id::text, address, status, created_at,
 		       inbound_provider, outbound_provider,
 		       inbound_provider_config_ref, outbound_provider_config_ref,
-		       forward_to
+		       forward_to, external_ref
 		FROM inboxes
 		WHERE id = $1
 	`, inboxID)
@@ -48,6 +52,7 @@ func (s *Store) GetInboxRecordByID(ctx context.Context, inboxID string) (InboxRe
 		&rec.InboundProviderConfigRef,
 		&rec.OutboundProviderConfigRef,
 		&rec.ForwardTo,
+		&rec.ExternalRef,
 	); err != nil {
 		return rec, err
 	}
@@ -60,7 +65,7 @@ func (s *Store) GetInboxRecordByIDForOrg(ctx context.Context, orgID string, inbo
 		SELECT id, org_id, org_domain_id::text, address, status, created_at,
 		       inbound_provider, outbound_provider,
 		       inbound_provider_config_ref, outbound_provider_config_ref,
-		       forward_to
+		       forward_to, external_ref
 		FROM inboxes
 		WHERE id = $1 AND org_id = $2
 	`, inboxID, orgID)
@@ -76,6 +81,7 @@ func (s *Store) GetInboxRecordByIDForOrg(ctx context.Context, orgID string, inbo
 		&rec.InboundProviderConfigRef,
 		&rec.OutboundProviderConfigRef,
 		&rec.ForwardTo,
+		&rec.ExternalRef,
 	); err != nil {
 		return rec, err
 	}
@@ -87,7 +93,7 @@ func (s *Store) ListInboxRecordsByOrg(ctx context.Context, orgID string) ([]Inbo
 		SELECT id, org_id, org_domain_id::text, address, status, created_at,
 		       inbound_provider, outbound_provider,
 		       inbound_provider_config_ref, outbound_provider_config_ref,
-		       forward_to
+		       forward_to, external_ref
 		FROM inboxes
 		WHERE org_id = $1
 		ORDER BY created_at DESC
@@ -112,6 +118,7 @@ func (s *Store) ListInboxRecordsByOrg(ctx context.Context, orgID string) ([]Inbo
 			&rec.InboundProviderConfigRef,
 			&rec.OutboundProviderConfigRef,
 			&rec.ForwardTo,
+			&rec.ExternalRef,
 		); err != nil {
 			return nil, err
 		}
@@ -126,7 +133,7 @@ func (s *Store) GetInboxByAddress(ctx context.Context, address string) (InboxRec
 		SELECT id, org_id, org_domain_id::text, address, status, created_at,
 		       inbound_provider, outbound_provider,
 		       inbound_provider_config_ref, outbound_provider_config_ref,
-		       forward_to
+		       forward_to, external_ref
 		FROM inboxes
 		WHERE lower(address) = lower($1) AND status = 'active'
 		ORDER BY created_at DESC
@@ -144,6 +151,7 @@ func (s *Store) GetInboxByAddress(ctx context.Context, address string) (InboxRec
 		&rec.InboundProviderConfigRef,
 		&rec.OutboundProviderConfigRef,
 		&rec.ForwardTo,
+		&rec.ExternalRef,
 	); err != nil {
 		return rec, err
 	}
@@ -152,8 +160,15 @@ func (s *Store) GetInboxByAddress(ctx context.Context, address string) (InboxRec
 
 func (s *Store) CreateInboxForOrg(ctx context.Context, orgID string, address string, orgDomainID string, outboundProviders ...string) (InboxRecord, error) {
 	outboundProvider := "smtp"
-	if len(outboundProviders) > 0 && outboundProviders[0] != "" {
+	if len(outboundProviders) > 0 && strings.TrimSpace(outboundProviders[0]) != "" {
 		outboundProvider = outboundProviders[0]
+	}
+	return s.createInboxForOrg(ctx, orgID, address, orgDomainID, outboundProvider, "")
+}
+
+func (s *Store) createInboxForOrg(ctx context.Context, orgID string, address string, orgDomainID string, outboundProvider string, externalRef string) (InboxRecord, error) {
+	if outboundProvider == "" {
+		outboundProvider = "smtp"
 	}
 	rec := InboxRecord{
 		ID:      uuid.NewString(),
@@ -174,18 +189,140 @@ func (s *Store) CreateInboxForOrg(ctx context.Context, orgID string, address str
 	}
 
 	row := s.q.QueryRowContext(ctx, `
-		INSERT INTO inboxes (id, org_id, org_domain_id, address, status, outbound_provider)
-		VALUES ($1, $2, $3, $4, 'active', $5)
+		INSERT INTO inboxes (id, org_id, org_domain_id, address, status, outbound_provider, external_ref)
+		VALUES ($1, $2, $3, $4, 'active', $5, nullif($6, ''))
 		RETURNING created_at
-	`, rec.ID, rec.OrgID, domainRef, rec.Address, outboundProvider)
+	`, rec.ID, rec.OrgID, domainRef, rec.Address, outboundProvider, externalRef)
 	if err := row.Scan(&rec.CreatedAt); err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "uq_inboxes_canonical_address" {
+		if isCanonicalInboxAddressConflict(err) {
 			return InboxRecord{}, ErrResourceConflict
 		}
 		return InboxRecord{}, err
 	}
 	return rec, nil
+}
+
+// EnsureInboxForOrg is the idempotent provisioning path. The external_ref may
+// be replayed only with the exact same org/address/domain/provider tuple.
+func (s *Store) EnsureInboxForOrg(ctx context.Context, orgID, address, orgDomainID, outboundProvider, externalRef string) (InboxRecord, bool, error) {
+	externalRef = strings.TrimSpace(externalRef)
+	if externalRef == "" {
+		return InboxRecord{}, false, errors.New("missing external_ref")
+	}
+	var rec InboxRecord
+	created := false
+	err := s.withTx(ctx, func(scoped *Store) error {
+		canonicalDomain, err := inboxCanonicalDomain(address)
+		if err != nil {
+			return err
+		}
+		if err := scoped.lockCanonicalDomain(ctx, canonicalDomain); err != nil {
+			return err
+		}
+		if err := scoped.lockActiveOrgForReconciliation(ctx, orgID); err != nil {
+			return err
+		}
+		var ensureErr error
+		rec, created, ensureErr = scoped.ensureInboxForOrgLocked(
+			ctx, orgID, address, orgDomainID, outboundProvider, externalRef,
+		)
+		return ensureErr
+	})
+	return rec, created, err
+}
+
+func inboxCanonicalDomain(address string) (string, error) {
+	address = strings.TrimSpace(address)
+	separator := strings.LastIndexByte(address, '@')
+	if separator <= 0 || separator == len(address)-1 {
+		return "", errors.New("inbox address must contain a local part and domain")
+	}
+	return domains.CanonicalizeDomain(address[separator+1:])
+}
+
+func (s *Store) ensureInboxForOrgLocked(ctx context.Context, orgID, address, orgDomainID, outboundProvider, externalRef string) (InboxRecord, bool, error) {
+	if outboundProvider == "" {
+		outboundProvider = "smtp"
+	}
+
+	rec := InboxRecord{
+		ID:               uuid.NewString(),
+		OrgID:            orgID,
+		Address:          address,
+		Status:           "active",
+		ExternalRef:      sql.NullString{String: externalRef, Valid: true},
+		InboundProvider:  "jmap",
+		OutboundProvider: outboundProvider,
+	}
+	var domainRef any
+	if orgDomainID != "" {
+		domainRef = orgDomainID
+		rec.OrgDomainID = sql.NullString{String: orgDomainID, Valid: true}
+	}
+
+	// Use the external-ref unique index as the serialization point so two
+	// reconcilers cannot both pass a pre-read and make the loser surface a raw
+	// unique-constraint error.
+	err := s.q.QueryRowContext(ctx, `
+		INSERT INTO inboxes
+		  (id, org_id, org_domain_id, address, status, outbound_provider, external_ref)
+		VALUES ($1, $2, $3, $4, 'active', $5, $6)
+		ON CONFLICT (external_ref) WHERE external_ref IS NOT NULL DO NOTHING
+		RETURNING created_at
+	`, rec.ID, rec.OrgID, domainRef, rec.Address, outboundProvider, externalRef).Scan(&rec.CreatedAt)
+	if err == nil {
+		return rec, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		if isCanonicalInboxAddressConflict(err) {
+			return InboxRecord{}, false, ErrResourceConflict
+		}
+		return InboxRecord{}, false, err
+	}
+
+	rec, err = s.GetInboxByExternalRef(ctx, externalRef)
+	if err != nil {
+		return InboxRecord{}, false, err
+	}
+	if rec.OrgID != orgID || !strings.EqualFold(rec.Address, address) || rec.OrgDomainID.String != orgDomainID || rec.OutboundProvider != outboundProvider {
+		return InboxRecord{}, false, ErrIdempotencyConflict
+	}
+	return rec, false, nil
+}
+
+func isCanonicalInboxAddressConflict(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "uq_inboxes_canonical_address"
+}
+
+func (s *Store) GetInboxByExternalRef(ctx context.Context, externalRef string) (InboxRecord, error) {
+	var rec InboxRecord
+	row := s.q.QueryRowContext(ctx, `
+		SELECT id, org_id, org_domain_id::text, address, status, created_at,
+		       inbound_provider, outbound_provider,
+		       inbound_provider_config_ref, outbound_provider_config_ref,
+		       forward_to, external_ref
+		FROM inboxes WHERE external_ref = $1
+	`, strings.TrimSpace(externalRef))
+	err := row.Scan(
+		&rec.ID, &rec.OrgID, &rec.OrgDomainID, &rec.Address, &rec.Status, &rec.CreatedAt,
+		&rec.InboundProvider, &rec.OutboundProvider,
+		&rec.InboundProviderConfigRef, &rec.OutboundProviderConfigRef,
+		&rec.ForwardTo, &rec.ExternalRef,
+	)
+	return rec, err
+}
+
+func (s *Store) ReactivateInboxForOrg(ctx context.Context, orgID, inboxID string) (bool, error) {
+	result, err := s.q.ExecContext(ctx, `
+		UPDATE inboxes SET status = 'active'
+		WHERE id = $1 AND org_id = $2 AND status = 'disabled'
+	`, inboxID, orgID)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	return n > 0, err
 }
 
 func (s *Store) UpdateInboxOutboundProvider(ctx context.Context, inboxID string, provider string) error {
@@ -245,6 +382,24 @@ func (s *Store) DisableInboxForOrg(ctx context.Context, orgID string, inboxID st
 	result, err := s.q.ExecContext(ctx, `
 		UPDATE inboxes
 		SET status = 'disabled'
+		WHERE id = $1 AND org_id = $2
+	`, inboxID, orgID)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+// DeleteInboxForOrg permanently removes a bootstrap-managed inbox and its
+// cascading mailbox data. Tenant-facing deletion must continue to use
+// DisableInboxForOrg so accidental user deletion remains recoverable.
+func (s *Store) DeleteInboxForOrg(ctx context.Context, orgID string, inboxID string) (bool, error) {
+	result, err := s.q.ExecContext(ctx, `
+		DELETE FROM inboxes
 		WHERE id = $1 AND org_id = $2
 	`, inboxID, orgID)
 	if err != nil {

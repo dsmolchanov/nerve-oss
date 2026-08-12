@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -85,6 +86,14 @@ func (s *Store) SetFeatureFlag(ctx context.Context, orgID *string, flag string, 
 	updatedBy = strings.TrimSpace(updatedBy)
 	if flag == "" || updatedBy == "" {
 		return false, errors.New("missing feature flag or updated_by")
+	}
+	if orgID == nil && flag == "domain_writes" {
+		if err := s.requireTx(); err != nil {
+			return false, fmt.Errorf("domain_writes fence mutation: %w", err)
+		}
+		if _, err := s.q.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('domain-writes-fence', 0))`); err != nil {
+			return false, err
+		}
 	}
 
 	var (
