@@ -91,7 +91,7 @@ func TestSDKServerTranslatesBusinessFailureAsCallToolResult(t *testing.T) {
 	}
 	defer session.Close()
 	result, err := session.CallTool(context.Background(), &sdkmcp.CallToolParams{
-		Name: "list_threads", Arguments: json.RawMessage(`{"inbox_id":"inbox-1"}`),
+		Name: "list_threads", Arguments: json.RawMessage(`{"inbox_id":"11111111-1111-4111-8111-111111111111"}`),
 	})
 	if err != nil {
 		t.Fatalf("business failure escaped as protocol error: %v", err)

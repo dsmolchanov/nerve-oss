@@ -45,27 +45,27 @@ func modernToolDescriptors(ctx context.Context, server *Server, principal auth.P
 	attachmentsEnabled := server.attachmentsEnabled(auth.WithPrincipal(ctx, principal))
 	tools := []toolDescriptor{
 		{Name: "list_threads", Description: "List threads in an inbox", InputSchema: inputObject(
-			map[string]any{"inbox_id": boundedStringProperty(1, 128), "status": boundedStringProperty(0, 32), "limit": map[string]any{"type": "integer", "minimum": 0, "maximum": 100}},
+			map[string]any{"inbox_id": uuidStringProperty(), "status": boundedStringProperty(0, 32), "limit": map[string]any{"type": "integer", "minimum": 0, "maximum": 100}},
 			"inbox_id"), OutputShape: outputObject(map[string]any{"threads": arrayProperty()}, "threads")},
 		{Name: "get_thread", Description: "Fetch a thread with messages", InputSchema: inputObject(
-			map[string]any{"thread_id": boundedStringProperty(1, 128)}, "thread_id"), OutputShape: outputObject(
+			map[string]any{"thread_id": uuidStringProperty()}, "thread_id"), OutputShape: outputObject(
 			map[string]any{"thread": objectProperty(), "messages": arrayProperty()}, "thread", "messages")},
 		{Name: "search_inbox", Description: "Semantic search over an inbox", InputSchema: inputObject(
-			map[string]any{"inbox_id": boundedStringProperty(1, 128), "query": boundedStringProperty(1, 4_096), "top_k": map[string]any{"type": "integer", "minimum": 0, "maximum": 100}},
+			map[string]any{"inbox_id": uuidStringProperty(), "query": boundedStringProperty(1, 4_096), "top_k": map[string]any{"type": "integer", "minimum": 0, "maximum": 100}},
 			"inbox_id", "query"), OutputShape: outputObject(map[string]any{"results": arrayProperty()}, "results")},
 		{Name: "triage_message", Description: "Classify intent, urgency, sentiment", InputSchema: inputObject(
-			map[string]any{"message_id": boundedStringProperty(1, 128)}, "message_id"), OutputShape: outputObject(map[string]any{
+			map[string]any{"message_id": uuidStringProperty()}, "message_id"), OutputShape: outputObject(map[string]any{
 			"intent": stringProperty(0), "urgency": stringProperty(0), "sentiment": stringProperty(0),
 			"confidence": map[string]any{"type": "number"}, "suggested_route": stringProperty(0),
 		}, "intent", "urgency", "sentiment", "confidence", "suggested_route")},
 		{Name: "extract_to_schema", Description: "Extract structured data", InputSchema: inputObject(
-			map[string]any{"message_id": boundedStringProperty(1, 128), "schema_id": boundedStringProperty(1, 128)}, "message_id", "schema_id"),
+			map[string]any{"message_id": uuidStringProperty(), "schema_id": boundedStringProperty(1, 128)}, "message_id", "schema_id"),
 			OutputShape: outputObject(map[string]any{
 				"data": map[string]any{}, "confidence": map[string]any{"type": "number"},
 				"missing_fields": arrayProperty(), "validation_errors": arrayProperty(),
 			}, "data", "confidence", "missing_fields", "validation_errors")},
 		{Name: "draft_reply_with_policy", Description: "Draft a reply constrained by policy", InputSchema: inputObject(
-			map[string]any{"thread_id": boundedStringProperty(1, 128), "goal": boundedStringProperty(0, 4_096)}, "thread_id"), OutputShape: outputObject(map[string]any{
+			map[string]any{"thread_id": uuidStringProperty(), "goal": boundedStringProperty(0, 4_096)}, "thread_id"), OutputShape: outputObject(map[string]any{
 			"draft": stringProperty(0), "risk_flags": arrayProperty(), "cited_message_ids": map[string]any{"type": []string{"array", "null"}},
 			"needs_human_approval": map[string]any{"type": "boolean"}, "policy_blocked": map[string]any{"type": "boolean"}, "reason": stringProperty(0),
 		}, "draft", "risk_flags", "cited_message_ids", "needs_human_approval")},
@@ -93,7 +93,7 @@ func modernInputSchema(schema map[string]any) map[string]any {
 func modernSendReplyInputSchema(attachmentsEnabled bool) map[string]any {
 	schema := sendReplyInputSchema(attachmentsEnabled)
 	properties := schema["properties"].(map[string]any)
-	properties["thread_id"] = boundedStringProperty(1, 128)
+	properties["thread_id"] = uuidStringProperty()
 	properties["body_or_draft_id"] = boundedStringProperty(1, 10<<20)
 	properties["idempotency_key"] = boundedStringProperty(0, 128)
 	properties["html"] = boundedStringProperty(0, 10<<20)
@@ -103,7 +103,7 @@ func modernSendReplyInputSchema(attachmentsEnabled bool) map[string]any {
 func modernComposeEmailInputSchema(attachmentsEnabled bool) map[string]any {
 	schema := composeEmailInputSchema(attachmentsEnabled)
 	properties := schema["properties"].(map[string]any)
-	properties["inbox_id"] = boundedStringProperty(1, 128)
+	properties["inbox_id"] = uuidStringProperty()
 	properties["to"] = map[string]any{
 		"type": "string", "format": "email", "pattern": `^[^\s@]+@[^\s@]+\.[^\s@]+$`, "maxLength": 320,
 	}
@@ -127,6 +127,13 @@ func boundedStringProperty(minLength, maxLength int) map[string]any {
 	property := stringProperty(minLength)
 	property["maxLength"] = maxLength
 	return property
+}
+
+func uuidStringProperty() map[string]any {
+	return map[string]any{
+		"type": "string", "format": "uuid", "minLength": 36, "maxLength": 36,
+		"pattern": `^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`,
+	}
 }
 
 func objectProperty() map[string]any {

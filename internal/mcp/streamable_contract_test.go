@@ -22,6 +22,8 @@ import (
 	"neuralmail/internal/entitlements"
 )
 
+const modernTestUUID = "11111111-1111-4111-8111-111111111111"
+
 func TestModernContractRejectsMetadataAndHeaderFailuresBeforeDispatch(t *testing.T) {
 	runtime := NewServer(config.Default(), nil, nil, nil)
 	handler := NewSDKHandler(runtime, true)
@@ -332,8 +334,9 @@ func TestModernToolArgumentsFailSchemaBeforeInvokerSideEffects(t *testing.T) {
 		},
 	}
 	for _, arguments := range []map[string]any{
-		{"inbox_id": "inbox-1", "to": "not-an-email", "subject": "subject", "body": "body"},
+		{"inbox_id": modernTestUUID, "to": "not-an-email", "subject": "subject", "body": "body"},
 		{"inbox_id": strings.Repeat("i", 129), "to": "valid@example.com", "subject": "subject", "body": "body"},
+		{"inbox_id": "not-a-uuid", "to": "valid@example.com", "subject": "subject", "body": "body"},
 	} {
 		request := modernContractRequest(t, "tools/call", map[string]any{
 			"_meta": meta, "name": "compose_email", "arguments": arguments,
@@ -366,9 +369,9 @@ func TestModernEmptyOutboundFieldsFailSchemaBeforePolicy(t *testing.T) {
 		scope     string
 		arguments map[string]any
 	}{
-		{name: "empty reply", tool: "send_reply", scope: "nerve:email.reply", arguments: map[string]any{"thread_id": "thread-1", "body_or_draft_id": ""}},
-		{name: "empty compose subject", tool: "compose_email", scope: "nerve:email.compose", arguments: map[string]any{"inbox_id": "inbox-1", "to": "recipient@example.net", "subject": "", "body": "body"}},
-		{name: "empty compose body", tool: "compose_email", scope: "nerve:email.compose", arguments: map[string]any{"inbox_id": "inbox-1", "to": "recipient@example.net", "subject": "subject", "body": ""}},
+		{name: "empty reply", tool: "send_reply", scope: "nerve:email.reply", arguments: map[string]any{"thread_id": modernTestUUID, "body_or_draft_id": ""}},
+		{name: "empty compose subject", tool: "compose_email", scope: "nerve:email.compose", arguments: map[string]any{"inbox_id": modernTestUUID, "to": "recipient@example.net", "subject": "", "body": "body"}},
+		{name: "empty compose body", tool: "compose_email", scope: "nerve:email.compose", arguments: map[string]any{"inbox_id": modernTestUUID, "to": "recipient@example.net", "subject": "subject", "body": ""}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -423,7 +426,7 @@ func TestModernHiddenToolCallStillReachesInvoker(t *testing.T) {
 		"_meta": meta,
 		"name":  "compose_email",
 		"arguments": map[string]any{
-			"inbox_id": "inbox-1", "to": "recipient@example.net", "subject": "subject", "body": "body",
+			"inbox_id": modernTestUUID, "to": "recipient@example.net", "subject": "subject", "body": "body",
 		},
 	})
 	callRequest.Header.Set("Mcp-Name", "compose_email")
@@ -453,7 +456,7 @@ func TestModernToolScopeFailureReturnsOAuth403BeforeInvoker(t *testing.T) {
 		"_meta": meta,
 		"name":  "compose_email",
 		"arguments": map[string]any{
-			"inbox_id": "inbox-1", "to": "recipient@example.net", "subject": "subject", "body": "body",
+			"inbox_id": modernTestUUID, "to": "recipient@example.net", "subject": "subject", "body": "body",
 		},
 	})
 	request.Header.Set("Mcp-Name", "compose_email")
