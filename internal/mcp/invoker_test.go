@@ -99,7 +99,7 @@ func TestStoreOutboundPolicyGateAllowsOnlyReadyOwnedCustomDomain(t *testing.T) {
 			"inbox-1": {ID: "inbox-1", OrgID: "org-1", Address: "agent@example.com", Status: "active", OrgDomainID: sql.NullString{String: "domain-1", Valid: true}},
 		},
 		domains: map[string]store.OrgDomain{
-			"domain-1": {ID: "domain-1", OrgID: "org-1", Domain: "example.com", Status: "active", SPFVerified: true, DKIMVerified: true},
+			"domain-1": {ID: "domain-1", OrgID: "org-1", Domain: "example.com", Status: "active", MXVerified: true, SPFVerified: true, DKIMVerified: true, InboundEnabled: true, ResendReceivingEnabled: true},
 		},
 	}
 	gate := &storeOutboundPolicyGate{store: base}
@@ -126,11 +126,72 @@ func TestStoreOutboundPolicyGateAllowsOnlyReadyOwnedCustomDomain(t *testing.T) {
 	}
 }
 
+func TestStoreOutboundPolicyGateRequiresLatestRealInboundReply(t *testing.T) {
+	trueValue := true
+	falseValue := false
+	principal := auth.Principal{Kind: auth.PrincipalM2MOrg, OrgID: "org-1"}
+	base := fakeOutboundPolicyStore{
+		values: map[string]store.FeatureFlagValues{
+			"autonomous_outbound_policy": {Org: &trueValue},
+			"email_outbound_suspended":   {Org: &falseValue},
+		},
+		inboxes: map[string]store.InboxRecord{
+			"inbox-1": {ID: "inbox-1", OrgID: "org-1", Status: "active"},
+		},
+		threads: map[string]fakeThreadRecord{
+			"thread-1": {
+				thread:   store.Thread{ID: "thread-1", InboxID: "inbox-1"},
+				messages: []store.Message{{ID: "message-1", ThreadID: "thread-1", InboxID: "inbox-1", Direction: "inbound"}},
+			},
+		},
+		messages: map[string]store.Message{
+			"message-1": {ID: "message-1", ThreadID: "thread-1", InboxID: "inbox-1", Direction: "inbound", ReceivedEmailID: "received-1", From: store.Participant{Email: "sender@example.net"}},
+		},
+	}
+	gate := &storeOutboundPolicyGate{store: base}
+	arguments := json.RawMessage(`{"thread_id":"thread-1"}`)
+	if err := gate.Authorize(context.Background(), principal, "send_reply", arguments); err != nil {
+		t.Fatalf("real inbound reply denied: %v", err)
+	}
+	if err := gate.Authorize(context.Background(), principal, "send_reply", nil); err != nil {
+		t.Fatalf("catalog hid reply before a thread was selected: %v", err)
+	}
+
+	latestOutbound := base
+	latestOutbound.threads = map[string]fakeThreadRecord{
+		"thread-1": {
+			thread: store.Thread{ID: "thread-1", InboxID: "inbox-1"},
+			messages: []store.Message{
+				{ID: "message-1", ThreadID: "thread-1", InboxID: "inbox-1", Direction: "inbound"},
+				{ID: "message-2", ThreadID: "thread-1", InboxID: "inbox-1", Direction: "outbound"},
+			},
+		},
+	}
+	if err := (&storeOutboundPolicyGate{store: latestOutbound}).Authorize(context.Background(), principal, "send_reply", arguments); err == nil {
+		t.Fatal("reply after a newer outbound message was allowed")
+	}
+
+	notReal := base
+	notReal.messages = map[string]store.Message{
+		"message-1": {ID: "message-1", ThreadID: "thread-1", InboxID: "inbox-1", Direction: "inbound", From: store.Participant{Email: "sender@example.net"}},
+	}
+	if err := (&storeOutboundPolicyGate{store: notReal}).Authorize(context.Background(), principal, "send_reply", arguments); err == nil {
+		t.Fatal("inbound row without receiving evidence was allowed")
+	}
+}
+
+type fakeThreadRecord struct {
+	thread   store.Thread
+	messages []store.Message
+}
+
 type fakeOutboundPolicyStore struct {
-	values  map[string]store.FeatureFlagValues
-	inboxes map[string]store.InboxRecord
-	domains map[string]store.OrgDomain
-	err     error
+	values   map[string]store.FeatureFlagValues
+	inboxes  map[string]store.InboxRecord
+	domains  map[string]store.OrgDomain
+	threads  map[string]fakeThreadRecord
+	messages map[string]store.Message
+	err      error
 }
 
 func (fake fakeOutboundPolicyStore) GetInboxRecordByIDForOrg(_ context.Context, orgID, inboxID string) (store.InboxRecord, error) {
@@ -160,6 +221,22 @@ func (fake fakeOutboundPolicyStore) GetOrgDomainByIDForOrg(_ context.Context, or
 		return store.OrgDomain{}, sql.ErrNoRows
 	}
 	return domain, nil
+}
+
+func (fake fakeOutboundPolicyStore) GetThread(_ context.Context, threadID string) (store.Thread, []store.Message, error) {
+	record, ok := fake.threads[threadID]
+	if !ok {
+		return store.Thread{}, nil, sql.ErrNoRows
+	}
+	return record.thread, record.messages, nil
+}
+
+func (fake fakeOutboundPolicyStore) GetMessage(_ context.Context, messageID string) (store.Message, error) {
+	message, ok := fake.messages[messageID]
+	if !ok {
+		return store.Message{}, sql.ErrNoRows
+	}
+	return message, nil
 }
 
 func (fake fakeOutboundPolicyStore) LookupFeatureFlagForOrg(_ context.Context, _ string, flag string) (store.FeatureFlagValues, error) {

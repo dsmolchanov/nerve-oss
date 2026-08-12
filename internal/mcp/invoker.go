@@ -76,6 +76,8 @@ type outboundPolicyStore interface {
 	GetInboxRecordByIDForOrg(context.Context, string, string) (store.InboxRecord, error)
 	ListInboxRecordsByOrg(context.Context, string) ([]store.InboxRecord, error)
 	GetOrgDomainByIDForOrg(context.Context, string, string) (store.OrgDomain, error)
+	GetThread(context.Context, string) (store.Thread, []store.Message, error)
+	GetMessage(context.Context, string) (store.Message, error)
 }
 
 type storeOutboundPolicyGate struct {
@@ -103,6 +105,15 @@ func (gate *storeOutboundPolicyGate) Authorize(ctx context.Context, principal au
 		}
 		if values.Org == nil || *values.Org != requirement.want {
 			return &outboundPolicyError{Code: fmt.Sprintf("%s_denied", requirement.flag)}
+		}
+	}
+	if toolName == "send_reply" && len(arguments) != 0 {
+		allowed, err := gate.hasRealInboundReplyTarget(ctx, principal.OrgID, arguments)
+		if err != nil {
+			return &outboundPolicyError{Code: "outbound_policy_unavailable"}
+		}
+		if !allowed {
+			return &outboundPolicyError{Code: "inbound_reply_policy_denied"}
 		}
 	}
 	if toolName == "compose_email" {
@@ -155,12 +166,47 @@ func (gate *storeOutboundPolicyGate) hasReadyOwnedComposeInbox(ctx context.Conte
 			continue
 		}
 		at := strings.LastIndexByte(inbox.Address, '@')
-		if domain.Status == "active" && domain.SPFVerified && domain.DKIMVerified &&
+		if domain.Status == "active" && domain.MXVerified && domain.SPFVerified && domain.DKIMVerified &&
+			domain.InboundEnabled && domain.ResendReceivingEnabled &&
 			at >= 0 && strings.EqualFold(inbox.Address[at+1:], domain.Domain) {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+func (gate *storeOutboundPolicyGate) hasRealInboundReplyTarget(ctx context.Context, orgID string, arguments json.RawMessage) (bool, error) {
+	var input struct {
+		ThreadID string `json:"thread_id"`
+	}
+	if err := json.Unmarshal(arguments, &input); err != nil {
+		return false, err
+	}
+	if input.ThreadID == "" {
+		return false, nil
+	}
+	thread, messages, err := gate.store.GetThread(ctx, input.ThreadID)
+	if err != nil {
+		return false, err
+	}
+	if len(messages) == 0 {
+		return false, nil
+	}
+	inbox, err := gate.store.GetInboxRecordByIDForOrg(ctx, orgID, thread.InboxID)
+	if err != nil {
+		return false, err
+	}
+	latest := messages[len(messages)-1]
+	if inbox.Status != "active" || latest.Direction != "inbound" || latest.InboxID != thread.InboxID {
+		return false, nil
+	}
+	message, err := gate.store.GetMessage(ctx, latest.ID)
+	if err != nil {
+		return false, err
+	}
+	return message.ThreadID == thread.ID && message.InboxID == thread.InboxID &&
+		message.Direction == "inbound" && message.ReceivedEmailID != "" &&
+		strings.TrimSpace(message.From.Email) != "", nil
 }
 
 func requiredToolScope(principal auth.Principal, toolName string) string {
