@@ -57,9 +57,15 @@ func modernToolCatalog(ctx context.Context, server *Server, principal auth.Princ
 	}
 	visible := tools[:0]
 	for _, tool := range tools {
-		if server.Auth.ValidateScopes(principal, requiredToolScope(principal, tool.Name)) == nil {
-			visible = append(visible, tool)
+		if server.Auth.ValidateScopes(principal, requiredToolScope(principal, tool.Name)) != nil {
+			continue
 		}
+		if principal.Kind == auth.PrincipalM2MOrg && isOutboundTool(tool.Name) {
+			if server.OutboundPolicy == nil || server.OutboundPolicy.Authorize(ctx, principal, tool.Name) != nil {
+				continue
+			}
+		}
+		visible = append(visible, tool)
 	}
 	return visible
 }

@@ -17,9 +17,12 @@ type modernBusinessError struct {
 func translateModernBusinessError(err error) modernBusinessError {
 	translated := modernBusinessError{Code: "tool_failed"}
 	var attachmentErr *tools.AttachmentInputError
+	var policyErr *outboundPolicyError
 	var rateErr *entitlements.RateLimitError
 	var inProgressErr *entitlements.IdempotencyInProgressError
 	switch {
+	case errors.As(err, &policyErr):
+		translated.Code = policyErr.Code
 	case errors.As(err, &attachmentErr):
 		translated.Code = attachmentErr.Code
 	case errors.Is(err, entitlements.ErrQuotaExceeded):

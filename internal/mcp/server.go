@@ -33,16 +33,21 @@ type FeatureGate interface {
 	Enabled(ctx context.Context, flag string, orgID string) (bool, error)
 }
 
+type OutboundPolicyGate interface {
+	Authorize(ctx context.Context, principal auth.Principal, toolName string) error
+}
+
 type Server struct {
-	Config       config.Config
-	Auth         *auth.Service
-	Entitlements EntitlementGate
-	Tools        *tools.Service
-	MemoryBudget *memguard.Budget
-	FeatureFlags FeatureGate
-	Invoker      *Invoker
-	mu           sync.Mutex
-	sessions     map[string]time.Time
+	Config         config.Config
+	Auth           *auth.Service
+	Entitlements   EntitlementGate
+	Tools          *tools.Service
+	MemoryBudget   *memguard.Budget
+	FeatureFlags   FeatureGate
+	OutboundPolicy OutboundPolicyGate
+	Invoker        *Invoker
+	mu             sync.Mutex
+	sessions       map[string]time.Time
 }
 
 func NewServer(cfg config.Config, toolsSvc *tools.Service, authSvc *auth.Service, entitlementSvc EntitlementGate) *Server {
@@ -51,6 +56,9 @@ func NewServer(cfg config.Config, toolsSvc *tools.Service, authSvc *auth.Service
 		budget, _ = memguard.New(64 << 20)
 	}
 	server := &Server{Config: cfg, Auth: authSvc, Entitlements: entitlementSvc, Tools: toolsSvc, MemoryBudget: budget, sessions: make(map[string]time.Time)}
+	if toolsSvc != nil && toolsSvc.Store != nil {
+		server.OutboundPolicy = &storeOutboundPolicyGate{store: toolsSvc.Store}
+	}
 	server.Invoker = &Invoker{server: server}
 	return server
 }

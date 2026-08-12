@@ -230,6 +230,7 @@ func TestSDKServerM2MOrgUsesSplitReplyAndComposeScopes(t *testing.T) {
 	cfg := hostedRouterConfig()
 	authService := auth.NewService(cfg, nil)
 	runtime := NewServer(cfg, nil, authService, nil)
+	runtime.OutboundPolicy = allowOutboundPolicyGate{}
 	principal := auth.Principal{
 		Kind: auth.PrincipalM2MOrg, OrgID: "org-1", ClientID: "client-1", Generation: 1,
 		Scopes: []string{"nerve:email.reply", "nerve:email.compose"}, AuthMethod: "m2m_bearer",
@@ -275,6 +276,12 @@ func TestSDKServerM2MOrgUsesSplitReplyAndComposeScopes(t *testing.T) {
 type originRoundTripper struct {
 	base   http.RoundTripper
 	origin string
+}
+
+type allowOutboundPolicyGate struct{}
+
+func (allowOutboundPolicyGate) Authorize(context.Context, auth.Principal, string) error {
+	return nil
 }
 
 func (transport originRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
