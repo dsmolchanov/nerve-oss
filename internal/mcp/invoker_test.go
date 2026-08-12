@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -58,10 +59,10 @@ func TestStoreOutboundPolicyGateUsesExplicitLiveOrgFlags(t *testing.T) {
 		"email_outbound_suspended":   {Org: &falseValue},
 		"email_compose_org_enabled":  {Org: &trueValue},
 	}}}
-	if err := allowed.Authorize(context.Background(), principal, "send_reply"); err != nil {
+	if err := allowed.Authorize(context.Background(), principal, "send_reply", nil); err != nil {
 		t.Fatalf("explicit reply policy denied: %v", err)
 	}
-	if err := allowed.Authorize(context.Background(), principal, "compose_email"); err != nil {
+	if err := allowed.Authorize(context.Background(), principal, "compose_email", nil); err != nil {
 		t.Fatalf("explicit compose policy denied: %v", err)
 	}
 
@@ -70,23 +71,95 @@ func TestStoreOutboundPolicyGateUsesExplicitLiveOrgFlags(t *testing.T) {
 		"email_outbound_suspended":   {Org: &trueValue},
 		"email_compose_org_enabled":  {Org: &trueValue},
 	}}}
-	if err := denied.Authorize(context.Background(), principal, "compose_email"); err == nil {
+	if err := denied.Authorize(context.Background(), principal, "compose_email", nil); err == nil {
 		t.Fatal("suspended org compose was allowed")
 	}
 	missing := &storeOutboundPolicyGate{store: fakeOutboundPolicyStore{values: map[string]store.FeatureFlagValues{}}}
-	if err := missing.Authorize(context.Background(), principal, "send_reply"); err == nil {
+	if err := missing.Authorize(context.Background(), principal, "send_reply", nil); err == nil {
 		t.Fatal("missing explicit policy was allowed")
 	}
 	failing := &storeOutboundPolicyGate{store: fakeOutboundPolicyStore{err: errors.New("database unavailable")}}
 	var policyErr *outboundPolicyError
-	if err := failing.Authorize(context.Background(), principal, "send_reply"); !errors.As(err, &policyErr) || policyErr.Code != "outbound_policy_unavailable" {
+	if err := failing.Authorize(context.Background(), principal, "send_reply", nil); !errors.As(err, &policyErr) || policyErr.Code != "outbound_policy_unavailable" {
 		t.Fatalf("policy read error did not fail closed: %v", err)
 	}
 }
 
+func TestStoreOutboundPolicyGateAllowsOnlyReadyOwnedCustomDomain(t *testing.T) {
+	trueValue := true
+	falseValue := false
+	principal := auth.Principal{Kind: auth.PrincipalM2MOrg, OrgID: "org-1"}
+	base := fakeOutboundPolicyStore{
+		values: map[string]store.FeatureFlagValues{
+			"autonomous_outbound_policy": {Org: &trueValue},
+			"email_outbound_suspended":   {Org: &falseValue},
+			"email_compose_org_enabled":  {Org: &falseValue},
+		},
+		inboxes: map[string]store.InboxRecord{
+			"inbox-1": {ID: "inbox-1", OrgID: "org-1", Address: "agent@example.com", Status: "active", OrgDomainID: sql.NullString{String: "domain-1", Valid: true}},
+		},
+		domains: map[string]store.OrgDomain{
+			"domain-1": {ID: "domain-1", OrgID: "org-1", Domain: "example.com", Status: "active", SPFVerified: true, DKIMVerified: true},
+		},
+	}
+	gate := &storeOutboundPolicyGate{store: base}
+	arguments := json.RawMessage(`{"inbox_id":"inbox-1"}`)
+	if err := gate.Authorize(context.Background(), principal, "compose_email", arguments); err != nil {
+		t.Fatalf("ready owned custom domain denied: %v", err)
+	}
+	if err := gate.Authorize(context.Background(), principal, "compose_email", nil); err != nil {
+		t.Fatalf("catalog hid compose for ready owned custom domain: %v", err)
+	}
+
+	notReady := base
+	notReady.domains = map[string]store.OrgDomain{
+		"domain-1": {ID: "domain-1", OrgID: "org-1", Domain: "example.com", Status: "active", SPFVerified: true},
+	}
+	if err := (&storeOutboundPolicyGate{store: notReady}).Authorize(context.Background(), principal, "compose_email", arguments); err == nil {
+		t.Fatal("custom domain without complete sending verification was allowed")
+	}
+
+	platformOwned := base
+	platformOwned.domains = map[string]store.OrgDomain{}
+	if err := (&storeOutboundPolicyGate{store: platformOwned}).Authorize(context.Background(), principal, "compose_email", arguments); err == nil {
+		t.Fatal("platform-owned mailbox granted custom-domain compose")
+	}
+}
+
 type fakeOutboundPolicyStore struct {
-	values map[string]store.FeatureFlagValues
-	err    error
+	values  map[string]store.FeatureFlagValues
+	inboxes map[string]store.InboxRecord
+	domains map[string]store.OrgDomain
+	err     error
+}
+
+func (fake fakeOutboundPolicyStore) GetInboxRecordByIDForOrg(_ context.Context, orgID, inboxID string) (store.InboxRecord, error) {
+	inbox, ok := fake.inboxes[inboxID]
+	if !ok || inbox.OrgID != orgID {
+		return store.InboxRecord{}, sql.ErrNoRows
+	}
+	return inbox, nil
+}
+
+func (fake fakeOutboundPolicyStore) ListInboxRecordsByOrg(_ context.Context, orgID string) ([]store.InboxRecord, error) {
+	if fake.err != nil {
+		return nil, fake.err
+	}
+	var inboxes []store.InboxRecord
+	for _, inbox := range fake.inboxes {
+		if inbox.OrgID == orgID {
+			inboxes = append(inboxes, inbox)
+		}
+	}
+	return inboxes, nil
+}
+
+func (fake fakeOutboundPolicyStore) GetOrgDomainByIDForOrg(_ context.Context, orgID, domainID string) (store.OrgDomain, error) {
+	domain, ok := fake.domains[domainID]
+	if !ok || domain.OrgID != orgID {
+		return store.OrgDomain{}, sql.ErrNoRows
+	}
+	return domain, nil
 }
 
 func (fake fakeOutboundPolicyStore) LookupFeatureFlagForOrg(_ context.Context, _ string, flag string) (store.FeatureFlagValues, error) {

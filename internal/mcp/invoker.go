@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"neuralmail/internal/auth"
 	"neuralmail/internal/store"
@@ -48,7 +49,7 @@ func (invoker *Invoker) Invoke(ctx context.Context, invocation ToolInvocation) (
 			if invoker.server.OutboundPolicy == nil {
 				return nil, &outboundPolicyError{Code: "outbound_policy_unavailable"}
 			}
-			if err := invoker.server.OutboundPolicy.Authorize(ctx, principal, invocation.Name); err != nil {
+			if err := invoker.server.OutboundPolicy.Authorize(ctx, principal, invocation.Name, invocation.Arguments); err != nil {
 				return nil, err
 			}
 		}
@@ -72,13 +73,16 @@ func (err *outboundPolicyError) Error() string {
 
 type outboundPolicyStore interface {
 	LookupFeatureFlagForOrg(context.Context, string, string) (store.FeatureFlagValues, error)
+	GetInboxRecordByIDForOrg(context.Context, string, string) (store.InboxRecord, error)
+	ListInboxRecordsByOrg(context.Context, string) ([]store.InboxRecord, error)
+	GetOrgDomainByIDForOrg(context.Context, string, string) (store.OrgDomain, error)
 }
 
 type storeOutboundPolicyGate struct {
 	store outboundPolicyStore
 }
 
-func (gate *storeOutboundPolicyGate) Authorize(ctx context.Context, principal auth.Principal, toolName string) error {
+func (gate *storeOutboundPolicyGate) Authorize(ctx context.Context, principal auth.Principal, toolName string, arguments json.RawMessage) error {
 	if principal.Kind != auth.PrincipalM2MOrg || !isOutboundTool(toolName) {
 		return nil
 	}
@@ -92,12 +96,6 @@ func (gate *storeOutboundPolicyGate) Authorize(ctx context.Context, principal au
 		{flag: "autonomous_outbound_policy", want: true},
 		{flag: "email_outbound_suspended", want: false},
 	}
-	if toolName == "compose_email" {
-		required = append(required, struct {
-			flag string
-			want bool
-		}{flag: "email_compose_org_enabled", want: true})
-	}
 	for _, requirement := range required {
 		values, err := gate.store.LookupFeatureFlagForOrg(ctx, principal.OrgID, requirement.flag)
 		if err != nil {
@@ -107,7 +105,62 @@ func (gate *storeOutboundPolicyGate) Authorize(ctx context.Context, principal au
 			return &outboundPolicyError{Code: fmt.Sprintf("%s_denied", requirement.flag)}
 		}
 	}
+	if toolName == "compose_email" {
+		values, err := gate.store.LookupFeatureFlagForOrg(ctx, principal.OrgID, "email_compose_org_enabled")
+		if err != nil || values.Org == nil {
+			return &outboundPolicyError{Code: "outbound_policy_unavailable"}
+		}
+		if *values.Org {
+			return nil
+		}
+		allowed, err := gate.hasReadyOwnedComposeInbox(ctx, principal.OrgID, arguments)
+		if err != nil {
+			return &outboundPolicyError{Code: "outbound_policy_unavailable"}
+		}
+		if !allowed {
+			return &outboundPolicyError{Code: "email_compose_org_enabled_denied"}
+		}
+	}
 	return nil
+}
+
+func (gate *storeOutboundPolicyGate) hasReadyOwnedComposeInbox(ctx context.Context, orgID string, arguments json.RawMessage) (bool, error) {
+	var inboxes []store.InboxRecord
+	if len(arguments) == 0 {
+		var err error
+		inboxes, err = gate.store.ListInboxRecordsByOrg(ctx, orgID)
+		if err != nil {
+			return false, err
+		}
+	} else {
+		var input struct {
+			InboxID string `json:"inbox_id"`
+		}
+		if err := json.Unmarshal(arguments, &input); err != nil || input.InboxID == "" {
+			return false, err
+		}
+		inbox, err := gate.store.GetInboxRecordByIDForOrg(ctx, orgID, input.InboxID)
+		if err != nil {
+			return false, err
+		}
+		inboxes = []store.InboxRecord{inbox}
+	}
+
+	for _, inbox := range inboxes {
+		if inbox.Status != "active" || !inbox.OrgDomainID.Valid {
+			continue
+		}
+		domain, err := gate.store.GetOrgDomainByIDForOrg(ctx, orgID, inbox.OrgDomainID.String)
+		if err != nil {
+			continue
+		}
+		at := strings.LastIndexByte(inbox.Address, '@')
+		if domain.Status == "active" && domain.SPFVerified && domain.DKIMVerified &&
+			at >= 0 && strings.EqualFold(inbox.Address[at+1:], domain.Domain) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func requiredToolScope(principal auth.Principal, toolName string) string {

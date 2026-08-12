@@ -34,7 +34,7 @@ type FeatureGate interface {
 }
 
 type OutboundPolicyGate interface {
-	Authorize(ctx context.Context, principal auth.Principal, toolName string) error
+	Authorize(ctx context.Context, principal auth.Principal, toolName string, arguments json.RawMessage) error
 }
 
 type Server struct {

@@ -280,7 +280,7 @@ type originRoundTripper struct {
 
 type allowOutboundPolicyGate struct{}
 
-func (allowOutboundPolicyGate) Authorize(context.Context, auth.Principal, string) error {
+func (allowOutboundPolicyGate) Authorize(context.Context, auth.Principal, string, json.RawMessage) error {
 	return nil
 }
 

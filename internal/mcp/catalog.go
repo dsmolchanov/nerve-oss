@@ -61,7 +61,7 @@ func modernToolCatalog(ctx context.Context, server *Server, principal auth.Princ
 			continue
 		}
 		if principal.Kind == auth.PrincipalM2MOrg && isOutboundTool(tool.Name) {
-			if server.OutboundPolicy == nil || server.OutboundPolicy.Authorize(ctx, principal, tool.Name) != nil {
+			if server.OutboundPolicy == nil || server.OutboundPolicy.Authorize(ctx, principal, tool.Name, nil) != nil {
 				continue
 			}
 		}
