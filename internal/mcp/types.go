@@ -82,7 +82,7 @@ func attachmentInputSchema() map[string]any {
 func sendReplyInputSchema(attachmentsEnabled bool) map[string]any {
 	properties := map[string]any{
 		"thread_id":            map[string]any{"type": "string", "minLength": 1, "maxLength": 128},
-		"body_or_draft_id":     map[string]any{"type": "string", "maxLength": 10 << 20},
+		"body_or_draft_id":     map[string]any{"type": "string", "minLength": 1, "maxLength": 10 << 20},
 		"idempotency_key":      map[string]any{"type": "string", "maxLength": 128},
 		"html":                 map[string]any{"type": "string", "maxLength": 10 << 20},
 		"needs_human_approval": map[string]any{"type": "boolean", "default": false},

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -191,6 +192,33 @@ func TestModernToolArgumentsFailSchemaBeforeInvokerSideEffects(t *testing.T) {
 	}
 }
 
+func TestModernEmptyReplyFailsSchemaBeforePolicy(t *testing.T) {
+	cfg := hostedRouterConfig()
+	runtime := NewServer(cfg, nil, auth.NewService(cfg, nil), nil)
+	policyGate := &countingOutboundPolicyGate{}
+	runtime.OutboundPolicy = policyGate
+	principal := auth.Principal{
+		Kind: auth.PrincipalM2MOrg, OrgID: "org-1", ClientID: "client-1", Generation: 1,
+		Scopes: []string{"nerve:email.reply"}, AuthMethod: "m2m_bearer",
+	}
+	request := modernContractRequest(t, "tools/call", map[string]any{
+		"_meta": modernOAuthMeta(), "name": "send_reply",
+		"arguments": map[string]any{"thread_id": "thread-1", "body_or_draft_id": ""},
+	})
+	request.Header.Set("Mcp-Name", "send_reply")
+	request = request.WithContext(auth.WithPrincipal(request.Context(), principal))
+	recorder := httptest.NewRecorder()
+	NewSDKHandler(runtime, true).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK ||
+		!bytes.Contains(recorder.Body.Bytes(), []byte(`"isError":true`)) ||
+		!bytes.Contains(recorder.Body.Bytes(), []byte(`validating`)) {
+		t.Fatalf("empty reply did not fail schema validation: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if policyGate.dispatchCalls.Load() != 0 {
+		t.Fatalf("empty reply reached outbound policy %d times", policyGate.dispatchCalls.Load())
+	}
+}
+
 func TestModernHiddenToolCallStillReachesInvoker(t *testing.T) {
 	cfg := hostedRouterConfig()
 	authService := auth.NewService(cfg, nil)
@@ -286,6 +314,17 @@ func TestModernResourceIDsAreBoundedBeforeRead(t *testing.T) {
 
 type denyOutboundPolicyGate struct {
 	code string
+}
+
+type countingOutboundPolicyGate struct {
+	dispatchCalls atomic.Int32
+}
+
+func (gate *countingOutboundPolicyGate) Authorize(_ context.Context, _ auth.Principal, _ string, arguments json.RawMessage) error {
+	if arguments != nil {
+		gate.dispatchCalls.Add(1)
+	}
+	return nil
 }
 
 func modernOAuthMeta() map[string]any {
