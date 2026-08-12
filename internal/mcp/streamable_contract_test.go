@@ -191,6 +191,57 @@ func TestModernToolArgumentsFailSchemaBeforeInvokerSideEffects(t *testing.T) {
 	}
 }
 
+func TestModernHiddenToolCallStillReachesInvoker(t *testing.T) {
+	cfg := hostedRouterConfig()
+	authService := auth.NewService(cfg, nil)
+	runtime := NewServer(cfg, nil, authService, nil)
+	runtime.OutboundPolicy = denyOutboundPolicyGate{code: "test_policy_denied"}
+	principal := auth.Principal{
+		Kind: auth.PrincipalM2MOrg, OrgID: "org-1", ClientID: "client-1", Generation: 1,
+		Scopes: []string{"nerve:email.compose"}, AuthMethod: "m2m_bearer",
+	}
+	meta := map[string]any{
+		sdkmcp.MetaKeyProtocolVersion: ModernProtocolVersion,
+		sdkmcp.MetaKeyClientCapabilities: map[string]any{
+			"extensions": map[string]any{oauthClientCredentialsExtension: map[string]any{}},
+		},
+	}
+
+	listRequest := modernContractRequest(t, "tools/list", map[string]any{"_meta": meta})
+	listRequest = listRequest.WithContext(auth.WithPrincipal(listRequest.Context(), principal))
+	listRecorder := httptest.NewRecorder()
+	NewSDKHandler(runtime, true).ServeHTTP(listRecorder, listRequest)
+	if listRecorder.Code != http.StatusOK || bytes.Contains(listRecorder.Body.Bytes(), []byte(`"compose_email"`)) {
+		t.Fatalf("denied tool remained discoverable: status=%d body=%s", listRecorder.Code, listRecorder.Body.String())
+	}
+
+	callRequest := modernContractRequest(t, "tools/call", map[string]any{
+		"_meta": meta,
+		"name":  "compose_email",
+		"arguments": map[string]any{
+			"inbox_id": "inbox-1", "to": "recipient@example.net", "subject": "subject", "body": "body",
+		},
+	})
+	callRequest.Header.Set("Mcp-Name", "compose_email")
+	callRequest = callRequest.WithContext(auth.WithPrincipal(callRequest.Context(), principal))
+	callRecorder := httptest.NewRecorder()
+	NewSDKHandler(runtime, true).ServeHTTP(callRecorder, callRequest)
+	if callRecorder.Code != http.StatusOK ||
+		!bytes.Contains(callRecorder.Body.Bytes(), []byte(`"isError":true`)) ||
+		!bytes.Contains(callRecorder.Body.Bytes(), []byte(`test_policy_denied`)) ||
+		bytes.Contains(callRecorder.Body.Bytes(), []byte(`unknown tool`)) {
+		t.Fatalf("hidden call bypassed invoker policy: status=%d body=%s", callRecorder.Code, callRecorder.Body.String())
+	}
+}
+
+type denyOutboundPolicyGate struct {
+	code string
+}
+
+func (gate denyOutboundPolicyGate) Authorize(context.Context, auth.Principal, string, json.RawMessage) error {
+	return &outboundPolicyError{Code: gate.code}
+}
+
 func modernContractRequest(t *testing.T, method string, params map[string]any) *http.Request {
 	t.Helper()
 	body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": params})

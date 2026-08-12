@@ -317,7 +317,10 @@ func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string,
 		if len(messages) == 0 {
 			return nil, errors.New("no messages in thread")
 		}
-		to := messages[len(messages)-1].From.Email
+		to, err := replyRecipient(scopedCtx, st, principal, thread, messages)
+		if err != nil {
+			return nil, err
+		}
 		if to == "" {
 			return nil, errors.New("missing recipient")
 		}
@@ -401,6 +404,36 @@ func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string,
 		}
 		return map[string]any{"message_id": msgID, "status": "queued"}, nil
 	})
+}
+
+type replyMessageStore interface {
+	GetMessage(context.Context, string) (store.Message, error)
+}
+
+func replyRecipient(ctx context.Context, messagesStore replyMessageStore, principal auth.Principal, thread store.Thread, messages []store.Message) (string, error) {
+	if len(messages) == 0 {
+		return "", errors.New("no messages in thread")
+	}
+	if principal.Kind != auth.PrincipalM2MOrg {
+		return messages[len(messages)-1].From.Email, nil
+	}
+	for index := len(messages) - 1; index >= 0; index-- {
+		candidate := messages[index]
+		if candidate.Direction != "inbound" || candidate.InboxID != thread.InboxID {
+			continue
+		}
+		message, err := messagesStore.GetMessage(ctx, candidate.ID)
+		if err != nil {
+			return "", err
+		}
+		if message.ThreadID == thread.ID && message.InboxID == thread.InboxID &&
+			message.Direction == "inbound" && message.ReceivedEmailID != "" {
+			if recipient := strings.TrimSpace(message.From.Email); recipient != "" {
+				return recipient, nil
+			}
+		}
+	}
+	return "", errors.New("no real inbound reply target")
 }
 
 func (s *Service) ComposeEmail(ctx context.Context, inboxID, toAddress, subject, body string, bodyHTML string, idempotencyKey string) (any, error) {

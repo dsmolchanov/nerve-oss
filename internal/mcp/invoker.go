@@ -196,17 +196,25 @@ func (gate *storeOutboundPolicyGate) hasRealInboundReplyTarget(ctx context.Conte
 	if err != nil {
 		return false, err
 	}
-	latest := messages[len(messages)-1]
-	if inbox.Status != "active" || latest.Direction != "inbound" || latest.InboxID != thread.InboxID {
+	if inbox.Status != "active" {
 		return false, nil
 	}
-	message, err := gate.store.GetMessage(ctx, latest.ID)
-	if err != nil {
-		return false, err
+	for index := len(messages) - 1; index >= 0; index-- {
+		candidate := messages[index]
+		if candidate.Direction != "inbound" || candidate.InboxID != thread.InboxID {
+			continue
+		}
+		message, err := gate.store.GetMessage(ctx, candidate.ID)
+		if err != nil {
+			return false, err
+		}
+		if message.ThreadID == thread.ID && message.InboxID == thread.InboxID &&
+			message.Direction == "inbound" && message.ReceivedEmailID != "" &&
+			strings.TrimSpace(message.From.Email) != "" {
+			return true, nil
+		}
 	}
-	return message.ThreadID == thread.ID && message.InboxID == thread.InboxID &&
-		message.Direction == "inbound" && message.ReceivedEmailID != "" &&
-		strings.TrimSpace(message.From.Email) != "", nil
+	return false, nil
 }
 
 func requiredToolScope(principal auth.Principal, toolName string) string {

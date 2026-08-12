@@ -22,6 +22,26 @@ func modernToolCatalog(ctx context.Context, server *Server, principal auth.Princ
 		// onboarding implementation. An empty list is a fail-closed profile.
 		return nil
 	}
+	tools := modernToolDescriptors(ctx, server, principal)
+	if !server.Config.Cloud.Mode || server.Auth == nil {
+		return tools
+	}
+	visible := tools[:0]
+	for _, tool := range tools {
+		if server.Auth.ValidateScopes(principal, requiredToolScope(principal, tool.Name)) != nil {
+			continue
+		}
+		if principal.Kind == auth.PrincipalM2MOrg && isOutboundTool(tool.Name) {
+			if server.OutboundPolicy == nil || server.OutboundPolicy.Authorize(ctx, principal, tool.Name, nil) != nil {
+				continue
+			}
+		}
+		visible = append(visible, tool)
+	}
+	return visible
+}
+
+func modernToolDescriptors(ctx context.Context, server *Server, principal auth.Principal) []toolDescriptor {
 	attachmentsEnabled := server.attachmentsEnabled(auth.WithPrincipal(ctx, principal))
 	tools := []toolDescriptor{
 		{Name: "list_threads", Description: "List threads in an inbox", InputSchema: inputObject(
@@ -52,22 +72,7 @@ func modernToolCatalog(ctx context.Context, server *Server, principal auth.Princ
 		{Name: "send_reply", Description: "Send a reply", InputSchema: modernInputSchema(sendReplyInputSchema(attachmentsEnabled)), OutputShape: queuedMessageOutput()},
 		{Name: "compose_email", Description: "Compose and send a new email (not a reply)", InputSchema: modernInputSchema(composeEmailInputSchema(attachmentsEnabled)), OutputShape: composeQueuedMessageOutput()},
 	}
-	if !server.Config.Cloud.Mode || server.Auth == nil {
-		return tools
-	}
-	visible := tools[:0]
-	for _, tool := range tools {
-		if server.Auth.ValidateScopes(principal, requiredToolScope(principal, tool.Name)) != nil {
-			continue
-		}
-		if principal.Kind == auth.PrincipalM2MOrg && isOutboundTool(tool.Name) {
-			if server.OutboundPolicy == nil || server.OutboundPolicy.Authorize(ctx, principal, tool.Name, nil) != nil {
-				continue
-			}
-		}
-		visible = append(visible, tool)
-	}
-	return visible
+	return tools
 }
 
 func inputObject(properties map[string]any, required ...string) map[string]any {

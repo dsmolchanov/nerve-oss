@@ -167,8 +167,8 @@ func TestStoreOutboundPolicyGateRequiresLatestRealInboundReply(t *testing.T) {
 			},
 		},
 	}
-	if err := (&storeOutboundPolicyGate{store: latestOutbound}).Authorize(context.Background(), principal, "send_reply", arguments); err == nil {
-		t.Fatal("reply after a newer outbound message was allowed")
+	if err := (&storeOutboundPolicyGate{store: latestOutbound}).Authorize(context.Background(), principal, "send_reply", arguments); err != nil {
+		t.Fatalf("reply after a newer outbound message was denied: %v", err)
 	}
 
 	notReal := base

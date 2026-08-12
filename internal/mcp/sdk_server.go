@@ -215,17 +215,18 @@ func newSDKServer(requestContext context.Context, runtime *Server) *sdkmcp.Serve
 	server := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "nerve-runtime", Version: release.RuntimeVersion}, &sdkmcp.ServerOptions{
 		Capabilities: capabilities,
 	})
+	principal, hasPrincipal := auth.PrincipalFromContext(requestContext)
 	server.AddReceivingMiddleware(func(next sdkmcp.MethodHandler) sdkmcp.MethodHandler {
 		return func(ctx context.Context, method string, request sdkmcp.Request) (sdkmcp.Result, error) {
 			result, err := next(ctx, method, request)
 			if err == nil {
+				filterModernToolList(result, modernToolCatalog(requestContext, runtime, principal))
 				setPrivateListCache(result)
 			}
 			return result, err
 		}
 	})
-	principal, hasPrincipal := auth.PrincipalFromContext(requestContext)
-	for _, descriptor := range modernToolCatalog(requestContext, runtime, principal) {
+	for _, descriptor := range modernToolDescriptors(requestContext, runtime, principal) {
 		descriptor := descriptor
 		sdkmcp.AddTool[map[string]any, any](server, sdkTool(descriptor), func(ctx context.Context, request *sdkmcp.CallToolRequest, _ map[string]any) (*sdkmcp.CallToolResult, any, error) {
 			if hasPrincipal {
@@ -249,6 +250,24 @@ func newSDKServer(requestContext context.Context, runtime *Server) *sdkmcp.Serve
 		registerSDKResources(server, runtime, principal, hasPrincipal)
 	}
 	return server
+}
+
+func filterModernToolList(result sdkmcp.Result, visible []toolDescriptor) {
+	listed, ok := result.(*sdkmcp.ListToolsResult)
+	if !ok {
+		return
+	}
+	allowed := make(map[string]struct{}, len(visible))
+	for _, descriptor := range visible {
+		allowed[descriptor.Name] = struct{}{}
+	}
+	filtered := listed.Tools[:0]
+	for _, tool := range listed.Tools {
+		if _, ok := allowed[tool.Name]; ok {
+			filtered = append(filtered, tool)
+		}
+	}
+	listed.Tools = filtered
 }
 
 func canReadModernResources(runtime *Server, principal auth.Principal) bool {
