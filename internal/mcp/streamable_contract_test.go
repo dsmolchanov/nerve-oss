@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -166,23 +167,24 @@ func TestModernToolArgumentsFailSchemaBeforeInvokerSideEffects(t *testing.T) {
 			"extensions": map[string]any{oauthClientCredentialsExtension: map[string]any{}},
 		},
 	}
-	request := modernContractRequest(t, "tools/call", map[string]any{
-		"_meta": meta,
-		"name":  "compose_email",
-		"arguments": map[string]any{
-			"inbox_id": "inbox-1", "to": "not-an-email", "subject": "subject", "body": "body",
-		},
-	})
-	request.Header.Set("Mcp-Name", "compose_email")
-	request = request.WithContext(auth.WithPrincipal(request.Context(), principal))
-	recorder := httptest.NewRecorder()
-	NewSDKHandler(runtime, true).ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("schema failure status=%d body=%s", recorder.Code, recorder.Body.String())
-	}
-	if !bytes.Contains(recorder.Body.Bytes(), []byte(`"isError":true`)) ||
-		!bytes.Contains(recorder.Body.Bytes(), []byte(`validating`)) {
-		t.Fatalf("schema failure did not return a tool error: %s", recorder.Body.String())
+	for _, arguments := range []map[string]any{
+		{"inbox_id": "inbox-1", "to": "not-an-email", "subject": "subject", "body": "body"},
+		{"inbox_id": strings.Repeat("i", 129), "to": "valid@example.com", "subject": "subject", "body": "body"},
+	} {
+		request := modernContractRequest(t, "tools/call", map[string]any{
+			"_meta": meta, "name": "compose_email", "arguments": arguments,
+		})
+		request.Header.Set("Mcp-Name", "compose_email")
+		request = request.WithContext(auth.WithPrincipal(request.Context(), principal))
+		recorder := httptest.NewRecorder()
+		NewSDKHandler(runtime, true).ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("schema failure status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		if !bytes.Contains(recorder.Body.Bytes(), []byte(`"isError":true`)) ||
+			!bytes.Contains(recorder.Body.Bytes(), []byte(`validating`)) {
+			t.Fatalf("schema failure did not return a tool error: %s", recorder.Body.String())
+		}
 	}
 	if entitlementGate.preAuthCalls != 0 {
 		t.Fatalf("invalid arguments reached entitlement gate %d times", entitlementGate.preAuthCalls)

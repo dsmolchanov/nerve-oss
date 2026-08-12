@@ -81,10 +81,10 @@ func attachmentInputSchema() map[string]any {
 
 func sendReplyInputSchema(attachmentsEnabled bool) map[string]any {
 	properties := map[string]any{
-		"thread_id":            map[string]any{"type": "string", "minLength": 1},
-		"body_or_draft_id":     map[string]any{"type": "string"},
-		"idempotency_key":      map[string]any{"type": "string"},
-		"html":                 map[string]any{"type": "string"},
+		"thread_id":            map[string]any{"type": "string", "minLength": 1, "maxLength": 128},
+		"body_or_draft_id":     map[string]any{"type": "string", "maxLength": 10 << 20},
+		"idempotency_key":      map[string]any{"type": "string", "maxLength": 128},
+		"html":                 map[string]any{"type": "string", "maxLength": 10 << 20},
 		"needs_human_approval": map[string]any{"type": "boolean", "default": false},
 	}
 	if attachmentsEnabled {
@@ -100,13 +100,13 @@ func sendReplyInputSchema(attachmentsEnabled bool) map[string]any {
 
 func composeEmailInputSchema(attachmentsEnabled bool) map[string]any {
 	properties := map[string]any{
-		"inbox_id":        map[string]any{"type": "string", "minLength": 1},
-		"to":              map[string]any{"type": "string", "format": "email", "pattern": `^[^\s@]+@[^\s@]+\.[^\s@]+$`},
-		"subject":         map[string]any{"type": "string"},
-		"from_name":       map[string]any{"type": "string"},
-		"idempotency_key": map[string]any{"type": "string"},
-		"body":            map[string]any{"type": "string"},
-		"html":            map[string]any{"type": "string"},
+		"inbox_id":        map[string]any{"type": "string", "minLength": 1, "maxLength": 128},
+		"to":              map[string]any{"type": "string", "format": "email", "pattern": `^[^\s@]+@[^\s@]+\.[^\s@]+$`, "maxLength": 320},
+		"subject":         map[string]any{"type": "string", "maxLength": 998},
+		"from_name":       map[string]any{"type": "string", "maxLength": 256},
+		"idempotency_key": map[string]any{"type": "string", "maxLength": 128},
+		"body":            map[string]any{"type": "string", "maxLength": 10 << 20},
+		"html":            map[string]any{"type": "string", "maxLength": 10 << 20},
 	}
 	if attachmentsEnabled {
 		properties["attachments"] = attachmentInputSchema()
