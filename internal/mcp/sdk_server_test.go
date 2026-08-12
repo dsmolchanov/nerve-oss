@@ -204,6 +204,20 @@ func TestSDKServerM2MOrgUsesSplitReplyAndComposeScopes(t *testing.T) {
 	if len(listed.Tools) != 2 || listed.Tools[0].Name != "compose_email" || listed.Tools[1].Name != "send_reply" {
 		t.Fatalf("split scopes exposed wrong tools: %#v", listed.Tools)
 	}
+	resources, err := session.ListResources(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list resources without read scope: %v", err)
+	}
+	if len(resources.Resources) != 0 {
+		t.Fatalf("read resources exposed without nerve:email.read: %#v", resources.Resources)
+	}
+	templates, err := session.ListResourceTemplates(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list resource templates without read scope: %v", err)
+	}
+	if len(templates.ResourceTemplates) != 0 {
+		t.Fatalf("read templates exposed without nerve:email.read: %#v", templates.ResourceTemplates)
+	}
 }
 
 type originRoundTripper struct {

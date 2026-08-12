@@ -66,10 +66,20 @@ func newSDKServer(requestContext context.Context, runtime *Server) *sdkmcp.Serve
 			}, nil
 		})
 	}
-	if principal.Kind != auth.PrincipalM2MOnboarding {
+	if canReadModernResources(runtime, principal) {
 		registerSDKResources(server, runtime, principal, hasPrincipal)
 	}
 	return server
+}
+
+func canReadModernResources(runtime *Server, principal auth.Principal) bool {
+	if principal.Kind == auth.PrincipalM2MOnboarding {
+		return false
+	}
+	if !runtime.Config.Cloud.Mode {
+		return true
+	}
+	return runtime.Auth != nil && runtime.Auth.ValidateScopes(principal, "nerve:email.read") == nil
 }
 
 func setPrivateListCache(result sdkmcp.Result) {
@@ -88,6 +98,14 @@ func registerSDKResources(server *sdkmcp.Server, runtime *Server, principal auth
 	handler := func(ctx context.Context, request *sdkmcp.ReadResourceRequest) (*sdkmcp.ReadResourceResult, error) {
 		if hasPrincipal {
 			ctx = auth.WithPrincipal(ctx, principal)
+		}
+		if runtime.Config.Cloud.Mode {
+			if runtime.Auth == nil {
+				return nil, errors.New("cloud auth not configured")
+			}
+			if err := runtime.Auth.ValidateScopes(principal, "nerve:email.read"); err != nil {
+				return nil, err
+			}
 		}
 		params, _ := json.Marshal(ResourceReadParams{URI: request.Params.URI})
 		result, err := runtime.readResource(ctx, Request{Method: "resources/read", Params: params})

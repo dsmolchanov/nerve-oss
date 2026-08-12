@@ -202,7 +202,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, routed bool)
 	}
 	if s.Config.Cloud.Mode {
 		requiredScope := s.requiredScope(req)
-		if requiredScope != "" && req.Method != "tools/call" {
+		if requiredScope != "" {
 			if err := s.Auth.ValidateScopes(principal, requiredScope); err != nil {
 				writeInsufficientScope(w, requiredScope)
 				return
