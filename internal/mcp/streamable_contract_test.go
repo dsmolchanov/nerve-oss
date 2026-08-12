@@ -1,9 +1,14 @@
 package mcp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -148,8 +153,166 @@ func TestModernContractSupportsJSONAndSSEResponses(t *testing.T) {
 				!bytes.Contains(recorder.Body.Bytes(), []byte(`"result"`)) {
 				t.Fatalf("missing final JSON-RPC result: %s", recorder.Body.String())
 			}
+			if err := validateModernResponseStream(request.Context(), recorder.Header().Get("Content-Type"), bytes.NewReader(recorder.Body.Bytes()), json.RawMessage(`1`)); err != nil {
+				t.Fatalf("handler response violated contract: %v body=%s", err, recorder.Body.String())
+			}
 		})
 	}
+}
+
+func TestModernSSEContractFixtures(t *testing.T) {
+	validResponse := `{"jsonrpc":"2.0","id":1,"result":{}}`
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+		wantError   bool
+	}{
+		{name: "multiline comments and related notification", contentType: "text/event-stream; charset=utf-8", body: ": keepalive\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\ndata: \"method\":\"notifications/progress\",\"params\":{}}\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\ndata: \"id\":1,\"result\":{}}\n\n"},
+		{name: "malformed event line", contentType: "text/event-stream", body: "not-an-sse-field\n\n", wantError: true},
+		{name: "truncated JSON", contentType: "text/event-stream", body: "data: {\"jsonrpc\":\"2.0\",\"id\":1", wantError: true},
+		{name: "wrong response ID", contentType: "text/event-stream", body: "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\n\n", wantError: true},
+		{name: "duplicate final response", contentType: "text/event-stream", body: "data: " + validResponse + "\n\ndata: " + validResponse + "\n\n", wantError: true},
+		{name: "EOF without final response", contentType: "text/event-stream", body: "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n", wantError: true},
+		{name: "missing content type", body: validResponse, wantError: true},
+		{name: "unsupported content type", contentType: "text/plain", body: validResponse, wantError: true},
+		{name: "duplicate JSON response", contentType: "application/json", body: validResponse + validResponse, wantError: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateModernResponseStream(context.Background(), test.contentType, strings.NewReader(test.body), json.RawMessage(`1`))
+			if (err != nil) != test.wantError {
+				t.Fatalf("error=%v wantError=%v", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestModernSSEContractHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := validateModernResponseStream(ctx, "text/event-stream", cancelReader{ctx: ctx}, json.RawMessage(`1`))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation error=%v", err)
+	}
+}
+
+type cancelReader struct {
+	ctx context.Context
+}
+
+func (reader cancelReader) Read([]byte) (int, error) {
+	<-reader.ctx.Done()
+	return 0, reader.ctx.Err()
+}
+
+type modernConformanceMessage struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Method  string          `json:"method"`
+	Result  json.RawMessage `json:"result"`
+	Error   json.RawMessage `json:"error"`
+}
+
+func validateModernResponseStream(ctx context.Context, contentType string, reader io.Reader, expectedID json.RawMessage) error {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return fmt.Errorf("invalid content type: %w", err)
+	}
+	switch mediaType {
+	case "application/json":
+		decoder := json.NewDecoder(reader)
+		var message modernConformanceMessage
+		if err := decoder.Decode(&message); err != nil {
+			return err
+		}
+		if err := requireConformanceJSONEOF(decoder); err != nil {
+			return err
+		}
+		return validateModernFinalMessage(message, expectedID)
+	case "text/event-stream":
+		return validateModernSSE(ctx, reader, expectedID)
+	default:
+		return fmt.Errorf("unsupported content type %q", mediaType)
+	}
+}
+
+func validateModernSSE(ctx context.Context, reader io.Reader, expectedID json.RawMessage) error {
+	scanner := bufio.NewScanner(reader)
+	var data []string
+	finalResponses := 0
+	flush := func() error {
+		if len(data) == 0 {
+			return nil
+		}
+		var message modernConformanceMessage
+		if err := json.Unmarshal([]byte(strings.Join(data, "\n")), &message); err != nil {
+			return fmt.Errorf("malformed SSE JSON: %w", err)
+		}
+		data = nil
+		if len(message.ID) == 0 && message.Method != "" {
+			return nil
+		}
+		if err := validateModernFinalMessage(message, expectedID); err != nil {
+			return err
+		}
+		finalResponses++
+		if finalResponses > 1 {
+			return errors.New("duplicate final response")
+		}
+		return nil
+	}
+	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		line := scanner.Text()
+		switch {
+		case line == "":
+			if err := flush(); err != nil {
+				return err
+			}
+		case strings.HasPrefix(line, ":"):
+			continue
+		case strings.HasPrefix(line, "data:"):
+			data = append(data, strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
+		case strings.HasPrefix(line, "event:") || strings.HasPrefix(line, "id:") || strings.HasPrefix(line, "retry:"):
+			continue
+		default:
+			return fmt.Errorf("malformed SSE line %q", line)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	if err := flush(); err != nil {
+		return err
+	}
+	if finalResponses != 1 {
+		return errors.New("EOF without exactly one final response")
+	}
+	return nil
+}
+
+func validateModernFinalMessage(message modernConformanceMessage, expectedID json.RawMessage) error {
+	if message.JSONRPC != "2.0" || len(message.ID) == 0 || (!bytes.Equal(bytes.TrimSpace(message.ID), bytes.TrimSpace(expectedID))) {
+		return errors.New("wrong JSON-RPC response ID or version")
+	}
+	if len(message.Result) == 0 && len(message.Error) == 0 {
+		return errors.New("response has neither result nor error")
+	}
+	return nil
+}
+
+func requireConformanceJSONEOF(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("duplicate JSON response")
+		}
+		return err
+	}
+	return nil
 }
 
 func TestModernToolArgumentsFailSchemaBeforeInvokerSideEffects(t *testing.T) {
