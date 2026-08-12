@@ -2,8 +2,11 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
@@ -79,15 +82,33 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	request := r.WithContext(ctx)
-	switch r.Header.Get("MCP-Protocol-Version") {
+	versions := r.Header.Values("MCP-Protocol-Version")
+	if len(versions) != 1 {
+		writeRouterProtocolError(w, sdkmcp.CodeHeaderMismatch, "MCP-Protocol-Version header is required exactly once", nil)
+		return
+	}
+	requestedVersion := versions[0]
+	switch requestedVersion {
 	case LegacyProtocolVersion:
 		router.serveAdapter(w, request.WithContext(withRoutedProtocolVersion(request.Context(), LegacyProtocolVersion)), router.legacy)
 	case ModernProtocolVersion:
 		router.serveAdapter(w, request.WithContext(withRoutedProtocolVersion(request.Context(), ModernProtocolVersion)), router.modern)
 	default:
 		w.Header().Set("MCP-Supported-Protocol-Versions", LegacyProtocolVersion+", "+ModernProtocolVersion)
-		http.Error(w, "missing or unsupported MCP-Protocol-Version", http.StatusBadRequest)
+		writeRouterProtocolError(w, sdkmcp.CodeUnsupportedProtocolVersion, "unsupported protocol version", sdkmcp.UnsupportedProtocolVersionData{
+			Supported: []string{LegacyProtocolVersion, ModernProtocolVersion},
+			Requested: requestedVersion,
+		})
 	}
+}
+
+func writeRouterProtocolError(w http.ResponseWriter, code int, message string, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	_ = json.NewEncoder(w).Encode(Response{
+		JSONRPC: "2.0",
+		Error:   &ResponseError{Code: code, Message: message, Data: data},
+	})
 }
 
 func (router *Router) serveAdapter(w http.ResponseWriter, r *http.Request, handler http.Handler) {

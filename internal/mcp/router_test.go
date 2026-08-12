@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
 )
@@ -113,18 +115,64 @@ func TestRouterRoutesExactProtocolVersions(t *testing.T) {
 	for _, test := range []struct {
 		version string
 		status  int
-	}{{LegacyProtocolVersion, http.StatusNoContent}, {ModernProtocolVersion, http.StatusAccepted}, {"", http.StatusBadRequest}, {"2027-01-01", http.StatusBadRequest}, {" " + LegacyProtocolVersion, http.StatusBadRequest}} {
+	}{{LegacyProtocolVersion, http.StatusNoContent}, {ModernProtocolVersion, http.StatusAccepted}, {"2027-01-01", http.StatusBadRequest}, {" " + LegacyProtocolVersion, http.StatusBadRequest}} {
 		recorder := httptest.NewRecorder()
 		router.ServeHTTP(recorder, routedRequest(test.version, ""))
 		if recorder.Code != test.status {
 			t.Fatalf("version %q: expected %d, got %d", test.version, test.status, recorder.Code)
 		}
-		if test.status == http.StatusBadRequest && recorder.Header().Get("MCP-Supported-Protocol-Versions") != LegacyProtocolVersion+", "+ModernProtocolVersion {
-			t.Fatal("unsupported response omitted supported versions")
+		if test.status == http.StatusBadRequest {
+			assertRouterProtocolError(t, recorder, sdkmcp.CodeUnsupportedProtocolVersion)
+			if recorder.Header().Get("MCP-Supported-Protocol-Versions") != LegacyProtocolVersion+", "+ModernProtocolVersion {
+				t.Fatal("unsupported response omitted supported versions")
+			}
 		}
 	}
 	if legacyCalls != 1 || modernCalls != 1 {
 		t.Fatalf("unexpected routes: legacy=%d modern=%d", legacyCalls, modernCalls)
+	}
+}
+
+func TestRouterRejectsMissingAndDuplicateProtocolHeaders(t *testing.T) {
+	router := NewRouter(config.Default(), nil, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("ambiguous protocol request reached adapter")
+	}), nil)
+	for _, test := range []struct {
+		name     string
+		versions []string
+	}{
+		{name: "missing"},
+		{name: "duplicate", versions: []string{LegacyProtocolVersion, ModernProtocolVersion}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+			for _, version := range test.versions {
+				req.Header.Add("MCP-Protocol-Version", version)
+			}
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, req)
+			assertRouterProtocolError(t, recorder, sdkmcp.CodeHeaderMismatch)
+			if recorder.Header().Get("MCP-Supported-Protocol-Versions") != "" {
+				t.Fatal("header mismatch unexpectedly advertised supported versions")
+			}
+		})
+	}
+}
+
+func assertRouterProtocolError(t *testing.T, recorder *httptest.ResponseRecorder, code int) {
+	t.Helper()
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if contentType := recorder.Header().Get("Content-Type"); contentType != "application/json" {
+		t.Fatalf("protocol error content type = %q", contentType)
+	}
+	var response Response
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode protocol error: %v", err)
+	}
+	if response.Error == nil || response.Error.Code != code {
+		t.Fatalf("protocol error = %#v, want code %d", response.Error, code)
 	}
 }
 
