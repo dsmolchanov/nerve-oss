@@ -23,7 +23,7 @@ func TestSDKServerIsStatelessAndListsDeterministicEmailTools(t *testing.T) {
 		http.HandlerFunc(runtime.HandleRoutedHTTP), NewSDKHandler(runtime, true)))
 	defer hosted.Close()
 
-	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "nerve-test", Version: "0.3.0"}, nil)
+	client := newModernSDKTestClient()
 	session, err := client.Connect(context.Background(), &sdkmcp.StreamableClientTransport{
 		Endpoint: hosted.URL, DisableStandaloneSSE: true,
 	}, nil)
@@ -80,7 +80,7 @@ func TestSDKServerTranslatesBusinessFailureAsCallToolResult(t *testing.T) {
 	}), NewLegacyHandler(runtime), NewSDKHandler(runtime, true)))
 	defer hosted.Close()
 
-	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "nerve-test", Version: "0.3.0"}, nil)
+	client := newModernSDKTestClient()
 	session, err := client.Connect(context.Background(), &sdkmcp.StreamableClientTransport{
 		Endpoint: hosted.URL, HTTPClient: &http.Client{Transport: originRoundTripper{
 			base: http.DefaultTransport, origin: "https://agent.example",
@@ -114,7 +114,7 @@ func TestSDKServerListsConformantPrivateResources(t *testing.T) {
 	hosted := httptest.NewServer(NewRouter(cfg, nil, NewLegacyHandler(runtime), NewSDKHandler(runtime, true)))
 	defer hosted.Close()
 
-	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "nerve-test", Version: "0.3.0"}, nil)
+	client := newModernSDKTestClient()
 	session, err := client.Connect(context.Background(), &sdkmcp.StreamableClientTransport{
 		Endpoint: hosted.URL, DisableStandaloneSSE: true,
 	}, nil)
@@ -207,7 +207,7 @@ func TestSDKServerOnboardingProfileHasNoLifecycleToolsBeforePhase3(t *testing.T)
 		http.HandlerFunc(runtime.HandleRoutedHTTP), NewSDKHandler(runtime, true)))
 	defer hosted.Close()
 
-	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "nerve-test", Version: "0.3.0"}, nil)
+	client := newModernSDKTestClient()
 	session, err := client.Connect(context.Background(), &sdkmcp.StreamableClientTransport{
 		Endpoint: hosted.URL, HTTPClient: &http.Client{Transport: originRoundTripper{
 			base: http.DefaultTransport, origin: "https://agent.example",
@@ -240,7 +240,7 @@ func TestSDKServerM2MOrgUsesSplitReplyAndComposeScopes(t *testing.T) {
 	}), http.HandlerFunc(runtime.HandleRoutedHTTP), NewSDKHandler(runtime, true)))
 	defer hosted.Close()
 
-	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "nerve-test", Version: "0.3.0"}, nil)
+	client := newModernSDKTestClient()
 	session, err := client.Connect(context.Background(), &sdkmcp.StreamableClientTransport{
 		Endpoint: hosted.URL, HTTPClient: &http.Client{Transport: originRoundTripper{
 			base: http.DefaultTransport, origin: "https://agent.example",
@@ -276,6 +276,14 @@ func TestSDKServerM2MOrgUsesSplitReplyAndComposeScopes(t *testing.T) {
 type originRoundTripper struct {
 	base   http.RoundTripper
 	origin string
+}
+
+func newModernSDKTestClient() *sdkmcp.Client {
+	capabilities := &sdkmcp.ClientCapabilities{}
+	capabilities.AddExtension(oauthClientCredentialsExtension, map[string]any{})
+	return sdkmcp.NewClient(&sdkmcp.Implementation{Name: "nerve-test", Version: "0.3.0"}, &sdkmcp.ClientOptions{
+		Capabilities: capabilities,
+	})
 }
 
 type allowOutboundPolicyGate struct{}

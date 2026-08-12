@@ -1,10 +1,12 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 
@@ -53,7 +55,157 @@ func NewSDKHandler(runtime *Server, jsonResponse bool) http.Handler {
 		}
 		defer release()
 		request.Body = http.MaxBytesReader(w, request.Body, maxMCPBodyBytes)
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			var maxBytesError *http.MaxBytesError
+			if errors.As(err, &maxBytesError) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+		_ = request.Body.Close()
+		request.Body = io.NopCloser(bytes.NewReader(body))
+		if !validateModernRequestContract(w, request, body) {
+			return
+		}
 		sdkHandler.ServeHTTP(w, request)
+	})
+}
+
+type modernWireRequest struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      any             `json:"id"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params"`
+}
+
+func validateModernRequestContract(w http.ResponseWriter, request *http.Request, body []byte) bool {
+	var wire modernWireRequest
+	if err := json.Unmarshal(body, &wire); err != nil || wire.Method == "" {
+		// The SDK owns ordinary JSON-RPC parse and shape errors. They cannot
+		// dispatch because no method was decoded.
+		return true
+	}
+	if values := request.Header.Values("Mcp-Method"); len(values) != 1 || values[0] != wire.Method {
+		writeHeaderMismatch(w, wire.ID, "Mcp-Method header must occur once and match the body method")
+		return false
+	}
+	if requiredName, present, ok := modernRequestName(wire.Method, wire.Params); present {
+		values := request.Header.Values("Mcp-Name")
+		if !ok || len(values) != 1 || values[0] != requiredName {
+			writeHeaderMismatch(w, wire.ID, "Mcp-Name header must occur once and match the body name")
+			return false
+		}
+	}
+
+	var params struct {
+		Meta map[string]json.RawMessage `json:"_meta"`
+	}
+	if err := json.Unmarshal(wire.Params, &params); err != nil || params.Meta == nil {
+		writeHeaderMismatch(w, wire.ID, "modern request params._meta is required")
+		return false
+	}
+	var protocolVersion string
+	protocolRaw, present := params.Meta[sdkmcp.MetaKeyProtocolVersion]
+	if !present || json.Unmarshal(protocolRaw, &protocolVersion) != nil || protocolVersion == "" {
+		writeHeaderMismatch(w, wire.ID, "modern request protocolVersion metadata is required")
+		return false
+	}
+	if protocolVersion != ModernProtocolVersion {
+		writeProtocolError(w, wire.ID, sdkmcp.CodeUnsupportedProtocolVersion, "unsupported protocol version", sdkmcp.UnsupportedProtocolVersionData{
+			Supported: []string{ModernProtocolVersion}, Requested: protocolVersion,
+		})
+		return false
+	}
+
+	capabilitiesRaw, present := params.Meta[sdkmcp.MetaKeyClientCapabilities]
+	var capabilities map[string]json.RawMessage
+	if !present || !isJSONObject(capabilitiesRaw) || json.Unmarshal(capabilitiesRaw, &capabilities) != nil {
+		writeMissingCapabilities(w, wire.ID, false)
+		return false
+	}
+	if clientInfoRaw, present := params.Meta[sdkmcp.MetaKeyClientInfo]; present && !validClientInfo(clientInfoRaw) {
+		writeHeaderMismatch(w, wire.ID, "clientInfo metadata is malformed or exceeds configured bounds")
+		return false
+	}
+	principal, _ := auth.PrincipalFromContext(request.Context())
+	if principal.Kind == auth.PrincipalM2MOnboarding || principal.Kind == auth.PrincipalM2MOrg {
+		if !hasOAuthClientCredentialsCapability(capabilities) {
+			writeMissingCapabilities(w, wire.ID, true)
+			return false
+		}
+	}
+	return true
+}
+
+func modernRequestName(method string, params json.RawMessage) (string, bool, bool) {
+	var field string
+	switch method {
+	case "tools/call", "prompts/get":
+		field = "name"
+	case "resources/read":
+		field = "uri"
+	default:
+		return "", false, true
+	}
+	var values map[string]json.RawMessage
+	if json.Unmarshal(params, &values) != nil {
+		return "", true, false
+	}
+	var name string
+	if json.Unmarshal(values[field], &name) != nil || name == "" {
+		return "", true, false
+	}
+	return name, true, true
+}
+
+func hasOAuthClientCredentialsCapability(capabilities map[string]json.RawMessage) bool {
+	extensionsRaw, ok := capabilities["extensions"]
+	if !ok || !isJSONObject(extensionsRaw) {
+		return false
+	}
+	var extensions map[string]json.RawMessage
+	if json.Unmarshal(extensionsRaw, &extensions) != nil {
+		return false
+	}
+	settings, ok := extensions[oauthClientCredentialsExtension]
+	if !ok || !isJSONObject(settings) {
+		return false
+	}
+	var settingsObject map[string]json.RawMessage
+	return json.Unmarshal(settings, &settingsObject) == nil
+}
+
+func isJSONObject(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) >= 2 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}'
+}
+
+func validClientInfo(raw json.RawMessage) bool {
+	if !isJSONObject(raw) {
+		return false
+	}
+	var implementation sdkmcp.Implementation
+	if json.Unmarshal(raw, &implementation) != nil {
+		return false
+	}
+	return boundedRequiredString(implementation.Name, 128) && boundedRequiredString(implementation.Version, 128) &&
+		len(implementation.Title) <= 256 && len(implementation.Description) <= 1_024 && len(implementation.WebsiteURL) <= 2_048
+}
+
+func boundedRequiredString(value string, maximum int) bool {
+	return value != "" && len(value) <= maximum
+}
+
+func writeMissingCapabilities(w http.ResponseWriter, id any, oauthExtension bool) {
+	required := &sdkmcp.ClientCapabilities{}
+	if oauthExtension {
+		required.AddExtension(oauthClientCredentialsExtension, map[string]any{})
+	}
+	writeProtocolError(w, id, sdkmcp.CodeMissingRequiredClientCapabilities, "missing required client capabilities", sdkmcp.MissingRequiredClientCapabilityData{
+		RequiredCapabilities: required,
 	})
 }
 
