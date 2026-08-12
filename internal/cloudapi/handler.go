@@ -714,18 +714,43 @@ func (h *Handler) handleDomainByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var deleted bool
+	var domain store.OrgDomain
+	var releaseStarted bool
 	err = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
 		var err error
-		deleted, err = scoped.DeleteOrgDomainForOrg(r.Context(), orgID, domainID)
+		domain, releaseStarted, err = scoped.BeginOrgDomainReleaseForOrg(r.Context(), orgID, domainID)
 		return err
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if !deleted {
+	if !releaseStarted {
 		http.Error(w, "domain not found", http.StatusNotFound)
+		return
+	}
+
+	if domain.ResendDomainID.Valid && strings.TrimSpace(domain.ResendDomainID.String) != "" {
+		if strings.TrimSpace(h.Config.Resend.APIKey) == "" {
+			http.Error(w, "domain release is pending provider credentials", http.StatusServiceUnavailable)
+			return
+		}
+		if err := h.resendDomainsClient().DeleteDomain(r.Context(), domain.ResendDomainID.String); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+	}
+
+	// On Cloud 0009 this removes the durable ownership claim and Core row only
+	// after the provider has confirmed absence. On Cloud 0008 the first call
+	// preserves the legacy immediate-delete behavior, so this is an idempotent
+	// no-op and the compatibility contract remains intact.
+	err = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+		_, err := scoped.FinalizeOrgDomainReleaseForOrg(r.Context(), orgID, domainID)
+		return err
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted"})

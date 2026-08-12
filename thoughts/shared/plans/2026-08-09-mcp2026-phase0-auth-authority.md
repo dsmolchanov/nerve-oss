@@ -1,17 +1,18 @@
 ---
-title: MCP 2026 Phase 0 Shared Authentication Authority
+title: MCP 2026 Phase 0/1 Shared Authority Foundation
 status: approved
 created_at: 2026-08-09
 repository: nerve-oss
-branch: codex/mcp2026-phase0
+branch: codex/mcp2026-service-token-binding
 base_commit: a794be9f2697e0864d3a31da8f087577e9748f7e
 ---
 
-# MCP 2026 Phase 0 Shared Authentication Authority
+# MCP 2026 Phase 0/1 Shared Authority Foundation
 
 ## Context
 
-This branch is the OSS-first authority tranche required by Phase 0.6 of the
+This branch is the OSS-first authority tranche required by Phase 0.6 and the
+shared-store portion of Phase 1 of the
 approved `nerve-cloud` plan
 `thoughts/shared/plans/2026-08-06-mcp-2026-autonomous-agent-onboarding.md`.
 Cloud must not author these shared bytes first or advance its source-authority
@@ -31,9 +32,25 @@ lock until this branch is merged and green.
 - Add focused tests for principal typing, algorithm/key/claim confusion,
   temporal-claim requirements, JWKS safety, and stable thumbprints.
 - Add `internal/auth/` to `sync-manifest.yaml` as an exact OSS-owned mirror.
+- Require a durable service-token row whose org, actor/generation, scopes,
+  expiry, revocation state, and JTI exactly match every `m2m_org` access token.
+  This is fail-closed runtime authority only: issuance remains globally off and
+  no client can be activated by this tranche.
+- Backport the schema-aware legacy domain writer fence, canonical ownership
+  claims, idempotent inbox provisioning, and transaction helpers needed by
+  Phase 1 Artifact A. These paths preserve legacy behavior on Cloud schema 8
+  and maintain claims only when Cloud schema 9 is present.
+- Extend the legacy domain DELETE caller to treat deletion as a durable release
+  workflow: retain the claim while provider absence is unknown, delete the
+  Resend domain when configured, and finalize local rows only after confirmed
+  absence.
+- Add the corresponding shared store files to `sync-manifest.yaml`; Cloud-only
+  OAuth registry, issuer, onboarding orchestration, and Cloud 0009 migration
+  remain outside OSS.
 
-No OAuth issuer, client registry, lifecycle mutation, MCP routing, deployment,
-or production activation is authorized by this tranche.
+No OAuth issuer, client registry, onboarding lifecycle, MCP routing,
+deployment, issuance enablement, client activation, or production activation
+is authorized by this tranche.
 
 ## Success criteria
 

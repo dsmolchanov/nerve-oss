@@ -452,10 +452,45 @@ func (s *Store) DeleteOrgDomain(ctx context.Context, id string) error {
 // DeleteOrgDomainForOrg removes a domain registration, scoped to an org.
 // Returns true if a row was deleted.
 func (s *Store) DeleteOrgDomainForOrg(ctx context.Context, orgID, id string) (bool, error) {
-	deleted := false
+	_, deleted, err := s.BeginOrgDomainReleaseForOrg(ctx, orgID, id)
+	return deleted, err
+}
+
+// BeginOrgDomainReleaseForOrg returns the locked provider identity at the same
+// linearization point that starts release. On Cloud schema 8 it preserves the
+// legacy immediate delete. On schema 9 it retains the Core row and ownership
+// claim in releasing state until FinalizeOrgDomainReleaseForOrg is called.
+func (s *Store) BeginOrgDomainReleaseForOrg(ctx context.Context, orgID, id string) (OrgDomain, bool, error) {
+	var domain OrgDomain
+	releaseStarted := false
 	err := s.withLockedLegacyDomain(ctx, id, orgID, func(scoped *Store, identity legacyDomainIdentity, schema9 bool) error {
 		if err := scoped.requireDomainWritesEnabled(ctx); err != nil {
 			return err
+		}
+		var err error
+		domain, err = scoped.GetOrgDomainByIDForOrg(ctx, orgID, id)
+		if err != nil {
+			return err
+		}
+		var blocked bool
+		if err := scoped.q.QueryRowContext(ctx, `
+			SELECT EXISTS(SELECT 1 FROM inboxes WHERE org_domain_id = $1)
+			    OR EXISTS(SELECT 1 FROM org_domain_grants WHERE org_domain_id = $1)
+		`, id).Scan(&blocked); err != nil {
+			return err
+		}
+		if schema9 && !blocked {
+			if err := scoped.q.QueryRowContext(ctx, `
+				SELECT EXISTS(
+				  SELECT 1 FROM managed_mailbox_platform_domains
+				  WHERE org_domain_id = $1
+				)
+			`, id).Scan(&blocked); err != nil {
+				return err
+			}
+		}
+		if blocked {
+			return ErrResourceConflict
 		}
 		if !schema9 {
 			result, err := scoped.q.ExecContext(ctx, `DELETE FROM org_domains WHERE id = $1 AND org_id = $2`, id, orgID)
@@ -463,7 +498,7 @@ func (s *Store) DeleteOrgDomainForOrg(ctx context.Context, orgID, id string) (bo
 				return err
 			}
 			n, err := result.RowsAffected()
-			deleted = n > 0
+			releaseStarted = n > 0
 			return err
 		}
 		if err := scoped.transitionLegacyDomainClaim(ctx, identity.Canonical, id, "failed", identity.ExpiresAt); err != nil {
@@ -477,13 +512,13 @@ func (s *Store) DeleteOrgDomainForOrg(ctx context.Context, orgID, id string) (bo
 			return err
 		}
 		n, err := result.RowsAffected()
-		deleted = n > 0
+		releaseStarted = n > 0
 		return err
 	})
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return OrgDomain{}, false, nil
 	}
-	return deleted, err
+	return domain, releaseStarted, err
 }
 
 // FinalizeOrgDomainReleaseForOrg removes a legacy claim and its Core row only
