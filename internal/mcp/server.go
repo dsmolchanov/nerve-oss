@@ -107,13 +107,25 @@ func (r *budgetedReadCloser) Close() error {
 }
 
 func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
+	s.handleHTTP(w, r, false)
+}
+
+// HandleRoutedHTTP serves the frozen legacy adapter after the shared router
+// has completed Origin validation and authentication exactly once.
+func (s *Server) HandleRoutedHTTP(w http.ResponseWriter, r *http.Request) {
+	s.handleHTTP(w, r, true)
+}
+
+func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, routed bool) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	if err := s.validateOrigin(r); err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
+	if !routed {
+		if err := s.validateOrigin(r); err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
 	}
 	log.Printf("mcp request protocol_version=%q", strings.TrimSpace(r.Header.Get("MCP-Protocol-Version")))
 
@@ -146,7 +158,7 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	var principal auth.Principal
-	if s.Config.Cloud.Mode {
+	if s.Config.Cloud.Mode && !routed {
 		if s.Auth == nil {
 			http.Error(w, "cloud auth not configured", http.StatusInternalServerError)
 			return
@@ -158,6 +170,13 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		principal = authenticated
 		ctx = auth.WithPrincipal(ctx, authenticated)
+	} else if s.Config.Cloud.Mode {
+		authenticated, ok := auth.PrincipalFromContext(ctx)
+		if !ok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		principal = authenticated
 	}
 
 	decoder := json.NewDecoder(r.Body)

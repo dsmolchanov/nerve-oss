@@ -6,6 +6,8 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 
@@ -456,6 +458,32 @@ func TestValidateScopes(t *testing.T) {
 	if err := svc.ValidateScopes(principal, "nerve:admin.billing"); err == nil {
 		t.Fatalf("expected admin scope to be denied")
 	}
+}
+
+func TestAuthenticateRequestLegacyBootstrap(t *testing.T) {
+	cfg := config.Default()
+	cfg.Security.APIKey = "bootstrap-secret"
+	service := NewService(cfg, nil)
+
+	t.Run("configured key", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+		req.Header.Set("X-API-Key", "bootstrap-secret")
+		principal, err := service.AuthenticateRequest(req)
+		if err != nil {
+			t.Fatalf("authenticate bootstrap: %v", err)
+		}
+		if principal.Kind != PrincipalBootstrap || principal.AuthMethod != "bootstrap_key" || !reflect.DeepEqual(principal.Scopes, []string{"*"}) {
+			t.Fatalf("unexpected bootstrap principal: %#v", principal)
+		}
+	})
+
+	t.Run("wrong key", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+		req.Header.Set("X-API-Key", "wrong")
+		if _, err := service.AuthenticateRequest(req); !errors.Is(err, ErrUnauthenticated) {
+			t.Fatalf("expected unauthenticated, got %v", err)
+		}
+	})
 }
 
 func signedJWT(t *testing.T, claims jwt.MapClaims) string {

@@ -68,6 +68,15 @@ func (s *Service) AuthenticateRequest(r *http.Request) (Principal, error) {
 	if key := strings.TrimSpace(r.Header.Get("X-Nerve-Cloud-Key")); key != "" {
 		return s.VerifyCloudAPIKey(r.Context(), key)
 	}
+	if bootstrap := strings.TrimSpace(r.Header.Get("X-API-Key")); bootstrap != "" &&
+		bootstrap == strings.TrimSpace(s.Config.Security.APIKey) {
+		return Principal{
+			ActorID:    "bootstrap_admin",
+			Scopes:     []string{"*"},
+			Kind:       PrincipalBootstrap,
+			AuthMethod: "bootstrap_key",
+		}, nil
+	}
 	return Principal{}, ErrUnauthorized
 }
 
