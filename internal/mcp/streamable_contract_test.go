@@ -12,6 +12,7 @@ import (
 
 	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
+	"neuralmail/internal/entitlements"
 )
 
 func TestModernContractRejectsMetadataAndHeaderFailuresBeforeDispatch(t *testing.T) {
@@ -146,6 +147,45 @@ func TestModernContractSupportsJSONAndSSEResponses(t *testing.T) {
 				t.Fatalf("missing final JSON-RPC result: %s", recorder.Body.String())
 			}
 		})
+	}
+}
+
+func TestModernToolArgumentsFailSchemaBeforeInvokerSideEffects(t *testing.T) {
+	cfg := hostedRouterConfig()
+	authService := auth.NewService(cfg, nil)
+	entitlementGate := &fakeEntitlementGate{preAuthErr: entitlements.ErrQuotaExceeded}
+	runtime := NewServer(cfg, nil, authService, entitlementGate)
+	runtime.OutboundPolicy = allowOutboundPolicyGate{}
+	principal := auth.Principal{
+		Kind: auth.PrincipalM2MOrg, OrgID: "org-1", ClientID: "client-1", Generation: 1,
+		Scopes: []string{"nerve:email.compose"}, AuthMethod: "m2m_bearer",
+	}
+	meta := map[string]any{
+		sdkmcp.MetaKeyProtocolVersion: ModernProtocolVersion,
+		sdkmcp.MetaKeyClientCapabilities: map[string]any{
+			"extensions": map[string]any{oauthClientCredentialsExtension: map[string]any{}},
+		},
+	}
+	request := modernContractRequest(t, "tools/call", map[string]any{
+		"_meta": meta,
+		"name":  "compose_email",
+		"arguments": map[string]any{
+			"inbox_id": "inbox-1", "to": "not-an-email", "subject": "subject", "body": "body",
+		},
+	})
+	request.Header.Set("Mcp-Name", "compose_email")
+	request = request.WithContext(auth.WithPrincipal(request.Context(), principal))
+	recorder := httptest.NewRecorder()
+	NewSDKHandler(runtime, true).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("schema failure status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !bytes.Contains(recorder.Body.Bytes(), []byte(`"isError":true`)) ||
+		!bytes.Contains(recorder.Body.Bytes(), []byte(`validating`)) {
+		t.Fatalf("schema failure did not return a tool error: %s", recorder.Body.String())
+	}
+	if entitlementGate.preAuthCalls != 0 {
+		t.Fatalf("invalid arguments reached entitlement gate %d times", entitlementGate.preAuthCalls)
 	}
 }
 

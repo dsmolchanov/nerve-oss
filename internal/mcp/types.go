@@ -101,7 +101,7 @@ func sendReplyInputSchema(attachmentsEnabled bool) map[string]any {
 func composeEmailInputSchema(attachmentsEnabled bool) map[string]any {
 	properties := map[string]any{
 		"inbox_id":        map[string]any{"type": "string", "minLength": 1},
-		"to":              map[string]any{"type": "string", "format": "email"},
+		"to":              map[string]any{"type": "string", "format": "email", "pattern": `^[^\s@]+@[^\s@]+\.[^\s@]+$`},
 		"subject":         map[string]any{"type": "string"},
 		"from_name":       map[string]any{"type": "string"},
 		"idempotency_key": map[string]any{"type": "string"},

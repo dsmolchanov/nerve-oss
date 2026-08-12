@@ -227,7 +227,7 @@ func newSDKServer(requestContext context.Context, runtime *Server) *sdkmcp.Serve
 	principal, hasPrincipal := auth.PrincipalFromContext(requestContext)
 	for _, descriptor := range modernToolCatalog(requestContext, runtime, principal) {
 		descriptor := descriptor
-		server.AddTool(sdkTool(descriptor), func(ctx context.Context, request *sdkmcp.CallToolRequest) (*sdkmcp.CallToolResult, error) {
+		sdkmcp.AddTool[map[string]any, any](server, sdkTool(descriptor), func(ctx context.Context, request *sdkmcp.CallToolRequest, _ map[string]any) (*sdkmcp.CallToolResult, any, error) {
 			if hasPrincipal {
 				ctx = auth.WithPrincipal(ctx, principal)
 			}
@@ -240,12 +240,9 @@ func newSDKServer(requestContext context.Context, runtime *Server) *sdkmcp.Serve
 				return &sdkmcp.CallToolResult{
 					IsError: true, StructuredContent: structured,
 					Content: []sdkmcp.Content{&sdkmcp.TextContent{Text: rawJSON(structured)}},
-				}, nil
+				}, nil, nil
 			}
-			return &sdkmcp.CallToolResult{
-				StructuredContent: result,
-				Content:           []sdkmcp.Content{&sdkmcp.TextContent{Text: rawJSON(result)}},
-			}, nil
+			return nil, result, nil
 		})
 	}
 	if canReadModernResources(runtime, principal) {
