@@ -67,6 +67,10 @@ func TestRouterAllowedOriginStillRequiresAuthentication(t *testing.T) {
 	if recorder.Code != http.StatusUnauthorized || handlerCalls != 0 {
 		t.Fatalf("expected 401 before handler, got status=%d calls=%d", recorder.Code, handlerCalls)
 	}
+	wantChallenge := `Bearer resource_metadata="https://nerve-runtime.fly.dev/.well-known/oauth-protected-resource/mcp", error="invalid_token"`
+	if got := recorder.Header().Get("WWW-Authenticate"); got != wantChallenge {
+		t.Fatalf("WWW-Authenticate = %q, want %q", got, wantChallenge)
+	}
 }
 
 func TestRouterAbsentOriginAcceptsNativePrincipalKinds(t *testing.T) {

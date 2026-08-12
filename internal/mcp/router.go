@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	LegacyProtocolVersion = "2025-11-25"
-	ModernProtocolVersion = "2026-07-28"
+	LegacyProtocolVersion        = "2025-11-25"
+	ModernProtocolVersion        = "2026-07-28"
+	protectedResourceMetadataURL = "https://nerve-runtime.fly.dev/.well-known/oauth-protected-resource/mcp"
 )
 
 type RequestAuthenticator interface {
@@ -70,7 +71,7 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "forbidden", http.StatusForbidden)
 				return
 			}
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			writeInvalidToken(w)
 			return
 		}
 		authenticated = true
@@ -100,6 +101,16 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Requested: requestedVersion,
 		})
 	}
+}
+
+func writeInvalidToken(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Bearer resource_metadata="`+protectedResourceMetadataURL+`", error="invalid_token"`)
+	http.Error(w, "unauthorized", http.StatusUnauthorized)
+}
+
+func writeInsufficientScope(w http.ResponseWriter, requiredScope string) {
+	w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_scope", scope="`+requiredScope+`"`)
+	http.Error(w, "forbidden", http.StatusForbidden)
 }
 
 func writeRouterProtocolError(w http.ResponseWriter, code int, message string, data any) {

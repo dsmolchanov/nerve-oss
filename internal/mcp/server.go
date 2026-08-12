@@ -165,7 +165,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, routed bool)
 		}
 		authenticated, err := s.Auth.AuthenticateRequest(r)
 		if err != nil {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			writeInvalidToken(w)
 			return
 		}
 		principal = authenticated
@@ -201,7 +201,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, routed bool)
 		requiredScope := s.requiredScope(req)
 		if requiredScope != "" {
 			if err := s.Auth.ValidateScopes(principal, requiredScope); err != nil {
-				http.Error(w, "forbidden", http.StatusForbidden)
+				writeInsufficientScope(w, requiredScope)
 				return
 			}
 		}
