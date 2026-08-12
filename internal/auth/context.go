@@ -1,6 +1,9 @@
 package auth
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 type PrincipalKind string
 
@@ -18,6 +21,7 @@ type Principal struct {
 	ClientID   string
 	Generation int64
 	Scopes     []string
+	ExpiresAt  time.Time
 	Kind       PrincipalKind
 	AuthMethod string // jwt or cloud_api_key
 }

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -913,8 +914,35 @@ func TestOrgDomainsStoreCreateAndGet(t *testing.T) {
 			t.Fatalf("delete domain: %v", err)
 		}
 		domains2, _ := st.ListOrgDomains(ctx, orgID)
-		if len(domains2) != 0 {
-			t.Fatalf("expected 0 domains after delete, got %d", len(domains2))
+		schema9, err := st.cloudSchemaSupportsM2M(ctx)
+		if err != nil {
+			t.Fatalf("detect Cloud 0009 support: %v", err)
+		}
+		if !schema9 {
+			if len(domains2) != 0 {
+				t.Fatalf("expected 0 domains after schema-8 delete, got %d", len(domains2))
+			}
+			return
+		}
+		if len(domains2) != 1 || domains2[0].Status != "failed" {
+			t.Fatalf("expected retained failed domain pending provider cleanup, got %+v", domains2)
+		}
+		claim, err := st.GetDomainOwnershipClaim(ctx, "acme.com")
+		if err != nil {
+			t.Fatalf("get releasing claim: %v", err)
+		}
+		if claim.State != "releasing" || claim.OrgDomainID != id {
+			t.Fatalf("expected releasing claim for %s, got %+v", id, claim)
+		}
+		finalized, err := st.FinalizeOrgDomainReleaseForOrg(ctx, orgID, id)
+		if err != nil || !finalized {
+			t.Fatalf("finalize provider-confirmed domain release: finalized=%v err=%v", finalized, err)
+		}
+		if _, err := st.GetOrgDomainByID(ctx, id); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("finalized domain lookup error=%v, want sql.ErrNoRows", err)
+		}
+		if _, err := st.GetDomainOwnershipClaim(ctx, "acme.com"); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("finalized claim lookup error=%v, want sql.ErrNoRows", err)
 		}
 	})
 }

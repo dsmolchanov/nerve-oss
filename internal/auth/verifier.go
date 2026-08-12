@@ -87,10 +87,55 @@ func (s *Service) verifyBearer(ctx context.Context, authHeader string) (Principa
 		if s.M2M == nil {
 			return Principal{}, ErrUnauthenticated
 		}
-		return s.M2M.Verify(ctx, headerParts[1])
+		principal, err := s.M2M.Verify(ctx, headerParts[1])
+		if err != nil {
+			return Principal{}, err
+		}
+		if principal.Kind == PrincipalM2MOrg {
+			return s.bindM2MOrgServiceToken(ctx, principal)
+		}
+		return principal, nil
 	default:
 		return Principal{}, ErrUnauthenticated
 	}
+}
+
+func (s *Service) bindM2MOrgServiceToken(ctx context.Context, principal Principal) (Principal, error) {
+	if s.LookupServiceToken == nil || principal.TokenID == "" || principal.OrgID == "" ||
+		principal.ClientID == "" || principal.Generation <= 0 || principal.ExpiresAt.IsZero() {
+		return Principal{}, ErrUnauthenticated
+	}
+	token, err := s.LookupServiceToken(ctx, principal.TokenID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Principal{}, ErrUnauthenticated
+		}
+		return Principal{}, err
+	}
+	expectedActor := fmt.Sprintf("oauth_client:%s:g:%d", principal.ClientID, principal.Generation)
+	if token.ID != principal.TokenID || token.OrgID != principal.OrgID || token.Actor != expectedActor ||
+		token.RevokedAt.Valid || !token.ExpiresAt.Equal(principal.ExpiresAt) || !equalScopes(token.Scopes, principal.Scopes) {
+		return Principal{}, ErrUnauthenticated
+	}
+	// Source resource authority from the durable row after proving exact claim
+	// equality. A targeted revoke therefore takes effect immediately rather
+	// than waiting for the signed JWT to expire.
+	principal.OrgID = token.OrgID
+	principal.ActorID = token.Actor
+	principal.Scopes = append([]string(nil), token.Scopes...)
+	return principal, nil
+}
+
+func equalScopes(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Service) VerifyJWT(ctx context.Context, authHeader string) (Principal, error) {
@@ -244,11 +289,18 @@ func (v *M2MTokenVerifier) Verify(_ context.Context, rawToken string) (Principal
 	if expErr != nil || iatErr != nil || nbfErr != nil || expiresAt == nil || issuedAt == nil || notBefore == nil {
 		return Principal{}, ErrUnauthenticated
 	}
+	if !notBefore.Time.Equal(issuedAt.Time) || !expiresAt.Time.After(issuedAt.Time) {
+		return Principal{}, ErrUnauthenticated
+	}
 	clientID := claimString(claims["client_id"])
 	if clientID == "" || clientID != claimString(claims["sub"]) {
 		return Principal{}, ErrUnauthenticated
 	}
 	generation, ok := claimPositiveInt64(claims["generation"])
+	if !ok {
+		return Principal{}, ErrUnauthenticated
+	}
+	scopes, ok := canonicalM2MScopes(claims["scope"])
 	if !ok {
 		return Principal{}, ErrUnauthenticated
 	}
@@ -258,7 +310,8 @@ func (v *M2MTokenVerifier) Verify(_ context.Context, rawToken string) (Principal
 		TokenID:    claimString(claims["jti"]),
 		ClientID:   clientID,
 		Generation: generation,
-		Scopes:     extractScopes(claims["scope"]),
+		Scopes:     scopes,
+		ExpiresAt:  expiresAt.Time,
 		AuthMethod: "m2m_bearer",
 	}
 	if principal.TokenID == "" || len(principal.Scopes) == 0 {
@@ -266,12 +319,14 @@ func (v *M2MTokenVerifier) Verify(_ context.Context, rawToken string) (Principal
 	}
 	switch claimString(claims["token_use"]) {
 	case string(PrincipalM2MOnboarding):
-		if principal.OrgID != "" {
+		if principal.OrgID != "" || expiresAt.Time.Sub(issuedAt.Time) != 5*time.Minute ||
+			len(principal.Scopes) != 1 || principal.Scopes[0] != "nerve:onboarding" {
 			return Principal{}, ErrUnauthenticated
 		}
 		principal.Kind = PrincipalM2MOnboarding
 	case string(PrincipalM2MOrg):
-		if principal.OrgID == "" {
+		if principal.OrgID == "" || expiresAt.Time.Sub(issuedAt.Time) != 15*time.Minute ||
+			containsString(principal.Scopes, "nerve:onboarding") {
 			return Principal{}, ErrUnauthenticated
 		}
 		principal.Kind = PrincipalM2MOrg
@@ -279,6 +334,37 @@ func (v *M2MTokenVerifier) Verify(_ context.Context, rawToken string) (Principal
 		return Principal{}, ErrUnauthenticated
 	}
 	return principal, nil
+}
+
+func canonicalM2MScopes(claim any) ([]string, bool) {
+	raw, ok := claim.(string)
+	if !ok || raw == "" || len(raw) > 512 {
+		return nil, false
+	}
+	order := map[string]int{
+		"nerve:onboarding":        0,
+		"nerve:email.read":        1,
+		"nerve:email.search":      2,
+		"nerve:email.draft":       3,
+		"nerve:email.reply":       4,
+		"nerve:email.compose":     5,
+		"nerve:billing.subscribe": 6,
+	}
+	scopes := strings.Split(raw, " ")
+	if len(scopes) == 0 || len(scopes) > 6 {
+		return nil, false
+	}
+	seen := make(map[string]bool, len(scopes))
+	previous := -1
+	for _, scope := range scopes {
+		position, known := order[scope]
+		if !known || seen[scope] || len(scope) > 64 || position <= previous {
+			return nil, false
+		}
+		seen[scope] = true
+		previous = position
+	}
+	return scopes, true
 }
 
 func claimPositiveInt64(value any) (int64, bool) {

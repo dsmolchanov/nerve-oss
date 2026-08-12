@@ -249,6 +249,21 @@ func (s *Store) withTx(ctx context.Context, fn func(*Store) error) error {
 	return tx.Commit()
 }
 
+// RunInTx exposes the store's nested-transaction-safe transaction boundary to
+// orchestration packages. Store methods that coordinate OAuth/onboarding state
+// require the scoped Store passed to fn so callers cannot accidentally split a
+// lifecycle transition across autocommit statements.
+func (s *Store) RunInTx(ctx context.Context, fn func(*Store) error) error {
+	return s.withTx(ctx, fn)
+}
+
+func (s *Store) requireTx() error {
+	if !s.inTx {
+		return errors.New("store operation requires an explicit transaction")
+	}
+	return nil
+}
+
 func (s *Store) HealthSummary(ctx context.Context) (map[string]string, error) {
 	if err := s.db.PingContext(ctx); err != nil {
 		return nil, err

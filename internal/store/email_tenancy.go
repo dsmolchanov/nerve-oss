@@ -127,33 +127,35 @@ func (s *Store) DeleteOrgIfEmpty(ctx context.Context, orgID string) (bool, error
 // transaction back and leaves a durable record that can be reconciled safely.
 func (s *Store) LockOrgDomainForCleanup(ctx context.Context, orgID, domainID string) (OrgDomain, error) {
 	var d OrgDomain
-	row := s.q.QueryRowContext(ctx, `
-		SELECT d.id, d.org_id, d.domain, d.status, d.verification_token,
-		       d.mx_verified, d.spf_verified, d.dkim_verified, d.dmarc_verified,
-		       d.inbound_enabled, d.dkim_selector, d.dkim_private_key_enc, d.dkim_public_key,
-		       d.dkim_method, d.last_check_at, d.verified_at, d.expires_at,
-		       d.resend_domain_id, d.resend_domain_status, d.resend_dns_records,
-		       d.resend_receiving_enabled, d.catch_all_enabled, d.forward_to,
-		       d.created_at, d.updated_at, d.external_ref
-		FROM org_domains d
-		WHERE d.id = $1 AND d.org_id = $2
-		FOR UPDATE
-	`, domainID, orgID)
-	if err := scanOrgDomain(row, &d); err != nil {
-		return OrgDomain{}, err
-	}
-
-	var blocked bool
-	if err := s.q.QueryRowContext(ctx, `
-		SELECT EXISTS(SELECT 1 FROM inboxes WHERE org_domain_id = $1)
-		    OR EXISTS(SELECT 1 FROM org_domain_grants WHERE org_domain_id = $1)
-	`, domainID).Scan(&blocked); err != nil {
-		return OrgDomain{}, err
-	}
-	if blocked {
-		return OrgDomain{}, ErrResourceConflict
-	}
-	return d, nil
+	err := s.withLockedLegacyDomain(ctx, domainID, orgID, func(scoped *Store, _ legacyDomainIdentity, schema9 bool) error {
+		var err error
+		d, err = scoped.GetOrgDomainByIDForOrg(ctx, orgID, domainID)
+		if err != nil {
+			return err
+		}
+		var blocked bool
+		if err := scoped.q.QueryRowContext(ctx, `
+			SELECT EXISTS(SELECT 1 FROM inboxes WHERE org_domain_id = $1)
+			    OR EXISTS(SELECT 1 FROM org_domain_grants WHERE org_domain_id = $1)
+		`, domainID).Scan(&blocked); err != nil {
+			return err
+		}
+		if schema9 && !blocked {
+			if err := scoped.q.QueryRowContext(ctx, `
+				SELECT EXISTS(
+				  SELECT 1 FROM managed_mailbox_platform_domains
+				  WHERE org_domain_id = $1
+				)
+			`, domainID).Scan(&blocked); err != nil {
+				return err
+			}
+		}
+		if blocked {
+			return ErrResourceConflict
+		}
+		return nil
+	})
+	return d, err
 }
 
 type OrgDomainGrant struct {
