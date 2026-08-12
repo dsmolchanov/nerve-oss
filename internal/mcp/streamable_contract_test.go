@@ -234,8 +234,67 @@ func TestModernHiddenToolCallStillReachesInvoker(t *testing.T) {
 	}
 }
 
+func TestModernToolScopeFailureReturnsOAuth403BeforeInvoker(t *testing.T) {
+	cfg := hostedRouterConfig()
+	authService := auth.NewService(cfg, nil)
+	entitlementGate := &fakeEntitlementGate{preAuthErr: entitlements.ErrQuotaExceeded}
+	runtime := NewServer(cfg, nil, authService, entitlementGate)
+	runtime.OutboundPolicy = allowOutboundPolicyGate{}
+	principal := auth.Principal{
+		Kind: auth.PrincipalM2MOrg, OrgID: "org-1", ClientID: "client-1", Generation: 1,
+		Scopes: []string{"nerve:email.read"}, AuthMethod: "m2m_bearer",
+	}
+	meta := modernOAuthMeta()
+	request := modernContractRequest(t, "tools/call", map[string]any{
+		"_meta": meta,
+		"name":  "compose_email",
+		"arguments": map[string]any{
+			"inbox_id": "inbox-1", "to": "recipient@example.net", "subject": "subject", "body": "body",
+		},
+	})
+	request.Header.Set("Mcp-Name", "compose_email")
+	request = request.WithContext(auth.WithPrincipal(request.Context(), principal))
+	recorder := httptest.NewRecorder()
+	NewSDKHandler(runtime, true).ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("scope failure status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("WWW-Authenticate"); got != `Bearer error="insufficient_scope", scope="nerve:email.compose"` {
+		t.Fatalf("scope challenge=%q", got)
+	}
+	if entitlementGate.preAuthCalls != 0 {
+		t.Fatalf("scope failure reached entitlement gate %d times", entitlementGate.preAuthCalls)
+	}
+}
+
+func TestModernResourceIDsAreBoundedBeforeRead(t *testing.T) {
+	cfg := hostedRouterConfig()
+	runtime := NewServer(cfg, nil, auth.NewService(cfg, nil), nil)
+	principal := auth.Principal{Kind: auth.PrincipalM2MOrg, OrgID: "org-1", Scopes: []string{"nerve:email.read"}}
+	uri := "email://threads/" + strings.Repeat("i", 129)
+	request := modernContractRequest(t, "resources/read", map[string]any{"_meta": modernOAuthMeta(), "uri": uri})
+	request.Header.Set("Mcp-Name", uri)
+	request = request.WithContext(auth.WithPrincipal(request.Context(), principal))
+	recorder := httptest.NewRecorder()
+	NewSDKHandler(runtime, true).ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest || !bytes.Contains(recorder.Body.Bytes(), []byte(`"code":-32602`)) {
+		t.Fatalf("oversized resource ID status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
 type denyOutboundPolicyGate struct {
 	code string
+}
+
+func modernOAuthMeta() map[string]any {
+	return map[string]any{
+		sdkmcp.MetaKeyProtocolVersion: ModernProtocolVersion,
+		sdkmcp.MetaKeyClientCapabilities: map[string]any{
+			"extensions": map[string]any{oauthClientCredentialsExtension: map[string]any{}},
+		},
+	}
 }
 
 func (gate denyOutboundPolicyGate) Authorize(context.Context, auth.Principal, string, json.RawMessage) error {

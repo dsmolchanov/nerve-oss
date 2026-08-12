@@ -70,6 +70,9 @@ func NewSDKHandler(runtime *Server, jsonResponse bool) http.Handler {
 		if !validateModernRequestContract(w, request, body) {
 			return
 		}
+		if !authorizeModernRequest(w, request, body, runtime) {
+			return
+		}
 		sdkHandler.ServeHTTP(w, request)
 	})
 }
@@ -138,6 +141,64 @@ func validateModernRequestContract(w http.ResponseWriter, request *http.Request,
 		}
 	}
 	return true
+}
+
+func authorizeModernRequest(w http.ResponseWriter, request *http.Request, body []byte, runtime *Server) bool {
+	var wire modernWireRequest
+	if json.Unmarshal(body, &wire) != nil {
+		return true
+	}
+	name, present, ok := modernRequestName(wire.Method, wire.Params)
+	if wire.Method == "resources/read" && (!present || !ok || !validModernResourceURI(name)) {
+		writeProtocolError(w, wire.ID, -32602, "invalid resource URI", nil)
+		return false
+	}
+	if !runtime.Config.Cloud.Mode {
+		return true
+	}
+	var requiredScope string
+	switch wire.Method {
+	case "tools/call":
+		if !present || !ok {
+			return true
+		}
+		principal, _ := auth.PrincipalFromContext(request.Context())
+		requiredScope = requiredToolScope(principal, name)
+	case "resources/read":
+		requiredScope = "nerve:email.read"
+	default:
+		return true
+	}
+	principal, _ := auth.PrincipalFromContext(request.Context())
+	if runtime.Auth == nil || runtime.Auth.ValidateScopes(principal, requiredScope) != nil {
+		writeInsufficientScope(w, requiredScope)
+		return false
+	}
+	return true
+}
+
+func validModernResourceURI(uri string) bool {
+	if uri == "email://inboxes" {
+		return true
+	}
+	for _, prefix := range []string{"email://threads/", "email://messages/"} {
+		if !strings.HasPrefix(uri, prefix) {
+			continue
+		}
+		id := strings.TrimPrefix(uri, prefix)
+		if len(id) == 0 || len(id) > 128 {
+			return false
+		}
+		for _, character := range id {
+			if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+				(character >= '0' && character <= '9') || character == '-' || character == '_' {
+				continue
+			}
+			return false
+		}
+		return true
+	}
+	return false
 }
 
 func modernRequestName(method string, params json.RawMessage) (string, bool, bool) {
