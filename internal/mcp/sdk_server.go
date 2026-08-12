@@ -16,6 +16,11 @@ import (
 
 const oauthClientCredentialsExtension = "io.modelcontextprotocol/oauth-client-credentials"
 
+const (
+	maxModernDecodedAttachmentBytes = 10 << 20
+	maxModernRequestMemoryBytes     = 2*maxMCPBodyBytes + maxModernDecodedAttachmentBytes
+)
+
 func NewSDKHandler(runtime *Server, jsonResponse bool) http.Handler {
 	sdkHandler := sdkmcp.NewStreamableHTTPHandler(func(request *http.Request) *sdkmcp.Server {
 		return newSDKServer(request.Context(), runtime)
@@ -36,10 +41,11 @@ func NewSDKHandler(runtime *Server, jsonResponse bool) http.Handler {
 			writeMemoryBudgetError(w)
 			return
 		}
-		// The SDK materializes the complete request body. Reserve the wire cap
-		// before dispatch so chunked and concurrent requests cannot evade the
-		// shared process budget by growing incrementally.
-		release, err := runtime.MemoryBudget.Acquire(request.Context(), maxMCPBodyBytes)
+		// The SDK may retain two wire copies while tool decoding materializes up
+		// to 10 MiB of attachment content. Reserve that worst case before
+		// dispatch so chunked and concurrent requests cannot evade the shared
+		// process budget by growing incrementally.
+		release, err := runtime.MemoryBudget.Acquire(request.Context(), maxModernRequestMemoryBytes)
 		if err != nil {
 			_ = request.Body.Close()
 			writeMemoryBudgetError(w)

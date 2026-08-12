@@ -148,7 +148,7 @@ func TestSDKServerListsConformantPrivateResources(t *testing.T) {
 
 func TestSDKHandlerEnforcesAndReleasesSharedMemoryBudget(t *testing.T) {
 	cfg := config.Default()
-	cfg.Memory.BudgetBytes = maxMCPBodyBytes - 1
+	cfg.Memory.BudgetBytes = maxModernRequestMemoryBytes - 1
 	exhausted := NewServer(cfg, nil, nil, nil)
 	request := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewBufferString(`{}`))
 	recorder := httptest.NewRecorder()
