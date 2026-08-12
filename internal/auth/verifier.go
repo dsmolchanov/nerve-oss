@@ -43,6 +43,7 @@ type M2MTokenVerifier struct {
 	Issuer   string
 	Audience string
 	Keys     *RSAPublicKeySet
+	Remote   *RemoteJWKS
 	Now      func() time.Time
 	Skew     time.Duration
 }
@@ -56,6 +57,12 @@ func NewService(cfg config.Config, st *store.Store) *Service {
 	if st != nil {
 		svc.LookupCloudKey = st.LookupCloudAPIKey
 		svc.LookupServiceToken = st.GetServiceToken
+	}
+	if issuer, audience, jwksURL := strings.TrimSpace(cfg.Auth.Issuer), strings.TrimSpace(cfg.Auth.Audience), strings.TrimSpace(cfg.Auth.JWKSURL); issuer != "" && audience != "" && jwksURL != "" {
+		remote, err := NewRemoteJWKS(jwksURL, nil)
+		if err == nil {
+			svc.M2M = &M2MTokenVerifier{Issuer: issuer, Audience: audience, Remote: remote}
+		}
 	}
 	return svc
 }
@@ -256,8 +263,8 @@ func (s *Service) VerifyCloudAPIKey(ctx context.Context, key string) (Principal,
 	}, nil
 }
 
-func (v *M2MTokenVerifier) Verify(_ context.Context, rawToken string) (Principal, error) {
-	if v == nil || v.Keys == nil || strings.TrimSpace(v.Issuer) == "" || strings.TrimSpace(v.Audience) == "" {
+func (v *M2MTokenVerifier) Verify(ctx context.Context, rawToken string) (Principal, error) {
+	if v == nil || (v.Keys == nil && v.Remote == nil) || strings.TrimSpace(v.Issuer) == "" || strings.TrimSpace(v.Audience) == "" {
 		return Principal{}, ErrUnauthenticated
 	}
 	now := v.Now
@@ -278,6 +285,13 @@ func (v *M2MTokenVerifier) Verify(_ context.Context, rawToken string) (Principal
 		kid, ok := token.Header["kid"].(string)
 		if !ok || kid == "" {
 			return nil, ErrUnauthenticated
+		}
+		if v.Remote != nil {
+			key, err := v.Remote.Lookup(ctx, kid)
+			if err != nil {
+				return nil, ErrUnauthenticated
+			}
+			return key, nil
 		}
 		key, found := v.Keys.Lookup(kid)
 		if !found {

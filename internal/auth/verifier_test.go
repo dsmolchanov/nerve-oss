@@ -19,6 +19,17 @@ import (
 
 const testSigningKey = "test-signing-key-for-unit-tests"
 
+func TestNewServiceWiresConfiguredM2MVerifier(t *testing.T) {
+	cfg := config.Default()
+	cfg.Auth.Issuer = "https://auth.nerve.email"
+	cfg.Auth.Audience = "https://api.nerve.email/mcp"
+	cfg.Auth.JWKSURL = "https://auth.nerve.email/.well-known/jwks.json"
+	service := NewService(cfg, nil)
+	if service.M2M == nil || service.M2M.Remote == nil {
+		t.Fatal("configured M2M verifier was not wired")
+	}
+}
+
 func TestAuthenticateRequestJWT(t *testing.T) {
 	cfg := config.Default()
 	cfg.Auth.Issuer = "https://auth.nerve.email"

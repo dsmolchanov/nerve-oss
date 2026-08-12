@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -181,6 +182,35 @@ func TestLegacyAdapterRejectsHeaderBodyProtocolMismatchBeforeDispatch(t *testing
 	}
 	if recorder.Header().Get("MCP-Session-Id") != "" {
 		t.Fatal("mismatched initialize created a session")
+	}
+}
+
+func TestLegacyAdapterPinsRoutedProtocolInResponse(t *testing.T) {
+	cfg := config.Default()
+	cfg.Cloud.Mode = false
+	cfg.MCP.ProtocolVersion = ModernProtocolVersion
+	server := NewServer(cfg, nil, nil, nil)
+	router := NewRouter(cfg, nil, http.HandlerFunc(server.HandleRoutedHTTP), nil)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}`))
+	req.Header.Set("MCP-Protocol-Version", LegacyProtocolVersion)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("MCP-Protocol-Version"); got != LegacyProtocolVersion {
+		t.Fatalf("response header protocol = %q, want %q", got, LegacyProtocolVersion)
+	}
+	var response struct {
+		Result struct {
+			ProtocolVersion string `json:"protocolVersion"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode initialize response: %v", err)
+	}
+	if response.Result.ProtocolVersion != LegacyProtocolVersion {
+		t.Fatalf("initialize protocol = %q, want %q", response.Result.ProtocolVersion, LegacyProtocolVersion)
 	}
 }
 

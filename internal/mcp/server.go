@@ -224,7 +224,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, routed bool)
 		}
 		w.Header().Set("MCP-Session-Id", sessionID)
 	}
-	w.Header().Set("MCP-Protocol-Version", s.Config.MCP.ProtocolVersion)
+	w.Header().Set("MCP-Protocol-Version", responseProtocolVersion(ctx, s.Config.MCP.ProtocolVersion))
 	w.Header().Set("Content-Type", "application/json")
 	resp := Response{JSONRPC: "2.0", ID: req.ID, Result: result}
 	_ = json.NewEncoder(w).Encode(resp)
@@ -243,6 +243,13 @@ func validateRoutedProtocolVersion(ctx context.Context, req Request) error {
 		return errors.New("MCP protocol version mismatch")
 	}
 	return nil
+}
+
+func responseProtocolVersion(ctx context.Context, fallback string) string {
+	if trusted, routed := routedProtocolVersion(ctx); routed {
+		return trusted
+	}
+	return fallback
 }
 
 func requireJSONEOF(decoder *json.Decoder, body io.Reader) error {
@@ -292,7 +299,7 @@ func (s *Server) dispatch(ctx context.Context, req Request) (any, error) {
 	switch req.Method {
 	case "initialize":
 		return map[string]any{
-			"protocolVersion": s.Config.MCP.ProtocolVersion,
+			"protocolVersion": responseProtocolVersion(ctx, s.Config.MCP.ProtocolVersion),
 			"serverInfo": map[string]any{
 				"name":    "nerve-runtime",
 				"version": "0.1.0",
