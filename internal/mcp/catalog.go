@@ -1,0 +1,153 @@
+package mcp
+
+import (
+	"context"
+	"encoding/json"
+
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"neuralmail/internal/auth"
+)
+
+type toolDescriptor struct {
+	Name        string
+	Description string
+	InputSchema any
+	OutputShape map[string]any
+}
+
+func modernToolCatalog(ctx context.Context, server *Server, principal auth.Principal) []toolDescriptor {
+	if principal.Kind == auth.PrincipalM2MOnboarding {
+		// Lifecycle tools are registered only when Phase 3 supplies the delegated
+		// onboarding implementation. An empty list is a fail-closed profile.
+		return nil
+	}
+	attachmentsEnabled := server.attachmentsEnabled(auth.WithPrincipal(ctx, principal))
+	tools := []toolDescriptor{
+		{Name: "list_threads", Description: "List threads in an inbox", InputSchema: inputObject(
+			map[string]any{"inbox_id": stringProperty(1), "status": stringProperty(0), "limit": map[string]any{"type": "integer", "minimum": 0}},
+			"inbox_id"), OutputShape: outputObject(map[string]any{"threads": arrayProperty()}, "threads")},
+		{Name: "get_thread", Description: "Fetch a thread with messages", InputSchema: inputObject(
+			map[string]any{"thread_id": stringProperty(1)}, "thread_id"), OutputShape: outputObject(
+			map[string]any{"thread": objectProperty(), "messages": arrayProperty()}, "thread", "messages")},
+		{Name: "search_inbox", Description: "Semantic search over an inbox", InputSchema: inputObject(
+			map[string]any{"inbox_id": stringProperty(1), "query": stringProperty(1), "top_k": map[string]any{"type": "integer", "minimum": 0}},
+			"inbox_id", "query"), OutputShape: outputObject(map[string]any{"results": arrayProperty()}, "results")},
+		{Name: "triage_message", Description: "Classify intent, urgency, sentiment", InputSchema: inputObject(
+			map[string]any{"message_id": stringProperty(1)}, "message_id"), OutputShape: outputObject(map[string]any{
+			"intent": stringProperty(0), "urgency": stringProperty(0), "sentiment": stringProperty(0),
+			"confidence": map[string]any{"type": "number"}, "suggested_route": stringProperty(0),
+		}, "intent", "urgency", "sentiment", "confidence", "suggested_route")},
+		{Name: "extract_to_schema", Description: "Extract structured data", InputSchema: inputObject(
+			map[string]any{"message_id": stringProperty(1), "schema_id": stringProperty(1)}, "message_id", "schema_id"),
+			OutputShape: outputObject(map[string]any{
+				"data": map[string]any{}, "confidence": map[string]any{"type": "number"},
+				"missing_fields": arrayProperty(), "validation_errors": arrayProperty(),
+			}, "data", "confidence", "missing_fields", "validation_errors")},
+		{Name: "draft_reply_with_policy", Description: "Draft a reply constrained by policy", InputSchema: inputObject(
+			map[string]any{"thread_id": stringProperty(1), "goal": stringProperty(0)}, "thread_id"), OutputShape: outputObject(map[string]any{
+			"draft": stringProperty(0), "risk_flags": arrayProperty(), "cited_message_ids": map[string]any{"type": []string{"array", "null"}},
+			"needs_human_approval": map[string]any{"type": "boolean"}, "policy_blocked": map[string]any{"type": "boolean"}, "reason": stringProperty(0),
+		}, "draft", "risk_flags", "cited_message_ids", "needs_human_approval")},
+		{Name: "send_reply", Description: "Send a reply", InputSchema: modernInputSchema(sendReplyInputSchema(attachmentsEnabled)), OutputShape: queuedMessageOutput()},
+		{Name: "compose_email", Description: "Compose and send a new email (not a reply)", InputSchema: modernInputSchema(composeEmailInputSchema(attachmentsEnabled)), OutputShape: queuedMessageOutput()},
+	}
+	if !server.Config.Cloud.Mode || server.Auth == nil {
+		return tools
+	}
+	visible := tools[:0]
+	for _, tool := range tools {
+		if server.Auth.ValidateScopes(principal, requiredToolScope(principal, tool.Name)) == nil {
+			visible = append(visible, tool)
+		}
+	}
+	return visible
+}
+
+func inputObject(properties map[string]any, required ...string) map[string]any {
+	return map[string]any{
+		"$schema":              "https://json-schema.org/draft/2020-12/schema",
+		"type":                 "object",
+		"additionalProperties": false,
+		"properties":           properties,
+		"required":             required,
+	}
+}
+
+func modernInputSchema(schema map[string]any) map[string]any {
+	schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+	return schema
+}
+
+func stringProperty(minLength int) map[string]any {
+	property := map[string]any{"type": "string"}
+	if minLength > 0 {
+		property["minLength"] = minLength
+	}
+	return property
+}
+
+func objectProperty() map[string]any {
+	return map[string]any{"type": "object", "additionalProperties": true}
+}
+
+func arrayProperty() map[string]any {
+	return map[string]any{"type": "array", "items": map[string]any{}}
+}
+
+func outputObject(properties map[string]any, required ...string) map[string]any {
+	properties["replay_id"] = stringProperty(0)
+	properties["audit_id"] = stringProperty(0)
+	return map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"properties":           properties,
+		"required":             required,
+	}
+}
+
+func queuedMessageOutput() map[string]any {
+	return outputObject(map[string]any{
+		"message_id": stringProperty(1),
+		"status":     map[string]any{"type": "string", "enum": []string{"queued"}},
+	}, "message_id", "status")
+}
+
+func modernErrorOutput() map[string]any {
+	return map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"properties": map[string]any{
+			"error": map[string]any{
+				"type":                 "object",
+				"additionalProperties": false,
+				"properties": map[string]any{
+					"code":      stringProperty(1),
+					"retryable": map[string]any{"type": "boolean"},
+					"retry_at":  map[string]any{"type": "string", "format": "date-time"},
+				},
+				"required": []string{"code", "retryable"},
+			},
+		},
+		"required": []string{"error"},
+	}
+}
+
+func sdkTool(descriptor toolDescriptor) *sdkmcp.Tool {
+	return &sdkmcp.Tool{
+		Name: descriptor.Name, Description: descriptor.Description,
+		InputSchema: descriptor.InputSchema,
+		OutputSchema: map[string]any{
+			"$schema": "https://json-schema.org/draft/2020-12/schema",
+			"oneOf":   []any{descriptor.OutputShape, modernErrorOutput()},
+		},
+	}
+}
+
+func rawJSON(value any) string {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return `{"error":"result_encoding_failed"}`
+	}
+	return string(raw)
+}

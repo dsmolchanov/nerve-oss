@@ -40,6 +40,7 @@ type Server struct {
 	Tools        *tools.Service
 	MemoryBudget *memguard.Budget
 	FeatureFlags FeatureGate
+	Invoker      *Invoker
 	mu           sync.Mutex
 	sessions     map[string]time.Time
 }
@@ -49,7 +50,9 @@ func NewServer(cfg config.Config, toolsSvc *tools.Service, authSvc *auth.Service
 	if err != nil {
 		budget, _ = memguard.New(64 << 20)
 	}
-	return &Server{Config: cfg, Auth: authSvc, Entitlements: entitlementSvc, Tools: toolsSvc, MemoryBudget: budget, sessions: make(map[string]time.Time)}
+	server := &Server{Config: cfg, Auth: authSvc, Entitlements: entitlementSvc, Tools: toolsSvc, MemoryBudget: budget, sessions: make(map[string]time.Time)}
+	server.Invoker = &Invoker{server: server}
+	return server
 }
 
 const maxMCPBodyBytes int64 = 16 << 20
@@ -199,7 +202,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, routed bool)
 	}
 	if s.Config.Cloud.Mode {
 		requiredScope := s.requiredScope(req)
-		if requiredScope != "" {
+		if requiredScope != "" && req.Method != "tools/call" {
 			if err := s.Auth.ValidateScopes(principal, requiredScope); err != nil {
 				writeInsufficientScope(w, requiredScope)
 				return
@@ -312,7 +315,11 @@ func (s *Server) dispatch(ctx context.Context, req Request) (any, error) {
 	case "tools/list":
 		return ListTools(s.attachmentsEnabled(ctx)), nil
 	case "tools/call":
-		return s.callTool(ctx, req)
+		invocation, err := ToolInvocationFromRequest(req)
+		if err != nil {
+			return nil, err
+		}
+		return s.Invoker.Invoke(ctx, invocation)
 	case "resources/list":
 		return ListResources(), nil
 	case "resources/read":
@@ -322,11 +329,8 @@ func (s *Server) dispatch(ctx context.Context, req Request) (any, error) {
 	}
 }
 
-func (s *Server) callTool(ctx context.Context, req Request) (any, error) {
-	var params ToolCallParams
-	if err := decodeParams(req.Params, &params); err != nil {
-		return nil, err
-	}
+func (invoker *Invoker) invokeTool(ctx context.Context, params ToolCallParams) (any, error) {
+	s := invoker.server
 	start := time.Now()
 	inputsHash := hashJSON(params.Arguments)
 	replayID := observability.NewReplayID()
