@@ -17,13 +17,37 @@ import (
 const oauthClientCredentialsExtension = "io.modelcontextprotocol/oauth-client-credentials"
 
 func NewSDKHandler(runtime *Server, jsonResponse bool) http.Handler {
-	return sdkmcp.NewStreamableHTTPHandler(func(request *http.Request) *sdkmcp.Server {
+	sdkHandler := sdkmcp.NewStreamableHTTPHandler(func(request *http.Request) *sdkmcp.Server {
 		return newSDKServer(request.Context(), runtime)
 	}, &sdkmcp.StreamableHTTPOptions{
 		Stateless:                    true,
 		JSONResponse:                 jsonResponse,
 		MaxRequestBodyBytes:          maxMCPBodyBytes,
 		PropagateRequestCancellation: true,
+	})
+	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.ContentLength > maxMCPBodyBytes {
+			_ = request.Body.Close()
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		if runtime == nil || runtime.MemoryBudget == nil {
+			_ = request.Body.Close()
+			writeMemoryBudgetError(w)
+			return
+		}
+		// The SDK materializes the complete request body. Reserve the wire cap
+		// before dispatch so chunked and concurrent requests cannot evade the
+		// shared process budget by growing incrementally.
+		release, err := runtime.MemoryBudget.Acquire(request.Context(), maxMCPBodyBytes)
+		if err != nil {
+			_ = request.Body.Close()
+			writeMemoryBudgetError(w)
+			return
+		}
+		defer release()
+		request.Body = http.MaxBytesReader(w, request.Body, maxMCPBodyBytes)
+		sdkHandler.ServeHTTP(w, request)
 	})
 }
 

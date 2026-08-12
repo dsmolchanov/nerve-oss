@@ -50,7 +50,7 @@ func modernToolCatalog(ctx context.Context, server *Server, principal auth.Princ
 			"needs_human_approval": map[string]any{"type": "boolean"}, "policy_blocked": map[string]any{"type": "boolean"}, "reason": stringProperty(0),
 		}, "draft", "risk_flags", "cited_message_ids", "needs_human_approval")},
 		{Name: "send_reply", Description: "Send a reply", InputSchema: modernInputSchema(sendReplyInputSchema(attachmentsEnabled)), OutputShape: queuedMessageOutput()},
-		{Name: "compose_email", Description: "Compose and send a new email (not a reply)", InputSchema: modernInputSchema(composeEmailInputSchema(attachmentsEnabled)), OutputShape: queuedMessageOutput()},
+		{Name: "compose_email", Description: "Compose and send a new email (not a reply)", InputSchema: modernInputSchema(composeEmailInputSchema(attachmentsEnabled)), OutputShape: composeQueuedMessageOutput()},
 	}
 	if !server.Config.Cloud.Mode || server.Auth == nil {
 		return tools
@@ -111,6 +111,14 @@ func queuedMessageOutput() map[string]any {
 		"message_id": stringProperty(1),
 		"status":     map[string]any{"type": "string", "enum": []string{"queued"}},
 	}, "message_id", "status")
+}
+
+func composeQueuedMessageOutput() map[string]any {
+	return outputObject(map[string]any{
+		"thread_id":  stringProperty(1),
+		"message_id": stringProperty(1),
+		"status":     map[string]any{"type": "string", "enum": []string{"queued"}},
+	}, "thread_id", "message_id", "status")
 }
 
 func modernErrorOutput() map[string]any {

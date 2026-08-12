@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -59,6 +60,9 @@ func TestSDKServerIsStatelessAndListsDeterministicEmailTools(t *testing.T) {
 		const draft = `"$schema":"https://json-schema.org/draft/2020-12/schema"`
 		if !strings.Contains(string(input), draft) || !strings.Contains(string(output), draft) {
 			t.Fatalf("%s does not advertise complete 2020-12 schemas: input=%s output=%s", tool.Name, input, output)
+		}
+		if tool.Name == "compose_email" && !strings.Contains(string(output), `"thread_id"`) {
+			t.Fatalf("compose output schema omits returned thread_id: %s", output)
 		}
 	}
 }
@@ -139,6 +143,41 @@ func TestSDKServerListsConformantPrivateResources(t *testing.T) {
 	}
 	if templates.CacheScope != "private" || templates.TTLMs != 5_000 {
 		t.Fatalf("template cache metadata=%q/%d want private/5000", templates.CacheScope, templates.TTLMs)
+	}
+}
+
+func TestSDKHandlerEnforcesAndReleasesSharedMemoryBudget(t *testing.T) {
+	cfg := config.Default()
+	cfg.Memory.BudgetBytes = maxMCPBodyBytes - 1
+	exhausted := NewServer(cfg, nil, nil, nil)
+	request := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewBufferString(`{}`))
+	recorder := httptest.NewRecorder()
+	NewSDKHandler(exhausted, true).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusServiceUnavailable || recorder.Header().Get("Retry-After") != "1" {
+		t.Fatalf("memory exhaustion status=%d retry=%q body=%s", recorder.Code, recorder.Header().Get("Retry-After"), recorder.Body.String())
+	}
+	if exhausted.MemoryBudget.Used() != 0 {
+		t.Fatalf("failed reservation leaked memory: %d", exhausted.MemoryBudget.Used())
+	}
+
+	cfg.Memory.BudgetBytes = 64 << 20
+	runtime := NewServer(cfg, nil, nil, nil)
+	tooLarge := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(nil))
+	tooLarge.ContentLength = maxMCPBodyBytes + 1
+	recorder = httptest.NewRecorder()
+	NewSDKHandler(runtime, true).ServeHTTP(recorder, tooLarge)
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized modern request status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if runtime.MemoryBudget.Used() != 0 {
+		t.Fatalf("oversized request changed memory accounting: %d", runtime.MemoryBudget.Used())
+	}
+
+	invalid := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewBufferString(`{}`))
+	recorder = httptest.NewRecorder()
+	NewSDKHandler(runtime, true).ServeHTTP(recorder, invalid)
+	if runtime.MemoryBudget.Used() != 0 {
+		t.Fatalf("completed modern request leaked memory: %d", runtime.MemoryBudget.Used())
 	}
 }
 
