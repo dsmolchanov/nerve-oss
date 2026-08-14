@@ -51,6 +51,23 @@ func NewService(cfg config.Config, store *store.Store, llmProvider llm.Provider,
 	return &Service{Config: cfg, Store: store, LLM: llmProvider, Vector: vectorStore, Policy: policyObj, Embedder: embedder, Transport: transport}
 }
 
+// reevaluateOutboundPolicy re-reads the autonomous send policy inside the
+// enqueue transaction.
+//
+// The protocol boundary checks the same policy before dispatch, but that answer
+// is stale by the time this transaction runs: an org suspended, or stripped of
+// its compose evidence, in that window would otherwise still get an outbox row.
+// The decision that matters is the one taken from the snapshot that writes.
+func (s *Service) reevaluateOutboundPolicy(
+	ctx context.Context, st OutboundPolicyStore, principal auth.Principal, input OutboundPolicyInput,
+) error {
+	if !s.Config.Cloud.Mode || principal.Kind != auth.PrincipalM2MOrg {
+		return nil
+	}
+	input.OrgID = principal.OrgID
+	return EvaluateOutboundPolicy(ctx, st, input)
+}
+
 func (s *Service) withScopedStore(ctx context.Context, fn func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error)) (any, error) {
 	if !s.Config.Cloud.Mode {
 		return fn(ctx, s.Store, auth.Principal{})
@@ -325,6 +342,12 @@ func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string,
 			return nil, errors.New("missing recipient")
 		}
 
+		if err := s.reevaluateOutboundPolicy(scopedCtx, st, principal, OutboundPolicyInput{
+			Tool: "send_reply", ThreadID: threadID,
+		}); err != nil {
+			return nil, err
+		}
+
 		inbox, err := s.activeInboxRecord(scopedCtx, st, principal, inboxID)
 		if err != nil {
 			return nil, err
@@ -463,6 +486,12 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 			if err := s.ensureInboxBelongsToOrg(scopedCtx, st, principal.OrgID, inboxID); err != nil {
 				return nil, err
 			}
+		}
+
+		if err := s.reevaluateOutboundPolicy(scopedCtx, st, principal, OutboundPolicyInput{
+			Tool: "compose_email", InboxID: inboxID,
+		}); err != nil {
+			return nil, err
 		}
 
 		inbox, err := s.activeInboxRecord(scopedCtx, st, principal, inboxID)

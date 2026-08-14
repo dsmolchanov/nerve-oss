@@ -4,11 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"strings"
 
 	"neuralmail/internal/auth"
-	"neuralmail/internal/store"
+	"neuralmail/internal/tools"
 )
 
 // ToolInvocation is the protocol-neutral input consumed by both MCP adapters.
@@ -71,150 +69,40 @@ func (err *outboundPolicyError) Error() string {
 	return err.Code
 }
 
-type outboundPolicyStore interface {
-	LookupFeatureFlagForOrg(context.Context, string, string) (store.FeatureFlagValues, error)
-	GetInboxRecordByIDForOrg(context.Context, string, string) (store.InboxRecord, error)
-	ListInboxRecordsByOrg(context.Context, string) ([]store.InboxRecord, error)
-	GetOrgDomainByIDForOrg(context.Context, string, string) (store.OrgDomain, error)
-	GetThread(context.Context, string) (store.Thread, []store.Message, error)
-	GetMessage(context.Context, string) (store.Message, error)
-}
-
 type storeOutboundPolicyGate struct {
-	store outboundPolicyStore
+	store tools.OutboundPolicyStore
 }
 
+// Authorize is the fast path at the protocol boundary. It is deliberately not
+// the authority: the same decision is re-read inside the enqueue transaction in
+// internal/tools, so a policy change committed between this check and the
+// insert cannot let an outbox row through.
 func (gate *storeOutboundPolicyGate) Authorize(ctx context.Context, principal auth.Principal, toolName string, arguments json.RawMessage) error {
 	if principal.Kind != auth.PrincipalM2MOrg || !isOutboundTool(toolName) {
 		return nil
 	}
-	if gate == nil || gate.store == nil || principal.OrgID == "" {
+	if gate == nil || gate.store == nil {
 		return &outboundPolicyError{Code: "outbound_policy_unavailable"}
 	}
-	required := []struct {
-		flag string
-		want bool
-	}{
-		{flag: "autonomous_outbound_policy", want: true},
-		{flag: "email_outbound_suspended", want: false},
+	input := tools.OutboundPolicyInput{Tool: toolName, OrgID: principal.OrgID}
+	if len(arguments) != 0 {
+		var identifiers struct {
+			ThreadID string `json:"thread_id"`
+			InboxID  string `json:"inbox_id"`
+		}
+		if err := json.Unmarshal(arguments, &identifiers); err != nil {
+			return &outboundPolicyError{Code: "outbound_policy_unavailable"}
+		}
+		input.ThreadID, input.InboxID = identifiers.ThreadID, identifiers.InboxID
 	}
-	for _, requirement := range required {
-		values, err := gate.store.LookupFeatureFlagForOrg(ctx, principal.OrgID, requirement.flag)
-		if err != nil {
-			return &outboundPolicyError{Code: "outbound_policy_unavailable"}
+	if err := tools.EvaluateOutboundPolicy(ctx, gate.store, input); err != nil {
+		var policyErr *tools.OutboundPolicyError
+		if errors.As(err, &policyErr) {
+			return &outboundPolicyError{Code: policyErr.Code}
 		}
-		if values.Org == nil || *values.Org != requirement.want {
-			return &outboundPolicyError{Code: fmt.Sprintf("%s_denied", requirement.flag)}
-		}
-	}
-	if toolName == "send_reply" && len(arguments) != 0 {
-		allowed, err := gate.hasRealInboundReplyTarget(ctx, principal.OrgID, arguments)
-		if err != nil {
-			return &outboundPolicyError{Code: "outbound_policy_unavailable"}
-		}
-		if !allowed {
-			return &outboundPolicyError{Code: "inbound_reply_policy_denied"}
-		}
-	}
-	if toolName == "compose_email" {
-		values, err := gate.store.LookupFeatureFlagForOrg(ctx, principal.OrgID, "email_compose_org_enabled")
-		if err != nil || values.Org == nil {
-			return &outboundPolicyError{Code: "outbound_policy_unavailable"}
-		}
-		if *values.Org {
-			return nil
-		}
-		allowed, err := gate.hasReadyOwnedComposeInbox(ctx, principal.OrgID, arguments)
-		if err != nil {
-			return &outboundPolicyError{Code: "outbound_policy_unavailable"}
-		}
-		if !allowed {
-			return &outboundPolicyError{Code: "email_compose_org_enabled_denied"}
-		}
+		return &outboundPolicyError{Code: "outbound_policy_unavailable"}
 	}
 	return nil
-}
-
-func (gate *storeOutboundPolicyGate) hasReadyOwnedComposeInbox(ctx context.Context, orgID string, arguments json.RawMessage) (bool, error) {
-	var inboxes []store.InboxRecord
-	if len(arguments) == 0 {
-		var err error
-		inboxes, err = gate.store.ListInboxRecordsByOrg(ctx, orgID)
-		if err != nil {
-			return false, err
-		}
-	} else {
-		var input struct {
-			InboxID string `json:"inbox_id"`
-		}
-		if err := json.Unmarshal(arguments, &input); err != nil || input.InboxID == "" {
-			return false, err
-		}
-		inbox, err := gate.store.GetInboxRecordByIDForOrg(ctx, orgID, input.InboxID)
-		if err != nil {
-			return false, err
-		}
-		inboxes = []store.InboxRecord{inbox}
-	}
-
-	for _, inbox := range inboxes {
-		if inbox.Status != "active" || !inbox.OrgDomainID.Valid {
-			continue
-		}
-		domain, err := gate.store.GetOrgDomainByIDForOrg(ctx, orgID, inbox.OrgDomainID.String)
-		if err != nil {
-			continue
-		}
-		at := strings.LastIndexByte(inbox.Address, '@')
-		if domain.Status == "active" && domain.MXVerified && domain.SPFVerified && domain.DKIMVerified &&
-			domain.InboundEnabled && domain.ResendReceivingEnabled &&
-			at >= 0 && strings.EqualFold(inbox.Address[at+1:], domain.Domain) {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func (gate *storeOutboundPolicyGate) hasRealInboundReplyTarget(ctx context.Context, orgID string, arguments json.RawMessage) (bool, error) {
-	var input struct {
-		ThreadID string `json:"thread_id"`
-	}
-	if err := json.Unmarshal(arguments, &input); err != nil {
-		return false, err
-	}
-	if input.ThreadID == "" {
-		return false, nil
-	}
-	thread, messages, err := gate.store.GetThread(ctx, input.ThreadID)
-	if err != nil {
-		return false, err
-	}
-	if len(messages) == 0 {
-		return false, nil
-	}
-	inbox, err := gate.store.GetInboxRecordByIDForOrg(ctx, orgID, thread.InboxID)
-	if err != nil {
-		return false, err
-	}
-	if inbox.Status != "active" {
-		return false, nil
-	}
-	for index := len(messages) - 1; index >= 0; index-- {
-		candidate := messages[index]
-		if candidate.Direction != "inbound" || candidate.InboxID != thread.InboxID {
-			continue
-		}
-		message, err := gate.store.GetMessage(ctx, candidate.ID)
-		if err != nil {
-			return false, err
-		}
-		if message.ThreadID == thread.ID && message.InboxID == thread.InboxID &&
-			message.Direction == "inbound" && message.ReceivedEmailID != "" &&
-			strings.TrimSpace(message.From.Email) != "" {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 func requiredToolScope(principal auth.Principal, toolName string) string {
