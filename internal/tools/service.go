@@ -312,16 +312,34 @@ func (s *Service) SendReply(ctx context.Context, threadID string, body string, b
 // false must not thereby escape review: the final body is evaluated with server
 // policy and either verdict can require approval. A policy violation is refused
 // outright rather than downgraded to an approval request.
-func (s *Service) approvalGate(ctx context.Context, body string, requested bool) error {
-	_, evaluated := policy.Evaluate(body, s.Policy)
-	if !evaluated.Allowed {
-		reason := evaluated.Reason
-		if reason == "" {
-			reason = "content is not allowed by policy"
+func (s *Service) approvalGate(ctx context.Context, body, bodyHTML string, requested bool) error {
+	needsApproval := requested
+	// Both representations are evaluated: an HTML-only message would otherwise
+	// be judged on an empty string. A redaction is a refusal rather than a
+	// silent pass, because the sanitized text is not what this path enqueues,
+	// and a plain-text replacement cannot be spliced into HTML safely; the
+	// drafting tool is where redacted content is produced for review.
+	for _, representation := range []struct {
+		label string
+		text  string
+	}{{"body", body}, {"html body", bodyHTML}} {
+		if strings.TrimSpace(representation.text) == "" {
+			continue
 		}
-		return errors.New("send blocked by policy: " + reason)
+		adjusted, evaluated := policy.Evaluate(representation.text, s.Policy)
+		if !evaluated.Allowed {
+			reason := evaluated.Reason
+			if reason == "" {
+				reason = "content is not allowed by policy"
+			}
+			return errors.New("send blocked by policy: " + reason)
+		}
+		if adjusted != representation.text {
+			return errors.New("send blocked by policy: " + representation.label + " requires redaction")
+		}
+		needsApproval = needsApproval || evaluated.NeedsApproval
 	}
-	if !requested && !evaluated.NeedsApproval {
+	if !needsApproval {
 		return nil
 	}
 	if !s.Config.Cloud.Mode {
@@ -341,7 +359,7 @@ func (s *Service) approvalGate(ctx context.Context, body string, requested bool)
 }
 
 func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string, body string, bodyHTML string, needsApproval bool, idempotencyKey string, attachments []store.OutboundAttachment) (any, error) {
-	if err := s.approvalGate(ctx, body, needsApproval); err != nil {
+	if err := s.approvalGate(ctx, body, bodyHTML, needsApproval); err != nil {
 		return nil, err
 	}
 	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
@@ -496,7 +514,7 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 	}
 	// compose carries no needs_human_approval field at all, so without this the
 	// content policy governed replies but never new messages.
-	if err := s.approvalGate(ctx, body, false); err != nil {
+	if err := s.approvalGate(ctx, body, bodyHTML, false); err != nil {
 		return nil, err
 	}
 	if toAddress == "" {

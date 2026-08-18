@@ -86,9 +86,37 @@ func TestSendReplyStillAllowsCleanContent(t *testing.T) {
 
 	// Clean content must pass the gate; it fails later for want of a store,
 	// which is exactly how far this unit can reach.
-	err := svc.approvalGate(context.Background(), "thanks, see you tomorrow", false)
+	err := svc.approvalGate(context.Background(), "thanks, see you tomorrow", "", false)
 
 	if err != nil {
 		t.Fatalf("clean content must pass the approval gate, got %v", err)
+	}
+}
+
+func TestApprovalGateEvaluatesTheHTMLRepresentation(t *testing.T) {
+	cfg := config.Default()
+	svc := &Service{Config: cfg, Policy: policy.Policy{ForbiddenPhrases: []string{"wire the deposit"}}}
+
+	// An HTML-only message used to be judged on an empty plain-text body.
+	err := svc.approvalGate(context.Background(), "", "<p>please wire the deposit</p>", false)
+
+	if err == nil || !strings.Contains(err.Error(), "send blocked by policy") {
+		t.Fatalf("expected the HTML body to be evaluated, got %v", err)
+	}
+}
+
+func TestApprovalGateRefusesContentPolicyWouldRewrite(t *testing.T) {
+	cfg := config.Default()
+	redacting := policy.Policy{}
+	redacting.Redactions.Patterns = []string{`\d{16}`}
+	redacting.Redactions.Replacement = "[redacted]"
+	svc := &Service{Config: cfg, Policy: redacting}
+
+	// A redaction means the evaluated text is not the text this path enqueues,
+	// so the send is refused rather than delivered unredacted.
+	err := svc.approvalGate(context.Background(), "card 4111111111111111 attached", "", false)
+
+	if err == nil || !strings.Contains(err.Error(), "requires redaction") {
+		t.Fatalf("expected a redaction refusal, got %v", err)
 	}
 }

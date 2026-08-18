@@ -49,6 +49,18 @@ var OutboundPolicyFlags = map[string]bool{
 	"email_compose_org_enabled":  true,
 }
 
+// FenceOrgPolicy runs fn in a transaction holding the org policy lock, so a
+// write to evidence the outbound policy reads cannot land between an enqueue's
+// check and its insert. Safe to call from inside an existing transaction.
+func (s *Store) FenceOrgPolicy(ctx context.Context, orgID string, fn func(*Store) error) error {
+	return s.withTx(ctx, func(scoped *Store) error {
+		if err := scoped.LockOrgPolicy(ctx, orgID); err != nil {
+			return err
+		}
+		return fn(scoped)
+	})
+}
+
 // LockOrgPolicy serializes this transaction against concurrent policy writes
 // for one org. It is transaction-scoped, so it must be called inside a
 // transaction and is released on commit or rollback.

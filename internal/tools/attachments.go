@@ -72,6 +72,13 @@ func DecodeOutboundAttachments(inputs []AttachmentInput) ([]store.OutboundAttach
 			return nil, attachmentInputError("attachment_type_not_allowed", ordinal)
 		}
 
+		// Reject on the encoded length first. Decoding to find out costs the
+		// allocation the limit exists to prevent, and concurrent oversized
+		// requests could exceed the process memory budget before any of them
+		// was refused. Base64 expands by 4/3, so this bounds the decode.
+		if len(input.ContentBase64) > base64.StdEncoding.EncodedLen(maxAttachmentBytes) {
+			return nil, attachmentInputError("attachment_too_large", ordinal)
+		}
 		content, err := base64.StdEncoding.Strict().DecodeString(input.ContentBase64)
 		if err != nil {
 			return nil, attachmentInputError("attachment_invalid_encoding", ordinal)
