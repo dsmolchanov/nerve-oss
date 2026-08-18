@@ -11,6 +11,7 @@ import (
 )
 
 const (
+	MeterMCPRequestsPerMinute      = "mcp_requests_per_minute"
 	meterOutboundReplyDay          = "autonomous_outbound_reply_day"
 	meterOutboundSendDay           = "autonomous_outbound_send_day"
 	meterOutboundFirstRecipientDay = "autonomous_outbound_first_recipient_day"
@@ -166,15 +167,18 @@ func UsageReplayID(orgID, toolName, idempotencyKey, meter, dimension string) str
 	return hex.EncodeToString(hash.Sum(nil))
 }
 
-// DeleteExpiredOutboundUsageCounters bounds the derived bucket table. Durable
-// usage_events and outbox history remain untouched and can reconstruct any
-// deleted bucket for audit.
+// DeleteExpiredOutboundUsageCounters bounds both autonomous send buckets and
+// the durable MCP RPM buckets. Durable usage_events and outbox history remain
+// untouched and can reconstruct any deleted bucket for audit.
 func (s *Store) DeleteExpiredOutboundUsageCounters(ctx context.Context, before time.Time) (int, error) {
 	result, err := s.q.ExecContext(ctx, `
 		DELETE FROM org_usage_counters
 		WHERE period_end < $1
-		  AND meter_name LIKE 'autonomous_outbound_%'
-	`, before)
+		  AND (
+			meter_name LIKE 'autonomous_outbound_%'
+			OR meter_name = $2
+		  )
+	`, before, MeterMCPRequestsPerMinute)
 	if err != nil {
 		return 0, err
 	}

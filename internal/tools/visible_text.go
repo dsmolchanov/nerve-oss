@@ -51,6 +51,17 @@ func visibleText(markup string) string {
 			}
 			continue
 		}
+		if strings.HasPrefix(markup[index:], "<!--") {
+			closing := strings.Index(markup[index+4:], "-->")
+			if closing < 0 {
+				// The remainder is an unterminated, invisible comment.
+				break
+			}
+			// Comments are transparent to rendered text: do not flush the run or
+			// add a boundary, so guar<!-- note -->antee stays "guarantee".
+			index += 4 + closing + 2
+			continue
+		}
 		closing := htmlTagEnd(markup[index:])
 		if closing < 0 {
 			// Unterminated tag: the remainder is markup, not visible text.

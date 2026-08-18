@@ -78,19 +78,31 @@ func TestExpiredOutboundBucketGCLeavesAuditEvents(t *testing.T) {
 		if err := st.EnsureOrgUsageCounter(ctx, orgID, meterOutboundReplyDay, start, start.Add(24*time.Hour)); err != nil {
 			t.Fatalf("seed counter: %v", err)
 		}
+		if err := st.EnsureOrgUsageCounter(ctx, orgID, MeterMCPRequestsPerMinute, start, start.Add(time.Minute)); err != nil {
+			t.Fatalf("seed RPM counter: %v", err)
+		}
+		if err := st.EnsureOrgUsageCounter(ctx, orgID, "mcp_units", start, start.Add(time.Minute)); err != nil {
+			t.Fatalf("seed unrelated counter: %v", err)
+		}
 		if err := st.RecordUsageEventAt(ctx, orgID, meterOutboundReplyDay, 1, "send_reply", "gc-event", "", "success", start); err != nil {
 			t.Fatalf("seed event: %v", err)
 		}
+		if err := st.RecordUsageEventAt(ctx, orgID, MeterMCPRequestsPerMinute, 1, "send_reply", "gc-rpm-event", "", "success", start); err != nil {
+			t.Fatalf("seed RPM event: %v", err)
+		}
 		deleted, err := st.DeleteExpiredOutboundUsageCounters(ctx, start.Add(48*time.Hour))
-		if err != nil || deleted != 1 {
+		if err != nil || deleted != 2 {
 			t.Fatalf("deleted=%d err=%v", deleted, err)
 		}
 		var events int
-		if err := st.q.QueryRowContext(ctx, `SELECT count(*) FROM usage_events WHERE replay_id = 'gc-event'`).Scan(&events); err != nil {
+		if err := st.q.QueryRowContext(ctx, `SELECT count(*) FROM usage_events WHERE replay_id IN ('gc-event', 'gc-rpm-event')`).Scan(&events); err != nil {
 			t.Fatalf("count retained events: %v", err)
 		}
-		if events != 1 {
+		if events != 2 {
 			t.Fatalf("audit event was removed")
+		}
+		if _, err := st.GetOrgUsageCounterUsed(ctx, orgID, "mcp_units", start); err != nil {
+			t.Fatalf("unrelated counter was removed: %v", err)
 		}
 	})
 }

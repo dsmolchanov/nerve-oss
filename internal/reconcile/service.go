@@ -41,6 +41,15 @@ func (s *Service) Run(ctx context.Context) (Report, error) {
 		return report, nil
 	}
 
+	// Delete expired derived buckets before listing counters; otherwise every
+	// minute of M2M traffic permanently increases the reconciliation scan.
+	now := s.Now()
+	deletedBuckets, err := s.Store.DeleteExpiredOutboundUsageCounters(ctx, now.Add(-24*time.Hour))
+	if err != nil {
+		return report, err
+	}
+	report.OutboundRateBucketsDeleted = deletedBuckets
+
 	counters, err := s.Store.ListOrgUsageCounters(ctx)
 	if err != nil {
 		return report, err
@@ -55,12 +64,6 @@ func (s *Service) Run(ctx context.Context) (Report, error) {
 		}
 	}
 
-	now := s.Now()
-	deletedBuckets, err := s.Store.DeleteExpiredOutboundUsageCounters(ctx, now.Add(-24*time.Hour))
-	if err != nil {
-		return report, err
-	}
-	report.OutboundRateBucketsDeleted = deletedBuckets
 	coreVersion, err := store.CurrentVersionCore(ctx, s.Store.DB())
 	if err != nil {
 		return report, err

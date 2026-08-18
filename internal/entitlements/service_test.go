@@ -154,14 +154,14 @@ func TestM2MRateLimitIsSharedAcrossServiceInstances(t *testing.T) {
 		}
 
 		minuteStart := now.Truncate(time.Minute)
-		used, err := st.GetOrgUsageCounterUsed(ctx, orgID, meterMCPRequestsPerMinute, minuteStart)
+		used, err := st.GetOrgUsageCounterUsed(ctx, orgID, store.MeterMCPRequestsPerMinute, minuteStart)
 		if err != nil {
 			t.Fatalf("read durable rate counter: %v", err)
 		}
 		if used != 1 {
 			t.Fatalf("expected one durable reservation, got %d", used)
 		}
-		events, err := st.SumUsageEvents(ctx, orgID, meterMCPRequestsPerMinute, minuteStart, minuteStart.Add(time.Minute))
+		events, err := st.SumUsageEvents(ctx, orgID, store.MeterMCPRequestsPerMinute, minuteStart, minuteStart.Add(time.Minute))
 		if err != nil {
 			t.Fatalf("sum durable rate events: %v", err)
 		}

@@ -18,7 +18,6 @@ import (
 )
 
 const meterMCPUnits = "mcp_units"
-const meterMCPRequestsPerMinute = "mcp_requests_per_minute"
 
 var ErrQuotaExceeded = errors.New("quota exceeded")
 
@@ -201,11 +200,11 @@ func (s *Service) reserveRateLimit(
 	}
 	periodStart := now.UTC().Truncate(time.Minute)
 	periodEnd := periodStart.Add(time.Minute)
-	if err := scoped.EnsureOrgUsageCounter(ctx, principal.OrgID, meterMCPRequestsPerMinute, periodStart, periodEnd); err != nil {
+	if err := scoped.EnsureOrgUsageCounter(ctx, principal.OrgID, store.MeterMCPRequestsPerMinute, periodStart, periodEnd); err != nil {
 		return false, 0, err
 	}
 	reserved, _, err := scoped.ReserveOrgUsageUnits(
-		ctx, principal.OrgID, meterMCPRequestsPerMinute, periodStart, 1, int64(rpm),
+		ctx, principal.OrgID, store.MeterMCPRequestsPerMinute, periodStart, 1, int64(rpm),
 	)
 	if err != nil {
 		return false, 0, err
@@ -222,10 +221,10 @@ func (s *Service) reserveRateLimit(
 		replayID = uuid.NewString()
 	}
 	rateReplayID := store.UsageReplayID(
-		principal.OrgID, toolName, replayID, meterMCPRequestsPerMinute, "",
+		principal.OrgID, toolName, replayID, store.MeterMCPRequestsPerMinute, "",
 	)
 	if err := scoped.RecordUsageEventAt(
-		ctx, principal.OrgID, meterMCPRequestsPerMinute, 1, toolName,
+		ctx, principal.OrgID, store.MeterMCPRequestsPerMinute, 1, toolName,
 		rateReplayID, "", "success", now,
 	); err != nil {
 		return false, 0, err

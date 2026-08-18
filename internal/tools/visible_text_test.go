@@ -19,8 +19,11 @@ func TestVisibleTextRendersAsAReaderSeesIt(t *testing.T) {
 		"single-quoted greater-than is not a delimiter": {
 			`<a title='1 > guarantee'>Hello</a>`, "Hello",
 		},
-		"unterminated tag is safe": {"<p>text<", "text"},
-		"plain text is unchanged":  {"just text", "just text"},
+		"comment greater-than is invisible":  {"<!-- score > guarantee -->Hello", "Hello"},
+		"comment inside word is transparent": {"guar<!-- score > 0 -->antee", "guarantee"},
+		"unterminated comment is invisible":  {"Hello<!-- guarantee >", "Hello"},
+		"unterminated tag is safe":           {"<p>text<", "text"},
+		"plain text is unchanged":            {"just text", "just text"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := visibleText(testCase.markup); got != testCase.want {
