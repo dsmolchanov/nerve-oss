@@ -1418,6 +1418,17 @@ Separate reply from compose, make autonomous policy fail closed, remove inbound-
 
 #### 7.2 Evaluate reply and compose against a transaction-scoped policy snapshot
 
+**Delivery-side items are a separate change from the adapter work.** The enqueue
+half of this section — the transaction-scoped policy snapshot, the per-org
+lock shared with policy writers, and server-side evaluation of the final content
+— lands with the MCP 2026 adapter branch. The delivery half does not: the claim
+recheck and the provider-start fence need a durable policy epoch on the outbox
+row, so they carry a migration and touch `internal/emailtransport/outbox_worker.go`,
+which the adapter branch does not otherwise open. Reviewing the adapter branch
+against the whole of 7.2 will therefore keep reporting the delivery fence as
+missing; it is tracked as its own change rather than deferred silently.
+
+
 **OSS-first/shared files**
 
 - `internal/tools/service.go`

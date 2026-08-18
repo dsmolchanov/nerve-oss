@@ -306,21 +306,43 @@ func (s *Service) SendReply(ctx context.Context, threadID string, body string, b
 	return s.SendReplyWithAttachments(ctx, threadID, body, bodyHTML, needsApproval, idempotencyKey, nil)
 }
 
-func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string, body string, bodyHTML string, needsApproval bool, idempotencyKey string, attachments []store.OutboundAttachment) (any, error) {
-	if needsApproval {
-		if !s.Config.Cloud.Mode {
-			if !s.Config.Security.AllowSendWithWarnings {
-				return nil, errors.New("send blocked: needs human approval")
-			}
-		} else {
-			reservation, ok := entitlements.ReservationFromContext(ctx)
-			if !ok {
-				return nil, errors.New("missing entitlement context")
-			}
-			if !entitlements.FeatureBool(reservation.Features, "email_autopilot_send_override", false) {
-				return nil, errors.New("send blocked: needs human approval")
-			}
+// approvalGate decides whether outbound content may leave without a human.
+//
+// needs_human_approval is caller-supplied, so a caller that omits it or sends
+// false must not thereby escape review: the final body is evaluated with server
+// policy and either verdict can require approval. A policy violation is refused
+// outright rather than downgraded to an approval request.
+func (s *Service) approvalGate(ctx context.Context, body string, requested bool) error {
+	_, evaluated := policy.Evaluate(body, s.Policy)
+	if !evaluated.Allowed {
+		reason := evaluated.Reason
+		if reason == "" {
+			reason = "content is not allowed by policy"
 		}
+		return errors.New("send blocked by policy: " + reason)
+	}
+	if !requested && !evaluated.NeedsApproval {
+		return nil
+	}
+	if !s.Config.Cloud.Mode {
+		if !s.Config.Security.AllowSendWithWarnings {
+			return errors.New("send blocked: needs human approval")
+		}
+		return nil
+	}
+	reservation, ok := entitlements.ReservationFromContext(ctx)
+	if !ok {
+		return errors.New("missing entitlement context")
+	}
+	if !entitlements.FeatureBool(reservation.Features, "email_autopilot_send_override", false) {
+		return errors.New("send blocked: needs human approval")
+	}
+	return nil
+}
+
+func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string, body string, bodyHTML string, needsApproval bool, idempotencyKey string, attachments []store.OutboundAttachment) (any, error) {
+	if err := s.approvalGate(ctx, body, needsApproval); err != nil {
+		return nil, err
 	}
 	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
 		if principal.OrgID != "" {
@@ -471,6 +493,11 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 	}
 	if body == "" && bodyHTML == "" {
 		return nil, errors.New("missing body")
+	}
+	// compose carries no needs_human_approval field at all, so without this the
+	// content policy governed replies but never new messages.
+	if err := s.approvalGate(ctx, body, false); err != nil {
+		return nil, err
 	}
 	if toAddress == "" {
 		return nil, errors.New("missing recipient")

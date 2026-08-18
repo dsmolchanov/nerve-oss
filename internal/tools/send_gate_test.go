@@ -3,10 +3,12 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"neuralmail/internal/config"
 	"neuralmail/internal/entitlements"
+	"neuralmail/internal/policy"
 )
 
 func TestSendReplyBlocksNeedsApprovalInCloudWithoutOverrideFeature(t *testing.T) {
@@ -36,5 +38,57 @@ func TestSendReplyAllowsNeedsApprovalInCloudWithOverrideFeature(t *testing.T) {
 	_, err := svc.SendReply(ctx, "", "", "", true, "idemp-2")
 	if err == nil || err.Error() != "missing cloud principal" {
 		t.Fatalf("expected to pass approval gate and then fail for missing principal, got %v", err)
+	}
+}
+
+func TestSendReplyDerivesApprovalFromServerPolicyWhenCallerSaysFalse(t *testing.T) {
+	cfg := config.Default()
+	cfg.Cloud.Mode = true
+	svc := &Service{Config: cfg, Policy: policy.Policy{
+		ForbiddenPhrases: []string{"wire the deposit"},
+	}}
+	ctx := entitlements.WithReservation(context.Background(), entitlements.Reservation{
+		Features: json.RawMessage(`{"email_autopilot_send_override": true}`),
+	})
+
+	// The caller claims no approval is needed; server policy disagrees, and the
+	// caller's claim must not decide it.
+	_, err := svc.SendReply(ctx, "thread-1", "please wire the deposit today", "", false, "idemp-policy-1")
+
+	if err == nil || !strings.Contains(err.Error(), "send blocked by policy") {
+		t.Fatalf("expected the server policy to block the send, got %v", err)
+	}
+}
+
+func TestComposeEmailEvaluatesServerPolicy(t *testing.T) {
+	cfg := config.Default()
+	cfg.Cloud.Mode = true
+	svc := &Service{Config: cfg, Policy: policy.Policy{
+		ForbiddenPhrases: []string{"wire the deposit"},
+	}}
+	ctx := entitlements.WithReservation(context.Background(), entitlements.Reservation{
+		Features: json.RawMessage(`{"email_autopilot_send_override": true}`),
+	})
+
+	// compose has no needs_human_approval field, so policy is the only check.
+	_, err := svc.ComposeEmailWithOptions(ctx, "inbox-1", "someone@example.test",
+		"Subject", "please wire the deposit today", "", "idemp-policy-2", ComposeEmailOptions{})
+
+	if err == nil || !strings.Contains(err.Error(), "send blocked by policy") {
+		t.Fatalf("expected the server policy to block the compose, got %v", err)
+	}
+}
+
+func TestSendReplyStillAllowsCleanContent(t *testing.T) {
+	cfg := config.Default()
+	cfg.Cloud.Mode = false
+	svc := &Service{Config: cfg, Policy: policy.Policy{ForbiddenPhrases: []string{"forbidden"}}}
+
+	// Clean content must pass the gate; it fails later for want of a store,
+	// which is exactly how far this unit can reach.
+	err := svc.approvalGate(context.Background(), "thanks, see you tomorrow", false)
+
+	if err != nil {
+		t.Fatalf("clean content must pass the approval gate, got %v", err)
 	}
 }
