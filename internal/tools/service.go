@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net/mail"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -649,11 +651,33 @@ func (s *Service) activeInboxRecord(ctx context.Context, st *store.Store, princi
 	return inbox, nil
 }
 
+// schemaIDPattern keeps a schema id a single directory-free name. The id is
+// interpolated into a path and read from disk, so anything able to traverse
+// (`..`, a separator, a leading dot) would let a caller hand the model an
+// arbitrary readable JSON file as the extraction schema.
+var schemaIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+
 func LoadSchema(schemaID string) (map[string]any, error) {
 	if schemaID == "" {
 		return nil, errors.New("missing schema id")
 	}
+	if !schemaIDPattern.MatchString(schemaID) {
+		return nil, errors.New("invalid schema id")
+	}
 	path := fmt.Sprintf("configs/schemas/%s.json", schemaID)
+	// Defence in depth: the pattern already excludes traversal, but the read
+	// itself refuses anything that does not resolve beneath the directory.
+	resolved, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	root, err := filepath.Abs("configs/schemas")
+	if err != nil {
+		return nil, err
+	}
+	if filepath.Dir(resolved) != root {
+		return nil, errors.New("invalid schema id")
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err

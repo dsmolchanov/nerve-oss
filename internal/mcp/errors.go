@@ -18,11 +18,16 @@ func translateModernBusinessError(err error) modernBusinessError {
 	translated := modernBusinessError{Code: "tool_failed"}
 	var attachmentErr *tools.AttachmentInputError
 	var policyErr *outboundPolicyError
+	// The enqueue-time recheck raises the tools-layer type; without this the
+	// caller would see a generic tool_failed instead of the actual denial.
+	var enqueuePolicyErr *tools.OutboundPolicyError
 	var rateErr *entitlements.RateLimitError
 	var inProgressErr *entitlements.IdempotencyInProgressError
 	switch {
 	case errors.As(err, &policyErr):
 		translated.Code = policyErr.Code
+	case errors.As(err, &enqueuePolicyErr):
+		translated.Code = enqueuePolicyErr.Code
 	case errors.As(err, &attachmentErr):
 		translated.Code = attachmentErr.Code
 	case errors.Is(err, entitlements.ErrQuotaExceeded):

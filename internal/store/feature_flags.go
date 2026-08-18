@@ -40,6 +40,31 @@ func (s *Store) LookupFeatureFlagForOrg(ctx context.Context, orgID string, flag 
 
 // LookupFeatureFlag returns the org-specific and global values separately so
 // callers can apply precedence without losing the distinction between an
+// OutboundPolicyFlags are the org flags that decide whether an autonomous
+// sender may enqueue. Readers and writers take the same per-org lock so a
+// suspension cannot commit between an enqueue's policy read and its insert.
+var OutboundPolicyFlags = map[string]bool{
+	"autonomous_outbound_policy": true,
+	"email_outbound_suspended":   true,
+	"email_compose_org_enabled":  true,
+}
+
+// LockOrgPolicy serializes this transaction against concurrent policy writes
+// for one org. It is transaction-scoped, so it must be called inside a
+// transaction and is released on commit or rollback.
+func (s *Store) LockOrgPolicy(ctx context.Context, orgID string) error {
+	orgID = strings.TrimSpace(orgID)
+	if orgID == "" {
+		return errors.New("missing org id")
+	}
+	if err := s.requireTx(); err != nil {
+		return fmt.Errorf("org policy lock: %w", err)
+	}
+	_, err := s.q.ExecContext(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "org-policy:"+orgID)
+	return err
+}
+
 // explicit false and an absent row.
 func (s *Store) LookupFeatureFlag(ctx context.Context, orgID string, flag string) (FeatureFlagValues, error) {
 	orgID = strings.TrimSpace(orgID)
@@ -86,6 +111,13 @@ func (s *Store) SetFeatureFlag(ctx context.Context, orgID *string, flag string, 
 	updatedBy = strings.TrimSpace(updatedBy)
 	if flag == "" || updatedBy == "" {
 		return false, errors.New("missing feature flag or updated_by")
+	}
+	if orgID != nil && OutboundPolicyFlags[flag] {
+		// Writers take the reader's lock so an enqueue in flight either sees
+		// this change or blocks until it commits, never lands between the two.
+		if err := s.LockOrgPolicy(ctx, *orgID); err != nil {
+			return false, err
+		}
 	}
 	if orgID == nil && flag == "domain_writes" {
 		if err := s.requireTx(); err != nil {

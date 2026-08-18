@@ -6,6 +6,7 @@ import (
 	"errors"
 
 	"neuralmail/internal/auth"
+	"neuralmail/internal/store"
 	"neuralmail/internal/tools"
 )
 
@@ -71,6 +72,54 @@ func (err *outboundPolicyError) Error() string {
 
 type storeOutboundPolicyGate struct {
 	store tools.OutboundPolicyStore
+}
+
+// boundaryPolicyStore adapts the unscoped store for the pre-dispatch check.
+//
+// Outside a transaction the reads need RunAsOrg to establish the org RLS
+// context, and a transaction-scoped advisory lock would be released
+// immediately, so it is skipped: this check is a fast fail, and the
+// authoritative decision is taken inside the enqueue transaction.
+type boundaryPolicyStore struct {
+	store *store.Store
+}
+
+func (adapter boundaryPolicyStore) LockOrgPolicy(context.Context, string) error { return nil }
+
+func (adapter boundaryPolicyStore) LookupFeatureFlag(
+	ctx context.Context, orgID, flag string,
+) (store.FeatureFlagValues, error) {
+	return adapter.store.LookupFeatureFlagForOrg(ctx, orgID, flag)
+}
+
+func (adapter boundaryPolicyStore) GetInboxRecordByIDForOrg(
+	ctx context.Context, orgID, inboxID string,
+) (store.InboxRecord, error) {
+	return adapter.store.GetInboxRecordByIDForOrg(ctx, orgID, inboxID)
+}
+
+func (adapter boundaryPolicyStore) ListInboxRecordsByOrg(
+	ctx context.Context, orgID string,
+) ([]store.InboxRecord, error) {
+	return adapter.store.ListInboxRecordsByOrg(ctx, orgID)
+}
+
+func (adapter boundaryPolicyStore) GetOrgDomainByIDForOrg(
+	ctx context.Context, orgID, domainID string,
+) (store.OrgDomain, error) {
+	return adapter.store.GetOrgDomainByIDForOrg(ctx, orgID, domainID)
+}
+
+func (adapter boundaryPolicyStore) GetThread(
+	ctx context.Context, threadID string,
+) (store.Thread, []store.Message, error) {
+	return adapter.store.GetThread(ctx, threadID)
+}
+
+func (adapter boundaryPolicyStore) GetMessage(
+	ctx context.Context, messageID string,
+) (store.Message, error) {
+	return adapter.store.GetMessage(ctx, messageID)
 }
 
 // Authorize is the fast path at the protocol boundary. It is deliberately not

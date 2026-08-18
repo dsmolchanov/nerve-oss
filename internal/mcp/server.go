@@ -57,7 +57,7 @@ func NewServer(cfg config.Config, toolsSvc *tools.Service, authSvc *auth.Service
 	}
 	server := &Server{Config: cfg, Auth: authSvc, Entitlements: entitlementSvc, Tools: toolsSvc, MemoryBudget: budget, sessions: make(map[string]time.Time)}
 	if toolsSvc != nil && toolsSvc.Store != nil {
-		server.OutboundPolicy = &storeOutboundPolicyGate{store: toolsSvc.Store}
+		server.OutboundPolicy = &storeOutboundPolicyGate{store: boundaryPolicyStore{store: toolsSvc.Store}}
 	}
 	server.Invoker = &Invoker{server: server}
 	return server

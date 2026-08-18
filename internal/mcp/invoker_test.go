@@ -239,7 +239,9 @@ func (fake fakeOutboundPolicyStore) GetMessage(_ context.Context, messageID stri
 	return message, nil
 }
 
-func (fake fakeOutboundPolicyStore) LookupFeatureFlagForOrg(_ context.Context, _ string, flag string) (store.FeatureFlagValues, error) {
+func (fake fakeOutboundPolicyStore) LockOrgPolicy(_ context.Context, _ string) error { return nil }
+
+func (fake fakeOutboundPolicyStore) LookupFeatureFlag(_ context.Context, _ string, flag string) (store.FeatureFlagValues, error) {
 	if fake.err != nil {
 		return store.FeatureFlagValues{}, fake.err
 	}

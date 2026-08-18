@@ -24,9 +24,16 @@ type policyStoreStub struct {
 	threadErr  error
 	message    store.Message
 	messageErr error
+	locks      int
+	lockErr    error
 }
 
-func (stub *policyStoreStub) LookupFeatureFlagForOrg(
+func (stub *policyStoreStub) LockOrgPolicy(_ context.Context, _ string) error {
+	stub.locks++
+	return stub.lockErr
+}
+
+func (stub *policyStoreStub) LookupFeatureFlag(
 	_ context.Context, _ string, flag string,
 ) (store.FeatureFlagValues, error) {
 	if stub.flagReads == nil {
@@ -236,5 +243,50 @@ func TestServiceSkipsPolicyForNonAutonomousPrincipals(t *testing.T) {
 	}
 	if len(stub.flagReads) != 0 {
 		t.Fatalf("expected no policy reads for a legacy principal, got %v", stub.flagReads)
+	}
+}
+
+func TestOutboundPolicyLocksTheOrgBeforeReadingFlags(t *testing.T) {
+	stub := &policyStoreStub{flags: allowedFlags()}
+
+	if err := EvaluateOutboundPolicy(context.Background(), stub, OutboundPolicyInput{
+		Tool: "compose_email", OrgID: "org-1", InboxID: "inbox-1",
+	}); err != nil {
+		t.Fatalf("expected the send to be allowed, got %v", err)
+	}
+
+	// Without the lock a suspension could commit between the read and the
+	// insert, so the lock is taken before any flag is read.
+	if stub.locks != 1 {
+		t.Fatalf("expected exactly one org policy lock, got %d", stub.locks)
+	}
+}
+
+func TestOutboundPolicyDeniesWhenTheOrgCannotBeLocked(t *testing.T) {
+	stub := &policyStoreStub{flags: allowedFlags(), lockErr: errors.New("not in a transaction")}
+
+	err := EvaluateOutboundPolicy(context.Background(), stub, OutboundPolicyInput{
+		Tool: "send_reply", OrgID: "org-1", ThreadID: "thread-1",
+	})
+
+	if got := policyCode(t, err); got != "outbound_policy_unavailable" {
+		t.Fatalf("expected outbound_policy_unavailable, got %q", got)
+	}
+	if len(stub.flagReads) != 0 {
+		t.Fatalf("expected no flag read without the lock, got %v", stub.flagReads)
+	}
+}
+
+func TestLoadSchemaRejectsTraversalOutsideTheSchemaDirectory(t *testing.T) {
+	for _, schemaID := range []string{
+		"../../../../etc/passwd",
+		"../secrets",
+		"nested/schema",
+		".hidden",
+		"UPPER",
+	} {
+		if _, err := LoadSchema(schemaID); err == nil || err.Error() != "invalid schema id" {
+			t.Fatalf("schema id %q must be rejected, got %v", schemaID, err)
+		}
 	}
 }

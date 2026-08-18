@@ -59,7 +59,7 @@ func modernToolDescriptors(ctx context.Context, server *Server, principal auth.P
 			"confidence": map[string]any{"type": "number"}, "suggested_route": stringProperty(0),
 		}, "intent", "urgency", "sentiment", "confidence", "suggested_route")},
 		{Name: "extract_to_schema", Description: "Extract structured data", InputSchema: inputObject(
-			map[string]any{"message_id": uuidStringProperty(), "schema_id": boundedStringProperty(1, 128)}, "message_id", "schema_id"),
+			map[string]any{"message_id": uuidStringProperty(), "schema_id": schemaIDProperty()}, "message_id", "schema_id"),
 			OutputShape: outputObject(map[string]any{
 				"data": map[string]any{}, "confidence": map[string]any{"type": "number"},
 				"missing_fields": arrayProperty(), "validation_errors": arrayProperty(),
@@ -127,6 +127,15 @@ func boundedStringProperty(minLength, maxLength int) map[string]any {
 	property := stringProperty(minLength)
 	property["maxLength"] = maxLength
 	return property
+}
+
+// schemaIDProperty mirrors tools.LoadSchema's accepted identifier so a
+// traversal attempt fails at the MCP boundary rather than at the file read.
+func schemaIDProperty() map[string]any {
+	return map[string]any{
+		"type": "string", "minLength": 1, "maxLength": 64,
+		"pattern": `^[a-z0-9][a-z0-9_-]{0,63}$`,
+	}
 }
 
 func uuidStringProperty() map[string]any {

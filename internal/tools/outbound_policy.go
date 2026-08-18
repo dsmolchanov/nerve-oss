@@ -18,12 +18,15 @@ func (err *OutboundPolicyError) Error() string {
 
 // OutboundPolicyStore is the read surface the decision needs.
 //
-// It is an interface so the enqueue transaction can pass its own org-scoped
-// store: the policy is then read from the same snapshot that writes the outbox
-// row, and a suspension committed after an earlier check cannot slip through
-// the gap. *store.Store satisfies it.
+// Every method must execute on the caller's own executor. LookupFeatureFlag is
+// deliberately the transaction-local reader rather than LookupFeatureFlagForOrg,
+// which opens its own RunAsOrg transaction: called from inside the enqueue
+// transaction that variant would read a different snapshot on a second pooled
+// connection, leaving the race open and risking pool exhaustion under
+// concurrent sends. *store.Store satisfies this interface.
 type OutboundPolicyStore interface {
-	LookupFeatureFlagForOrg(context.Context, string, string) (store.FeatureFlagValues, error)
+	LockOrgPolicy(context.Context, string) error
+	LookupFeatureFlag(context.Context, string, string) (store.FeatureFlagValues, error)
 	GetInboxRecordByIDForOrg(context.Context, string, string) (store.InboxRecord, error)
 	ListInboxRecordsByOrg(context.Context, string) ([]store.InboxRecord, error)
 	GetOrgDomainByIDForOrg(context.Context, string, string) (store.OrgDomain, error)
@@ -52,6 +55,11 @@ func EvaluateOutboundPolicy(
 	if st == nil || input.OrgID == "" {
 		return &OutboundPolicyError{Code: "outbound_policy_unavailable"}
 	}
+	// Serialize against concurrent policy writers before reading, so a
+	// suspension either is already visible here or waits for this transaction.
+	if err := st.LockOrgPolicy(ctx, input.OrgID); err != nil {
+		return &OutboundPolicyError{Code: "outbound_policy_unavailable"}
+	}
 	required := []struct {
 		flag string
 		want bool
@@ -60,7 +68,7 @@ func EvaluateOutboundPolicy(
 		{flag: "email_outbound_suspended", want: false},
 	}
 	for _, requirement := range required {
-		values, err := st.LookupFeatureFlagForOrg(ctx, input.OrgID, requirement.flag)
+		values, err := st.LookupFeatureFlag(ctx, input.OrgID, requirement.flag)
 		if err != nil {
 			return &OutboundPolicyError{Code: "outbound_policy_unavailable"}
 		}
@@ -81,7 +89,7 @@ func EvaluateOutboundPolicy(
 			return &OutboundPolicyError{Code: "inbound_reply_policy_denied"}
 		}
 	case "compose_email":
-		values, err := st.LookupFeatureFlagForOrg(ctx, input.OrgID, "email_compose_org_enabled")
+		values, err := st.LookupFeatureFlag(ctx, input.OrgID, "email_compose_org_enabled")
 		if err != nil || values.Org == nil {
 			return &OutboundPolicyError{Code: "outbound_policy_unavailable"}
 		}
