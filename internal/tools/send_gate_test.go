@@ -120,3 +120,53 @@ func TestApprovalGateRefusesContentPolicyWouldRewrite(t *testing.T) {
 		t.Fatalf("expected a redaction refusal, got %v", err)
 	}
 }
+
+func TestApprovalGateSeesTextHiddenByEntitiesAndTags(t *testing.T) {
+	cfg := config.Default()
+	svc := &Service{Config: cfg, Policy: policy.Policy{ForbiddenPhrases: []string{"guarantee"}}}
+
+	for name, markup := range map[string]string{
+		"entity encoded": "<p>we guar&#97;ntee it</p>",
+		"split by a tag": "<p>we guar<b>a</b>ntee it</p>",
+		"plain markup":   "<p>we guarantee it</p>",
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := svc.approvalGate(context.Background(), "", markup, false)
+			if err == nil || !strings.Contains(err.Error(), "send blocked by policy") {
+				t.Fatalf("expected the rendered text to be evaluated, got %v", err)
+			}
+		})
+	}
+}
+
+func TestApprovalGateKeepsWordBoundariesAcrossBlocks(t *testing.T) {
+	cfg := config.Default()
+	svc := &Service{Config: cfg, Policy: policy.Policy{ForbiddenPhrases: []string{"nowarranty"}}}
+
+	// Two separate words must not fuse into a forbidden phrase, which is why
+	// the spaced rendering exists alongside the joined one.
+	if err := svc.approvalGate(context.Background(), "", "<p>no</p><p>warranty</p>", false); err != nil {
+		t.Fatalf("adjacent blocks must not fabricate a violation, got %v", err)
+	}
+}
+
+func TestApprovalGateIgnoresScriptAndStyleContent(t *testing.T) {
+	cfg := config.Default()
+	svc := &Service{Config: cfg, Policy: policy.Policy{ForbiddenPhrases: []string{"guarantee"}}}
+
+	if err := svc.approvalGate(context.Background(), "",
+		"<style>.guarantee{color:red}</style><p>hello</p>", false); err != nil {
+		t.Fatalf("invisible content must not trip policy, got %v", err)
+	}
+}
+
+func TestApprovalGateStillEvaluatesTheHTMLBodyWhenPlainIsEmpty(t *testing.T) {
+	cfg := config.Default()
+	svc := &Service{Config: cfg, Policy: policy.Policy{ForbiddenPhrases: []string{"wire the deposit"}}}
+
+	err := svc.approvalGate(context.Background(), "", "<div><p>please wire the deposit</p></div>", false)
+
+	if err == nil || !strings.Contains(err.Error(), "send blocked by policy") {
+		t.Fatalf("an HTML-only send must still be evaluated, got %v", err)
+	}
+}

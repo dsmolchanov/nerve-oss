@@ -61,6 +61,7 @@ func DecodeOutboundAttachments(inputs []AttachmentInput) ([]store.OutboundAttach
 
 	attachments := make([]store.OutboundAttachment, 0, len(inputs))
 	totalBytes := 0
+	encodedTotal := 0
 	for ordinal, input := range inputs {
 		filename := strings.TrimSpace(input.Filename)
 		if invalidAttachmentFilename(filename) {
@@ -72,12 +73,18 @@ func DecodeOutboundAttachments(inputs []AttachmentInput) ([]store.OutboundAttach
 			return nil, attachmentInputError("attachment_type_not_allowed", ordinal)
 		}
 
-		// Reject on the encoded length first. Decoding to find out costs the
-		// allocation the limit exists to prevent, and concurrent oversized
-		// requests could exceed the process memory budget before any of them
-		// was refused. Base64 expands by 4/3, so this bounds the decode.
+		// Reject on the encoded length first, per item and cumulatively.
+		// Decoding to find out costs the allocation the limit exists to
+		// prevent, and the earlier per-item guard alone still let several
+		// items decode past the total before the decoded check fired, so the
+		// transient peak could exceed what the caller reserved. Base64 expands
+		// by 4/3, so bounding the encoded input bounds every decode.
 		if len(input.ContentBase64) > base64.StdEncoding.EncodedLen(maxAttachmentBytes) {
 			return nil, attachmentInputError("attachment_too_large", ordinal)
+		}
+		encodedTotal += len(input.ContentBase64)
+		if encodedTotal > base64.StdEncoding.EncodedLen(maxAttachmentTotalBytes) {
+			return nil, attachmentInputError("attachment_total_too_large", ordinal)
 		}
 		content, err := base64.StdEncoding.Strict().DecodeString(input.ContentBase64)
 		if err != nil {

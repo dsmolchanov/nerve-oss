@@ -319,10 +319,20 @@ func (s *Service) approvalGate(ctx context.Context, body, bodyHTML string, reque
 	// silent pass, because the sanitized text is not what this path enqueues,
 	// and a plain-text replacement cannot be spliced into HTML safely; the
 	// drafting tool is where redacted content is produced for review.
-	for _, representation := range []struct {
+	representations := []struct {
 		label string
 		text  string
-	}{{"body", body}, {"html body", bodyHTML}} {
+	}{{"body", body}}
+	if rendered := visibleText(bodyHTML); rendered != "" {
+		// The HTML is judged as a reader sees it. Raw markup is deliberately
+		// not evaluated: attribute values, URLs and stylesheet contents are not
+		// what the recipient reads, and matching them invents violations.
+		representations = append(representations, struct {
+			label string
+			text  string
+		}{"html body", rendered})
+	}
+	for _, representation := range representations {
 		if strings.TrimSpace(representation.text) == "" {
 			continue
 		}
