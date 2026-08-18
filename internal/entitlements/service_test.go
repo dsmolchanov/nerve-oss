@@ -127,6 +127,50 @@ func TestPreAuthorizeToolRollsUsagePeriodForward(t *testing.T) {
 	})
 }
 
+func TestM2MRateLimitIsSharedAcrossServiceInstances(t *testing.T) {
+	withTempStore(t, func(ctx context.Context, st *store.Store) {
+		orgID := uuid.NewString()
+		now := time.Date(2026, 8, 18, 20, 15, 30, 0, time.UTC)
+		periodStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+		periodEnd := periodStart.Add(30 * 24 * time.Hour)
+		insertEntitlementFixture(t, ctx, st, orgID, periodStart, periodEnd, 100, 1)
+
+		first := NewService(config.Default(), st, nil)
+		second := NewService(config.Default(), st, nil)
+		first.Now = func() time.Time { return now }
+		second.Now = func() time.Time { return now }
+		principal := auth.Principal{Kind: auth.PrincipalM2MOrg, OrgID: orgID}
+
+		if _, err := first.PreAuthorizeTool(ctx, principal, "list_threads", "rate-replay-1", ""); err != nil {
+			t.Fatalf("first replica reservation: %v", err)
+		}
+		_, err := second.PreAuthorizeTool(ctx, principal, "list_threads", "rate-replay-2", "")
+		var rateErr *RateLimitError
+		if !errors.As(err, &rateErr) {
+			t.Fatalf("second replica must observe the shared limit, got %v", err)
+		}
+		if rateErr.RetryAfterSeconds != 30 {
+			t.Fatalf("expected retry_after_seconds=30, got %d", rateErr.RetryAfterSeconds)
+		}
+
+		minuteStart := now.Truncate(time.Minute)
+		used, err := st.GetOrgUsageCounterUsed(ctx, orgID, meterMCPRequestsPerMinute, minuteStart)
+		if err != nil {
+			t.Fatalf("read durable rate counter: %v", err)
+		}
+		if used != 1 {
+			t.Fatalf("expected one durable reservation, got %d", used)
+		}
+		events, err := st.SumUsageEvents(ctx, orgID, meterMCPRequestsPerMinute, minuteStart, minuteStart.Add(time.Minute))
+		if err != nil {
+			t.Fatalf("sum durable rate events: %v", err)
+		}
+		if events != 1 {
+			t.Fatalf("expected one reconstructible rate event, got %d", events)
+		}
+	})
+}
+
 func TestPreAuthorizeToolDeniesSendToolsWhenSendDisabled(t *testing.T) {
 	withTempStore(t, func(ctx context.Context, st *store.Store) {
 		orgID := uuid.NewString()

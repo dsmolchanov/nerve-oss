@@ -12,7 +12,13 @@ func TestVisibleTextRendersAsAReaderSeesIt(t *testing.T) {
 		"script content is invisible": {
 			"<script>var guarantee = 1;</script><p>hi</p>", "hi",
 		},
-		"attributes are not text":  {`<a href="https://example.test/guarantee">link</a>`, "link"},
+		"attributes are not text": {`<a href="https://example.test/guarantee">link</a>`, "link"},
+		"quoted greater-than is not a delimiter": {
+			`<a title="1 > guarantee">Hello</a>`, "Hello",
+		},
+		"single-quoted greater-than is not a delimiter": {
+			`<a title='1 > guarantee'>Hello</a>`, "Hello",
+		},
 		"unterminated tag is safe": {"<p>text<", "text"},
 		"plain text is unchanged":  {"just text", "just text"},
 	} {

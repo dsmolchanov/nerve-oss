@@ -45,14 +45,11 @@ func (s *Service) Run(ctx context.Context) (Report, error) {
 		return report, err
 	}
 	for _, counter := range counters {
-		expected, err := s.Store.SumUsageEvents(ctx, counter.OrgID, counter.MeterName, counter.PeriodStart, counter.PeriodEnd)
+		_, changed, err := s.Store.ReconcileOrgUsageCounter(ctx, counter)
 		if err != nil {
 			return report, err
 		}
-		if expected != counter.Used {
-			if err := s.Store.SetOrgUsageCounterUsed(ctx, counter.OrgID, counter.MeterName, counter.PeriodStart, expected); err != nil {
-				return report, err
-			}
+		if changed {
 			report.CountersRepaired++
 		}
 	}

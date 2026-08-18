@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
 	"neuralmail/internal/entitlements"
 	"neuralmail/internal/policy"
@@ -47,9 +48,7 @@ func TestSendReplyDerivesApprovalFromServerPolicyWhenCallerSaysFalse(t *testing.
 	svc := &Service{Config: cfg, Policy: policy.Policy{
 		ForbiddenPhrases: []string{"wire the deposit"},
 	}}
-	ctx := entitlements.WithReservation(context.Background(), entitlements.Reservation{
-		Features: json.RawMessage(`{"email_autopilot_send_override": true}`),
-	})
+	ctx := autonomousSendContext()
 
 	// The caller claims no approval is needed; server policy disagrees, and the
 	// caller's claim must not decide it.
@@ -66,9 +65,7 @@ func TestComposeEmailEvaluatesServerPolicy(t *testing.T) {
 	svc := &Service{Config: cfg, Policy: policy.Policy{
 		ForbiddenPhrases: []string{"wire the deposit"},
 	}}
-	ctx := entitlements.WithReservation(context.Background(), entitlements.Reservation{
-		Features: json.RawMessage(`{"email_autopilot_send_override": true}`),
-	})
+	ctx := autonomousSendContext()
 
 	// compose has no needs_human_approval field, so policy is the only check.
 	_, err := svc.ComposeEmailWithOptions(ctx, "inbox-1", "someone@example.test",
@@ -95,10 +92,11 @@ func TestSendReplyStillAllowsCleanContent(t *testing.T) {
 
 func TestApprovalGateEvaluatesTheHTMLRepresentation(t *testing.T) {
 	cfg := config.Default()
+	cfg.Cloud.Mode = true
 	svc := &Service{Config: cfg, Policy: policy.Policy{ForbiddenPhrases: []string{"wire the deposit"}}}
 
 	// An HTML-only message used to be judged on an empty plain-text body.
-	err := svc.approvalGate(context.Background(), "", "<p>please wire the deposit</p>", false)
+	err := svc.approvalGate(autonomousSendContext(), "", "<p>please wire the deposit</p>", false)
 
 	if err == nil || !strings.Contains(err.Error(), "send blocked by policy") {
 		t.Fatalf("expected the HTML body to be evaluated, got %v", err)
@@ -107,6 +105,7 @@ func TestApprovalGateEvaluatesTheHTMLRepresentation(t *testing.T) {
 
 func TestApprovalGateRefusesContentPolicyWouldRewrite(t *testing.T) {
 	cfg := config.Default()
+	cfg.Cloud.Mode = true
 	redacting := policy.Policy{}
 	redacting.Redactions.Patterns = []string{`\d{16}`}
 	redacting.Redactions.Replacement = "[redacted]"
@@ -114,7 +113,7 @@ func TestApprovalGateRefusesContentPolicyWouldRewrite(t *testing.T) {
 
 	// A redaction means the evaluated text is not the text this path enqueues,
 	// so the send is refused rather than delivered unredacted.
-	err := svc.approvalGate(context.Background(), "card 4111111111111111 attached", "", false)
+	err := svc.approvalGate(autonomousSendContext(), "card 4111111111111111 attached", "", false)
 
 	if err == nil || !strings.Contains(err.Error(), "requires redaction") {
 		t.Fatalf("expected a redaction refusal, got %v", err)
@@ -123,6 +122,7 @@ func TestApprovalGateRefusesContentPolicyWouldRewrite(t *testing.T) {
 
 func TestApprovalGateSeesTextHiddenByEntitiesAndTags(t *testing.T) {
 	cfg := config.Default()
+	cfg.Cloud.Mode = true
 	svc := &Service{Config: cfg, Policy: policy.Policy{ForbiddenPhrases: []string{"guarantee"}}}
 
 	for name, markup := range map[string]string{
@@ -131,7 +131,7 @@ func TestApprovalGateSeesTextHiddenByEntitiesAndTags(t *testing.T) {
 		"plain markup":   "<p>we guarantee it</p>",
 	} {
 		t.Run(name, func(t *testing.T) {
-			err := svc.approvalGate(context.Background(), "", markup, false)
+			err := svc.approvalGate(autonomousSendContext(), "", markup, false)
 			if err == nil || !strings.Contains(err.Error(), "send blocked by policy") {
 				t.Fatalf("expected the rendered text to be evaluated, got %v", err)
 			}
@@ -141,20 +141,22 @@ func TestApprovalGateSeesTextHiddenByEntitiesAndTags(t *testing.T) {
 
 func TestApprovalGateKeepsWordBoundariesAcrossBlocks(t *testing.T) {
 	cfg := config.Default()
+	cfg.Cloud.Mode = true
 	svc := &Service{Config: cfg, Policy: policy.Policy{ForbiddenPhrases: []string{"nowarranty"}}}
 
 	// Two separate words must not fuse into a forbidden phrase, which is why
 	// the spaced rendering exists alongside the joined one.
-	if err := svc.approvalGate(context.Background(), "", "<p>no</p><p>warranty</p>", false); err != nil {
+	if err := svc.approvalGate(autonomousSendContext(), "", "<p>no</p><p>warranty</p>", false); err != nil {
 		t.Fatalf("adjacent blocks must not fabricate a violation, got %v", err)
 	}
 }
 
 func TestApprovalGateIgnoresScriptAndStyleContent(t *testing.T) {
 	cfg := config.Default()
+	cfg.Cloud.Mode = true
 	svc := &Service{Config: cfg, Policy: policy.Policy{ForbiddenPhrases: []string{"guarantee"}}}
 
-	if err := svc.approvalGate(context.Background(), "",
+	if err := svc.approvalGate(autonomousSendContext(), "",
 		"<style>.guarantee{color:red}</style><p>hello</p>", false); err != nil {
 		t.Fatalf("invisible content must not trip policy, got %v", err)
 	}
@@ -162,11 +164,30 @@ func TestApprovalGateIgnoresScriptAndStyleContent(t *testing.T) {
 
 func TestApprovalGateStillEvaluatesTheHTMLBodyWhenPlainIsEmpty(t *testing.T) {
 	cfg := config.Default()
+	cfg.Cloud.Mode = true
 	svc := &Service{Config: cfg, Policy: policy.Policy{ForbiddenPhrases: []string{"wire the deposit"}}}
 
-	err := svc.approvalGate(context.Background(), "", "<div><p>please wire the deposit</p></div>", false)
+	err := svc.approvalGate(autonomousSendContext(), "", "<div><p>please wire the deposit</p></div>", false)
 
 	if err == nil || !strings.Contains(err.Error(), "send blocked by policy") {
 		t.Fatalf("an HTML-only send must still be evaluated, got %v", err)
 	}
+}
+
+func TestApprovalGatePreservesLegacyContentBehavior(t *testing.T) {
+	cfg := config.Default()
+	cfg.Cloud.Mode = true
+	svc := &Service{Config: cfg, Policy: policy.Policy{ForbiddenPhrases: []string{"guarantee"}}}
+	ctx := auth.WithPrincipal(context.Background(), auth.Principal{Kind: auth.PrincipalCloudAPIKey, OrgID: "org-1"})
+
+	if err := svc.approvalGate(ctx, "we guarantee it", "", false); err != nil {
+		t.Fatalf("legacy principals must retain their prior content behavior, got %v", err)
+	}
+}
+
+func autonomousSendContext() context.Context {
+	ctx := entitlements.WithReservation(context.Background(), entitlements.Reservation{
+		Features: json.RawMessage(`{"email_autopilot_send_override": true}`),
+	})
+	return auth.WithPrincipal(ctx, auth.Principal{Kind: auth.PrincipalM2MOrg, OrgID: "org-1"})
 }

@@ -51,7 +51,7 @@ func visibleText(markup string) string {
 			}
 			continue
 		}
-		closing := strings.IndexByte(markup[index:], '>')
+		closing := htmlTagEnd(markup[index:])
 		if closing < 0 {
 			// Unterminated tag: the remainder is markup, not visible text.
 			break
@@ -79,4 +79,23 @@ func visibleText(markup string) string {
 	flush(false)
 
 	return strings.TrimSpace(out.String())
+}
+
+// htmlTagEnd returns the first tag-closing delimiter that is not inside a
+// quoted attribute. Model-generated HTML commonly contains literal angle
+// brackets in titles and data attributes; treating one of those as the end of
+// the tag would turn invisible attribute text into policy input.
+func htmlTagEnd(tag string) int {
+	var quote byte
+	for index := 1; index < len(tag); index++ {
+		switch current := tag[index]; {
+		case quote != 0 && current == quote:
+			quote = 0
+		case quote == 0 && (current == '\'' || current == '"'):
+			quote = current
+		case quote == 0 && current == '>':
+			return index
+		}
+	}
+	return -1
 }

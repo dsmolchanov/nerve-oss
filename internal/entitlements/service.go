@@ -2,12 +2,16 @@ package entitlements
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
 	"time"
 
+	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
 
 	"neuralmail/internal/auth"
@@ -17,6 +21,7 @@ import (
 )
 
 const meterMCPUnits = "mcp_units"
+const meterMCPRequestsPerMinute = "mcp_requests_per_minute"
 
 var ErrQuotaExceeded = errors.New("quota exceeded")
 
@@ -130,7 +135,10 @@ func (s *Service) PreAuthorizeTool(ctx context.Context, principal auth.Principal
 			}
 		}
 
-		allowed, retryAfter := s.RateLimiter.Allow(principal.OrgID, ent.MCPRPM)
+		allowed, retryAfter, err := s.reserveRateLimit(ctx, scoped, principal, toolName, replayID, now, ent.MCPRPM)
+		if err != nil {
+			return err
+		}
 		if !allowed {
 			s.Observer.RecordDeny(principal.OrgID, "rate_limited")
 			if idempotencyKey != "" && (toolName == "send_reply" || toolName == "compose_email") {
@@ -178,6 +186,65 @@ func (s *Service) PreAuthorizeTool(ctx context.Context, principal auth.Principal
 		return nil, err
 	}
 	return reservation, nil
+}
+
+// reserveRateLimit keeps the legacy process-local limiter for existing
+// principals, while autonomous M2M orgs reserve from PostgreSQL so adding a
+// runtime replica cannot multiply their configured RPM allowance.
+func (s *Service) reserveRateLimit(
+	ctx context.Context, scoped *store.Store, principal auth.Principal,
+	toolName, replayID string, now time.Time, rpm int,
+) (bool, int, error) {
+	if principal.Kind != auth.PrincipalM2MOrg {
+		allowed, retryAfter := s.RateLimiter.Allow(principal.OrgID, rpm)
+		return allowed, retryAfter, nil
+	}
+	if rpm <= 0 {
+		return false, 60, nil
+	}
+	periodStart := now.UTC().Truncate(time.Minute)
+	periodEnd := periodStart.Add(time.Minute)
+	if err := scoped.EnsureOrgUsageCounter(ctx, principal.OrgID, meterMCPRequestsPerMinute, periodStart, periodEnd); err != nil {
+		return false, 0, err
+	}
+	reserved, _, err := scoped.ReserveOrgUsageUnits(
+		ctx, principal.OrgID, meterMCPRequestsPerMinute, periodStart, 1, int64(rpm),
+	)
+	if err != nil {
+		return false, 0, err
+	}
+	if !reserved {
+		remaining := periodEnd.Sub(now)
+		retryAfter := int((remaining + time.Second - 1) / time.Second)
+		if retryAfter < 1 {
+			retryAfter = 1
+		}
+		return false, retryAfter, nil
+	}
+	if replayID == "" {
+		replayID = uuid.NewString()
+	}
+	rateReplayID := durableUsageReplayID(
+		principal.OrgID, toolName, replayID, meterMCPRequestsPerMinute, "",
+	)
+	if err := scoped.RecordUsageEventAt(
+		ctx, principal.OrgID, meterMCPRequestsPerMinute, 1, toolName,
+		rateReplayID, "", "success", now,
+	); err != nil {
+		return false, 0, err
+	}
+	return true, 0, nil
+}
+
+func durableUsageReplayID(orgID, toolName, replayID, meter, dimension string) string {
+	hash := sha256.New()
+	for _, part := range []string{"mcp-usage-v1", orgID, toolName, replayID, meter, dimension} {
+		var length [4]byte
+		binary.BigEndian.PutUint32(length[:], uint32(len(part)))
+		_, _ = hash.Write(length[:])
+		_, _ = hash.Write([]byte(part))
+	}
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 // FeatureBool extracts a boolean feature flag from a JSON entitlement blob.

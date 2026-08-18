@@ -314,6 +314,10 @@ func (s *Service) SendReply(ctx context.Context, threadID string, body string, b
 // outright rather than downgraded to an approval request.
 func (s *Service) approvalGate(ctx context.Context, body, bodyHTML string, requested bool) error {
 	needsApproval := requested
+	principal, _ := auth.PrincipalFromContext(ctx)
+	if principal.Kind != auth.PrincipalM2MOrg {
+		return s.requireApprovalOverride(ctx, needsApproval)
+	}
 	// Both representations are evaluated: an HTML-only message would otherwise
 	// be judged on an empty string. A redaction is a refusal rather than a
 	// silent pass, because the sanitized text is not what this path enqueues,
@@ -349,6 +353,10 @@ func (s *Service) approvalGate(ctx context.Context, body, bodyHTML string, reque
 		}
 		needsApproval = needsApproval || evaluated.NeedsApproval
 	}
+	return s.requireApprovalOverride(ctx, needsApproval)
+}
+
+func (s *Service) requireApprovalOverride(ctx context.Context, needsApproval bool) error {
 	if !needsApproval {
 		return nil
 	}
