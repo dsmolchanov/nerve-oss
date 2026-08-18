@@ -102,6 +102,9 @@ func validateModernRequestContract(w http.ResponseWriter, request *http.Request,
 			writeHeaderMismatch(w, wire.ID, "Mcp-Name header must occur once and match the body name")
 			return false
 		}
+	} else if len(request.Header.Values("Mcp-Name")) != 0 {
+		writeHeaderMismatch(w, wire.ID, "Mcp-Name header must be absent when the method has no name")
+		return false
 	}
 
 	var params struct {

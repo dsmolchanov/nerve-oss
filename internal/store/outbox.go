@@ -79,6 +79,7 @@ type OutboxMessage struct {
 	HTMLBody          string
 	ContentHash       string
 	Attachments       []OutboundAttachment
+	AutonomousLimits  *OutboundLimitInput
 
 	// Threading headers for reply-chain continuity (RFC 5322).
 	// Set when replying to an inbound message so the recipient's
@@ -274,6 +275,15 @@ func (s *Store) enqueueOutboxMessage(ctx context.Context, msg OutboxMessage, aft
 		outID = resolvedID
 		if !inserted {
 			return nil
+		}
+		if msg.AutonomousLimits != nil {
+			limits := *msg.AutonomousLimits
+			if limits.Recipient == "" {
+				limits.Recipient = msg.To
+			}
+			if err := scoped.ReserveOutboundLimits(ctx, msg.OrgID, outID, limits); err != nil {
+				return err
+			}
 		}
 
 		for ordinal, attachment := range msg.Attachments {

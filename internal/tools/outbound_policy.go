@@ -143,6 +143,22 @@ func hasReadyOwnedComposeInbox(
 	return false, nil
 }
 
+// AutonomousComposeAllowed reports which V1 abuse-limit family applies to a
+// send. It uses the same explicit paid projection and live owned-domain proof
+// as compose authorization, on the caller's transaction-scoped snapshot.
+func AutonomousComposeAllowed(
+	ctx context.Context, st OutboundPolicyStore, orgID, inboxID string,
+) (bool, error) {
+	values, err := st.LookupFeatureFlag(ctx, orgID, "email_compose_org_enabled")
+	if err != nil || values.Org == nil {
+		return false, &OutboundPolicyError{Code: "outbound_policy_unavailable"}
+	}
+	if *values.Org {
+		return true, nil
+	}
+	return hasReadyOwnedComposeInbox(ctx, st, orgID, inboxID)
+}
+
 func hasRealInboundReplyTarget(
 	ctx context.Context, st OutboundPolicyStore, orgID, threadID string,
 ) (bool, error) {

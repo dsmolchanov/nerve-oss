@@ -407,6 +407,14 @@ func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string,
 		}); err != nil {
 			return nil, err
 		}
+		composeEnabled := false
+		if principal.Kind == auth.PrincipalM2MOrg {
+			var err error
+			composeEnabled, err = AutonomousComposeAllowed(scopedCtx, st, principal.OrgID, inboxID)
+			if err != nil {
+				return nil, &OutboundPolicyError{Code: "outbound_policy_unavailable"}
+			}
+		}
 
 		inbox, err := s.activeInboxRecord(scopedCtx, st, principal, inboxID)
 		if err != nil {
@@ -458,9 +466,12 @@ func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string,
 			TextBody:       body,
 			HTMLBody:       bodyHTML,
 			Attachments:    attachments,
+			AutonomousLimits: autonomousLimitInput(
+				principal, "send_reply", idempotencyKey, to, composeEnabled,
+			),
 		})
 		if err != nil {
-			return nil, err
+			return nil, translateOutboundLimitError(err)
 		}
 
 		if _, err := st.GetMessage(scopedCtx, outboxID); err == nil {
@@ -608,9 +619,12 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 			TextBody:       body,
 			HTMLBody:       bodyHTML,
 			Attachments:    options.Attachments,
+			AutonomousLimits: autonomousLimitInput(
+				principal, "compose_email", idempotencyKey, toAddress, true,
+			),
 		})
 		if err != nil {
-			return nil, err
+			return nil, translateOutboundLimitError(err)
 		}
 
 		if existing, err := st.GetMessage(scopedCtx, outboxID); err == nil {
@@ -645,6 +659,26 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 			"status":     "queued",
 		}, nil
 	})
+}
+
+func autonomousLimitInput(
+	principal auth.Principal, toolName, idempotencyKey, recipient string, composeEnabled bool,
+) *store.OutboundLimitInput {
+	if principal.Kind != auth.PrincipalM2MOrg {
+		return nil
+	}
+	return &store.OutboundLimitInput{
+		ToolName: toolName, IdempotencyKey: idempotencyKey,
+		Recipient: recipient, ComposeEnabled: composeEnabled, AcceptedAt: time.Now().UTC(),
+	}
+}
+
+func translateOutboundLimitError(err error) error {
+	var limitErr *store.OutboundLimitError
+	if errors.As(err, &limitErr) {
+		return &entitlements.RateLimitError{RetryAfterSeconds: limitErr.RetryAfterSeconds}
+	}
+	return err
 }
 
 func normalizeFromName(value string) (string, error) {

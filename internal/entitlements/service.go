@@ -2,10 +2,7 @@ package entitlements
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -224,7 +221,7 @@ func (s *Service) reserveRateLimit(
 	if replayID == "" {
 		replayID = uuid.NewString()
 	}
-	rateReplayID := durableUsageReplayID(
+	rateReplayID := store.UsageReplayID(
 		principal.OrgID, toolName, replayID, meterMCPRequestsPerMinute, "",
 	)
 	if err := scoped.RecordUsageEventAt(
@@ -234,17 +231,6 @@ func (s *Service) reserveRateLimit(
 		return false, 0, err
 	}
 	return true, 0, nil
-}
-
-func durableUsageReplayID(orgID, toolName, replayID, meter, dimension string) string {
-	hash := sha256.New()
-	for _, part := range []string{"mcp-usage-v1", orgID, toolName, replayID, meter, dimension} {
-		var length [4]byte
-		binary.BigEndian.PutUint32(length[:], uint32(len(part)))
-		_, _ = hash.Write(length[:])
-		_, _ = hash.Write([]byte(part))
-	}
-	return hex.EncodeToString(hash.Sum(nil))
 }
 
 // FeatureBool extracts a boolean feature flag from a JSON entitlement blob.

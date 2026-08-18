@@ -47,6 +47,7 @@ func TestModernContractRejectsMetadataAndHeaderFailuresBeforeDispatch(t *testing
 		{name: "malformed client info", meta: mergeModernMeta(validMeta, sdkmcp.MetaKeyClientInfo, map[string]any{"name": "", "version": "0.3.0"}), headerName: "tools/list", wantCode: sdkmcp.CodeHeaderMismatch},
 		{name: "method mismatch", meta: validMeta, headerName: "resources/list", wantCode: sdkmcp.CodeHeaderMismatch},
 		{name: "name mismatch", meta: validMeta, headerName: "tools/call", headerTool: "wrong-tool", wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "unexpected name", meta: validMeta, headerName: "tools/list", headerTool: "stale-tool", wantCode: sdkmcp.CodeHeaderMismatch},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

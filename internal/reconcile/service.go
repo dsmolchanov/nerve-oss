@@ -15,14 +15,15 @@ type Service struct {
 }
 
 type Report struct {
-	CountersRepaired          int
-	PeriodsRolled             int
-	OrgEventsFannedOut        int
-	AttachmentUsageSeeded     int
-	AttachmentUsageRepaired   int
-	OutboxAttachmentsReleased int
-	AttachmentBlobsDeleted    int
-	AttachmentBytesReleased   int64
+	CountersRepaired           int
+	PeriodsRolled              int
+	OrgEventsFannedOut         int
+	AttachmentUsageSeeded      int
+	AttachmentUsageRepaired    int
+	OutboxAttachmentsReleased  int
+	AttachmentBlobsDeleted     int
+	AttachmentBytesReleased    int64
+	OutboundRateBucketsDeleted int
 }
 
 func NewService(st *store.Store) *Service {
@@ -55,6 +56,11 @@ func (s *Service) Run(ctx context.Context) (Report, error) {
 	}
 
 	now := s.Now()
+	deletedBuckets, err := s.Store.DeleteExpiredOutboundUsageCounters(ctx, now.Add(-24*time.Hour))
+	if err != nil {
+		return report, err
+	}
+	report.OutboundRateBucketsDeleted = deletedBuckets
 	coreVersion, err := store.CurrentVersionCore(ctx, s.Store.DB())
 	if err != nil {
 		return report, err
