@@ -69,6 +69,33 @@ func TestHandleHTTPCloudModeRejectsInsufficientScope(t *testing.T) {
 	}
 }
 
+func TestHandleHTTPLegacyToolCallPreservesInsufficientScopeChallenge(t *testing.T) {
+	cfg := config.Default()
+	cfg.Dev.Mode = true
+	cfg.Cloud.Mode = true
+	cfg.Security.TokenSigningKey = testSigningKey
+
+	server := NewServer(cfg, nil, &auth.Service{Config: cfg, Now: time.Now}, nil)
+	server.sessions["legacy-session"] = time.Now().Add(time.Hour)
+	token := signedJWT(t, jwtlib.MapClaims{
+		"org_id": "org-1", "sub": "user-1", "jti": "token-1",
+		"exp": time.Now().Add(5 * time.Minute).Unix(), "scope": "nerve:email.read",
+	})
+	request := rpcRequest(t, map[string]any{
+		"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+		"params": map[string]any{"name": "compose_email", "arguments": map[string]any{}},
+	}, "legacy-session", token)
+	recorder := httptest.NewRecorder()
+	server.HandleHTTP(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("legacy insufficient scope status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("WWW-Authenticate"); got != `Bearer error="insufficient_scope", scope="nerve:email.send"` {
+		t.Fatalf("legacy insufficient scope challenge=%q", got)
+	}
+}
+
 func TestHandleHTTPOssModeAllowsInitializeWithoutCloudAuth(t *testing.T) {
 	cfg := config.Default()
 	cfg.Dev.Mode = true

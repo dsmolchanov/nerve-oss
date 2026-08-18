@@ -314,15 +314,22 @@ func (s *Store) GetInboxByExternalRef(ctx context.Context, externalRef string) (
 }
 
 func (s *Store) ReactivateInboxForOrg(ctx context.Context, orgID, inboxID string) (bool, error) {
-	result, err := s.q.ExecContext(ctx, `
-		UPDATE inboxes SET status = 'active'
-		WHERE id = $1 AND org_id = $2 AND status = 'disabled'
-	`, inboxID, orgID)
-	if err != nil {
-		return false, err
-	}
-	n, err := result.RowsAffected()
-	return n > 0, err
+	// Inbox status is evidence the outbound policy reads, so the change takes
+	// the same fence as an enqueue rather than racing it.
+	var changed bool
+	err := s.FenceOrgPolicy(ctx, orgID, func(scoped *Store) error {
+		result, err := scoped.q.ExecContext(ctx, `
+			UPDATE inboxes SET status = 'active'
+			WHERE id = $1 AND org_id = $2 AND status = 'disabled'
+		`, inboxID, orgID)
+		if err != nil {
+			return err
+		}
+		n, err := result.RowsAffected()
+		changed = n > 0
+		return err
+	})
+	return changed, err
 }
 
 func (s *Store) UpdateInboxOutboundProvider(ctx context.Context, inboxID string, provider string) error {
@@ -379,35 +386,45 @@ func (s *Store) UpdateInboxForwardTo(ctx context.Context, orgID, inboxID, forwar
 }
 
 func (s *Store) DisableInboxForOrg(ctx context.Context, orgID string, inboxID string) (bool, error) {
-	result, err := s.q.ExecContext(ctx, `
-		UPDATE inboxes
-		SET status = 'disabled'
-		WHERE id = $1 AND org_id = $2
-	`, inboxID, orgID)
-	if err != nil {
-		return false, err
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return rows > 0, nil
+	var changed bool
+	err := s.FenceOrgPolicy(ctx, orgID, func(scoped *Store) error {
+		result, err := scoped.q.ExecContext(ctx, `
+			UPDATE inboxes
+			SET status = 'disabled'
+			WHERE id = $1 AND org_id = $2
+		`, inboxID, orgID)
+		if err != nil {
+			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		changed = rows > 0
+		return nil
+	})
+	return changed, err
 }
 
 // DeleteInboxForOrg permanently removes a bootstrap-managed inbox and its
 // cascading mailbox data. Tenant-facing deletion must continue to use
 // DisableInboxForOrg so accidental user deletion remains recoverable.
 func (s *Store) DeleteInboxForOrg(ctx context.Context, orgID string, inboxID string) (bool, error) {
-	result, err := s.q.ExecContext(ctx, `
-		DELETE FROM inboxes
-		WHERE id = $1 AND org_id = $2
-	`, inboxID, orgID)
-	if err != nil {
-		return false, err
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return rows > 0, nil
+	var changed bool
+	err := s.FenceOrgPolicy(ctx, orgID, func(scoped *Store) error {
+		result, err := scoped.q.ExecContext(ctx, `
+			DELETE FROM inboxes
+			WHERE id = $1 AND org_id = $2
+		`, inboxID, orgID)
+		if err != nil {
+			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		changed = rows > 0
+		return nil
+	})
+	return changed, err
 }

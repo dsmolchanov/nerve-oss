@@ -190,6 +190,13 @@ func (s *Store) withLockedLegacyDomain(ctx context.Context, domainID, requiredOr
 		); err != nil {
 			return err
 		}
+		// Domain readiness is evidence the autonomous outbound policy reads, so
+		// every writer that reaches this helper also takes the enqueue fence.
+		// Without it a domain could lose readiness between an enqueue's policy
+		// check and its outbox insert.
+		if err := scoped.LockOrgPolicy(ctx, identity.OrgID); err != nil {
+			return err
+		}
 		lockedCanonical, err := domains.CanonicalizeDomain(identity.Canonical)
 		if err != nil {
 			return fmt.Errorf("canonicalize locked domain: %w", err)

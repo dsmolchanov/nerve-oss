@@ -174,6 +174,12 @@ func TestHandleHTTPReadTimeoutReleasesSlowBodyReservation(t *testing.T) {
 	}
 	request.ContentLength = 128
 
+	writeResult := make(chan error, 1)
+	go func() {
+		_, err := writer.Write([]byte(`{"jsonrpc":`))
+		writeResult <- err
+	}()
+
 	result := make(chan error, 1)
 	go func() {
 		response, err := httpServer.Client().Do(request)
@@ -183,7 +189,7 @@ func TestHandleHTTPReadTimeoutReleasesSlowBodyReservation(t *testing.T) {
 		result <- err
 	}()
 
-	if _, err := writer.Write([]byte(`{"jsonrpc":`)); err != nil {
+	if err := <-writeResult; err != nil {
 		t.Fatalf("write initial body: %v", err)
 	}
 	select {

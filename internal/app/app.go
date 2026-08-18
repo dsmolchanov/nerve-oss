@@ -107,7 +107,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	entitlementSvc := entitlements.NewService(cfg, st, entitlementObserver)
 	mcpServer := mcp.NewServer(cfg, toolSvc, authSvc, entitlementSvc)
 	mcpServer.FeatureFlags = featureflags.New(cfg.Cloud.Mode, st)
-	mcpRouter := mcp.NewRouter(cfg, authSvc, http.HandlerFunc(mcpServer.HandleRoutedHTTP), nil)
+	mcpRouter := mcp.NewRouter(cfg, authSvc, mcp.NewLegacyHandler(mcpServer), mcp.NewSDKHandler(mcpServer, true))
 
 	return &App{
 		Config:    cfg,

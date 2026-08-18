@@ -1418,6 +1418,17 @@ Separate reply from compose, make autonomous policy fail closed, remove inbound-
 
 #### 7.2 Evaluate reply and compose against a transaction-scoped policy snapshot
 
+**Delivery-side items are a separate change from the adapter work.** The enqueue
+half of this section — the transaction-scoped policy snapshot, the per-org
+lock shared with policy writers, and server-side evaluation of the final content
+— lands with the MCP 2026 adapter branch. The delivery half does not: the claim
+recheck and the provider-start fence need a durable policy epoch on the outbox
+row, so they carry a migration and touch `internal/emailtransport/outbox_worker.go`,
+which the adapter branch does not otherwise open. Reviewing the adapter branch
+against the whole of 7.2 will therefore keep reporting the delivery fence as
+missing; it is tracked as its own change rather than deferred silently.
+
+
 **OSS-first/shared files**
 
 - `internal/tools/service.go`
@@ -1441,6 +1452,40 @@ Separate reply from compose, make autonomous policy fail closed, remove inbound-
 - Replay returns the prior result without consuming another daily unit.
 - Use the common per-org policy lock/epoch for enqueue, claim, provider-start, complaint/suspension, clear, and close. Claim cannot select a suspended/deprovisioning autonomous org; the pre-provider transaction rechecks epoch/policy and records the durable provider-start fence.
 - Suspension/close terminalizes queued autonomous rows and prevents any later provider start. An already-started call is drained/read back and keeps suspension cleanup or onboarding close nonterminal until its outcome is known; no DB lock is held across the network call.
+
+#### 7.2a Threat model for outbound content policy
+
+Content policy needs a stated adversary, because without one "evade the policy"
+has no boundary: every normalization invites the next encoding, and a reviewer
+is right every time.
+
+**Who sends.** The caller is the tenant's own pre-registered `m2m_org` agent,
+authenticated with the tenant's own credential and sending from the tenant's own
+inbox.
+
+**What the policy is for.** It is a guardrail between a tenant and their own
+agent. It catches content the tenant's configured policy forbids when their
+model produces it — including the encodings a model emits without intent, such
+as HTML entities and inline tags inside a word. Those are ordinary model output,
+so the evaluation renders markup to its visible text before matching.
+
+**What it is not for.** It is not a barrier against a tenant who deliberately
+smuggles content past their own guardrail. That tenant holds the credential and
+owns the mailbox; they can send the same text directly, without encoding
+anything. Hardening the matcher against homoglyphs, zero-width joiners,
+CSS-hidden text or nested encodings defends nobody from anybody: the only party
+it constrains already controls the channel.
+
+**What this does not relax.** The distinction is who is being protected. Content
+policy protects a tenant from their own agent, so its scope is bounded by that
+purpose. Memory and size limits, tenant isolation, authorization, scope checks
+and the enqueue fence protect *other* tenants and the platform from this one —
+those assume a hostile caller and are not narrowed by this section.
+
+**Consequence for review.** An evasion that requires the token holder to encode
+content deliberately is out of scope for this policy and is not a blocker. A
+case where an ordinary model output slips through — a new entity form, a markup
+shape the renderer mishandles — is in scope and is a defect.
 
 #### 7.3 Project only paid and abuse evidence
 
