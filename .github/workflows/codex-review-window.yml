@@ -57,15 +57,22 @@ on:
 # 08:13:34, and auto-merge squashed it into main at 08:15:23. So: a 15-minute
 # window, a timeout that FAILS, and a late review that re-triggers the gate.
 #
-# Exit-0 audit — exactly THREE paths, each deliberate. `tests/test_gate_workflow.py`
-# asserts the count, and `tests/test_gate_behavior.py` executes this script to
-# assert the exit code, because exit 0 means "this pull request may merge".
-#   1. the `fast-merge` repo-topic opt-out;
-#   2. a head-bound clean signal with no formal review (Codex 👍 on this head's
-#      anchor, or a "Reviewed commit <sha>" summary comment with no P0/P1 marker);
-#   3. a head-bound review carrying no P0/P1 marker.
+# Exit-0 audit — exactly TWO paths, each deliberate. `tests/test_gate_workflow.py`
+# asserts the count and the static invariants; `tests/test_gate_behavior.py`
+# EXECUTES this script against a stubbed GitHub API and asserts the exit code on
+# each path, because exit 0 means "this pull request may merge".
+#   1. a head-bound clean signal with no formal review (Codex 👍 on this head's
+#      anchor, or the verbatim "Codex Review: Didn't find any major issues."
+#      summary naming this head and carrying no P0/P1 marker), re-checked for a
+#      late formal review before it is honoured;
+#   2. a head-bound review carrying no P0/P1 marker.
 # Everything else — no verdict, quota exhausted, any GitHub API failure, an
 # unresolvable or superseded head, any open blocker — exits 1.
+#
+# There is NO repo-wide opt-out. A `fast-merge` repo topic disabled this gate
+# for every PR, indefinitely and unattributably; a deliberate opt-out needs an
+# authenticated identity, which is controller work
+# (thoughts/shared/plans/2026-08-17-codex-gate-controller.md).
 
 concurrency:
   # A superseded head's run must not race the current one. Safe to key on the PR
@@ -101,6 +108,34 @@ jobs:
       # Empty for fork PRs, where secrets are withheld — the alert is then
       # skipped and the gate still fails.
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+      # A PAT for a GitHub account with a connected Codex Cloud subscription.
+      #
+      # SCOPE IT TO NOTHING BUT COMMENTING. This workflow runs from the PULL
+      # REQUEST's copy of itself on a same-repository branch, and same-repo PRs
+      # receive base-repository secrets — so anyone who can push a branch here
+      # can add a step that prints this value. `permissions:` above does not
+      # constrain it; that block governs GITHUB_TOKEN, not a PAT.
+      #
+      # Therefore: a FINE-GRAINED token, limited to these repositories, with
+      # `Pull requests: Read and write` and nothing else. Stealing it then buys
+      # the ability to write PR comments, which is noise. A classic token with
+      # `repo` would hand over read/write on every private repository it covers.
+      #
+      # The right home for this is the App-owned controller, where the credential
+      # never enters a PR-executed workflow at all:
+      # thoughts/shared/plans/2026-08-17-codex-gate-controller.md, Phase 2. Until
+      # that exists, the narrow token is the containment.
+      # Codex serves review requests per REQUESTING IDENTITY, and every
+      # GITHUB_TOKEN comment is authored by `github-actions[bot]` — an identity
+      # with no Codex account. It answers those with "To use Codex here, create
+      # a Codex account and connect to github" within seconds and never
+      # reviews. On this repository that silently blocked four PRs for six days
+      # across thirteen requests: the gate posted, Codex refused, the gate
+      # waited out its window and reported "no verdict arrived", which reads as
+      # a flaky timeout rather than a request that was rejected outright.
+      # Optional so a fork PR (secrets withheld) still runs; the gate then
+      # depends on Codex Automatic Reviews, which fire on open/ready only.
+      CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       # Quiet interval before the verdict lookup, so a burst of checkpoint pushes
       # costs one review generation instead of one each.
@@ -133,15 +168,13 @@ jobs:
               printf '%s\n' "${out}" | tail -5 >&2
               exit 1
             fi
-            # Terminate non-empty output. `$(...)` strips gh's trailing newline,
-            # and `codex_clean_comment_for_head` pipes this straight into
-            # `wc -l` — so ONE clean "Reviewed commit" summary counted as zero
-            # records. The head then read as having no verdict, waited the full
-            # window and failed the hard gate, on every rerun, despite Codex
-            # having answered cleanly.
-            #
-            # Empty output must stay empty: printing a bare newline would make
-            # "no records" count as one.
+            # Newline-TERMINATED when non-empty, and nothing at all when empty.
+            # `printf '%s'` left the last line unterminated, so a caller piping
+            # into `wc -l` counted one fewer than it matched: with exactly one
+            # clean verdict comment — the ordinary case — the count came back 0
+            # and the clean-verdict path never fired. Command substitution
+            # strips the trailing newline anyway, and `tail`/`grep -c` are
+            # indifferent to it, so every other caller is unaffected.
             if [ -n "${out}" ]; then
               printf '%s\n' "${out}"
             fi
@@ -170,25 +203,13 @@ jobs:
           # / `badge/P0` — and does not necessarily add `[BLOCKER]`. A P1-only
           # pattern therefore read a P0-bearing review as marker-free and exited
           # 0: the most severe class of finding was the one that could merge.
-          # Keep the two patterns in lockstep; `tests/test_gate_behavior.py`
-          # executes the script against a P0 review.
+          # Keep the two patterns in lockstep: the shell PATTERN and the jq
+          # JQ_PATTERN below must always match the same set of bodies.
           PATTERN='\[BLOCKER\]|badge/P[01]|P[01] Badge'
           # Same regex for jq's test(), where a string literal needs the
           # backslashes doubled — `\[` alone is an invalid escape and jq refuses
           # to compile the program.
           JQ_PATTERN='\\[BLOCKER\\]|badge/P[01]|P[01] Badge'
-
-          # ---------------------------------------------------------------
-          # Deliberate bypass 1 of 3: the fast-merge repo topic. A standing,
-          # repo-wide, unattributed opt-out. An attributed per-PR alternative
-          # needs an authenticated identity, so it is controller work.
-          # ---------------------------------------------------------------
-          if gh api "repos/${REPO}/topics" \
-               -H "Accept: application/vnd.github+json" \
-               --jq '.names[]' 2>/dev/null | grep -qx 'fast-merge'; then
-            echo "::warning::Repo carries the 'fast-merge' topic; the Codex gate is bypassed for every PR in this repository."
-            exit 0
-          fi
 
           # ---------------------------------------------------------------
           # Debounce. Wait IN-RUN, then re-read the head. If it moved, a newer
@@ -238,6 +259,26 @@ jobs:
               | tail -1
           }
 
+          # Resolve who will ask Codex for the review. With a request token the
+          # anchor is authored by THAT account, not by `github-actions[bot]`, so
+          # ANCHOR_AUTHOR has to move with it — otherwise anchor_comment_id()
+          # looks for the wrong author, never finds the anchor it just posted,
+          # and requests a fresh review on every run.
+          REQUEST_TOKEN="${CODEX_REQUEST_TOKEN:-}"
+          if [ -n "${REQUEST_TOKEN}" ]; then
+            REQUEST_LOGIN=$(GH_TOKEN="${REQUEST_TOKEN}" gh api user --jq '.login' 2>/dev/null || true)
+            if [ -z "${REQUEST_LOGIN}" ]; then
+              # Fail closed: a rotated or expired PAT would otherwise fall back
+              # to the bot identity and reproduce the six-day silent stall.
+              echo "::error::CODEX_REQUEST_TOKEN is set but does not authenticate — Codex would refuse a request from the fallback bot identity and this gate would time out without a verdict. Rotate the secret, or unset it to depend on Codex Automatic Reviews."
+              exit 1
+            fi
+            ANCHOR_AUTHOR="${REQUEST_LOGIN}"
+            echo "Review requests are posted as ${REQUEST_LOGIN} (a Codex-connected identity)."
+          else
+            echo "::warning::No CODEX_REQUEST_TOKEN is configured, so a review request would be posted as ${ANCHOR_AUTHOR}, which Codex refuses. Only Codex Automatic Reviews (PR opened / marked ready) can produce a verdict here; a verdict for a PUSHED head will never arrive and this gate will time out."
+          fi
+
           # Codex auto-reviews on open/ready but NOT on pushes, so ask for the
           # re-review — and leave the anchor behind either way. The request asks
           # for ONE comprehensive inventory: a bare "@codex review" returns
@@ -245,23 +286,21 @@ jobs:
           # review generation.
           ANCHOR_ID="$(anchor_comment_id)"
           ANCHOR_FAILED=0
-          # `submitted` is in this list because it SHARES the cancel-in-progress
-          # concurrency group with `synchronize`. A late review — Codex's for an
-          # earlier head, or any human's — starts a run that cancels the
-          # in-flight synchronize run during its debounce. The replacement then
-          # carries ACTION=submitted, and while this case excluded it the
-          # replacement never posted `@codex review`. Codex does not auto-review
-          # pushes, so the run waited the full window and failed; re-running
-          # preserved ACTION=submitted and failed again. The pull request was
-          # blocked until some unrelated event happened to fire.
-          #
-          # The guard below already prevents a duplicate request: it fires only
-          # when this head has neither an anchor nor a review.
+          # `submitted` belongs here. A `pull_request_review` event starts a
+          # replacement run and `cancel-in-progress` kills the synchronize run
+          # that would have asked — so if a human review, or a review of a stale
+          # head, lands during the 90s debounce, excluding `submitted` leaves
+          # NOBODY having requested a verdict for the current head. The run then
+          # waits out its window and fails, and the gate stays red until someone
+          # pushes again or reruns by hand. The guard below already makes the
+          # request idempotent, so including `submitted` costs nothing when the
+          # synchronize run did get there first.
           case "${ACTION}" in
             synchronize|reopened|ready_for_review|submitted)
               if [ -z "${ANCHOR_ID}" ] && [ -z "$(review_ids_for_head)" ]; then
                 REQUEST_BODY=$(printf '@codex review\n\nReturn ONE comprehensive inventory of every P0/P1 in this diff, grouped by the root invariant each violates. For each finding give the affected symbol, every sibling consumer with the same defect, the failing input or call path, impact, confidence, a safe remediation path, and the regression test that would represent the class. Completeness on this pass matters more than brevity — a finding held back costs a full review generation. See "Code Review Rules" in AGENTS.md.\n\n<!-- %s -->' "${ANCHOR}")
-                ANCHOR_ID=$(gh api "repos/${REPO}/issues/${PR}/comments" \
+                ANCHOR_ID=$(GH_TOKEN="${REQUEST_TOKEN:-${GH_TOKEN}}" \
+                  gh api "repos/${REPO}/issues/${PR}/comments" \
                   -f body="${REQUEST_BODY}" \
                   --jq '.id' 2>/dev/null || true)
                 if [ -n "${ANCHOR_ID}" ]; then
@@ -281,11 +320,21 @@ jobs:
           # A requested re-review that finds nothing comes back as an issue
           # comment — "Codex Review: Didn't find any major issues ... Reviewed
           # commit: <sha>" — not as a review and not as a reaction. That body
-          # names the commit, so it is bound to this head; accept it as green
-          # only when it carries no P1 marker of its own.
+          # names the commit, so it is bound to this head.
+          #
+          # The VERDICT SENTENCE IS REQUIRED, not merely the absence of a
+          # severity marker. Codex posts other head-naming comments — quota
+          # notices, "review failed" errors, progress updates — that carry no
+          # marker either; matching on "names the commit and looks unalarming"
+          # promoted every one of them to an approval. Only the sentence below
+          # actually asserts that the diff was reviewed and found clean. The
+          # marker test stays as a second condition: a body that both claims no
+          # major issues and carries a P0/P1 badge is contradictory, and the
+          # blocking reading is the safe one.
+          CLEAN_VERDICT="Codex Review: Didn't find any major issues."
           codex_clean_comment_for_head() {
             api "repos/${REPO}/issues/${PR}/comments" \
-              --jq "[.[] | select(.user.login == \"${CODEX_BOT}\") | select(.body | contains(\"Reviewed commit\") and contains(\"${HEAD_SHORT}\")) | select(.body | test(\"${JQ_PATTERN}\") | not) | .id] | .[]" \
+              --jq "[.[] | select(.user.login == \"${CODEX_BOT}\") | select(.body | contains(\"${CLEAN_VERDICT}\") and contains(\"${HEAD_SHORT}\")) | select(.body | test(\"${JQ_PATTERN}\") | not) | .id] | .[]" \
               | wc -l | tr -d ' '
           }
 
@@ -368,13 +417,47 @@ jobs:
               echo "::error::No Codex verdict for ${HEAD_SHA} within ${WINDOW}s, and this run could not request one — the token is read-only, which is normal for a fork PR. The verdict is UNKNOWN, so the gate holds the merge. A maintainer can comment '@codex review' on the PR and re-run this job."
               exit 1
             fi
-            echo "::error::No Codex verdict for ${HEAD_SHA} within ${WINDOW}s — neither a review nor a 👍. The verdict is UNKNOWN, so the gate holds the merge. Re-run this job once Codex has answered; if the repo is genuinely not connected to Codex Cloud, add the 'fast-merge' repo topic to opt out deliberately."
+            echo "::error::No Codex verdict for ${HEAD_SHA} within ${WINDOW}s — neither a review nor a 👍. The verdict is UNKNOWN, so the gate holds the merge. Re-run this job once Codex has answered; if the repo is genuinely not connected to Codex Cloud, disconnect this required check in branch protection rather than opening a repo-wide bypass here."
             exit 1
           fi
 
           # ---------------------------------------------------------------
-          # Deliberate bypass 2 of 3: a clean head-bound signal, no review.
+          # Deliberate bypass 1 of 2: a clean head-bound signal, no review.
+          #
+          # The loop above breaks the instant a clean signal appears, and a
+          # formal review is routinely PUBLISHED MOMENTS AFTER the summary
+          # comment or 👍 that announces it. Exiting 0 straight off the clean
+          # signal therefore re-runs the race this file exists to lose no more:
+          # on NeoMenu#658 the review landed 59s after the gate had already
+          # decided. Wait, then re-query — a review found now is authoritative
+          # and the clean signal does not override it.
           # ---------------------------------------------------------------
+          # POLL across the whole window rather than checking once at the end.
+          # A single `sleep 15` was shorter than the lag recorded two lines above:
+          # on NeoMenu#658 the review landed 59 seconds later, so the one recheck
+          # found nothing, the gate exited 0, and auto-merge consumed the green
+          # check before the P1s were published. A grace shorter than the lag it
+          # cites is not a grace.
+          #
+          # 90s covers the observed 59s with room, and the poll returns the
+          # instant a review appears — so only a genuinely clean head pays the
+          # full window.
+          if [ -z "${RIDS}" ]; then
+            GRACE="${GRACE_SECONDS:-90}"
+            GRACE_DEADLINE=$((SECONDS + GRACE))
+            while :; do
+              RIDS="$(review_ids_for_head)"
+              [ -n "${RIDS}" ] && break
+              [ ${SECONDS} -ge ${GRACE_DEADLINE} ] && break
+              sleep 5
+            done
+            if [ -n "${RIDS}" ]; then
+              echo "A formal review for ${HEAD_SHA} arrived during the ${GRACE}s grace window; it overrides the clean signal."
+            else
+              echo "No formal review for ${HEAD_SHA} within ${GRACE}s of the clean signal."
+            fi
+          fi
+
           if [ -z "${RIDS}" ]; then
             echo "Codex reports no findings for ${HEAD_SHA}."
             exit 0
@@ -403,7 +486,7 @@ jobs:
           fi
 
           # ---------------------------------------------------------------
-          # Deliberate bypass 3 of 3: a head-bound review with no P0/P1 marker.
+          # Deliberate bypass 2 of 2: a head-bound review with no P0/P1 marker.
           # ---------------------------------------------------------------
           echo "Codex review is green for ${HEAD_SHA}."
           exit 0
