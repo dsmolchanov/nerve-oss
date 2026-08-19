@@ -53,6 +53,8 @@ type OutboxWorker struct {
 	StaleLockAfter time.Duration
 }
 
+const providerReplayExpirySafety = time.Minute
+
 // MetricsSink is the dependency-injected interface the outbox worker uses
 // to emit metrics. Defining it locally avoids a hard dep on the
 // observability package and keeps tests cheap to write.
@@ -183,10 +185,14 @@ func (w *OutboxWorker) claimAndDeliver(ctx context.Context) {
 }
 
 func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) error {
+	if !msg.LockedBy.Valid || msg.LockedBy.String == "" {
+		return errors.New("outbox message is missing claim lease")
+	}
+	claimLeaseID := msg.LockedBy.String
 	adapter, ok := w.Registry.Outbound(msg.Provider)
 	if !ok {
 		next := time.Now().UTC().Add(30 * time.Second)
-		_ = w.Store.RequeueOutboxMessage(ctx, msg.ID, next, fmt.Sprintf("unknown provider: %s", msg.Provider))
+		_ = w.Store.RequeueClaimedOutboxMessage(ctx, msg.ID, claimLeaseID, next, fmt.Sprintf("unknown provider: %s", msg.Provider))
 		return fmt.Errorf("unknown provider: %s", msg.Provider)
 	}
 
@@ -201,6 +207,28 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 			)
 		} else if customAdapter != nil {
 			adapter = customAdapter
+		}
+	}
+
+	if msg.AutonomousPolicyEpoch > 0 && msg.ProviderStartedAt.Valid && !msg.ProviderResolvedAt.Valid {
+		// A stale claim proves a prior worker may already have completed the
+		// provider call. Replay is safe only inside the adapter's bounded
+		// idempotency window. Quarantine before loading attachments or touching
+		// the provider when that guarantee is absent or expired.
+		operationID := msg.ProviderOperationID.String
+		if !msg.ProviderOperationID.Valid || operationID == "" {
+			return errors.New("unresolved provider start is missing operation identity")
+		}
+		if replayDeadline, ok := adapterReplayDeadline(adapter, msg.ProviderStartedAt.Time); !ok || !time.Now().UTC().Before(replayDeadline) {
+			reason := "provider_unknown_non_idempotent: unresolved provider operation cannot be replayed"
+			if ok {
+				reason = "provider_unknown_replay_window_expired: unresolved provider operation cannot be replayed safely"
+			}
+			w.incDeliver(msg.Provider, "provider_unknown_quarantined")
+			if err := w.Store.QuarantineClaimedOutboxUnknown(ctx, msg.ID, claimLeaseID, operationID, reason); err != nil {
+				return fmt.Errorf("quarantine unreplayable provider operation: %w", err)
+			}
+			return errors.New("unresolved provider operation quarantined without replay")
 		}
 	}
 
@@ -222,24 +250,28 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		if errors.Is(err, store.ErrAttachmentsReleased) {
 			w.incDeliver(msg.Provider, "permanent")
 			w.incDLQ(msg.Provider, "attachments_released")
-			_ = w.Store.MarkOutboxMessageFailed(ctx, msg.ID, err.Error())
+			if finishErr := w.Store.MarkClaimedOutboxMessageFailed(ctx, msg.ID, claimLeaseID, err.Error()); finishErr != nil {
+				return fmt.Errorf("record released attachment failure: %w", finishErr)
+			}
 			return err
 		}
 		next := time.Now().UTC().Add(w.BaseBackoff)
-		_ = w.Store.RequeueOutboxMessage(ctx, msg.ID, next, fmt.Sprintf("load attachment metadata: %v", err))
+		_ = w.Store.RequeueClaimedOutboxMessage(ctx, msg.ID, claimLeaseID, next, fmt.Sprintf("load attachment metadata: %v", err))
 		return fmt.Errorf("load outbox attachment metadata: %w", err)
 	}
 	if attachmentBytes > w.MemoryBudget.Limit() {
 		err := fmt.Errorf("attachment bytes exceed configured memory budget: requested=%d limit=%d", attachmentBytes, w.MemoryBudget.Limit())
 		w.incDeliver(msg.Provider, "permanent")
 		w.incDLQ(msg.Provider, "attachment_memory_limit")
-		_ = w.Store.MarkOutboxMessageFailed(ctx, msg.ID, err.Error())
+		if finishErr := w.Store.MarkClaimedOutboxMessageFailed(ctx, msg.ID, claimLeaseID, err.Error()); finishErr != nil {
+			return fmt.Errorf("record attachment memory failure: %w", finishErr)
+		}
 		return err
 	}
 	releaseMemory, err := w.MemoryBudget.Acquire(ctx, attachmentBytes)
 	if err != nil {
 		next := time.Now().UTC().Add(w.BaseBackoff)
-		_ = w.Store.RequeueOutboxMessage(ctx, msg.ID, next, fmt.Sprintf("reserve attachment memory: %v", err))
+		_ = w.Store.RequeueClaimedOutboxMessage(ctx, msg.ID, claimLeaseID, next, fmt.Sprintf("reserve attachment memory: %v", err))
 		return fmt.Errorf("reserve outbox attachment memory: %w", err)
 	}
 	defer releaseMemory()
@@ -249,11 +281,13 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		if errors.Is(err, store.ErrAttachmentsReleased) {
 			w.incDeliver(msg.Provider, "permanent")
 			w.incDLQ(msg.Provider, "attachments_released")
-			_ = w.Store.MarkOutboxMessageFailed(ctx, msg.ID, err.Error())
+			if finishErr := w.Store.MarkClaimedOutboxMessageFailed(ctx, msg.ID, claimLeaseID, err.Error()); finishErr != nil {
+				return fmt.Errorf("record released attachment failure: %w", finishErr)
+			}
 			return err
 		}
 		next := time.Now().UTC().Add(w.BaseBackoff)
-		_ = w.Store.RequeueOutboxMessage(ctx, msg.ID, next, fmt.Sprintf("load attachments: %v", err))
+		_ = w.Store.RequeueClaimedOutboxMessage(ctx, msg.ID, claimLeaseID, next, fmt.Sprintf("load attachments: %v", err))
 		return fmt.Errorf("load outbox attachments: %w", err)
 	}
 
@@ -295,12 +329,32 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		// is the forward target; the inbox address is the "from")
 	}
 
+	operation, err := w.Store.BeginOutboxProviderOperationState(ctx, msg)
+	if err != nil {
+		if errors.Is(err, store.ErrOutboxPolicyRevoked) {
+			w.incDeliver(msg.Provider, "policy_revoked")
+			return err
+		}
+		if errors.Is(err, store.ErrOutboxClaimLost) {
+			return err
+		}
+		next := time.Now().UTC().Add(w.BaseBackoff)
+		_ = w.Store.RequeueClaimedOutboxMessage(ctx, msg.ID, claimLeaseID, next, fmt.Sprintf("provider-start fence: %v", err))
+		return fmt.Errorf("begin outbox provider operation: %w", err)
+	}
+	operationID := operation.ID
+	providerStartedAt := operation.StartedAt
+	providerOperationKey := msg.IdempotencyKey
+	if operationID != "" {
+		providerOperationKey = operationID
+	}
+
 	sendStart := time.Now()
-	providerMessageID, err := adapter.SendMessage(ctx, out, msg.IdempotencyKey)
+	providerMessageID, err := adapter.SendMessage(ctx, out, providerOperationKey)
 	w.observeDelivery(msg.Provider, time.Since(sendStart).Seconds())
 	if err == nil {
 		w.incDeliver(msg.Provider, "ok")
-		return w.Store.MarkOutboxMessageSent(ctx, msg.ID, providerMessageID)
+		return w.Store.MarkClaimedOutboxMessageSent(ctx, msg.ID, claimLeaseID, operationID, providerMessageID)
 	}
 
 	// Classify the provider error. Permanent errors terminate the message
@@ -320,11 +374,45 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		)
 		w.incDeliver(msg.Provider, "permanent")
 		w.incDLQ(msg.Provider, classified.Reason)
-		_ = w.Store.MarkOutboxMessageFailed(ctx, msg.ID, fmt.Sprintf("permanent:%s: %s", classified.Reason, err.Error()))
+		if finishErr := w.Store.MarkClaimedOutboxProviderFailure(ctx, msg.ID, claimLeaseID, operationID, fmt.Sprintf("permanent:%s: %s", classified.Reason, err.Error())); finishErr != nil {
+			return fmt.Errorf("record permanent provider failure: %w", finishErr)
+		}
+		return err
+	}
+
+	// A provider-confirmed 4xx rejection proves this attempt was not accepted.
+	// A 5xx response remains ambiguous: the provider may have accepted the
+	// logical operation before failing the request, so only idempotent
+	// replay/readback may resolve it. Transport errors are ambiguous too.
+	knownOutcome := classified != nil && classified.StatusCode >= 400 && classified.StatusCode < 500
+	if msg.AutonomousPolicyEpoch > 0 && !knownOutcome && !adapterSupportsIdempotentReplay(adapter) {
+		// Replaying an ambiguous operation through SMTP or another adapter that
+		// cannot honor the stable operation identity can duplicate a delivery.
+		// Quarantine immediately; the unresolved fence keeps lifecycle cleanup
+		// blocked until an operator/provider reconciliation establishes outcome.
+		w.incDeliver(msg.Provider, "provider_unknown_quarantined")
+		if quarantineErr := w.Store.QuarantineClaimedOutboxUnknown(ctx, msg.ID, claimLeaseID, operationID, "provider_unknown_non_idempotent: "+err.Error()); quarantineErr != nil {
+			return fmt.Errorf("quarantine ambiguous provider outcome: %w", quarantineErr)
+		}
 		return err
 	}
 
 	if msg.AttemptCount >= store.MaxOutboxRetries {
+		if msg.AutonomousPolicyEpoch > 0 && !knownOutcome && adapterSupportsIdempotentReplay(adapter) {
+			// Unknown autonomous outcomes cannot be declared failed: retrying the
+			// same provider idempotency identity is the recovery/readback path.
+			next := time.Now().UTC().Add(w.MaxBackoff)
+			if replayDeadline, ok := adapterReplayDeadline(adapter, providerStartedAt); !ok || !next.Before(replayDeadline) {
+				w.incDeliver(msg.Provider, "provider_unknown_quarantined")
+				if quarantineErr := w.Store.QuarantineClaimedOutboxUnknown(ctx, msg.ID, claimLeaseID, operationID, "provider_unknown_replay_window_expired: retry would exceed safe replay window"); quarantineErr != nil {
+					return fmt.Errorf("quarantine expiring provider operation: %w", quarantineErr)
+				}
+				return err
+			}
+			w.incDeliver(msg.Provider, "provider_unknown")
+			_ = w.Store.RequeueClaimedOutboxMessage(ctx, msg.ID, claimLeaseID, next, err.Error())
+			return err
+		}
 		slog.WarnContext(ctx, "outbox: retry budget exhausted, terminating",
 			slog.String("worker_id", w.WorkerID),
 			slog.String("outbox_id", msg.ID),
@@ -339,15 +427,40 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 			reason = classified.Reason
 		}
 		w.incDLQ(msg.Provider, reason)
-		_ = w.Store.MarkOutboxMessageFailed(ctx, msg.ID, err.Error())
+		if finishErr := w.Store.MarkClaimedOutboxProviderFailure(ctx, msg.ID, claimLeaseID, operationID, err.Error()); finishErr != nil {
+			return fmt.Errorf("record exhausted provider failure: %w", finishErr)
+		}
 		return err
 	}
 
 	w.incDeliver(msg.Provider, "transient")
 	backoff := w.backoffForAttempt(msg.AttemptCount)
 	next := time.Now().UTC().Add(backoff)
-	_ = w.Store.RequeueOutboxMessage(ctx, msg.ID, next, err.Error())
+	if knownOutcome && operationID != "" {
+		if requeueErr := w.Store.RequeueClaimedOutboxKnownProviderFailure(ctx, msg.ID, claimLeaseID, operationID, next, err.Error()); requeueErr != nil {
+			return fmt.Errorf("resolve and requeue provider failure: %w", requeueErr)
+		}
+		return err
+	}
+	_ = w.Store.RequeueClaimedOutboxMessage(ctx, msg.ID, claimLeaseID, next, err.Error())
 	return err
+}
+
+func adapterSupportsIdempotentReplay(adapter OutboundAdapter) bool {
+	capability, ok := adapter.(IdempotentReplayAdapter)
+	return ok && capability.SupportsIdempotentReplay() && capability.IdempotentReplayWindow() > providerReplayExpirySafety
+}
+
+func adapterReplayDeadline(adapter OutboundAdapter, startedAt time.Time) (time.Time, bool) {
+	capability, ok := adapter.(IdempotentReplayAdapter)
+	if !ok || !capability.SupportsIdempotentReplay() || startedAt.IsZero() {
+		return time.Time{}, false
+	}
+	window := capability.IdempotentReplayWindow()
+	if window <= providerReplayExpirySafety {
+		return time.Time{}, false
+	}
+	return startedAt.Add(window - providerReplayExpirySafety), true
 }
 
 // Metrics helpers — all no-op when w.Metrics is nil so the worker can

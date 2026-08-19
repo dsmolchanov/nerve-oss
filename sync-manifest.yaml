@@ -9,6 +9,7 @@
     "internal/store/store_threads.go",
     "internal/store/store_threads_test.go",
     "internal/store/outbox.go",
+    "internal/store/outbox_policy_fence_test.go",
     "internal/store/outbox_test.go",
     "internal/store/outbound_limits.go",
     "internal/store/outbound_limits_test.go",

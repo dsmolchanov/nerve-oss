@@ -28,6 +28,8 @@ type FeatureFlag struct {
 	UpdatedBy string
 }
 
+var ErrOutboundPolicyStateMissing = errors.New("outbound policy state missing")
+
 func (s *Store) LookupFeatureFlagForOrg(ctx context.Context, orgID string, flag string) (FeatureFlagValues, error) {
 	var values FeatureFlagValues
 	err := s.RunAsOrg(ctx, orgID, func(scoped *Store) error {
@@ -47,6 +49,15 @@ var OutboundPolicyFlags = map[string]bool{
 	"autonomous_outbound_policy": true,
 	"email_outbound_suspended":   true,
 	"email_compose_org_enabled":  true,
+}
+
+// outboundDeliveryFenceFlags revoke or restore all autonomous delivery. A
+// compose-only transition still takes LockOrgPolicy (it participates in the
+// enqueue snapshot) but must not advance the shared epoch: outbox rows do not
+// retain enough policy context to distinguish compose from reply.
+var outboundDeliveryFenceFlags = map[string]bool{
+	"autonomous_outbound_policy": true,
+	"email_outbound_suspended":   true,
 }
 
 // FenceOrgPolicy runs fn in a transaction holding the org policy lock, so a
@@ -75,6 +86,101 @@ func (s *Store) LockOrgPolicy(ctx context.Context, orgID string) error {
 	_, err := s.q.ExecContext(ctx,
 		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "org-policy:"+orgID)
 	return err
+}
+
+// EnsureOutboundPolicyState creates the first autonomous policy epoch. It is
+// intentionally transaction-only so onboarding can seed it atomically with
+// the org graph and explicit policy flags.
+func (s *Store) EnsureOutboundPolicyState(ctx context.Context, orgID string) (int64, error) {
+	orgID = strings.TrimSpace(orgID)
+	if orgID == "" {
+		return 0, errors.New("missing org id")
+	}
+	if err := s.requireTx(); err != nil {
+		return 0, fmt.Errorf("ensure outbound policy state: %w", err)
+	}
+	if err := s.LockOrgPolicy(ctx, orgID); err != nil {
+		return 0, err
+	}
+	var epoch int64
+	err := s.q.QueryRowContext(ctx, `
+		INSERT INTO org_outbound_policy_state (org_id, policy_epoch)
+		VALUES ($1::uuid, 1)
+		ON CONFLICT (org_id) DO UPDATE
+		SET org_id = EXCLUDED.org_id
+		RETURNING policy_epoch
+	`, orgID).Scan(&epoch)
+	return epoch, err
+}
+
+// CurrentOutboundPolicyEpoch reads the row while the caller holds the
+// transaction-scoped org policy lock. Absence fails closed for autonomous
+// senders rather than silently treating the org as legacy.
+func (s *Store) CurrentOutboundPolicyEpoch(ctx context.Context, orgID string) (int64, error) {
+	orgID = strings.TrimSpace(orgID)
+	if orgID == "" {
+		return 0, errors.New("missing org id")
+	}
+	if err := s.requireTx(); err != nil {
+		return 0, fmt.Errorf("read outbound policy epoch: %w", err)
+	}
+	var epoch int64
+	err := s.q.QueryRowContext(ctx, `
+		SELECT policy_epoch
+		FROM org_outbound_policy_state
+		WHERE org_id = $1::uuid
+		FOR UPDATE
+	`, orgID).Scan(&epoch)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrOutboundPolicyStateMissing
+	}
+	return epoch, err
+}
+
+// AdvanceOutboundPolicyEpoch fences every queued autonomous row from the old
+// epoch in the same transaction as the caller's policy transition. The
+// existing failed status is retained; policy_revoked is the bounded reason.
+func (s *Store) AdvanceOutboundPolicyEpoch(ctx context.Context, orgID string) (epoch int64, terminalized int64, err error) {
+	orgID = strings.TrimSpace(orgID)
+	if orgID == "" {
+		return 0, 0, errors.New("missing org id")
+	}
+	if err := s.requireTx(); err != nil {
+		return 0, 0, fmt.Errorf("advance outbound policy epoch: %w", err)
+	}
+	if err := s.LockOrgPolicy(ctx, orgID); err != nil {
+		return 0, 0, err
+	}
+	if err := s.q.QueryRowContext(ctx, `
+		UPDATE org_outbound_policy_state
+		SET policy_epoch = policy_epoch + 1,
+		    updated_at = now()
+		WHERE org_id = $1::uuid
+		RETURNING policy_epoch
+	`, orgID).Scan(&epoch); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, 0, ErrOutboundPolicyStateMissing
+		}
+		return 0, 0, err
+	}
+	result, err := s.q.ExecContext(ctx, `
+		UPDATE outbox_messages
+		SET status = 'failed',
+		    last_error = 'policy_revoked',
+		    locked_at = NULL,
+		    locked_by = NULL,
+		    terminal_at = now()
+		WHERE org_id = $1::uuid
+		  AND autonomous_policy_epoch IS NOT NULL
+		  AND autonomous_policy_epoch < $2
+		  AND status IN ('queued', 'sending')
+		  AND NOT (provider_started_at IS NOT NULL AND provider_resolved_at IS NULL)
+	`, orgID, epoch)
+	if err != nil {
+		return 0, 0, err
+	}
+	terminalized, err = result.RowsAffected()
+	return epoch, terminalized, err
 }
 
 // explicit false and an absent row.
@@ -173,7 +279,26 @@ func (s *Store) SetFeatureFlag(ctx context.Context, orgID *string, flag string, 
 		return false, err
 	}
 	changed, err := result.RowsAffected()
-	return changed > 0, err
+	if err != nil || changed == 0 || orgID == nil || !outboundDeliveryFenceFlags[flag] {
+		return changed > 0, err
+	}
+	// Legacy organizations have no epoch row and retain their existing flag
+	// behavior. Every real autonomous policy change advances the fence in the
+	// same transaction, so suspended work can never revive after a later clear.
+	var hasPolicyState bool
+	if err := s.q.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM org_outbound_policy_state WHERE org_id = $1::uuid
+		)
+	`, strings.TrimSpace(*orgID)).Scan(&hasPolicyState); err != nil {
+		return false, err
+	}
+	if hasPolicyState {
+		if _, _, err := s.AdvanceOutboundPolicyEpoch(ctx, strings.TrimSpace(*orgID)); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 // SetFeatureFlagAudited atomically applies an idempotent flag write and
