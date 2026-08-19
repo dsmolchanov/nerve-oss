@@ -40,6 +40,19 @@ jobs:
         if: steps.changes.outputs.has_changes == 'true'
         run: oss/scripts/sync/verify_exact_mirror.sh oss/sync-manifest.yaml oss cloud
 
+      - name: Advance OSS source authority
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          OSS_SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          lock_file="cloud/deploy/cloud/oss-source.lock"
+          test "$(grep -c '^OSS_SOURCE_REVISION=' "$lock_file")" -eq 1
+          test "$(grep -c '^OSS_SYNC_MANIFEST_SHA256=' "$lock_file")" -eq 1
+          manifest_sha="$(sha256sum oss/sync-manifest.yaml | awk '{print $1}')"
+          sed -i "s/^OSS_SOURCE_REVISION=.*/OSS_SOURCE_REVISION=${OSS_SOURCE_REVISION}/" "$lock_file"
+          sed -i "s/^OSS_SYNC_MANIFEST_SHA256=.*/OSS_SYNC_MANIFEST_SHA256=${manifest_sha}/" "$lock_file"
+
       - uses: actions/setup-go@v5
         if: steps.changes.outputs.has_changes == 'true'
         with:

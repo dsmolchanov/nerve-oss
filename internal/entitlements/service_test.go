@@ -240,6 +240,39 @@ func TestIdempotentReplayDoesNotDoubleChargeUnits(t *testing.T) {
 	})
 }
 
+func TestRecoveredOutboundIdempotencyEnablesLegacyReplayOnlyForRecoveredTool(t *testing.T) {
+	withTempStore(t, func(ctx context.Context, st *store.Store) {
+		orgID := uuid.NewString()
+		periodStart := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+		periodEnd := periodStart.Add(30 * 24 * time.Hour)
+		insertEntitlementFixture(t, ctx, st, orgID, periodStart, periodEnd, 100, 100000)
+
+		now := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
+		const rawKey = "legacy-recovery"
+		if err := st.MarkToolIdempotencyFailed(ctx, orgID, "send_reply", rawKey, now.Add(-time.Hour)); err != nil {
+			t.Fatalf("seed failed send_reply idempotency: %v", err)
+		}
+
+		svc := NewService(config.Default(), st, nil)
+		svc.Now = func() time.Time { return now }
+		recovered, err := svc.PreAuthorizeTool(ctx, auth.Principal{OrgID: orgID}, "send_reply", "recover-replay", rawKey)
+		if err != nil {
+			t.Fatalf("recover send_reply idempotency: %v", err)
+		}
+		if !recovered.LegacyOutboundReplay {
+			t.Fatal("recovered tool idempotency did not enable legacy outbox lookup")
+		}
+
+		fresh, err := svc.PreAuthorizeTool(ctx, auth.Principal{OrgID: orgID}, "compose_email", "fresh-replay", rawKey)
+		if err != nil {
+			t.Fatalf("authorize fresh compose_email with same raw key: %v", err)
+		}
+		if fresh.LegacyOutboundReplay {
+			t.Fatal("fresh cross-tool idempotency unexpectedly enabled legacy outbox lookup")
+		}
+	})
+}
+
 func insertEntitlementFixture(t *testing.T, ctx context.Context, st *store.Store, orgID string, periodStart, periodEnd time.Time, monthlyUnits int64, mcpRPM int) {
 	t.Helper()
 	if _, err := st.DB().ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, $2)`, orgID, "entitlements-test"); err != nil {

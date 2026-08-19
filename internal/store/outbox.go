@@ -80,6 +80,10 @@ type OutboxMessage struct {
 	ContentHash       string
 	Attachments       []OutboundAttachment
 	AutonomousLimits  *OutboundLimitInput
+	// AllowLegacyIdempotencyReplay permits a raw-key lookup during the
+	// tool-scoped outbox-key rollout. Callers set it only after recovering an
+	// existing failed/stale tool-idempotency record for this same tool.
+	AllowLegacyIdempotencyReplay bool
 
 	// Threading headers for reply-chain continuity (RFC 5322).
 	// Set when replying to an inbound message so the recipient's
@@ -228,6 +232,21 @@ func (s *Store) enqueueOutboxMessage(ctx context.Context, msg OutboxMessage, aft
 	if msg.IdempotencyKey == "" {
 		return "", errors.New("missing idempotency_key")
 	}
+	legacyIdempotencyKey := ""
+	if msg.AutonomousLimits != nil {
+		if msg.AutonomousLimits.ToolName == "" || msg.AutonomousLimits.IdempotencyKey == "" {
+			return "", errors.New("missing autonomous tool idempotency identity")
+		}
+		if msg.AutonomousLimits.IdempotencyKey != msg.IdempotencyKey {
+			return "", errors.New("outbox and autonomous idempotency keys differ")
+		}
+		if msg.AllowLegacyIdempotencyReplay {
+			legacyIdempotencyKey = msg.IdempotencyKey
+		}
+		msg.IdempotencyKey = OutboundIdempotencyKey(
+			msg.AutonomousLimits.ToolName, msg.AutonomousLimits.IdempotencyKey,
+		)
+	}
 	if msg.To == "" || msg.From == "" {
 		return "", errors.New("missing to/from")
 	}
@@ -267,7 +286,7 @@ func (s *Store) enqueueOutboxMessage(ctx context.Context, msg OutboxMessage, aft
 	var outID string
 	err = s.withTx(ctx, func(scoped *Store) error {
 		resolvedID, inserted, resolveErr := scoped.resolveOrInsertOutboxParent(
-			ctx, id, msg, hash, suppressed, suppressReason, afterConflict,
+			ctx, id, msg, hash, legacyIdempotencyKey, suppressed, suppressReason, afterConflict,
 		)
 		if resolveErr != nil {
 			return resolveErr
@@ -337,6 +356,7 @@ func (s *Store) resolveOrInsertOutboxParent(
 	id string,
 	msg OutboxMessage,
 	hash string,
+	legacyIdempotencyKey string,
 	suppressed bool,
 	suppressReason string,
 	afterConflict func() error,
@@ -348,6 +368,38 @@ func (s *Store) resolveOrInsertOutboxParent(
 		status = "failed"
 		deliveryStatus = "suppressed"
 		lastError = fmt.Sprintf("suppressed:%s", suppressReason)
+	}
+	var scopedHash sql.NullString
+	row := s.q.QueryRowContext(ctx, `
+		SELECT id::text, content_hash
+		FROM outbox_messages
+		WHERE org_id = $1 AND idempotency_key = $2
+		LIMIT 1
+	`, msg.OrgID, msg.IdempotencyKey)
+	if scanErr := row.Scan(&outID, &scopedHash); scanErr == nil {
+		if scopedHash.Valid && scopedHash.String != hash {
+			return "", false, fmt.Errorf("%w: key=%q", ErrOutboxIdempotencyConflict, msg.IdempotencyKey)
+		}
+		return outID, false, nil
+	} else if !errors.Is(scanErr, sql.ErrNoRows) {
+		return "", false, scanErr
+	}
+	if legacyIdempotencyKey != "" {
+		var storedHash sql.NullString
+		row = s.q.QueryRowContext(ctx, `
+			SELECT id::text, content_hash
+			FROM outbox_messages
+			WHERE org_id = $1 AND idempotency_key = $2
+			LIMIT 1
+		`, msg.OrgID, legacyIdempotencyKey)
+		if scanErr := row.Scan(&outID, &storedHash); scanErr == nil {
+			if storedHash.Valid && storedHash.String != hash {
+				return "", false, fmt.Errorf("%w: key=%q", ErrOutboxIdempotencyConflict, legacyIdempotencyKey)
+			}
+			return outID, false, nil
+		} else if !errors.Is(scanErr, sql.ErrNoRows) {
+			return "", false, scanErr
+		}
 	}
 
 	const maxConflictRetries = 3
@@ -395,17 +447,20 @@ func (s *Store) resolveOrInsertOutboxParent(
 			WHERE org_id = $1
 			  AND (
 				idempotency_key = $2
+				OR (nullif($5, '') IS NOT NULL AND idempotency_key = $5)
 				OR (inbox_id = $3 AND content_hash = $4 AND status IN ('queued', 'sending'))
 			  )
 			ORDER BY
 			  CASE WHEN idempotency_key = $2 THEN 0 ELSE 1 END,
+			  CASE WHEN idempotency_key = $5 THEN 0 ELSE 1 END,
 			  CASE WHEN status IN ('queued', 'sending') THEN 0 ELSE 1 END,
 			  created_at DESC,
 			  id DESC
 			LIMIT 1
-		`, msg.OrgID, msg.IdempotencyKey, msg.InboxID, hash)
+		`, msg.OrgID, msg.IdempotencyKey, msg.InboxID, hash, legacyIdempotencyKey)
 		if scanErr := row.Scan(&outID, &storedHash, &storedKey); scanErr == nil {
-			if storedKey == msg.IdempotencyKey && storedHash.Valid && storedHash.String != hash {
+			if (storedKey == msg.IdempotencyKey || storedKey == legacyIdempotencyKey) &&
+				storedHash.Valid && storedHash.String != hash {
 				return "", false, fmt.Errorf("%w: key=%q", ErrOutboxIdempotencyConflict, msg.IdempotencyKey)
 			}
 			return outID, false, nil
