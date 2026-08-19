@@ -133,7 +133,18 @@ jobs:
               printf '%s\n' "${out}" | tail -5 >&2
               exit 1
             fi
-            printf '%s' "${out}"
+            # Terminate non-empty output. `$(...)` strips gh's trailing newline,
+            # and `codex_clean_comment_for_head` pipes this straight into
+            # `wc -l` — so ONE clean "Reviewed commit" summary counted as zero
+            # records. The head then read as having no verdict, waited the full
+            # window and failed the hard gate, on every rerun, despite Codex
+            # having answered cleanly.
+            #
+            # Empty output must stay empty: printing a bare newline would make
+            # "no records" count as one.
+            if [ -n "${out}" ]; then
+              printf '%s\n' "${out}"
+            fi
           }
 
           # Count matching lines without letting grep's exit-1 (no match) be
@@ -234,8 +245,20 @@ jobs:
           # review generation.
           ANCHOR_ID="$(anchor_comment_id)"
           ANCHOR_FAILED=0
+          # `submitted` is in this list because it SHARES the cancel-in-progress
+          # concurrency group with `synchronize`. A late review — Codex's for an
+          # earlier head, or any human's — starts a run that cancels the
+          # in-flight synchronize run during its debounce. The replacement then
+          # carries ACTION=submitted, and while this case excluded it the
+          # replacement never posted `@codex review`. Codex does not auto-review
+          # pushes, so the run waited the full window and failed; re-running
+          # preserved ACTION=submitted and failed again. The pull request was
+          # blocked until some unrelated event happened to fire.
+          #
+          # The guard below already prevents a duplicate request: it fires only
+          # when this head has neither an anchor nor a review.
           case "${ACTION}" in
-            synchronize|reopened|ready_for_review)
+            synchronize|reopened|ready_for_review|submitted)
               if [ -z "${ANCHOR_ID}" ] && [ -z "$(review_ids_for_head)" ]; then
                 REQUEST_BODY=$(printf '@codex review\n\nReturn ONE comprehensive inventory of every P0/P1 in this diff, grouped by the root invariant each violates. For each finding give the affected symbol, every sibling consumer with the same defect, the failing input or call path, impact, confidence, a safe remediation path, and the regression test that would represent the class. Completeness on this pass matters more than brevity — a finding held back costs a full review generation. See "Code Review Rules" in AGENTS.md.\n\n<!-- %s -->' "${ANCHOR}")
                 ANCHOR_ID=$(gh api "repos/${REPO}/issues/${PR}/comments" \
