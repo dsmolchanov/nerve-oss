@@ -18,7 +18,6 @@ import (
 
 func TestAutonomousReplyLimitsAreAtomicAcrossConnections(t *testing.T) {
 	withOutboundLimitStore(t, func(ctx context.Context, st *Store, orgID, inboxID string) {
-		now := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
 		var accepted atomic.Int64
 		var limited atomic.Int64
 		var other atomic.Int64
@@ -30,7 +29,7 @@ func TestAutonomousReplyLimitsAreAtomicAcrossConnections(t *testing.T) {
 				defer wait.Done()
 				_, err := st.EnqueueOutboxMessage(ctx, outboundLimitMessage(
 					orgID, inboxID, fmt.Sprintf("reply-%d", index),
-					fmt.Sprintf("recipient-%d@example.test", index), false, now,
+					fmt.Sprintf("recipient-%d@example.test", index), false,
 				))
 				var limitErr *OutboundLimitError
 				switch {
@@ -47,14 +46,13 @@ func TestAutonomousReplyLimitsAreAtomicAcrossConnections(t *testing.T) {
 		if accepted.Load() != limitReplyPerDay || limited.Load() != 5 || other.Load() != 0 {
 			t.Fatalf("accepted=%d limited=%d other=%d", accepted.Load(), limited.Load(), other.Load())
 		}
-		assertUsageCounterMatchesEvents(t, ctx, st, orgID, meterOutboundReplyDay, now, limitReplyPerDay)
+		assertUsageCounterMatchesEvents(t, ctx, st, orgID, meterOutboundReplyDay, limitReplyPerDay)
 	})
 }
 
 func TestAutonomousOutboundReplayConsumesOneUnit(t *testing.T) {
 	withOutboundLimitStore(t, func(ctx context.Context, st *Store, orgID, inboxID string) {
-		now := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
-		message := outboundLimitMessage(orgID, inboxID, "same-key", "one@example.test", false, now)
+		message := outboundLimitMessage(orgID, inboxID, "same-key", "one@example.test", false)
 		first, err := st.EnqueueOutboxMessage(ctx, message)
 		if err != nil {
 			t.Fatalf("first enqueue: %v", err)
@@ -66,9 +64,9 @@ func TestAutonomousOutboundReplayConsumesOneUnit(t *testing.T) {
 		if first != second {
 			t.Fatalf("replay returned %s, want %s", second, first)
 		}
-		assertUsageCounterMatchesEvents(t, ctx, st, orgID, meterOutboundReplyDay, now, 1)
+		assertUsageCounterMatchesEvents(t, ctx, st, orgID, meterOutboundReplyDay, 1)
 		recipientMeter := meterOutboundReplyRecipient + ":" + outboundRecipientHash("one@example.test")
-		assertUsageCounterMatchesEvents(t, ctx, st, orgID, recipientMeter, now, 1)
+		assertUsageCounterMatchesEvents(t, ctx, st, orgID, recipientMeter, 1)
 	})
 }
 
@@ -109,18 +107,17 @@ func TestExpiredOutboundBucketGCLeavesAuditEvents(t *testing.T) {
 
 func TestComposeCountsOnlyNewRecipientsAgainstDailyLimit(t *testing.T) {
 	withOutboundLimitStore(t, func(ctx context.Context, st *Store, orgID, inboxID string) {
-		now := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
 		for index := 0; index < int(limitFirstRecipientsPerDay); index++ {
 			_, err := st.EnqueueOutboxMessage(ctx, outboundLimitMessage(
 				orgID, inboxID, fmt.Sprintf("compose-%d", index),
-				fmt.Sprintf("new-%d@example.test", index), true, now,
+				fmt.Sprintf("new-%d@example.test", index), true,
 			))
 			if err != nil {
 				t.Fatalf("compose %d: %v", index, err)
 			}
 		}
 		_, err := st.EnqueueOutboxMessage(ctx, outboundLimitMessage(
-			orgID, inboxID, "compose-over-limit", "one-more@example.test", true, now,
+			orgID, inboxID, "compose-over-limit", "one-more@example.test", true,
 		))
 		var limitErr *OutboundLimitError
 		if !errors.As(err, &limitErr) || limitErr.MeterName != meterOutboundFirstRecipientDay {
@@ -130,13 +127,56 @@ func TestComposeCountsOnlyNewRecipientsAgainstDailyLimit(t *testing.T) {
 		// An already-seen recipient does not consume a second first-recipient
 		// unit, but it still consumes the total-send unit.
 		_, err = st.EnqueueOutboxMessage(ctx, outboundLimitMessage(
-			orgID, inboxID, "compose-known", "new-0@example.test", true, now,
+			orgID, inboxID, "compose-known", "new-0@example.test", true,
 		))
 		if err != nil {
 			t.Fatalf("known recipient compose: %v", err)
 		}
-		assertUsageCounterMatchesEvents(t, ctx, st, orgID, meterOutboundFirstRecipientDay, now, limitFirstRecipientsPerDay)
-		assertUsageCounterMatchesEvents(t, ctx, st, orgID, meterOutboundSendDay, now, limitFirstRecipientsPerDay+1)
+		assertUsageCounterMatchesEvents(t, ctx, st, orgID, meterOutboundFirstRecipientDay, limitFirstRecipientsPerDay)
+		assertUsageCounterMatchesEvents(t, ctx, st, orgID, meterOutboundSendDay, limitFirstRecipientsPerDay+1)
+	})
+}
+
+func TestOutboundLimitsUsePostgreSQLClockForBucketEventAndRetry(t *testing.T) {
+	withOutboundLimitStore(t, func(ctx context.Context, st *Store, orgID, inboxID string) {
+		for index := 0; index < int(limitReplyPerRecipientDay); index++ {
+			if _, err := st.EnqueueOutboxMessage(ctx, outboundLimitMessage(
+				orgID, inboxID, fmt.Sprintf("database-clock-%d", index), "clock@example.test", false,
+			)); err != nil {
+				t.Fatalf("enqueue %d: %v", index, err)
+			}
+		}
+		_, err := st.EnqueueOutboxMessage(ctx, outboundLimitMessage(
+			orgID, inboxID, "database-clock-limited", "clock@example.test", false,
+		))
+		var limitErr *OutboundLimitError
+		if !errors.As(err, &limitErr) {
+			t.Fatalf("expected database-clock rate limit, got %v", err)
+		}
+
+		physicalMeter := meterOutboundReplyRecipient + ":" + outboundRecipientHash("clock@example.test")
+		var periodStart, periodEnd, eventTime, databaseNow time.Time
+		if err := st.q.QueryRowContext(ctx, `
+			SELECT c.period_start, c.period_end, min(e.created_at), clock_timestamp()
+			FROM org_usage_counters c
+			JOIN usage_events e
+			  ON e.org_id = c.org_id AND e.meter_name = c.meter_name
+			WHERE c.org_id = $1 AND c.meter_name = $2
+			GROUP BY c.period_start, c.period_end
+		`, orgID, physicalMeter).Scan(&periodStart, &periodEnd, &eventTime, &databaseNow); err != nil {
+			t.Fatalf("read database-clock evidence: %v", err)
+		}
+		if eventTime.Before(periodStart) || !eventTime.Before(periodEnd) {
+			t.Fatalf("event time %s is outside database bucket [%s,%s)", eventTime, periodStart, periodEnd)
+		}
+		expectedStart := time.Date(databaseNow.UTC().Year(), databaseNow.UTC().Month(), databaseNow.UTC().Day(), 0, 0, 0, 0, time.UTC)
+		if !periodStart.Equal(expectedStart) || !periodEnd.Equal(expectedStart.Add(24*time.Hour)) {
+			t.Fatalf("database bucket=[%s,%s), want [%s,%s)", periodStart, periodEnd, expectedStart, expectedStart.Add(24*time.Hour))
+		}
+		remaining := int(periodEnd.Sub(databaseNow).Seconds())
+		if limitErr.RetryAfterSeconds < remaining-2 || limitErr.RetryAfterSeconds > remaining+2 {
+			t.Fatalf("retry-after=%d, database bucket remaining about %d", limitErr.RetryAfterSeconds, remaining)
+		}
 	})
 }
 
@@ -183,7 +223,7 @@ func TestOutboundLimitConstantsMatchVersionedPolicy(t *testing.T) {
 	}
 }
 
-func outboundLimitMessage(orgID, inboxID, key, recipient string, composeEnabled bool, now time.Time) OutboxMessage {
+func outboundLimitMessage(orgID, inboxID, key, recipient string, composeEnabled bool) OutboxMessage {
 	toolName := "send_reply"
 	if composeEnabled {
 		toolName = "compose_email"
@@ -193,21 +233,25 @@ func outboundLimitMessage(orgID, inboxID, key, recipient string, composeEnabled 
 		To: recipient, From: "sender@local.neuralmail", Subject: "subject " + key, TextBody: "body " + key,
 		AutonomousLimits: &OutboundLimitInput{
 			ToolName: toolName, IdempotencyKey: key, Recipient: recipient,
-			ComposeEnabled: composeEnabled, AcceptedAt: now,
+			ComposeEnabled: composeEnabled,
 		},
 	}
 }
 
 func assertUsageCounterMatchesEvents(
-	t *testing.T, ctx context.Context, st *Store, orgID, meter string, now time.Time, want int64,
+	t *testing.T, ctx context.Context, st *Store, orgID, meter string, want int64,
 ) {
 	t.Helper()
-	start := now.Truncate(24 * time.Hour)
-	used, err := st.GetOrgUsageCounterUsed(ctx, orgID, meter, start)
-	if err != nil {
+	var start, end time.Time
+	var used int64
+	if err := st.q.QueryRowContext(ctx, `
+		SELECT period_start, period_end, used
+		FROM org_usage_counters
+		WHERE org_id = $1 AND meter_name = $2
+	`, orgID, meter).Scan(&start, &end, &used); err != nil {
 		t.Fatalf("read %s counter: %v", meter, err)
 	}
-	events, err := st.SumUsageEvents(ctx, orgID, meter, start, start.Add(24*time.Hour))
+	events, err := st.SumUsageEvents(ctx, orgID, meter, start, end)
 	if err != nil {
 		t.Fatalf("sum %s events: %v", meter, err)
 	}
