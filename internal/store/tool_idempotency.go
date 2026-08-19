@@ -28,18 +28,21 @@ const (
 type ToolIdempotencyAcquireResult struct {
 	State          ToolIdempotencyAcquireState
 	CachedResponse json.RawMessage
+	Recovered      bool
 }
 
 func (s *Store) GetToolIdempotency(ctx context.Context, orgID string, toolName string, idempotencyKey string) (ToolIdempotencyRecord, error) {
 	var rec ToolIdempotencyRecord
+	var cachedResponse []byte
 	row := s.q.QueryRowContext(ctx, `
 		SELECT org_id::text, tool_name, idempotency_key, status, cached_response, updated_at
 		FROM tool_idempotency
 		WHERE org_id = $1 AND tool_name = $2 AND idempotency_key = $3
 	`, orgID, toolName, idempotencyKey)
-	if err := row.Scan(&rec.OrgID, &rec.ToolName, &rec.IdempotencyKey, &rec.Status, &rec.CachedResponse, &rec.UpdatedAt); err != nil {
+	if err := row.Scan(&rec.OrgID, &rec.ToolName, &rec.IdempotencyKey, &rec.Status, &cachedResponse, &rec.UpdatedAt); err != nil {
 		return rec, err
 	}
+	rec.CachedResponse = json.RawMessage(cachedResponse)
 	return rec, nil
 }
 
@@ -96,7 +99,7 @@ func (s *Store) AcquireToolIdempotency(ctx context.Context, orgID string, toolNa
 			return ToolIdempotencyAcquireResult{}, err
 		}
 		if acquired {
-			return ToolIdempotencyAcquireResult{State: ToolIdempotencyAcquired}, nil
+			return ToolIdempotencyAcquireResult{State: ToolIdempotencyAcquired, Recovered: true}, nil
 		}
 	case "failed":
 		acquired, err := execRowsAffected(s.q.ExecContext(ctx, `
@@ -109,7 +112,7 @@ func (s *Store) AcquireToolIdempotency(ctx context.Context, orgID string, toolNa
 			return ToolIdempotencyAcquireResult{}, err
 		}
 		if acquired {
-			return ToolIdempotencyAcquireResult{State: ToolIdempotencyAcquired}, nil
+			return ToolIdempotencyAcquireResult{State: ToolIdempotencyAcquired, Recovered: true}, nil
 		}
 	}
 

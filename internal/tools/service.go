@@ -456,16 +456,17 @@ func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string,
 		}
 
 		outboxID, err := st.EnqueueOutboxMessage(scopedCtx, store.OutboxMessage{
-			OrgID:          inbox.OrgID,
-			InboxID:        inboxID,
-			Provider:       provider,
-			IdempotencyKey: idempotencyKey,
-			To:             to,
-			From:           from,
-			Subject:        subject,
-			TextBody:       body,
-			HTMLBody:       bodyHTML,
-			Attachments:    attachments,
+			OrgID:                        inbox.OrgID,
+			InboxID:                      inboxID,
+			Provider:                     provider,
+			IdempotencyKey:               idempotencyKey,
+			AllowLegacyIdempotencyReplay: allowLegacyOutboundReplay(scopedCtx),
+			To:                           to,
+			From:                         from,
+			Subject:                      subject,
+			TextBody:                     body,
+			HTMLBody:                     bodyHTML,
+			Attachments:                  attachments,
 			AutonomousLimits: autonomousLimitInput(
 				principal, "send_reply", idempotencyKey, to, composeEnabled,
 			),
@@ -609,16 +610,17 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 		}
 
 		outboxID, err := st.EnqueueOutboxMessage(scopedCtx, store.OutboxMessage{
-			OrgID:          inbox.OrgID,
-			InboxID:        inboxID,
-			Provider:       provider,
-			IdempotencyKey: idempotencyKey,
-			To:             toAddress,
-			From:           fromMailbox,
-			Subject:        subject,
-			TextBody:       body,
-			HTMLBody:       bodyHTML,
-			Attachments:    options.Attachments,
+			OrgID:                        inbox.OrgID,
+			InboxID:                      inboxID,
+			Provider:                     provider,
+			IdempotencyKey:               idempotencyKey,
+			AllowLegacyIdempotencyReplay: allowLegacyOutboundReplay(scopedCtx),
+			To:                           toAddress,
+			From:                         fromMailbox,
+			Subject:                      subject,
+			TextBody:                     body,
+			HTMLBody:                     bodyHTML,
+			Attachments:                  options.Attachments,
 			AutonomousLimits: autonomousLimitInput(
 				principal, "compose_email", idempotencyKey, toAddress, true,
 			),
@@ -671,6 +673,11 @@ func autonomousLimitInput(
 		ToolName: toolName, IdempotencyKey: idempotencyKey,
 		Recipient: recipient, ComposeEnabled: composeEnabled,
 	}
+}
+
+func allowLegacyOutboundReplay(ctx context.Context) bool {
+	reservation, ok := entitlements.ReservationFromContext(ctx)
+	return ok && reservation.LegacyOutboundReplay
 }
 
 func translateOutboundLimitError(err error) error {

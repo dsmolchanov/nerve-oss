@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"net/mail"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -184,6 +185,14 @@ func UsageReplayID(orgID, toolName, idempotencyKey, meter, dimension string) str
 		_, _ = hash.Write([]byte(part))
 	}
 	return hex.EncodeToString(hash.Sum(nil))
+}
+
+// OutboundIdempotencyKey scopes the caller's tool-idempotency key before it
+// reaches the outbox and transport layers. Tool idempotency is defined over
+// (org, tool, key), so the outbox must not collapse equal caller keys from two
+// different tools into one parent row before their usage reservations run.
+func OutboundIdempotencyKey(toolName, idempotencyKey string) string {
+	return "mcp-outbox-v1:" + strconv.Itoa(len(toolName)) + ":" + toolName + ":" + idempotencyKey
 }
 
 // DeleteExpiredOutboundUsageCounters bounds both autonomous send buckets and

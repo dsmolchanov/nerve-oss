@@ -39,6 +39,11 @@ type Reservation struct {
 	UsedAfter    int64
 	Subscription string
 	Features     json.RawMessage
+	// LegacyOutboundReplay is true only when this invocation recovered a
+	// pre-existing failed or stale tool-idempotency record. It permits one
+	// rollout compatibility lookup of the old raw outbox key without making a
+	// fresh cross-tool reuse collide with another tool's historical row.
+	LegacyOutboundReplay bool
 }
 
 type Service struct {
@@ -77,6 +82,7 @@ func (s *Service) PreAuthorizeTool(ctx context.Context, principal auth.Principal
 	cost := s.toolCost(toolName)
 	now := s.Now()
 	var reservation *Reservation
+	legacyOutboundReplay := false
 
 	err := s.Store.RunAsOrg(ctx, principal.OrgID, func(scoped *store.Store) error {
 		ent, err := scoped.GetOrgEntitlement(ctx, principal.OrgID)
@@ -124,7 +130,7 @@ func (s *Service) PreAuthorizeTool(ctx context.Context, principal auth.Principal
 				case store.ToolIdempotencyInProgress:
 					return &IdempotencyInProgressError{RetryAfterSeconds: 2}
 				case store.ToolIdempotencyAcquired:
-					// proceed
+					legacyOutboundReplay = acquire.Recovered
 				default:
 					return &IdempotencyInProgressError{RetryAfterSeconds: 2}
 				}
@@ -166,15 +172,16 @@ func (s *Service) PreAuthorizeTool(ctx context.Context, principal auth.Principal
 
 		s.Observer.RecordAllow(principal.OrgID, "authorized", usedAfter, ent.MonthlyUnits)
 		reservation = &Reservation{
-			OrgID:        principal.OrgID,
-			MeterName:    meterMCPUnits,
-			PeriodStart:  ent.UsagePeriodStart,
-			PeriodEnd:    ent.UsagePeriodEnd,
-			Quantity:     cost,
-			MonthlyUnits: ent.MonthlyUnits,
-			UsedAfter:    usedAfter,
-			Subscription: ent.SubscriptionStatus,
-			Features:     ent.Features,
+			OrgID:                principal.OrgID,
+			MeterName:            meterMCPUnits,
+			PeriodStart:          ent.UsagePeriodStart,
+			PeriodEnd:            ent.UsagePeriodEnd,
+			Quantity:             cost,
+			MonthlyUnits:         ent.MonthlyUnits,
+			UsedAfter:            usedAfter,
+			Subscription:         ent.SubscriptionStatus,
+			Features:             ent.Features,
+			LegacyOutboundReplay: legacyOutboundReplay,
 		}
 		return nil
 	})
