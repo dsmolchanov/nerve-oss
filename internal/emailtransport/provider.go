@@ -3,6 +3,7 @@ package emailtransport
 import (
 	"context"
 	"errors"
+	"time"
 
 	"neuralmail/internal/store"
 )
@@ -49,6 +50,14 @@ type OutboundAdapter interface {
 	Name() string
 	SendMessage(ctx context.Context, msg OutboundMessage, idempotencyKey string) (providerMessageID string, err error)
 	GetDeliveryStatus(ctx context.Context, providerMessageID string) (DeliveryStatus, error) // optional in MVP
+}
+
+// IdempotentReplayAdapter marks providers that apply the supplied operation
+// identity to delivery and can safely replay an ambiguous request for a
+// bounded provider-documented window.
+type IdempotentReplayAdapter interface {
+	SupportsIdempotentReplay() bool
+	IdempotentReplayWindow() time.Duration
 }
 
 type DNSRecord struct {

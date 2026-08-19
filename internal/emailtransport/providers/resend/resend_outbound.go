@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -45,6 +46,12 @@ func NewOutboundAdapter(cfg Config) *OutboundAdapter {
 }
 
 func (a *OutboundAdapter) Name() string { return "resend" }
+
+func (a *OutboundAdapter) SupportsIdempotentReplay() bool { return true }
+
+// Resend retains idempotency keys for 24 hours. The worker applies an
+// additional safety margin before this provider-documented boundary.
+func (a *OutboundAdapter) IdempotentReplayWindow() time.Duration { return 24 * time.Hour }
 
 func (a *OutboundAdapter) SendMessage(ctx context.Context, msg emailtransport.OutboundMessage, idempotencyKey string) (string, error) {
 	if a.apiKey == "" {
@@ -84,9 +91,14 @@ func (a *OutboundAdapter) SendMessage(ctx context.Context, msg emailtransport.Ou
 		payload["reply_to"] = msg.ReplyTo
 	}
 	if len(msg.Tags) > 0 {
-		var tags []map[string]string
-		for k, v := range msg.Tags {
-			tags = append(tags, map[string]string{"name": k, "value": v})
+		tagNames := make([]string, 0, len(msg.Tags))
+		for name := range msg.Tags {
+			tagNames = append(tagNames, name)
+		}
+		sort.Strings(tagNames)
+		tags := make([]map[string]string, 0, len(tagNames))
+		for _, name := range tagNames {
+			tags = append(tags, map[string]string{"name": name, "value": msg.Tags[name]})
 		}
 		payload["tags"] = tags
 	}

@@ -29,6 +29,9 @@ type captureOutboundAdapter struct {
 
 func (a *captureOutboundAdapter) Name() string { return "capture" }
 
+func (a *captureOutboundAdapter) SupportsIdempotentReplay() bool        { return true }
+func (a *captureOutboundAdapter) IdempotentReplayWindow() time.Duration { return 24 * time.Hour }
+
 func (a *captureOutboundAdapter) SendMessage(_ context.Context, message OutboundMessage, idempotencyKey string) (string, error) {
 	if a.onSend != nil {
 		a.onSend()

@@ -1,16 +1,17 @@
 ---
 title: MCP 2026 and Autonomous Agent Onboarding
 status: draft
-revision: 5
+revision: 13
 created_at: 2026-08-06 12:49:07 CEST
-enhanced_at: 2026-08-08
+enhanced_at: 2026-08-19
 repository: nerve-cloud
 branch: main
-commit: 99092688c3213af3cf7dc8e72cc28bd89983f6a1
+commit: 016dd09fae2960c3cbdefc3df5d0ee22c8e3fe92
 runtime_baseline: v0.0.17
 runtime_source_revision: a794be9f2697e0864d3a31da8f087577e9748f7e
 core_schema_baseline: 0028
-cloud_schema_baseline: 0008
+core_schema_target: 0029
+cloud_schema_baseline: 0009
 ---
 
 # MCP 2026 and Autonomous Agent Onboarding Implementation Plan
@@ -42,7 +43,7 @@ The one-time registration of the machine identity, the one-time configuration of
 | Initial outbound | Inbound, reading, drafting, and replies are available immediately | A reply must target the latest real inbound sender in that tenant-owned thread |
 | New-message outbound | compose_email unlocks after verified custom domain or confirmed paid subscription | Tool scope is a ceiling; durable send policy is re-evaluated on every enqueue and inbound traffic never changes trust in V1 |
 | Protocol rollout | Hybrid router on one /mcp endpoint | SDK 0.2.0 remains sessionful; MCP 2026 is stateless and uses the official Go SDK |
-| Schema ownership | One new Cloud migration, cloud/0009; Core remains at 0028 | Runtime never reads Cloud onboarding tables and delegates provisioning to control plane |
+| Schema ownership | Cloud 0009 plus OSS-authority additive Core 0029 | Runtime never reads Cloud onboarding tables; Core 0029 owns only the shared outbox policy fence required at provider start |
 | OAuth origin | Dedicated https://auth.nerve.email control-plane origin | Avoid dashboard login middleware and path-rewrite coupling |
 | DNS automation | Agent uses its own DNS connector | Nerve returns records and verifies them; it never accepts DNS credentials |
 | Async readiness | Explicit status and verify tools plus the existing reconciler | Do not require optional MCP Tasks support in the first release |
@@ -61,7 +62,7 @@ The one-time registration of the machine identity, the one-time configuration of
 
 - Cloud main is commit 99092688c3213af3cf7dc8e72cc28bd89983f6a1.
 - deploy/cloud/runtime.lock pins runtime v0.0.17 from nerve-oss revision a794be9f2697e0864d3a31da8f087577e9748f7e.
-- Production schema heads are Core 0028 and Cloud 0008. Both binaries currently use exact compatibility windows rather than expand-compatible windows.
+- Production is Core 0028 and Cloud 0009 behind proven Artifact A, with M2M issuance disabled. Immutable runtime v0.0.17 is compiled for Core `[28,28]` and cannot start on Core 29. Phase 9 must therefore deploy and prove a distinct legacy bridge R0 with Core `[28,29]` before applying 0029; the final runtime/C pair contracts to Core 29/Cloud 9.
 - Runtime is deployed before control plane after explicit migrations in .github/workflows/deploy.yml. This order means a new runtime may consume only control-plane capabilities that were already deployed in an earlier release.
 - The runtime has one active and one stopped Fly Machine. The process-local MCP session map is therefore not safe for more than one active Machine without affinity or shared session state.
 - Exact-mirror CI currently derives source authority from deploy/cloud/runtime.lock, which also pins the deployed artifact. That coupling prevents an OSS-first shared-auth tranche from becoming authoritative before a new runtime image exists; source authority and deployed-artifact authority need separate locks.
@@ -109,7 +110,7 @@ The one-time registration of the machine identity, the one-time configuration of
 - internal/entitlements/service.go:104-109 defaults email sending to enabled. A generic cached `false` feature value therefore fails open for autonomous sends and cannot be used as the security decision.
 - The current MCP rate limiter is process-local. It is not a durable anti-abuse limit across multiple Machines.
 - Resend delivery webhooks already create recipient suppressions for permanent bounces and complaints in internal/cloudapi/resend_webhook.go:613-640. They provide the signals needed to pause an organization's outbound access, but inbound `From` is not authenticated reputation evidence and cannot earn compose trust.
-- Existing core org_feature_flags and live org-domain ownership can express the effective runtime decision without a new Core migration. Cloud 0009 will preserve the source evidence and policy history.
+- Existing Core `org_feature_flags` and live org-domain ownership express the effective enqueue decision, but they cannot durably distinguish a merely claimed row from a provider-started operation after the transaction lock is released. Core 0029 therefore adds the shared monotonic epoch and provider-start/resolution fence; Cloud 0009 continues to preserve source evidence and policy history.
 - The generic usage reconciler overwrites every counter from `usage_events`; any new durable send meter must emit matching deterministic events or it will be reset.
 - `usage_events.replay_id` is globally unique while tool idempotency is tenant/tool scoped, and the current reconciler performs separate SUM and SET operations. An un-namespaced replay ID can collide across tenants, and a concurrent reconcile can overwrite a committed reservation.
 - ClaimOutboxMessages changes rows to `sending` without a live autonomous-policy check, and internal/emailtransport/outbox_worker.go:185-303 reaches the provider without rechecking suspension/close. Deleting an inbox is not a cancellation primitive: the worker can retain the payload and send after the cascading row deletion.
@@ -126,7 +127,7 @@ The one-time registration of the machine identity, the one-time configuration of
 - `.github/workflows/deploy.yml` always migrates before runtime/control-plane deployment, so it cannot perform the required predecessor-before-migration transition.
 - `cmd/nerve-reconcile` begins mutating work without the startup compatibility check used by the web binary.
 - runtime manifests omit outbound-policy provenance; the OSS tag workflow publishes immediately; and the SDK publish workflow can be dispatched without production combination evidence.
-- Runtime deploy verifies a pre-existing Fly mirror but no current workflow creates the candidate mirror before release-set construction. After runtime.lock moves to vNext, v0.0.17 also loses an authorized rollback entry point unless the final release set carries a signed baseline member.
+- Runtime deploy verifies a pre-existing Fly mirror but no current workflow creates the candidate mirror before release-set construction. The signed v0.0.17 baseline is valid historical/provenance evidence only: its compiled Core window rejects Core 29. A distinct attested legacy bridge R0 must be built, proven, and embedded as the authorized below-vNext rollback member before the additive migration.
 - Cloud's repository token cannot create OSS tags/releases or retag OSS GHCR, while the current OSS `v*` workflow rebuilds the image. Publication therefore needs an OSS-side no-rebuild workflow and a least-privilege cross-repository handoff.
 - scripts/deploy/cloud_deploy.sh and parts of the runbook still contain obsolete Core 19 / Cloud 7 defaults.
 - The public dashboard origin rewrites only /v1 paths and its middleware protects other paths with Supabase. OAuth endpoints should therefore use the dedicated auth.nerve.email origin rather than depend on dashboard rewrites.
@@ -187,7 +188,7 @@ The feature is complete only when the production contract workflow proves both j
 - No transfer of a canceled generation's Stripe subscription or entitlement to a reconnect generation.
 - No automatic prorated refund during autonomous close; existing financial obligations remain visible and operator-auditable.
 - No promise of unlimited outbound volume; compose means arbitrary new-message recipients within plan and abuse limits.
-- No new Core migration. If implementation discovers a true need for Core 0029, stop and revise this plan before authoring it.
+- No destructive Core rewrite or new autonomous lifecycle table in Core. The approved additive Core 0029 is limited to the shared outbox policy epoch/provider-start fence and must preserve all legacy SQL/data behavior. Actual post-migration binary compatibility is provided by the separately versioned R0 bridge; immutable v0.0.17 remains Core `[28,28]` and is never relabeled or deployed after Core 29.
 
 ## Implementation Approach
 
@@ -357,17 +358,19 @@ Workers claim with `SELECT ... FOR UPDATE SKIP LOCKED` plus CAS over state and `
 
 The Cloud 0009 down migration refuses when any durable client, key, assertion, nonce, activation approval, onboarding, alias, domain claim, rate, billing-workflow, or evidence row exists.
 
-### Existing Core state used by runtime
+### Existing Core state and Core 0029 used by runtime
 
-Core remains at 0028. Before an org email token can be issued, every autonomous organization must have explicit existing feature rows:
+Core 0029 is an additive OSS-authority migration. Before an org email token can be issued, every autonomous organization must have one `org_outbound_policy_state` row with a positive monotonic epoch and explicit existing feature rows:
 
 - `autonomous_outbound_policy=true`;
 - `email_compose_org_enabled=false` initially;
 - `email_outbound_suspended=false` initially.
 
-The security decision does not use the generic cached feature resolver. For an authenticated `m2m_org`, enqueue reads one transaction-scoped org policy snapshot directly from the database. Missing rows, malformed values, or read errors deny the send. Legacy principals retain existing behavior and are identified by principal kind, never inferred from a missing flag.
+The security decision does not use the generic cached feature resolver. For an authenticated `m2m_org`, enqueue reads one transaction-scoped org policy snapshot and the current epoch directly from the database. Missing rows, malformed values, or read errors deny the send. Legacy principals retain existing behavior and are identified by principal kind, never inferred from a missing flag.
 
-Enqueue, outbox claim/provider-start, complaint/bounce suspension, operator suspension clear, and onboarding close use one per-org policy advisory lock and monotonic policy epoch. Enqueue and claim recheck the live epoch; suspension/close increments it and terminalizes all `queued` autonomous rows as `policy_revoked`. Immediately before a provider call, the worker takes the same lock, proves the saved epoch is current, and atomically records `provider_started_at` plus a stable provider operation ID. That commit is the send linearization point. A later suspension may not pretend the already-started operation was canceled: it fences all further starts and remains pending/deprovisioning until the in-flight call is terminal or provider readback resolves an unknown outcome.
+Core 0029 creates `org_outbound_policy_state(org_id, policy_epoch, updated_at)` and adds nullable `autonomous_policy_epoch`, `provider_started_at`, `provider_operation_id`, and `provider_resolved_at` columns to `outbox_messages`. Legacy rows keep all four columns null. Autonomous enqueue copies the locked current epoch. A provider operation ID is stable for the outbox row and provider idempotency key; retry never invents another logical operation. `provider_started_at IS NOT NULL AND provider_resolved_at IS NULL` is durable unresolved-provider evidence even after a worker crash.
+
+Enqueue, outbox claim/provider-start, complaint/bounce suspension, operator suspension clear, and onboarding close use one per-org policy advisory lock and monotonic policy epoch. Enqueue and claim recheck the live epoch; suspension/close increments it and terminalizes all `queued` autonomous rows through the existing `failed` terminal status with bounded reason `policy_revoked`—the status constraint is not expanded. Immediately before a provider call, the worker takes the same lock, proves the saved epoch and live flags still allow the operation, and atomically records `provider_started_at` plus the stable provider operation ID. That commit is the send linearization point. A later suspension may not pretend the already-started operation was canceled: it fences all further starts and remains pending/deprovisioning until `provider_resolved_at` is set by a terminal response or provider idempotency replay/readback resolves an unknown outcome.
 
 Close never calls cascading inbox deletion. It retires aliases, disables the generation-owned inbox, completes the outbox barrier, and then uses a Cloud-only autonomous tombstone operation that proves every remaining inbox is generation-owned and disabled, no `queued|sending` row exists, and every provider-started operation is terminal/read back. Existing legacy `TombstoneOrg` semantics remain unchanged; retained child rows preserve audit and FK integrity.
 
@@ -600,8 +603,12 @@ Make every later migration, protocol, rollback, and production assertion executa
 - new `schemas/mcp2026-legacy-runtime-baseline.schema.json`
 - new `scripts/release/generate_legacy_runtime_baseline.py`
 - new `scripts/ci/verify_legacy_runtime_baseline.py`
+- new OSS `schemas/mcp2026-legacy-bridge-receipt.schema.json`
+- new OSS `scripts/release/build_mcp2026_legacy_bridge.sh`
+- new OSS `scripts/ci/verify_mcp2026_legacy_bridge.py`
+- new OSS `.github/workflows/mcp2026-legacy-bridge.yml`
 - new `.github/workflows/mcp2026-capture-runtime-baseline.yml`
-- new `.github/workflows/mcp2026-rollback-runtime-baseline.yml`
+- new `.github/workflows/mcp2026-rollback-runtime-bridge.yml`
 - new `.github/workflows/mcp2026-phase0-rehearsal.yml`
 - new `deploy/cloud/oss-source.lock`
 - new `deploy/cloud/runtime-candidate.lock`
@@ -617,16 +624,18 @@ Make every later migration, protocol, rollback, and production assertion executa
 
 - Define an attested `mcp2026-transition-bundle.json` available in Phase 1 before B/C/runtime/SDK exist. It pins only Cloud SHA, Artifact A image/manifest and all six shipped database-mutating binary hashes/windows, Cloud/Core migration hashes/heads, issuance-off state, source CI/workflow identity, and the production target. The Phase 1 transition accepts only its artifact run ID plus SHA.
 - Define and verify an attested transition-receipt schema. The receipt binds the transition-bundle digest, exact A manifest/image/binary identities, pre/post schema evidence, every active/stopped/scheduled Machine identity and resolved digest, issuance-off proof, target, workflow identity, and timestamps.
-- Define one attested `mcp2026-release-set.json` pinning Cloud and OSS SHAs; a preselected final unused runtime semver; runtime candidate index and linux/amd64 digests; runtime-manifest SHA and MCP/Core windows; a verified pre-release Fly-mirror receipt and resolved Machine digest; a signed v0.0.17 legacy-runtime-baseline member; control-plane A/B/C digests and manifest SHAs; every shipped binary hash/window; Cloud migration head/hash; SDK 0.3 filename/SHA; immutable SDK 0.2 SHA; outbound-policy version/SHA; conformance commit; and producing workflow identities.
+- Define one attested `mcp2026-release-set.json` pinning Cloud and OSS SHAs; a preselected final unused runtime semver; runtime candidate index and linux/amd64 digests; runtime-manifest SHA and MCP/Core windows; a verified pre-release Fly-mirror receipt and resolved Machine digest; the signed historical v0.0.17 baseline receipt; a distinct signed R0 legacy-bridge receipt and its index/platform/Fly digests; control-plane A/B/C digests and manifest SHAs; every shipped binary hash/window; Cloud and Core migration heads/hashes; SDK 0.3 filename/SHA; immutable SDK 0.2 SHA; outbound-policy version/SHA; conformance commit; and producing workflow identities.
 - The final release set embeds the verified transition-bundle digest and Phase 1 transition-receipt digest so A identity/provenance cannot be substituted later.
 - Verify GitHub OIDC/Sigstore attestations, repository/ref/workflow identity, and subject digest. Only Phase 1 transition consumes transition-bundle inputs. Phase 9 candidate deployment and every Phase 10 artifact-selection path accept only `release_set_run_id` plus `release_set_sha`—never component overrides—and derive build/deploy components from that set. Phase 10 may additionally accept independently attested lifecycle, soak, promotion, or one-use approval evidence created after deployment only when each artifact names the same release-set SHA and its expected protected producer/workflow identity.
 - Add the policy YAML to OSS exact mirror, runtime manifest, and OCI labels. Control-plane manifest pins the same hash; mismatch is fatal.
-- Support a separate pre-tag `runtime-candidate.lock` at a digest-addressed OCI/artifact locator. Before its Phase 8 build, select and prove one final runtime semver unused across git tags, GitHub Releases, and public OCI tags; freeze that value into the candidate manifest/OCI labels and later release set without creating the tag. Production `runtime.lock` keeps its strict released-artifact contract and continues to describe v0.0.17 until promotion.
+- Support a separate pre-tag `runtime-candidate.lock` at a digest-addressed OCI/artifact locator. Before its Phase 8 build, select and prove one final runtime semver unused across git tags, GitHub Releases, and public OCI tags; freeze that value into the candidate manifest/OCI labels and later release set without creating the tag. Production `runtime.lock` keeps its strict released-artifact contract and describes v0.0.17 only until the protected R0 bridge deployment. R0 uses its own release-set/receipt identity and never reuses or rewrites the public v0.0.17 lock, tag, version, or digest.
 - Remove `runtime.lock` from any automatic rollout path filter. Runtime deployment is called explicitly with verified release-set evidence; changing candidate/public lock metadata alone cannot restart Machines.
 - OSS candidate build pushes immutable bytes/digests without a semver tag or GitHub Release. Post-soak promotion retags that already-tested digest and publishes the exact manifest without rebuild.
 - Remove direct SDK publish dispatch. SDK 0.3 publication is callable only by post-soak promotion with matching release-set evidence.
 - Capture the current v0.0.17 production state before runtime.lock changes: exact source revision, GitHub Release manifest/assets, GHCR index/platform digests, current Fly content-addressed tag/Machine digest, contract/core hashes, and verification workflow identity. The signed baseline receipt is immutable and later embedded in the final release set.
-- The dedicated below-vNext rollback workflow accepts only the final release set, an issuance-off receipt, and a complete lifecycle-drain receipt. It derives v0.0.17 solely from the embedded baseline member, keeps control plane B, deploys the exact baseline Fly tag, and verifies every Machine; it accepts no raw image/tag/version input and never depends on the later runtime.lock contents.
+- Build a distinct non-semver R0 legacy bridge from the pinned v0.0.17 source plus one machine-verified allowlisted patch that widens only the compiled Core window from `[28,28]` to `[28,29]` and adds the required build/attestation wiring. A protected OSS workflow must reject every other source, dependency, API, protocol, SQL, policy, or manifest-behavior delta; build reproducibly; and emit a signed receipt binding source, patch digest, exact diff allowlist, index/platform/Fly digests, Core window, and producer identity.
+- Run the actual R0 binary with production `NM_MIGRATE_ON_START=verify`: first against Core 28, where its legacy HTTP/MCP/SDK 0.2 and SQL behavior must match the immutable v0.0.17 artifact, then against additive Core 29, where startup, enqueue, claim, delivery, and inspection must pass. A hand-written legacy-SQL fixture proves only schema/statement compatibility and can never substitute for these artifact-level executions.
+- The dedicated below-vNext rollback workflow accepts only the final release set, an issuance-off receipt, and a complete lifecycle-drain receipt. It derives R0 solely from the embedded bridge member, keeps control plane B, deploys the exact content-addressed R0 Fly image, and verifies every Machine; it accepts no raw image/tag/version input and never depends on later `runtime.lock` contents. Immutable v0.0.17 is not an authorized target after Core 0029.
 - Add a protected Phase 0 operator rehearsal under the shared `deploy-<environment>` lock. It accepts only a successful main Artifact A run and exact manifest SHA, verifies its Sigstore identity and manifests, mirrors those exact bytes to Fly Registry, creates a stopped ephemeral Machine, proves its resolved digest before start, executes every manifest-listed `compatibility --json` entry point, validates the non-deploying candidate-locator fixture independently from `runtime.lock`, emits signed evidence, and destroys the exact Machine on every exit. It never deploys a durable service or applies a migration.
 
 #### 0.5 Pin protocol conformance tooling
@@ -666,6 +675,7 @@ Make every later migration, protocol, rollback, and production assertion executa
 - Make `runtime.lock` authoritative only for the deployed runtime artifact and create `oss-source.lock` for the exact OSS source revision/manifest used by shared-code CI. Baseline values are equal; they may diverge only while a verified candidate is under construction and must converge again at promotion.
 - In nerve-oss first, add the typed `m2m_onboarding|m2m_org` verifier/JWKS/context foundation, include `internal/auth/**` in the shared exact-mirror manifest, and merge a green OSS authority commit before Artifact A is built.
 - Import those exact bytes into Cloud, advance only `oss-source.lock`, and make exact-mirror CI read that lock. Cloud-only assertion issuance, client registry, billing profile, and OAuth control remain in `internal/oauth/**`; no Cloud-first copy of a shared auth file is permitted.
+- Every automated OSS-to-Cloud sync PR must atomically advance `deploy/cloud/oss-source.lock` to the triggering OSS commit and the SHA-256 of that commit's `sync-manifest.yaml`. Creating exact mirrors while leaving the prior source lock is a failed sync, not a review-only discrepancy.
 - Prove runtime-lock verification still validates the deployed v0.0.17 image/source labels independently. Candidate source movement cannot silently retarget a production deploy.
 
 ### Success Criteria
@@ -686,6 +696,7 @@ Make every later migration, protocol, rollback, and production assertion executa
 - [x] The OSS-first shared-auth commit and manifest entry exist before Artifact A's source SHA; Cloud copies are byte-identical.
 - [x] The client-credentials-only metadata fixture passes every pinned ext-auth client while empty/fabricated `response_types_supported` fixtures fail.
 - [x] The signed v0.0.17 baseline receipt resolves the current Release/GHCR/Fly bytes and rejects every digest/source/manifest substitution.
+- [ ] The protected R0 workflow proves an exact allowlisted v0.0.17-source delta, reproducible distinct bytes, legacy equivalence on Core 28, and actual production-startup compatibility on Core 29; its receipt rejects any substituted patch, source, digest, window, or workflow identity.
 
 #### Operator verification
 
@@ -1418,27 +1429,24 @@ Separate reply from compose, make autonomous policy fail closed, remove inbound-
 
 #### 7.2 Evaluate reply and compose against a transaction-scoped policy snapshot
 
-**Delivery-side items are a separate change from the adapter work.** The enqueue
-half of this section — the transaction-scoped policy snapshot, the per-org
-lock shared with policy writers, and server-side evaluation of the final content
-— lands with the MCP 2026 adapter branch. The delivery half does not: the claim
-recheck and the provider-start fence need a durable policy epoch on the outbox
-row, so they carry a migration and touch `internal/emailtransport/outbox_worker.go`,
-which the adapter branch does not otherwise open. Reviewing the adapter branch
-against the whole of 7.2 will therefore keep reporting the delivery fence as
-missing; it is tracked as its own change rather than deferred silently.
-
+**Delivery-side items are a separate OSS-first change from the adapter work.** The MCP 2026 adapter already carries the enqueue-time policy snapshot, shared policy-writer lock, latest-inbound reply selection, and server-side final-content evaluation. The remaining claim/provider-start/drain half lands with Core 0029 because it must survive worker crashes and lock release. It is not complete until the migration, runtime worker, suspension/close writers, reconciler, and PostgreSQL race fixtures land together and sync to Cloud.
 
 **OSS-first/shared files**
 
+- new `internal/store/migrations/core/0029_outbox_policy_fence.sql`
 - `internal/tools/service.go`
 - new `internal/tools/outbound_policy.go`
 - `internal/store/store_threads.go`
 - `internal/store/outbox.go`
+- `internal/store/outbox_test.go`
+- new `internal/store/outbox_policy_fence_test.go`
 - `internal/store/feature_flags.go`
 - `internal/emailtransport/outbox_worker.go`
+- `internal/emailtransport/outbox_worker_test.go`
 - `internal/entitlements/service.go`
 - `configs/policy/autonomous-outbound-v1.yaml`
+- `sync-manifest.yaml`
+- `scripts/release/generate_runtime_manifest.sh`
 
 **Changes**
 
@@ -1453,39 +1461,21 @@ missing; it is tracked as its own change rather than deferred silently.
 - Use the common per-org policy lock/epoch for enqueue, claim, provider-start, complaint/suspension, clear, and close. Claim cannot select a suspended/deprovisioning autonomous org; the pre-provider transaction rechecks epoch/policy and records the durable provider-start fence.
 - Suspension/close terminalizes queued autonomous rows and prevents any later provider start. An already-started call is drained/read back and keeps suspension cleanup or onboarding close nonterminal until its outcome is known; no DB lock is held across the network call.
 
-#### 7.2a Threat model for outbound content policy
+#### 7.2a Core 0029 migration and provider-start state machine
 
-Content policy needs a stated adversary, because without one "evade the policy"
-has no boundary: every normalization invites the next encoding, and a reviewer
-is right every time.
+- Author Core 0029 in nerve-oss first and mirror it byte-for-byte to Cloud. Create the RLS-protected `org_outbound_policy_state` table keyed by org, with a positive monotonic `policy_epoch`, and add the four nullable fence columns specified in the implementation approach to `outbox_messages`.
+- Keep legacy rows untouched and all new outbox columns null. The migration is additive at the SQL/data boundary: frozen legacy statement fixtures must continue to enqueue, claim, deliver, and inspect legacy rows. Do not claim immutable v0.0.17 binary compatibility on Core 0029; its startup window remains `[28,28]`, and the Phase 9 R0 bridge supplies the actual post-migration legacy runtime.
+- The down migration succeeds only while the epoch table is empty and every new outbox column is null; otherwise it refuses rather than discarding provider-start/drain evidence.
+- Seed the epoch row in the same transaction as the autonomous organization graph. Every suspension, clear, or close writer takes the org-policy lock, increments the epoch exactly once for a real policy transition, updates its evidence/flags, and terminalizes stale queued rows atomically.
+- Autonomous enqueue copies the current locked epoch. Claim admits legacy rows unchanged, but admits an autonomous row only when its saved epoch equals the live epoch and the complete fail-closed policy snapshot still permits sending.
+- Immediately before the network call, CAS the claimed row under the org-policy lock using outbox ID, worker ownership, status, saved epoch, and unresolved state. Record one stable provider operation ID and `provider_started_at`; only the transaction that commits this CAS may call the provider.
+- If policy changed before that CAS, terminalize the row as `failed/policy_revoked` without a provider call. If policy changes after it, suspension/close observes unresolved provider-start evidence and waits for terminal response or idempotent replay/readback.
+- Apply provider success, permanent failure, retryable known failure, timeout, and crash recovery without clearing start evidence. Set `provider_resolved_at` only when the logical provider outcome is known; an unknown outcome remains unresolved and may be retried only with the same provider idempotency/operation identity.
+- Keep database locks out of the network call. The reconciler claims unresolved starts with `SKIP LOCKED`, resolves them through provider idempotency replay/readback, and uses CAS so a stale worker cannot overwrite a later resolution.
 
-**Who sends.** The caller is the tenant's own pre-registered `m2m_org` agent,
-authenticated with the tenant's own credential and sending from the tenant's own
-inbox.
+#### 7.2b Threat model for outbound content policy
 
-**What the policy is for.** It is a guardrail between a tenant and their own
-agent. It catches content the tenant's configured policy forbids when their
-model produces it — including the encodings a model emits without intent, such
-as HTML entities and inline tags inside a word. Those are ordinary model output,
-so the evaluation renders markup to its visible text before matching.
-
-**What it is not for.** It is not a barrier against a tenant who deliberately
-smuggles content past their own guardrail. That tenant holds the credential and
-owns the mailbox; they can send the same text directly, without encoding
-anything. Hardening the matcher against homoglyphs, zero-width joiners,
-CSS-hidden text or nested encodings defends nobody from anybody: the only party
-it constrains already controls the channel.
-
-**What this does not relax.** The distinction is who is being protected. Content
-policy protects a tenant from their own agent, so its scope is bounded by that
-purpose. Memory and size limits, tenant isolation, authorization, scope checks
-and the enqueue fence protect *other* tenants and the platform from this one —
-those assume a hostile caller and are not narrowed by this section.
-
-**Consequence for review.** An evasion that requires the token holder to encode
-content deliberately is out of scope for this policy and is not a blocker. A
-case where an ordinary model output slips through — a new entity form, a markup
-shape the renderer mishandles — is in scope and is a defect.
+The caller is the tenant's own authenticated `m2m_org` agent sending from that tenant's inbox. Content policy is a guardrail between the tenant and its own model, so ordinary model encodings such as entities and inline markup are rendered to visible text before matching. Deliberate token-holder evasions such as homoglyphs, zero-width joins, CSS-hidden text, or nested encodings are outside this guardrail: that same tenant already controls the channel. This boundary does not relax memory limits, tenant isolation, authorization, scope checks, or the enqueue/provider-start fence, which continue to treat the caller as hostile because they protect other tenants and the platform.
 
 #### 7.3 Project only paid and abuse evidence
 
@@ -1523,17 +1513,22 @@ shape the renderer mishandles — is in scope and is a defect.
 
 **Cloud files**
 
+- `internal/store/store_usage.go`
 - `internal/reconcile/service.go`
+- `internal/reconcile/service_test.go`
 
 **Changes**
 
-- Use PostgreSQL UTC buckets and the common `(org_id,meter,period_start,period_end)` counter-row lock across Machines. Reservation and reconciliation take the same lock.
+- Use PostgreSQL UTC buckets and the common `(org_id,meter,period_start,period_end)` counter-row lock across Machines. Reservation and reconciliation take the same lock and derive the effective `period_end` from the row held under that lock.
+- `internal/store/store_usage.go` remains Cloud-only under `sync-manifest.yaml`, so Cloud provides `RecordUsageEventAt` as the compatibility boundary required by the OSS-first shared `outbound_limits.go` implementation.
+- Keep ordinary `RecordUsageEvent` on PostgreSQL's authoritative `DEFAULT now()` path by omitting `created_at`; use `RecordUsageEventAt` only when an explicit authoritative timestamp is part of the operation, including reservation, backfill, and deterministic tests.
 - For every reply, total-send, first-recipient, or recipient-hash reservation, insert a matching successful `usage_events` row in the same transaction as idempotency and outbox enqueue.
 - Derive the global replay ID as SHA-256 over the versioned length-prefixed `(org_id,tool_name,idempotency_key,meter,dimension)` tuple so retry cannot increment twice, and cross-org/cross-tool keys cannot collide.
 - Reconciler locks the counter before SUM and SET and performs both in one transaction. A concurrent reservation is therefore wholly before the SUM or waits and increments after SET.
 - Count an attempt when accepted for enqueue regardless of later provider outcome; do not refund abuse units.
 - Keep the existing process-local MCP RPM limiter only as a cheap front-line shedder until a durable MCP RPM replacement is proven.
 - Garbage-collect expired rate buckets without removing audit or delivery history.
+- **Resolved follow-up (2026-08-19):** Cloud PR #105 now re-reads the complete counter period under `FOR UPDATE` and its real PostgreSQL fixtures prove reservation-first and reconcile-first orderings. OSS PR #47 plus Cloud sync PR #107 prove org/tool/meter replay namespaces against the database and advance the source lock atomically. The earlier accepted period-boundary risk is closed.
 
 ### Success Criteria
 
@@ -1550,10 +1545,15 @@ shape the renderer mishandles — is in scope and is a defect.
 - [ ] Spoofed From, self-mail, arbitrary Authentication-Results headers, and inbound volume never unlock compose.
 - [ ] Suspension overrides every scope/evidence path immediately, including a previously issued compose token.
 - [ ] Enqueue/claim/provider-start versus complaint/close barriers in both orders prove no provider start after the new epoch and correct drain/readback of the earlier linearization point.
+- [ ] Core 0028→0029 migration preserves every legacy outbox row, leaves its fence columns null, and frozen legacy SQL-shape enqueue/claim/delivery fixtures remain green; artifact-level Core 29 compatibility is separately proven by R0 before production migration.
+- [ ] Core 0029 down succeeds only with no epoch rows or outbox fence evidence and refuses independently for a saved autonomous epoch, provider start, provider operation identity, or provider resolution timestamp.
+- [ ] Claim-versus-suspension and provider-start-versus-suspension/close two-connection fixtures cover both commit orders; a pre-fence row never calls the provider, while a post-fence row keeps cleanup nonterminal until resolved.
+- [ ] Crash after claim, after provider-start commit, after provider response, and before terminal persistence converges through the same provider operation identity without duplicate logical delivery or false `closed`.
 - [ ] One complaint suspends; bounce threshold obeys sample size and rate.
 - [ ] Multi-Machine concurrent sends cannot exceed durable limits.
 - [ ] Every counter increment has a matching event and a generic reconcile preserves the value.
-- [ ] Cross-org same-key, cross-tool same-key, and two-connection reserve-versus-reconcile fixtures prove no replay collision or lost update.
+- [x] Cross-org same-key, cross-tool same-key, and two-connection reserve-versus-reconcile fixtures prove no replay collision or lost update.
+- [x] Concurrent period-boundary update versus reconcile cannot exclude newly in-period events; a two-connection fixture proves both lock orderings.
 - [ ] Idempotent replay consumes one applicable unit/event and creates one outbox row.
 - [ ] Closing a paid generation removes compose immediately and never transfers it to reconnect.
 - [ ] Caller manipulation of needs_human_approval cannot bypass policy.
@@ -1601,7 +1601,7 @@ Build the immutable runtime and modern client candidates exactly once while pres
 - Keep onboarding and org tokens in separate cache entries keyed by resource, client, selected generation, and canonical scope set; refreshing one must not replace the other.
 - After a closed generation, a fresh onboarding exchange selects N+1; never reuse the token bound to N.
 - Never log a private key, assertion, bearer token, or full JWK.
-- Support a deliberate legacy mode/fallback for ordinary email tools against v0.0.17.
+- Support a deliberate legacy mode/fallback for ordinary email tools against immutable v0.0.17 on Core 28 and the behavior-equivalent R0 bridge on Core 28/29.
 - Do not pretend onboarding works after fallback to a runtime older than vNext.
 - Continue accepting static Cloud API keys and bearer tokens for existing clients.
 
@@ -1623,7 +1623,7 @@ Build the immutable runtime and modern client candidates exactly once while pres
 - Run that exact wheel against the vNext hybrid runtime.
 - Build SDK 0.3.0 once in successful main CI, retain it as an immutable candidate, record its SHA, and install only those bytes in every contract job.
 - Remove direct publish dispatch; publication is callable only by the Phase 10 post-soak workflow with signed matching evidence.
-- Test 0.3.0 against both vNext modern mode and v0.0.17 legacy mode.
+- Test 0.3.0 against vNext modern mode, immutable v0.0.17 legacy mode on Core 28, and R0 legacy mode on Core 28/29.
 
 #### 8.3 Synchronize contract and candidate authority atomically
 
@@ -1642,8 +1642,8 @@ Build the immutable runtime and modern client candidates exactly once while pres
 
 - Before building, select the approved final runtime semver, prove it is unused across git tags, GitHub Releases, and public OCI tags, and freeze it as `runtime_version` in the candidate manifest and OCI labels without creating a public tag. Prove the SDK 0.3.0 filename is not already published with different bytes.
 - Build the OSS candidate exactly once from an exact successful main SHA without a semver tag, GitHub Release, or public release asset; retain the attested manifest/index/platform digests as the sole Phase 9 inputs.
-- In one Cloud PR, apply exact mirrors, advance `oss-source.lock`, and write `runtime-candidate.lock` with the attested candidate locator/digests, source revision, MCP contract hash, policy hash, and runtime-manifest SHA. Keep deployed-artifact `runtime.lock` on v0.0.17 until post-soak promotion; changing either source/candidate lock is non-deploying.
-- Keep CORE_SCHEMA_HASH and [28,28] unchanged.
+- In one Cloud PR, apply exact mirrors, advance `oss-source.lock`, and write `runtime-candidate.lock` with the attested candidate locator/digests, source revision, MCP contract hash, policy hash, and runtime-manifest SHA. Keep deployed-artifact `runtime.lock` on v0.0.17 through candidate construction. The later protected R0 deployment is authorized only by its signed bridge receipt/release-set member and does not mutate `runtime.lock`; changing source/candidate/bridge metadata alone is non-deploying.
+- Advance `CORE_SCHEMA_HASH` to the OSS-authority Core 0029 tree and pin the runtime candidate to `[29,29]`. Before the migration gate, build and attest R0 with `[28,29]`, prove exact legacy equivalence on Core 28, then deploy it on production Core 28. Immutable v0.0.17 is never claimed compatible with Core 29.
 - Update contract export to cover onboarding, compose-locked/unlocked, attachment-off/on, legacy/modern, and structured error shapes.
 - Do not mutate a public version tag or PyPI in this phase; Phase 9 binds candidates and Phase 10 publishes tested bytes.
 
@@ -1682,7 +1682,7 @@ Build the immutable runtime and modern client candidates exactly once while pres
 - [ ] Missing content type, wrong/duplicate ID, malformed/truncated SSE, cancellation, and EOF without final response fail safely.
 - [ ] Separate token-cache tests cover active, deprovisioning, expiry, close, and N-to-N+1 selection.
 - [ ] 0.3.0 modern tests cover all tool success/error schemas and result unwrapping.
-- [ ] 0.3.0 legacy mode passes against v0.0.17 for existing email tools.
+- [ ] 0.3.0 legacy mode passes against immutable v0.0.17 on Core 28 and R0 on Core 28/29 for existing email tools.
 - [ ] Exact published 0.2.0 wheel passes against vNext.
 - [ ] Candidate/source locks, frozen final semver, policy, manifest, and exact-mirror checks are green in the same Cloud PR while production runtime.lock still validates v0.0.17; rebuilding or changing manifest bytes is not a later release step.
 - [ ] The SDK publish workflow cannot be manually dispatched.
@@ -1695,21 +1695,23 @@ Build the immutable runtime and modern client candidates exactly once while pres
 
 ---
 
-## Phase 9: Candidate Release Set and Cloud `[9,9]` Contraction
+## Phase 9: Candidate Release Set and Core/Cloud Contraction
 
 ### Overview
 
-Replace temporary Artifact A with feature-complete Artifact B, record B as the permanent rollback floor, and then deploy contracted Artifact C. Runtime and SDK remain unpublished candidates addressed only by immutable digest/SHA.
+Replace temporary Artifact A with feature-complete Artifact B, record B as the permanent control-plane rollback floor, replace v0.0.17 with the behavior-equivalent R0 bridge while Core is still 28, apply additive Core 0029, and then deploy the `[29,29]` runtime plus contracted Artifact C. R0, runtime, and SDK remain unpublished candidates addressed only by immutable digest/SHA.
 
 ### Artifact identities
 
 | Artifact | Purpose | Core window | Cloud window |
 |---|---|---:|---:|
-| A | Initial migration-boundary predecessor from Phase 1 | `[28,28]` | `[8,9]` |
-| B | Final feature-complete rollback predecessor | `[28,28]` | `[8,9]` |
-| C | Normal contracted production control plane | `[28,28]` | `[9,9]` |
+| v0.0.17 | Immutable historical production baseline; pre-Core29 only | `[28,28]` | n/a |
+| R0 | Non-semver legacy bridge and authorized post-Core29 runtime rollback floor | `[28,29]` | n/a |
+| A | Historical Cloud migration-boundary predecessor from Phase 1 | `[28,28]` | `[8,9]` |
+| B | Final feature-complete Core/Cloud expand predecessor and rollback floor | `[28,29]` | `[8,9]` |
+| C | Normal contracted production control plane | `[29,29]` | `[9,9]` |
 
-A and B are different immutable images. After B is proven, A is historical transition evidence and is no longer an operational rollback target.
+A and B are different immutable images. After B is proven, A is historical transition evidence and is no longer an operational rollback target. R0 is also a distinct immutable image: it retains v0.0.17 behavior while widening only the compiled Core window to `[28,29]`. The runtime candidate requires Core `[29,29]`; R0—not v0.0.17—is the independently attested below-vNext runtime fallback after Core 0029.
 
 ### Changes Required
 
@@ -1729,6 +1731,7 @@ A and B are different immutable images. After B is proven, A is historical trans
 - new `scripts/release/build_mcp2026_release_set.sh`
 - new `scripts/ci/verify_mcp2026_release_set.sh`
 - OSS candidate workflow from Phase 8
+- OSS R0 bridge workflow and receipt from Phase 0
 - `.github/workflows/publish-python-sdk.yml`
 
 **Changes**
@@ -1737,44 +1740,48 @@ A and B are different immutable images. After B is proven, A is historical trans
 - Build C from an explicit contraction change. Restrict the B-to-C source diff to compiled Cloud minimum, compatibility tests, manifests, and release wiring; fail CI if business behavior changes.
 - Resolve the exact already-built Phase 8 runtime candidate and SDK 0.3 wheel by attested workflow-run identity and SHA; verify source, manifest, frozen semver, filename, and digests. Phase 9 never rebuilds either artifact.
 - Before release-set construction, run the protected mirror workflow with only the verified OSS candidate run ID and receipt SHA. Authenticate to Fly Registry, copy the exact candidate digest to a content-addressed non-semver `registry.fly.io/nerve-runtime:sha-...` tag without deployment or rebuild, and resolve both target index and linux/amd64 Machine digest. An already exact tag is an idempotent retry; any mismatch fails closed. Emit the signed runtime-mirror receipt defined in Phase 0.
-- Resolve and reverify the Phase 0 v0.0.17 legacy-runtime-baseline receipt. Release-set construction accepts only its protected run ID/SHA and the new mirror receipt run ID/SHA; it accepts no raw Fly tag, baseline tag, or digest.
+- Resolve and reverify both the Phase 0 historical v0.0.17 baseline receipt and the protected R0 bridge receipt. Release-set construction accepts only their protected run IDs/SHAs and the new candidate mirror receipt run ID/SHA; it accepts no raw Fly tag, baseline tag, bridge tag, patch, or digest.
 - Re-prove the frozen runtime semver and SDK filename remain unpublished before constructing the release set; a collision stops the release and requires a new plan revision/candidate build rather than manifest rewriting.
-- Generate/attest the canonical release set defined in Phase 0, binding A/B/C, runtime candidate and verified Fly mirror receipt, the v0.0.17 baseline member, SDK, schemas, contract, policy, exact mirrors, conformance pins, source SHAs, and workflow identities.
+- Generate/attest the canonical release set defined in Phase 0, binding A/B/C, runtime candidate and verified Fly mirror receipt, the historical v0.0.17 baseline member, the authorized R0 bridge member, SDK, schemas, contract, policy, exact mirrors, conformance pins, source SHAs, and workflow identities.
 - Inject the verified release-set SHA and bounded signed canonical set/verification envelope at deployment time. B/C require it from their immutable artifact-role manifest even when every environment marker is absent. Each binary verifies the envelope offline and reports its build-manifest identity plus that runtime-bound release-set identity only after proving exact role/image/manifest/binary membership; no binary or manifest is rebuilt to embed the release-set hash.
 - Candidate deployment accepts only release-set run ID/SHA. Remove or disable raw image, tag, wheel, manifest, and digest inputs in `deploy.yml`, `runtime-deploy.yml`, and `control-plane-deploy.yml`; every candidate entry point must derive exact components from the verified set, and reusable child workflows reject calls without the parent verification receipt.
 
 #### 9.2 Rehearse the final lifecycle and rollback graph
 
-- Restore a fresh production snapshot at Core 28/Cloud 9 including every onboarding lifecycle state, expired/active leases, domain claims, aliases, billing workflows, provider retries, tokens, and usage meters.
+- Restore a fresh production snapshot at Core 28/Cloud 9 including every onboarding lifecycle state, expired/active leases, domain claims, aliases, billing workflows, provider retries, tokens, usage meters, and legacy outbox states; rehearse v0.0.17→R0→B→Core 29→runtime candidate→C and the reverse C→B plus runtime-candidate→R0 paths on Core 29.
 - Before building/deploying the candidate, run a claim-drift preflight proving every live Core domain has exactly one canonical ownership claim and no claim points at a missing/wrong live domain.
-- Run all six B manifest-listed database-mutating binaries on schema 9 and schema 8. On 9 prove full behavior; on 8 prove legacy behavior, issuance-off refusal, and absence of every 0009 query/mutation before each binary's first side effect.
-- Run C on schema 9 and prove all six manifest-listed database-mutating binaries reject schema 8 before listener, lease, provider call, or mutation.
-- Rehearse controlled C→B→C rollback on schema 9 with no data rewrite or migration.
+- Run all six B manifest-listed database-mutating binaries across Core 28/29 and Cloud 8/9. Full autonomous behavior requires Core 29 plus Cloud 9; every predecessor combination proves legacy behavior, issuance-off refusal, and absence of unsupported-schema query/mutation before each binary's first side effect.
+- Run C on Core 29/Cloud 9 and prove all six manifest-listed database-mutating binaries reject Core 28 or Cloud 8 before listener, lease, provider call, or mutation.
+- Rehearse controlled C→B→C rollback on Core 29/Cloud 9 with no data rewrite or migration.
+- Rehearse controlled runtime-candidate→R0→runtime-candidate rollback on Core 29 with no schema change, using only release-set identities and proving every Machine digest.
 - Run immutable SDK 0.2 and exact candidate SDK 0.3 contracts against the release-set runtime.
 
 #### 9.3 Install B as rollback floor and contract to C
 
-1. Under the shared deploy lock, verify Core current/head 28 and Cloud current/head 9 with zero pending plus a valid Phase 1 transition receipt.
-2. Deploy the release-set runtime candidate only from its verified content-addressed Fly mirror; prove every active/stopped runtime Machine and resolved linux/amd64 digest.
-3. Deploy B web and reconciler; run all six manifest-listed compatibility commands and full legacy/modern contract smoke.
-4. Prove every active/stopped/scheduled control-plane Machine is B and record B in signed deployment evidence as the permanent rollback floor.
-5. Re-prove schema 9 and deploy C web; admit traffic only after the shared `[9,9]` readiness check.
-6. Converge reconciler to C only after web is green; run reconciler and migrate compatibility before mutation/schedule activation.
-7. Prove every web/reconciler Machine and binary digest/window is C and run both SDK contracts again.
+1. Under the shared deploy lock, verify Core current 28/head 29/pending `[0029]` and Cloud current/head 9 with zero Cloud pending migrations plus the valid Phase 1 transition receipt.
+2. Deploy the release-set R0 bridge on Core 28 from its content-addressed image. Prove every active/stopped runtime Machine is R0, its digest and `[28,29]` window match the signed receipt, production startup verification is enabled, and v0.0.17-equivalent legacy/SDK 0.2 contracts remain green.
+3. Deploy B web and reconciler while R0 serves Core 28; run all six manifest-listed compatibility commands and the legacy contract on Core 28/Cloud 9.
+4. Prove every active/stopped/scheduled control-plane Machine is B and record B in signed deployment evidence as the permanent control-plane rollback floor; record R0 as the runtime rollback floor.
+5. Apply Core 0029 with B's migrate binary. Before continuing, prove current/head 29, zero pending, preserved legacy rows/SQL behavior, exact Core schema hash, R0 startup/readiness, and legacy/SDK 0.2 contracts on the actual production R0 Machines.
+6. Deploy the release-set runtime candidate only from its verified content-addressed Fly mirror; prove every active/stopped runtime Machine, resolved linux/amd64 digest, `[29,29]` compatibility, and both legacy/modern contract smoke.
+7. Deploy C web; admit traffic only after the shared Core `[29,29]`/Cloud `[9,9]` readiness check.
+8. Converge reconciler to C only after web is green; run reconciler and migrate compatibility before mutation/schedule activation.
+9. Prove every web/reconciler Machine and binary digest/window is C and run both SDK contracts again.
 
-If C fails, roll web and reconciler back to B. Do not change schema and never roll back to A or `[8,8]`.
+If C fails, roll web and reconciler back to B on Core 29/Cloud 9. Do not change schema and never roll back to A, Core 28, or Cloud `[8,8]` after fence evidence exists.
 
 ### Success Criteria
 
-- [ ] B is feature-complete, runs legacy/issuance-off behavior on Cloud 8 and full behavior on 9; C is behaviorally equivalent on 9 but refuses 8.
+- [ ] B is feature-complete, runs legacy/issuance-off behavior on predecessor Core/Cloud combinations and full behavior on Core 29/Cloud 9; C is behaviorally equivalent on 29/9 but refuses Core 28 or Cloud 8.
 - [ ] Every manifest-listed database-mutating binary verifies and reports its immutable build-manifest identity, injected release-set hash, exact set membership, and correct window without an artifact rebuild.
 - [ ] Missing/wrong injected release-set identity and every raw candidate deployment bypass fail before listener or mutation.
 - [ ] B is recorded before any C Machine receives traffic.
-- [ ] C→B→C rehearsal and production rollback path require no schema change or data loss.
+- [ ] C→B→C rehearsal on Core 29/Cloud 9 and production rollback require no schema change or data loss.
+- [ ] v0.0.17→R0 on Core 28 and runtime-candidate→R0→runtime-candidate on Core 29 use distinct attested digests and require no schema change or data loss; v0.0.17 is rejected as a post-Core29 target.
 - [ ] One signed release set binds every exact candidate and policy/contract/schema provenance item.
 - [ ] Runtime and SDK bytes/digests equal the Phase 8 artifacts exactly, and the frozen runtime manifest/version is byte-identical before and after release-set construction.
 - [ ] Mirror production accepts only the candidate receipt, copies without rebuild/deploy, is idempotent only for an exact existing tag, and release-set verification rejects a missing/substituted mirror receipt.
-- [ ] The release set embeds the independently verified v0.0.17 baseline member, and the dedicated rollback entry point accepts only release-set + issuance-off + complete-drain evidence.
+- [ ] The release set embeds both the independently verified historical v0.0.17 baseline and distinct R0 bridge members, and the dedicated rollback entry point accepts only release-set + issuance-off + complete-drain evidence and resolves R0.
 - [ ] No semver tag, GitHub Release, public OCI release tag, or PyPI 0.3 file exists yet.
 
 **Phase gate:** Do not begin production drills until every Machine is C, B is recorded, and the signed release set independently verifies from production.
@@ -1795,7 +1802,7 @@ Validate both onboarding modes with isolated least-privilege clients. Keep every
 - `synthetic-custom-domain` permits custom-domain mode only for the disposable delegated zone.
 - Use distinct client IDs, keypairs, scopes, orgs, generations, rate buckets, and audit identities. Store private keys only in the protected canary secret store; upload only public JWKs.
 - The release-set-bound production-canary workflow alone registers/activates the two configured `synthetic` identities after C is proven; it checks their immutable class and cannot name or activate an `external` client. The managed synthetic additionally receives a spending-capped operator-owned live Stripe canary billing profile whose payment method and off-session mandate completed SCA before this workflow; only provider references enter the registry.
-- With global issuance still off, a protected `mcp2026-enable-issuance` step verifies the signed release set, exact deployed runtime/C digests, schema 9, policy/contract hashes, transition receipt, and exactly these two active synthetic identities. Under the shared deploy lock it atomically enables `oauth_issuance_control` for that release-set SHA and emits a signed enable receipt. Only then may the first token exchange run.
+- With global issuance still off, a protected `mcp2026-enable-issuance` step verifies the signed release set, exact deployed runtime/C digests, Core 29/Cloud 9, policy/contract hashes, transition receipt, and exactly these two active synthetic identities. Under the shared deploy lock it atomically enables `oauth_issuance_control` for that release-set SHA and emits a signed enable receipt. Only then may the first token exchange run.
 - Missing/wrong release set, an external active client, stale Machine digest, schema drift, or a concurrent disable makes enable/exchange fail closed. Every rollback first performs the symmetric locked disable, emits an issuance-off receipt, and only then drains/revokes lifecycle state.
 - Prove each client is denied the other mode and every cross-client onboarding/org/domain/inbox/thread/attachment resource.
 - Keep all partner clients pending/revoked. No deploy, tag, SDK-publish, or smoke workflow may activate one implicitly.
@@ -1858,7 +1865,7 @@ Validate both onboarding modes with isolated least-privilege clients. Keep every
 - Each lifecycle receipt binds schema version; signed release-set digest; deployed runtime/C digests and schema; hashed client identity, immutable client class, mode, key thumbprint, and every generation; idempotency replay outcomes; token-expiry/reacquisition proof; mode-specific readiness/mail assertions; cross-client denials; billing/provider cleanup states; retired alias/domain-claim evidence; zero-live-resource query results; workflow/run identity; timestamps; and a redaction attestation. Missing cleanup fields, cross-mode substitution, or a different release set makes verification fail.
 - After lifecycle cleanup, use fresh onboarding tokens and new idempotency keys to create an explicit managed generation 3 and custom generation 2 for soak. Bind the two immutable `synthetic` client IDs in protected release configuration and the drill/soak evidence; normal registration cannot claim those identities or class.
 - Probe both clients at least every 15 minutes for at least 24 uninterrupted hours. A missing interval longer than 30 minutes, any failed probe, digest/schema/policy mismatch, cross-tenant anomaly, or unresolved alert resets the continuous-window start.
-- Every observation verifies and records the same release-set digest, deployed runtime/C digests, schema 9, and policy hash before calling MCP.
+- Every observation verifies and records the same release-set digest, deployed runtime/C digests, Core 29/Cloud 9, and policy hash before calling MCP.
 - Exercise immutable SDK 0.2 and exact unpublished SDK 0.3 during the same window.
 - Produce signed soak evidence with `gate=pilot|broader`, release set, deployment time, hashed client identities, every expected/observed interval, successful run IDs, zero unresolved failures/alerts, and continuous start/end. Its schema/verifier recomputes cadence/coverage rather than trusting claimed timestamps. Promotion and activation accept only protected `soak_evidence_run_id` plus `soak_evidence_sha`, verify producer identity/attestation and the same release-set SHA, and reject direct timestamps or hand-authored summaries. Never record keys, assertions, tokens, DNS credentials, message bodies, or attachment bytes.
 - Pilot evidence covers at least 24 uninterrupted hours and has `continuous_end` no older than 30 minutes when used. After the one external pilot activation commits, keep both synthetic canaries running and emit a distinct `gate=broader` artifact bound to the pilot activation audit ID/timestamp. It must cover at least 168 uninterrupted hours beginning no earlier than that pilot commit (or the latest reset) and also end within 30 minutes of broader activation. The original 24-hour artifact can never satisfy the broader gate.
@@ -1881,7 +1888,7 @@ Publication is split across repository authority. The protected Cloud post-soak 
 
 - Because required-reviewer environment protection is unavailable for this private repository, `mcp2026-activation-approval.yml` is the sole approval producer. It accepts an exact canonical external-client list, release-set digest, `pilot|broader` cohort, not-before, and expiry; requires `github.actor` in the audited repository allowlist of activation approvers; emits a schema-validated GitHub-attested artifact binding those values plus approver/run identity; and cannot activate anything itself.
 - The separate protected `mcp2026-activate-clients.yml` workflow runs under the shared deploy lock and accepts the exact pending external `client_id` list, promoted release-set digest, only `promotion_evidence_run_id` plus SHA, only `soak_evidence_run_id` plus SHA, and only `approval_run_id` plus SHA. It first verifies promotion and the same release set/publication, then verifies a fresh soak artifact whose `gate` equals the requested `pilot|broader` cohort, and finally verifies approval producer/actor allowlist and exact set/release/cohort/time equality. It atomically consumes the approval digest with activation in `oauth_activation_approvals`; no wildcard, raw evidence fields, or class mutation is allowed. Exact retry after a committed activation is idempotent; replay for another set/release/cohort is rejected.
-- It queries durable client classification/activation state and verifies issuance still enabled for the exact current release set, current digests/schema 9, both drill receipts, gate-appropriate fresh cadence-valid soak evidence, green synthetic canaries, and zero blockers before an audited targeted DB activation.
+- It queries durable client classification/activation state and verifies issuance still enabled for the exact current release set, current digests/Core 29/Cloud 9, both drill receipts, gate-appropriate fresh cadence-valid soak evidence, green synthetic canaries, and zero blockers before an audited targeted DB activation.
 - Activation does not edit runtime.lock, set Fly secrets, redeploy, or activate any unlisted client.
 - When zero external clients are active, the input list must contain exactly one preapproved pilot ID and match its one-use approval; a multi-ID first cohort is rejected even after 24 hours.
 - Once any external client is active, every additional activation requires the distinct fresh `gate=broader` artifact covering 168 continuous post-pilot hours plus a separate approval that was not used for the pilot. Any release-set component change, canary gap/failure, issuance disable, or policy/schema drift resets the broader window.
@@ -1952,7 +1959,7 @@ Publication is split across repository authority. The protected Cloud post-soak 
 - Golden client-credentials-only RFC 8414/Errata 7793 metadata plus token-error-extension fixtures.
 - Legacy 2025-11-25 golden response fixtures.
 - Exact PyPI 0.2.0 wheel against vNext.
-- SDK 0.3.0 pinned PEM/private-key JWT, JSON/SSE modern mode against vNext, and legacy mode against v0.0.17.
+- SDK 0.3.0 pinned PEM/private-key JWT, JSON/SSE modern mode against vNext, legacy mode against v0.0.17 on Core 28, and legacy mode against R0 on Core 28/29.
 - Exact request `_meta`, metadata/form/cache/challenge/OAuth-error/token-claim golden tests and capability-negotiation failure.
 - Route matrix for protocol, credential, absent/allowed/hostile Origin, principal, paid/domain policy, attachment, and response media type.
 - B/C compatibility matrix and C→B→C rollback fixture with all lifecycle/retry states; rollback below vNext refuses any non-closed generation, including `active`.
@@ -2055,7 +2062,7 @@ Alerts:
 ### Schema ownership
 
 - Cloud 0009 is authored only in nerve-cloud.
-- Core remains at 0028; CORE_SCHEMA_HASH and runtime core window stay unchanged.
+- Core 0029 is authored in nerve-oss first, mirrored byte-for-byte to Cloud, and advances `CORE_SCHEMA_HASH`. It owns only `org_outbound_policy_state` and the nullable outbox provider-fence columns; Cloud must not carry a divergent copy.
 - Cloud 0009 owns its lifecycle tables and the alias/catch-all protection triggers installed over existing Core inbox/domain tables in the same database.
 - Shared Go/auth/store files follow OSS-first exact-mirror discipline where they truly exist in both repositories.
 - `oss-source.lock` alone selects shared-source authority during development; `runtime.lock` alone selects the deployed production artifact. `runtime-candidate.lock` is non-deploying evidence consumed only by release-set construction.
@@ -2066,9 +2073,12 @@ Alerts:
 ### Expand and contract
 
 - Artifact A `[8,9]` crosses the boundary in the dedicated deploy-before-migrate transition and is only the temporary floor.
-- Artifact B is built from final feature code with `[8,9]`, proven on schema 9 and compatibility-tested on 8, then recorded as the permanent rollback floor.
-- Artifact C contracts the same behavior to `[9,9]`; web, reconciler, and migrate all reject schema 8 before side effects.
+- Artifact B is built from final feature code with Core `[28,29]` and Cloud `[8,9]`, proven on Core 29/Cloud 9 and compatibility-tested on every predecessor combination, then recorded as the permanent rollback floor.
+- Before Core 0029, the protected bridge workflow builds R0 as a distinct digest from pinned v0.0.17 source plus the exact allowlisted `[28,28]`→`[28,29]` compatibility-window patch. Production moves v0.0.17→R0 while Core is 28 and proves legacy equivalence.
+- After every durable control-plane role is B and every runtime Machine is R0, B's migrate binary applies additive Core 0029. The migration gate proves preserved legacy SQL/data behavior and runs the actual R0 binary on Core 29 before the runtime candidate is deployed.
+- Artifact C contracts the same behavior to Core `[29,29]` and Cloud `[9,9]`; web, reconciler, and migrate all reject Core 28 or Cloud 8 before side effects.
 - Cloud 0009 down refuses after durable data. Production recovery uses forward fixes/restores, not casual down migration.
+- Core 0029 down refuses after any autonomous epoch or provider-fence evidence. Production recovery likewise uses a forward fix/restore; B remains compatible with Core 29.
 
 ### Runtime promotion
 
@@ -2083,11 +2093,11 @@ Preserve the existing decision to use production-snapshot rehearsal plus two iso
 
 ## Rollback Matrix
 
-| Component | Schema 8 before transition | Schema 9 after A | Candidate production after B/C | After external activation |
+| Component | Cloud 8/Core 28 before transition | Cloud 9/Core 28 after A | Candidate production after B/Core 29/C | After external activation |
 |---|---|---|---|---|
-| Control plane | `[8,8]` remains valid until every role is A | A `[8,9]` temporary floor; `[8,8]` forbidden | C `[9,9]` normal; B `[8,9]` is the only rollback floor | Same C→B rollback; never A/`[8,8]` |
-| Runtime | v0.0.17 while issuance is off | v0.0.17 possible only with autonomous issuance/use off | Release-set dual runtime is product floor | Rollback below it requires client disable and lifecycle drain |
-| Schema | Cloud 8 | Cloud 9; no casual down after durable rows | Cloud 9 | Cloud 9; forward fix or restore only |
+| Control plane | Cloud `[8,8]`, Core `[28,28]` remains valid until every role is A | A Core `[28,28]`/Cloud `[8,9]` temporary floor | C Core `[29,29]`/Cloud `[9,9]` normal; B Core `[28,29]`/Cloud `[8,9]` is the only rollback floor | Same C→B rollback; never A/Core 28/Cloud 8 after fence evidence |
+| Runtime | v0.0.17 while issuance is off | v0.0.17 until protected R0 deployment on Core 28 | Release-set dual runtime requires Core `[29,29]` and is product floor; R0 `[28,29]` is the only runtime rollback floor | Rollback below vNext requires client disable/lifecycle drain and deploys R0; v0.0.17 is forbidden on Core 29 |
+| Schema | Cloud 8/Core 28 | Cloud 9/Core 28; no casual Cloud down after durable rows | Cloud 9/Core 29 | Cloud 9/Core 29; forward fix or restore only |
 | SDK 0.2.0 | Supported | Supported | Supported and canaried | Supported until separate retirement plan |
 | SDK 0.3.0 | Unpublished candidate | Modern unavailable if runtime remains old | Exact release-set wheel | Published exact bytes; legacy email fallback only below vNext |
 | Alias/domain claims | None before 0009 | Permanent registry/claims survive every rollback | Never delete/reuse/bypass | Same invariant |
@@ -2101,14 +2111,17 @@ Preferred rollback is C→B with schema unchanged. Before any runtime rollback b
 2. Enumerate every non-closed M2M generation, including `active`, under the common lifecycle lock. For each one, run audited close or `revoke-client`, revoke email authority, and retain its onboarding-only polling path when the client itself is not revoked.
 3. Keep B running until every enumerated generation is `closed`, every subscription-create/payment/cancellation workflow, outbox provider-start, and domain-claim release is terminal, and signed drain evidence proves the enumeration did not change. Refuse rollback while any generation or cleanup barrier remains nonterminal.
 4. Do not delete Cloud 0009 state, alias tombstones, domain claims, billing workflows, or evidence history.
-5. Invoke the dedicated baseline rollback workflow with only the final release set, issuance-off receipt, and lifecycle-drain receipt. It derives and deploys the embedded v0.0.17 Fly baseline, verifies every Machine digest, and keeps B. State clearly that existing legacy org email may work while autonomous onboarding is unavailable.
+5. Invoke the dedicated bridge rollback workflow with only the final release set, issuance-off receipt, and lifecycle-drain receipt. It derives and deploys embedded R0, verifies every Machine digest and its `[28,29]` startup window, and keeps B. State clearly that existing legacy org email may work while autonomous onboarding is unavailable. The workflow must reject v0.0.17 or any raw image/tag input.
+
+Core stays at 29 throughout C→B or below-vNext runtime rollback. R0 is the only legacy-behavior runtime authorized on Core 29, and provider-fence evidence is never removed as part of rollback.
 
 ## Definition of Done
 
 - [ ] Every Phase 0 proof gate is real and green.
 - [ ] Artifact A crossed Cloud 8→9 through the dedicated deploy-before-migrate workflow and produced a signed receipt.
 - [ ] Artifact B is recorded as the permanent feature-complete `[8,9]` rollback floor.
-- [ ] Artifact C runs `[9,9]`; web, reconciler, and migrate independently refuse Cloud 8 before side effects.
+- [ ] Artifact C runs Core `[29,29]`/Cloud `[9,9]`; web, reconciler, and migrate independently refuse Core 28 or Cloud 8 before side effects.
+- [ ] Core 0029 is applied only after B is the durable control-plane floor and R0 is the deployed runtime floor; the runtime candidate and C require `[29,29]`, B and R0 remain `[28,29]`, and actual R0 legacy behavior is proven on Core 28 and additive Core 29.
 - [ ] auth.nerve.email serves correct public metadata/JWKS/token behavior.
 - [ ] Client-credentials-only metadata passes the pinned consumers with the Errata 7793 omission; numerical request limits, versioned error extension, permanent key thumbprints, and JTI skew retention are exact and tested.
 - [ ] A pre-registered private-key JWT client obtains separate generation-bound onboarding and org tokens without a human tenant flow, including maintenance after initial token expiry.
@@ -2125,7 +2138,7 @@ Preferred rollback is C→B with schema unchanged. Before any runtime rollback b
 - [ ] Every durable outbound meter has matching idempotent usage events with an org/tool/meter-namespaced replay ID; reserve and reconcile share one counter lock, survive generic reconciliation, and cannot collide or lose updates.
 - [ ] Complaint/bounce suspension overrides stale token scope, fences new claims/provider starts, terminalizes queued work, and drains/readbacks earlier provider starts before close.
 - [ ] Close immediately disables authority, confirms generation-owned Stripe cancellation and provider cleanup, then reconnect creates a clean generation with no entitlement transfer.
-- [ ] Runtime candidate/Fly mirror/v0.0.17 baseline, A/B/C, all shipped mutating binaries, SDK, contract, policy, schema, transition evidence, and CI identities are bound by verified signed provenance without a self-hash/rebuild cycle.
+- [ ] Runtime candidate/Fly mirror, historical v0.0.17 baseline, distinct R0 bridge, A/B/C, all shipped mutating binaries, SDK, contract, policy, schema, transition evidence, and CI identities are bound by verified signed provenance without a self-hash/rebuild cycle.
 - [ ] Two isolated synthetic clients pass managed/custom drills, signed lifecycle receipts, cross-client denials, final cleanup, and cadence-valid unchanged 24-hour pilot soak; they continue canarying through a distinct fresh 168-hour post-pilot broader window.
 - [ ] Global issuance remains off until exact C/synthetic proof and has signed enable/disable receipts. Tags, OSS no-rebuild release, PyPI publication, and exactly one first external activation occur only through matching evidence; every additional activation requires fresh broader-soak evidence plus separate approval.
 - [ ] Rollback below vNext refuses until every M2M generation, including active ones, is closed and all billing/domain/provider cleanup is terminal.
@@ -2160,6 +2173,7 @@ Preferred rollback is C→B with schema unchanged. Before any runtime rollback b
 - internal/store/email_tenancy.go
 - internal/store/migrations/core/0024_email_tenancy.sql
 - internal/store/migrations/core/0026_feature_flags.sql
+- internal/store/migrations/core/0029_outbox_policy_fence.sql
 - internal/store/migrations/core/0002_runtime_tenanting_and_entitlements.sql
 - internal/store/migrations/core/0007_tool_idempotency.sql
 - sdk/python/src/nerve_email/client.py
@@ -2195,6 +2209,30 @@ Preferred rollback is C→B with schema unchanged. Before any runtime rollback b
 - https://resend.com/docs/api-reference/emails/retrieve-received-email
 
 ## Enhancement History
+
+### Revision 13 — 2026-08-19
+
+**Trigger:** Core 0029 review checked the immutable v0.0.17 source at `a794be9f2697e0864d3a31da8f087577e9748f7e` instead of relying on the migration's frozen SQL fixture. That runtime is compiled for Core `[28,28]`, and production startup verification rejects Core 29 before any legacy SQL path can run. Revision 12's claim that v0.0.17 could serve through the migration and remain the post-Core29 rollback target was therefore false.
+
+**Disposition:** Keep v0.0.17 immutable and historical. Introduce a separate non-semver R0 bridge built reproducibly from the pinned v0.0.17 source plus one exact allowlisted compatibility-window patch `[28,28]`→`[28,29]` and attestation wiring. The actual R0 binary must prove v0.0.17-equivalent legacy behavior on Core 28 and production startup/legacy behavior on Core 29. Frozen legacy SQL fixtures remain schema-level evidence only and make no artifact-compatibility claim.
+
+**Release consequence:** Production now moves v0.0.17→R0 on Core 28 before B applies Core 0029. The final release set embeds both the historical v0.0.17 baseline receipt and distinct R0 receipt/digests, but only R0 is authorized for below-vNext rollback once Core is 29. The dedicated rollback workflow derives R0 from the release set, never accepts v0.0.17 or a raw image/tag, and leaves Core 29 plus provider-fence evidence intact.
+
+### Revision 12 — 2026-08-19
+
+**Trigger:** Completing the Phase 7.4 reserve/reconcile fixes exposed the next delivery-side Phase 7.2 tranche. The adapter-side enqueue lock is not sufficient after the transaction releases: the existing Core 0028 outbox schema cannot distinguish a merely claimed row from a provider-started operation after a worker crash, so suspension/close cannot both prevent a later start and wait for an earlier start without durable evidence. The prior “no Core migration” constraint therefore contradicted the already-approved provider-start linearization requirement.
+
+**Disposition:** Approve one additive OSS-authority Core 0029. It adds an org-scoped monotonic policy epoch plus nullable autonomous epoch/provider-start/operation/resolution fields on outbox rows, preserves the existing outbox status constraint, leaves legacy rows null, and uses refusal-style down once evidence exists. The MCP adapter enqueue half and delivery worker half remain separate review units, but the migration, claim/provider-start CAS, suspension/close writers, reconciler recovery, and PostgreSQL race fixtures must land as one delivery-fence tranche before Phase 7.2 is complete.
+
+**Release consequence (superseded by Revision 13):** Artifact B expands to Core `[28,29]`/Cloud `[8,9]`; the runtime candidate and Artifact C require Core `[29,29]`, with C also Cloud `[9,9]`. Revision 13 replaces the invalid v0.0.17-on-Core29 premise with the distinct R0 bridge. C→B and below-vNext runtime rollback keep Core 29; no rollback path deletes provider-fence evidence. Runtime/manifest/source locks and the final release set bind the Core 0029 head/hash.
+
+**Closed prior risk:** Cloud PR #105 (`d95fa69354fc2cb98425ec074096b1f407c98bef`) and OSS-to-Cloud sync PR #107 (`c0e97c25bc74b8886733d6c25af3803cbc99e427`) close Revision 11's period-boundary/replay-namespace follow-up with real PostgreSQL fixtures for both lock orders and atomic source-lock advancement.
+
+### Revision 11 — 2026-08-19
+
+**Trigger:** The post-merge OSS-to-Cloud sync run `32190508638` compiled the OSS-first `internal/store/outbound_limits.go` against Cloud's intentionally unsynchronized `internal/store/store_usage.go` and failed because Cloud lacked `RecordUsageEventAt`. Cloud PR #102 added that compatibility method, preserved the database-clock default for ordinary events, and moved reconcile SUM/SET under a counter-row transaction with a two-connection reservation fixture. Its successful rerun then created Cloud PR #103, whose first head copied the new manifest-owned bytes but left `oss-source.lock` on the predecessor revision, so exact-mirror correctly failed closed.
+
+**Disposition:** Explicitly authorize the Cloud-only store compatibility file and reconcile test in Phase 7.4. Preserve PostgreSQL `DEFAULT now()` for implicit event time and reserve explicit timestamps for operations that own an authoritative time. Require each generated sync PR to update the Cloud source revision and manifest digest in the same change as its exact mirrors. Admin merge `3950a4c45314bb59eef71cb6576945eb4a4f2aef` accepted the remaining concurrent `period_end` mutation race as a deferred follow-up so transport sync could proceed; the period-boundary invariant and its two-ordering test remain open success criteria rather than being reported as complete.
 
 ### Revision 10 — 2026-08-12
 

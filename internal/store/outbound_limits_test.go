@@ -425,6 +425,18 @@ func withOutboundLimitStore(t *testing.T, run func(context.Context, *Store, stri
 		`, inboxID, orgID); err != nil {
 			t.Fatalf("insert inbox: %v", err)
 		}
+		if err := st.RunInTx(ctx, func(scoped *Store) error {
+			if _, err := scoped.SetFeatureFlag(ctx, &orgID, "autonomous_outbound_policy", true, "test"); err != nil {
+				return err
+			}
+			if _, err := scoped.SetFeatureFlag(ctx, &orgID, "email_outbound_suspended", false, "test"); err != nil {
+				return err
+			}
+			_, err := scoped.EnsureOutboundPolicyState(ctx, orgID)
+			return err
+		}); err != nil {
+			t.Fatalf("seed autonomous policy: %v", err)
+		}
 		run(ctx, st, orgID, inboxID)
 	})
 }
@@ -442,6 +454,18 @@ func insertOutboundLimitTenant(t *testing.T, ctx context.Context, st *Store, lab
 		VALUES ($1, $2, $3, 'active')
 	`, inboxID, orgID, address); err != nil {
 		t.Fatalf("insert %s inbox: %v", label, err)
+	}
+	if err := st.RunInTx(ctx, func(scoped *Store) error {
+		if _, err := scoped.SetFeatureFlag(ctx, &orgID, "autonomous_outbound_policy", true, "test"); err != nil {
+			return err
+		}
+		if _, err := scoped.SetFeatureFlag(ctx, &orgID, "email_outbound_suspended", false, "test"); err != nil {
+			return err
+		}
+		_, err := scoped.EnsureOutboundPolicyState(ctx, orgID)
+		return err
+	}); err != nil {
+		t.Fatalf("seed %s autonomous policy: %v", label, err)
 	}
 	return orgID, inboxID
 }
