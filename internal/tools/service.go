@@ -669,7 +669,7 @@ func autonomousLimitInput(
 	}
 	return &store.OutboundLimitInput{
 		ToolName: toolName, IdempotencyKey: idempotencyKey,
-		Recipient: recipient, ComposeEnabled: composeEnabled, AcceptedAt: time.Now().UTC(),
+		Recipient: recipient, ComposeEnabled: composeEnabled,
 	}
 }
 

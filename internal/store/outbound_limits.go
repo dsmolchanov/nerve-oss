@@ -29,7 +29,13 @@ type OutboundLimitInput struct {
 	IdempotencyKey string
 	Recipient      string
 	ComposeEnabled bool
-	AcceptedAt     time.Time
+}
+
+type outboundLimitClock struct {
+	acceptedAt        time.Time
+	dayStart          time.Time
+	dayEnd            time.Time
+	retryAfterSeconds int
 }
 
 type OutboundLimitError struct {
@@ -52,18 +58,15 @@ func (s *Store) ReserveOutboundLimits(
 	if err := s.LockOrgPolicy(ctx, orgID); err != nil {
 		return err
 	}
-	acceptedAt := input.AcceptedAt.UTC()
-	if acceptedAt.IsZero() {
-		acceptedAt = time.Now().UTC()
+	reservationClock, err := s.readOutboundLimitClock(ctx)
+	if err != nil {
+		return err
 	}
-	input.AcceptedAt = acceptedAt
-	dayStart := acceptedAt.Truncate(24 * time.Hour)
-	dayEnd := dayStart.Add(24 * time.Hour)
 	canonicalRecipient := canonicalOutboundRecipient(input.Recipient)
 	recipientHash := outboundRecipientHash(canonicalRecipient)
 
 	if input.ComposeEnabled {
-		if err := s.reserveOutboundBucket(ctx, orgID, input, meterOutboundSendDay, "", dayStart, dayEnd, limitSendPerDay); err != nil {
+		if err := s.reserveOutboundBucket(ctx, orgID, input, meterOutboundSendDay, "", reservationClock, limitSendPerDay); err != nil {
 			return err
 		}
 		first, err := s.firstOutboundRecipient(ctx, orgID, outboxID, canonicalRecipient, recipientHash)
@@ -71,55 +74,71 @@ func (s *Store) ReserveOutboundLimits(
 			return err
 		}
 		if first {
-			if err := s.reserveOutboundBucket(ctx, orgID, input, meterOutboundFirstRecipientDay, "", dayStart, dayEnd, limitFirstRecipientsPerDay); err != nil {
+			if err := s.reserveOutboundBucket(ctx, orgID, input, meterOutboundFirstRecipientDay, "", reservationClock, limitFirstRecipientsPerDay); err != nil {
 				return err
 			}
 			seenMeter := meterOutboundRecipientSeen + ":" + recipientHash
 			if err := s.RecordUsageEventAt(ctx, orgID, seenMeter, 1, input.ToolName,
 				UsageReplayID(orgID, input.ToolName, input.IdempotencyKey, meterOutboundRecipientSeen, recipientHash),
-				"", "success", acceptedAt); err != nil {
+				"", "success", reservationClock.acceptedAt); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 
-	if err := s.reserveOutboundBucket(ctx, orgID, input, meterOutboundReplyDay, "", dayStart, dayEnd, limitReplyPerDay); err != nil {
+	if err := s.reserveOutboundBucket(ctx, orgID, input, meterOutboundReplyDay, "", reservationClock, limitReplyPerDay); err != nil {
 		return err
 	}
 	return s.reserveOutboundBucket(
 		ctx, orgID, input, meterOutboundReplyRecipient, recipientHash,
-		dayStart, dayEnd, limitReplyPerRecipientDay,
+		reservationClock, limitReplyPerRecipientDay,
 	)
+}
+
+func (s *Store) readOutboundLimitClock(ctx context.Context) (outboundLimitClock, error) {
+	var result outboundLimitClock
+	err := s.q.QueryRowContext(ctx, `
+		WITH db_clock AS (
+			SELECT clock_timestamp() AS accepted_at
+		), bucket AS (
+			SELECT
+				accepted_at,
+				date_trunc('day', accepted_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS day_start
+			FROM db_clock
+		)
+		SELECT
+			accepted_at,
+			day_start,
+			day_start + interval '1 day',
+			greatest(1, ceil(extract(epoch FROM (day_start + interval '1 day' - accepted_at))))::integer
+		FROM bucket
+	`).Scan(&result.acceptedAt, &result.dayStart, &result.dayEnd, &result.retryAfterSeconds)
+	return result, err
 }
 
 func (s *Store) reserveOutboundBucket(
 	ctx context.Context, orgID string, input OutboundLimitInput,
-	meter, dimension string, periodStart, periodEnd time.Time, limit int64,
+	meter, dimension string, reservationClock outboundLimitClock, limit int64,
 ) error {
 	physicalMeter := meter
 	if dimension != "" {
 		physicalMeter += ":" + dimension
 	}
-	if err := s.EnsureOrgUsageCounter(ctx, orgID, physicalMeter, periodStart, periodEnd); err != nil {
+	if err := s.EnsureOrgUsageCounter(ctx, orgID, physicalMeter, reservationClock.dayStart, reservationClock.dayEnd); err != nil {
 		return err
 	}
-	reserved, _, err := s.ReserveOrgUsageUnits(ctx, orgID, physicalMeter, periodStart, 1, limit)
+	reserved, _, err := s.ReserveOrgUsageUnits(ctx, orgID, physicalMeter, reservationClock.dayStart, 1, limit)
 	if err != nil {
 		return err
 	}
 	if !reserved {
-		remaining := periodEnd.Sub(input.AcceptedAt.UTC())
-		retryAfter := int((remaining + time.Second - 1) / time.Second)
-		if retryAfter < 1 {
-			retryAfter = 1
-		}
-		return &OutboundLimitError{MeterName: meter, RetryAfterSeconds: retryAfter}
+		return &OutboundLimitError{MeterName: meter, RetryAfterSeconds: reservationClock.retryAfterSeconds}
 	}
 	return s.RecordUsageEventAt(
 		ctx, orgID, physicalMeter, 1, input.ToolName,
 		UsageReplayID(orgID, input.ToolName, input.IdempotencyKey, meter, dimension),
-		"", "success", input.AcceptedAt.UTC(),
+		"", "success", reservationClock.acceptedAt,
 	)
 }
 
