@@ -185,6 +185,9 @@ func (s *Service) VerifyJWT(ctx context.Context, authHeader string) (Principal, 
 	if !ok {
 		return Principal{}, ErrUnauthorized
 	}
+	if hasM2MOnlyClaims(claims) {
+		return Principal{}, ErrUnauthorized
+	}
 
 	orgID := claimString(claims["org_id"])
 	if orgID == "" {
@@ -205,6 +208,18 @@ func (s *Service) VerifyJWT(ctx context.Context, authHeader string) (Principal, 
 		Kind:       PrincipalLegacyJWT,
 		AuthMethod: "jwt",
 	}, nil
+}
+
+func hasM2MOnlyClaims(claims jwt.MapClaims) bool {
+	tokenUse := claimString(claims["token_use"])
+	legacyTokenKind := claimString(claims["token_kind"])
+	if tokenUse == string(PrincipalM2MOnboarding) || tokenUse == string(PrincipalM2MOrg) ||
+		legacyTokenKind == string(PrincipalM2MOnboarding) || legacyTokenKind == string(PrincipalM2MOrg) {
+		return true
+	}
+	_, hasClientID := claims["client_id"]
+	_, hasGeneration := claims["generation"]
+	return hasClientID || hasGeneration
 }
 
 func (s *Service) resolveServiceTokenPrincipal(ctx context.Context, tokenID string) (Principal, bool, error) {
