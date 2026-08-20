@@ -4,6 +4,12 @@ package mcp
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,9 +20,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"neuralmail/internal/auth"
+	"neuralmail/internal/store"
 )
 
 const immutableSDK02Python = `
@@ -54,25 +62,65 @@ func TestImmutableSDK02AndNativeMCP2026ShareEndpoint(t *testing.T) {
 	}
 
 	cfg := hostedRouterConfig()
-	authService := auth.NewService(cfg, nil)
-	runtime := NewServer(cfg, nil, authService, nil)
-	authenticator := authenticatorFunc(func(request *http.Request) (auth.Principal, error) {
-		switch request.Header.Get("MCP-Protocol-Version") {
-		case LegacyProtocolVersion:
-			return auth.Principal{
-				Kind: auth.PrincipalCloudAPIKey, OrgID: "legacy-org",
-				Scopes: []string{"nerve:email.read"}, AuthMethod: "cloud_api_key",
-			}, nil
-		case ModernProtocolVersion:
-			return auth.Principal{
-				Kind: auth.PrincipalM2MOrg, OrgID: "modern-org", ClientID: "agent-client",
-				Generation: 1, Scopes: []string{"nerve:email.read"}, AuthMethod: "m2m_bearer",
-			}, nil
-		default:
-			return auth.Principal{}, fmt.Errorf("unexpected protocol at authenticator")
-		}
+	now := time.Unix(1_800_000_000, 0).UTC()
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate M2M access-token key: %v", err)
+	}
+	const keyID = "dual-profile-access-key"
+	encodedModulus := base64.RawURLEncoding.EncodeToString(privateKey.PublicKey.N.Bytes())
+	encodedExponent := base64.RawURLEncoding.EncodeToString([]byte{1, 0, 1})
+	keys, err := auth.ParseRSAPublicJWKS([]byte(fmt.Sprintf(
+		`{"keys":[{"kty":"RSA","kid":%q,"use":"sig","alg":"PS256","n":%q,"e":%q}]}`,
+		keyID, encodedModulus, encodedExponent,
+	)))
+	if err != nil {
+		t.Fatalf("parse M2M access-token key: %v", err)
+	}
+	const (
+		issuer   = "https://auth.nerve.email"
+		audience = "https://api.nerve.email/mcp"
+		clientID = "dual-profile-agent"
+		orgID    = "dual-profile-org"
+		tokenID  = "dual-profile-token"
+	)
+	expiresAt := now.Add(15 * time.Minute)
+	m2mToken := jwt.NewWithClaims(jwt.SigningMethodPS256, jwt.MapClaims{
+		"iss": issuer, "aud": audience, "exp": expiresAt.Unix(), "nbf": now.Unix(), "iat": now.Unix(),
+		"jti": tokenID, "sub": clientID, "client_id": clientID, "generation": 1,
+		"token_use": string(auth.PrincipalM2MOrg), "org_id": orgID, "scope": "nerve:email.read",
 	})
-	router := NewRouter(cfg, authenticator, NewLegacyHandler(runtime), NewSDKHandler(runtime, true))
+	m2mToken.Header["kid"] = keyID
+	signedM2MToken, err := m2mToken.SignedString(privateKey)
+	if err != nil {
+		t.Fatalf("sign M2M access token: %v", err)
+	}
+
+	authService := auth.NewService(cfg, nil)
+	authService.Now = func() time.Time { return now }
+	authService.M2M = &auth.M2MTokenVerifier{
+		Issuer: issuer, Audience: audience, Keys: keys, Now: func() time.Time { return now },
+	}
+	legacyKeyHash := sha256.Sum256([]byte("immutable-sdk-0.2-proof"))
+	authService.LookupCloudKey = func(_ context.Context, keyHash string) (store.CloudAPIKey, error) {
+		if keyHash != hex.EncodeToString(legacyKeyHash[:]) {
+			return store.CloudAPIKey{}, sql.ErrNoRows
+		}
+		return store.CloudAPIKey{
+			ID: "immutable-sdk-0.2", OrgID: "legacy-org", Scopes: []string{"nerve:email.read"},
+		}, nil
+	}
+	authService.LookupServiceToken = func(_ context.Context, requestedTokenID string) (store.ServiceToken, error) {
+		if requestedTokenID != tokenID {
+			return store.ServiceToken{}, sql.ErrNoRows
+		}
+		return store.ServiceToken{
+			ID: tokenID, OrgID: orgID, Actor: "oauth_client:" + clientID + ":g:1",
+			Scopes: []string{"nerve:email.read"}, ExpiresAt: expiresAt,
+		}, nil
+	}
+	runtime := NewServer(cfg, nil, authService, nil)
+	router := NewRouter(cfg, authService, NewLegacyHandler(runtime), NewSDKHandler(runtime, true))
 	barrier := newDualProfileBarrier(router)
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", barrier)
@@ -95,8 +143,8 @@ func TestImmutableSDK02AndNativeMCP2026ShareEndpoint(t *testing.T) {
 	client := newModernSDKTestClient()
 	session, err := client.Connect(ctx, &sdkmcp.StreamableClientTransport{
 		Endpoint: hosted.URL + "/mcp",
-		HTTPClient: &http.Client{Transport: originRoundTripper{
-			base: http.DefaultTransport, origin: "https://agent.example",
+		HTTPClient: &http.Client{Transport: authenticatedOriginRoundTripper{
+			base: http.DefaultTransport, origin: "https://agent.example", bearer: signedM2MToken,
 		}},
 		DisableStandaloneSSE: true,
 	}, nil)
@@ -122,6 +170,19 @@ func TestImmutableSDK02AndNativeMCP2026ShareEndpoint(t *testing.T) {
 	if !barrier.sawBoth() {
 		t.Fatal("both protocol profiles did not reach the shared /mcp endpoint concurrently")
 	}
+}
+
+type authenticatedOriginRoundTripper struct {
+	base   http.RoundTripper
+	origin string
+	bearer string
+}
+
+func (transport authenticatedOriginRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	clone := request.Clone(request.Context())
+	clone.Header.Set("Origin", transport.origin)
+	clone.Header.Set("Authorization", "Bearer "+transport.bearer)
+	return transport.base.RoundTrip(clone)
 }
 
 type dualProfileBarrier struct {
