@@ -1,0 +1,229 @@
+package onboarding
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"neuralmail/internal/auth"
+	"neuralmail/internal/mcp"
+)
+
+func TestClientSignsFixedDestinationAndAuthenticatedGeneration(t *testing.T) {
+	now := time.Unix(1_723_000_000, 0).UTC()
+	var capturedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != operationPaths["start"] || request.Method != http.MethodPost {
+			t.Fatalf("request target=%s %s", request.Method, request.URL.Path)
+		}
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Fatalf("read request: %v", err)
+		}
+		capturedBody = body
+		if got := request.Header.Get("Authorization"); got != "Bearer original-token" {
+			t.Fatalf("authorization=%q", got)
+		}
+		bodyHash := sha256.Sum256(body)
+		bodyHashHex := hex.EncodeToString(bodyHash[:])
+		if got := request.Header.Get(delegationBodyHashHeader); got != bodyHashHex {
+			t.Fatalf("body hash=%q want=%q", got, bodyHashHex)
+		}
+		canonical := strings.Join([]string{
+			"runtime-current", "nonce-1", "1723000000", http.MethodPost,
+			operationPaths["start"], bodyHashHex,
+		}, "\n")
+		mac := hmac.New(sha256.New, []byte("delegation-secret"))
+		_, _ = mac.Write([]byte(canonical))
+		if got, want := request.Header.Get(delegationSignatureHeader), hex.EncodeToString(mac.Sum(nil)); got != want {
+			t.Fatalf("signature=%q want=%q", got, want)
+		}
+		if request.Header.Get(delegationKeyIDHeader) != "runtime-current" ||
+			request.Header.Get(delegationNonceHeader) != "nonce-1" ||
+			request.Header.Get(delegationTimestampHeader) != "1723000000" {
+			t.Fatalf("delegation headers=%v", request.Header)
+		}
+		writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(writer).Encode(map[string]any{"result": map[string]any{
+			"resultType": "complete", "onboarding_id": "onboarding-1", "generation": 7, "state": "provisioning",
+			"mode": "managed_mailbox", "reauthorize": false,
+		}})
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL, server.Client(), now)
+	result, err := client.Start(context.Background(), testCaller(), mcp.OnboardingStartInput{
+		IdempotencyKey: "start-1", OrganizationName: "Example", MailboxMode: mcp.OnboardingMailboxManaged,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if result.ResultType != "complete" || result.OnboardingID != "onboarding-1" || result.Generation != 7 || result.State != "provisioning" {
+		t.Fatalf("result=%+v", result)
+	}
+	var envelope struct {
+		Principal delegationPrincipal      `json:"principal"`
+		Input     mcp.OnboardingStartInput `json:"input"`
+	}
+	if err := json.Unmarshal(capturedBody, &envelope); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	if envelope.Principal.Kind != auth.PrincipalM2MOnboarding || envelope.Principal.ClientID != "client-1" ||
+		envelope.Principal.Generation != 7 || envelope.Principal.TokenID != "token-1" {
+		t.Fatalf("delegated principal=%+v", envelope.Principal)
+	}
+	if envelope.Input.IdempotencyKey != "start-1" || envelope.Input.OrganizationName != "Example" {
+		t.Fatalf("delegated input=%+v", envelope.Input)
+	}
+}
+
+func TestClientRejectsRedirectsAndUnboundedResponses(t *testing.T) {
+	var redirected atomic.Bool
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		redirected.Store(true)
+	}))
+	defer target.Close()
+	redirect := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Location", target.URL)
+		writer.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer redirect.Close()
+	client := newTestClient(t, redirect.URL, redirect.Client(), time.Unix(1_723_000_000, 0))
+	if _, err := client.Status(context.Background(), testCaller()); err == nil {
+		t.Fatal("redirect response was accepted")
+	}
+	if redirected.Load() {
+		t.Fatal("delegation client followed redirect")
+	}
+
+	large := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"result":"` + strings.Repeat("x", maxDelegationBodyBytes) + `"}`))
+	}))
+	defer large.Close()
+	client = newTestClient(t, large.URL, large.Client(), time.Unix(1_723_000_000, 0))
+	if _, err := client.Status(context.Background(), testCaller()); err == nil || !strings.Contains(err.Error(), "exceeds 64 KiB") {
+		t.Fatalf("oversized response error=%v", err)
+	}
+}
+
+func TestClientResponseBodyTimeoutReturnsOutcomeUnknownForEveryOperation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte(`{"result":`))
+		writer.(http.Flusher).Flush()
+		time.Sleep(100 * time.Millisecond)
+		_, _ = writer.Write([]byte(`{}}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{
+		BaseURL: server.URL, KeyID: "runtime-current", Secret: "delegation-secret",
+		Timeout: 20 * time.Millisecond, HTTPClient: server.Client(), Nonce: func() string { return "nonce-1" },
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	operations := map[string]func() error{
+		"start": func() error {
+			_, err := client.Start(context.Background(), testCaller(), mcp.OnboardingStartInput{
+				IdempotencyKey: "start-1", OrganizationName: "Example", MailboxMode: mcp.OnboardingMailboxManaged,
+			})
+			return err
+		},
+		"status": func() error {
+			_, err := client.Status(context.Background(), testCaller())
+			return err
+		},
+		"verify domain": func() error {
+			_, err := client.VerifyDomain(context.Background(), testCaller())
+			return err
+		},
+		"close": func() error {
+			_, err := client.Close(context.Background(), testCaller(), mcp.OnboardingCloseInput{
+				IdempotencyKey: "close-1", ExpectedGeneration: 7,
+			})
+			return err
+		},
+	}
+	for name, operation := range operations {
+		t.Run(name, func(t *testing.T) {
+			if err := operation(); !errors.Is(err, mcp.ErrOnboardingOutcomeUnknown) {
+				t.Fatalf("body timeout error=%v", err)
+			}
+		})
+	}
+}
+
+func TestClientRejectsInvalidAuthorityAndDestinations(t *testing.T) {
+	validClient := newTestClient(t, "https://control.internal.example", nil, time.Unix(1_723_000_000, 0))
+	invalidCallers := []mcp.OnboardingCaller{
+		{},
+		{Principal: auth.Principal{Kind: auth.PrincipalM2MOrg, ClientID: "client-1", Generation: 7}, Authorization: "Bearer token"},
+		{Principal: auth.Principal{Kind: auth.PrincipalM2MOnboarding, ClientID: "client-1", Generation: 7}, Authorization: "Basic token"},
+	}
+	for _, caller := range invalidCallers {
+		if _, err := validClient.Status(context.Background(), caller); err == nil {
+			t.Fatalf("invalid caller accepted: %+v", caller)
+		}
+	}
+
+	for _, baseURL := range []string{
+		"", "http://control.internal.example", "https://user@control.internal.example",
+		"https://control.internal.example/path", "https://control.internal.example?target=other",
+	} {
+		if _, err := NewClient(ClientConfig{BaseURL: baseURL, KeyID: "key", Secret: "secret"}); err == nil {
+			t.Fatalf("invalid base URL accepted: %q", baseURL)
+		}
+	}
+}
+
+func TestClientReturnsTypedBusinessError(t *testing.T) {
+	retryAt := time.Unix(1_723_000_100, 0).UTC()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(writer).Encode(map[string]any{"error": map[string]any{
+			"code": "onboarding_idempotency_conflict", "retryable": false, "retry_at": retryAt,
+		}})
+	}))
+	defer server.Close()
+	client := newTestClient(t, server.URL, server.Client(), time.Unix(1_723_000_000, 0))
+	_, err := client.Status(context.Background(), testCaller())
+	var businessError *mcp.OnboardingBusinessError
+	if !errors.As(err, &businessError) || businessError.Code != "onboarding_idempotency_conflict" || businessError.Retryable || businessError.RetryAt == nil || !businessError.RetryAt.Equal(retryAt) {
+		t.Fatalf("business error=%#v err=%v", businessError, err)
+	}
+}
+
+func newTestClient(t *testing.T, baseURL string, httpClient *http.Client, now time.Time) *Client {
+	t.Helper()
+	client, err := NewClient(ClientConfig{
+		BaseURL: baseURL, KeyID: "runtime-current", Secret: "delegation-secret",
+		Timeout: time.Second, HTTPClient: httpClient, Now: func() time.Time { return now },
+		Nonce: func() string { return "nonce-1" },
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	return client
+}
+
+func testCaller() mcp.OnboardingCaller {
+	return mcp.OnboardingCaller{
+		Principal: auth.Principal{
+			Kind: auth.PrincipalM2MOnboarding, ClientID: "client-1", Generation: 7, TokenID: "token-1",
+		},
+		Authorization: "Bearer original-token",
+	}
+}
