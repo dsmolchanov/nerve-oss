@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -68,44 +71,130 @@ func TestSDKServerIsStatelessAndListsDeterministicEmailTools(t *testing.T) {
 }
 
 func TestSDKServerTranslatesBusinessFailureAsCallToolResult(t *testing.T) {
-	cfg := hostedRouterConfig()
-	authService := auth.NewService(cfg, nil)
-	runtime := NewServer(cfg, nil, authService, &fakeEntitlementGate{preAuthErr: entitlements.ErrQuotaExceeded})
-	principal := auth.Principal{
-		Kind: auth.PrincipalM2MOrg, OrgID: "org-1", ClientID: "client-1", Generation: 1,
-		Scopes: []string{"nerve:email.read"}, AuthMethod: "m2m_bearer",
+	modes := []struct {
+		name         string
+		jsonResponse bool
+		contentType  string
+	}{
+		{name: "JSON", jsonResponse: true, contentType: "application/json"},
+		{name: "SSE", jsonResponse: false, contentType: "text/event-stream"},
 	}
-	hosted := httptest.NewServer(NewRouter(cfg, authenticatorFunc(func(*http.Request) (auth.Principal, error) {
-		return principal, nil
-	}), NewLegacyHandler(runtime), NewSDKHandler(runtime, true)))
-	defer hosted.Close()
+	tests := []struct {
+		name          string
+		err           error
+		wantCode      string
+		wantRetryable bool
+	}{
+		{name: "quota", err: entitlements.ErrQuotaExceeded, wantCode: "quota_exceeded"},
+		{name: "subscription", err: entitlements.ErrSubscriptionInactive, wantCode: "subscription_inactive"},
+		{name: "rate", err: &entitlements.RateLimitError{RetryAfterSeconds: 12}, wantCode: "rate_limited", wantRetryable: true},
+		{name: "idempotency", err: &entitlements.IdempotencyInProgressError{RetryAfterSeconds: 3}, wantCode: "idempotency_in_progress", wantRetryable: true},
+	}
+	for _, mode := range modes {
+		for _, test := range tests {
+			t.Run(mode.name+"/"+test.name, func(t *testing.T) {
+				cfg := hostedRouterConfig()
+				authService := auth.NewService(cfg, nil)
+				runtime := NewServer(cfg, nil, authService, &fakeEntitlementGate{preAuthErr: test.err})
+				principal := auth.Principal{
+					Kind: auth.PrincipalM2MOrg, OrgID: "org-1", ClientID: "client-1", Generation: 1,
+					Scopes: []string{"nerve:email.read"}, AuthMethod: "m2m_bearer",
+				}
+				hosted := httptest.NewServer(NewRouter(cfg, authenticatorFunc(func(*http.Request) (auth.Principal, error) {
+					return principal, nil
+				}), NewLegacyHandler(runtime), NewSDKHandler(runtime, mode.jsonResponse)))
+				defer hosted.Close()
 
-	client := newModernSDKTestClient()
-	session, err := client.Connect(context.Background(), &sdkmcp.StreamableClientTransport{
-		Endpoint: hosted.URL, HTTPClient: &http.Client{Transport: originRoundTripper{
-			base: http.DefaultTransport, origin: "https://agent.example",
-		}}, DisableStandaloneSSE: true,
-	}, nil)
+				recorder := &rawResponseRecordingTransport{base: http.DefaultTransport, origin: "https://agent.example"}
+				client := newModernSDKTestClient()
+				session, err := client.Connect(context.Background(), &sdkmcp.StreamableClientTransport{
+					Endpoint: hosted.URL, HTTPClient: &http.Client{Transport: recorder}, DisableStandaloneSSE: true,
+				}, nil)
+				if err != nil {
+					t.Fatalf("connect modern client: %v", err)
+				}
+				defer session.Close()
+				result, err := session.CallTool(context.Background(), &sdkmcp.CallToolParams{
+					Name: "list_threads", Arguments: json.RawMessage(`{"inbox_id":"11111111-1111-4111-8111-111111111111"}`),
+				})
+				if err != nil {
+					t.Fatalf("business failure escaped as protocol error: %v", err)
+				}
+				if !result.IsError {
+					t.Fatalf("business failure missing isError: %#v", result)
+				}
+				contentType, raw, requestID := recorder.snapshot()
+				if !strings.HasPrefix(contentType, mode.contentType) {
+					t.Fatalf("content type=%q want base=%q", contentType, mode.contentType)
+				}
+				if err := validateModernResponseStream(context.Background(), contentType, bytes.NewReader(raw), requestID); err != nil {
+					t.Fatalf("raw modern response violated final-response contract: %v body=%s", err, raw)
+				}
+				wire := string(raw)
+				if !strings.Contains(wire, `"code":"`+test.wantCode+`"`) ||
+					!strings.Contains(wire, fmt.Sprintf(`"retryable":%t`, test.wantRetryable)) ||
+					strings.Contains(wire, "-32040") || strings.Contains(wire, "-32041") ||
+					strings.Contains(wire, "-32042") || strings.Contains(wire, "-32043") {
+					t.Fatalf("modern error partition violated: %s", raw)
+				}
+				if test.wantRetryable != strings.Contains(wire, `"retry_at":`) {
+					t.Fatalf("modern retry metadata=%s want retry_at present=%v", raw, test.wantRetryable)
+				}
+			})
+		}
+	}
+}
+
+type rawResponseRecordingTransport struct {
+	base   http.RoundTripper
+	origin string
+
+	mu          sync.Mutex
+	contentType string
+	body        []byte
+	requestID   json.RawMessage
+}
+
+func (transport *rawResponseRecordingTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	clone := request.Clone(request.Context())
+	clone.Header.Set("Origin", transport.origin)
+	var requestID json.RawMessage
+	if clone.Body != nil {
+		body, err := io.ReadAll(clone.Body)
+		if err != nil {
+			return nil, err
+		}
+		clone.Body = io.NopCloser(bytes.NewReader(body))
+		var message struct {
+			ID json.RawMessage `json:"id"`
+		}
+		if json.Unmarshal(body, &message) == nil {
+			requestID = message.ID
+		}
+	}
+	response, err := transport.base.RoundTrip(clone)
 	if err != nil {
-		t.Fatalf("connect modern client: %v", err)
+		return nil, err
 	}
-	defer session.Close()
-	result, err := session.CallTool(context.Background(), &sdkmcp.CallToolParams{
-		Name: "list_threads", Arguments: json.RawMessage(`{"inbox_id":"11111111-1111-4111-8111-111111111111"}`),
-	})
+	body, err := io.ReadAll(response.Body)
 	if err != nil {
-		t.Fatalf("business failure escaped as protocol error: %v", err)
+		_ = response.Body.Close()
+		return nil, err
 	}
-	if !result.IsError {
-		t.Fatalf("business failure missing isError: %#v", result)
-	}
-	encoded, err := json.Marshal(result)
-	if err != nil {
-		t.Fatalf("marshal business result: %v", err)
-	}
-	if !strings.Contains(string(encoded), `"code":"quota_exceeded"`) || strings.Contains(string(encoded), "-3204") {
-		t.Fatalf("modern error partition violated: %s", encoded)
-	}
+	_ = response.Body.Close()
+	response.Body = io.NopCloser(bytes.NewReader(body))
+	transport.mu.Lock()
+	transport.contentType = response.Header.Get("Content-Type")
+	transport.body = append(transport.body[:0], body...)
+	transport.requestID = append(transport.requestID[:0], requestID...)
+	transport.mu.Unlock()
+	return response, nil
+}
+
+func (transport *rawResponseRecordingTransport) snapshot() (string, []byte, json.RawMessage) {
+	transport.mu.Lock()
+	defer transport.mu.Unlock()
+	return transport.contentType, append([]byte(nil), transport.body...), append(json.RawMessage(nil), transport.requestID...)
 }
 
 func TestSDKServerListsConformantPrivateResources(t *testing.T) {
