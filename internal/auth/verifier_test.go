@@ -337,6 +337,63 @@ func TestAuthenticateRequestM2MRejectsAlgorithmAndClaimConfusion(t *testing.T) {
 	}
 }
 
+func TestAuthenticateRequestRejectsHS256M2MClaimDowngrade(t *testing.T) {
+	now := time.Unix(1_000, 0)
+	cfg := config.Default()
+	cfg.Security.TokenSigningKey = testSigningKey
+	service := &Service{
+		Config: cfg,
+		Now:    func() time.Time { return now },
+		M2M: &M2MTokenVerifier{
+			Issuer: "https://auth.nerve.email", Audience: "https://api.nerve.email/mcp",
+		},
+	}
+	base := jwt.MapClaims{
+		"org_id": "org-1", "sub": "client-1", "jti": "token-1", "scope": "nerve:email.read",
+		"iat": now.Unix(), "exp": now.Add(15 * time.Minute).Unix(),
+	}
+	tests := map[string]func(jwt.MapClaims){
+		"m2m token_use": func(claims jwt.MapClaims) {
+			claims["token_use"] = string(PrincipalM2MOrg)
+		},
+		"legacy m2m token_kind": func(claims jwt.MapClaims) {
+			claims["token_kind"] = string(PrincipalM2MOrg)
+		},
+		"client id marker": func(claims jwt.MapClaims) {
+			claims["client_id"] = "client-1"
+		},
+		"generation marker": func(claims jwt.MapClaims) {
+			claims["generation"] = 1
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			claims := jwt.MapClaims{}
+			for key, value := range base {
+				claims[key] = value
+			}
+			mutate(claims)
+			request := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+			request.Header.Set("Authorization", "Bearer "+signedJWT(t, claims))
+			if _, err := service.AuthenticateRequest(request); !errors.Is(err, ErrUnauthenticated) {
+				t.Fatalf("HS256 M2M claim downgrade was not rejected: %v", err)
+			}
+		})
+	}
+
+	legacyClaims := jwt.MapClaims{}
+	for key, value := range base {
+		legacyClaims[key] = value
+	}
+	legacyClaims["token_use"] = "service"
+	request := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	request.Header.Set("Authorization", "Bearer "+signedJWT(t, legacyClaims))
+	principal, err := service.AuthenticateRequest(request)
+	if err != nil || principal.Kind != PrincipalLegacyJWT {
+		t.Fatalf("legacy HS256 service token compatibility failed: principal=%#v err=%v", principal, err)
+	}
+}
+
 func TestAuthenticateRequestJWTRequiresOrgID(t *testing.T) {
 	cfg := config.Default()
 	cfg.Security.TokenSigningKey = testSigningKey
