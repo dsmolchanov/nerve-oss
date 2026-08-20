@@ -11,6 +11,7 @@ import (
 	"mime"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -498,6 +499,94 @@ func TestModernHiddenToolCallStillReachesInvoker(t *testing.T) {
 	}
 }
 
+func TestModernToolsListChangesWithPrincipalAndPolicyStateAndStaysPrivate(t *testing.T) {
+	cfg := hostedRouterConfig()
+	runtime := NewServer(cfg, nil, auth.NewService(cfg, nil), nil)
+	policy := &mutableOutboundPolicyGate{allowed: true}
+	runtime.OutboundPolicy = policy
+	handler := NewSDKHandler(runtime, true)
+
+	type catalogCase struct {
+		name      string
+		principal auth.Principal
+		allowed   bool
+		wantTools []string
+	}
+	cases := []catalogCase{
+		{
+			name: "onboarding principal",
+			principal: auth.Principal{
+				Kind: auth.PrincipalM2MOnboarding, ClientID: "client-1", Generation: 1,
+				Scopes: []string{"nerve:onboarding"}, AuthMethod: "m2m_bearer",
+			},
+			allowed:   true,
+			wantTools: nil,
+		},
+		{
+			name: "read-only org principal",
+			principal: auth.Principal{
+				Kind: auth.PrincipalM2MOrg, OrgID: "org-1", ClientID: "client-1", Generation: 1,
+				Scopes: []string{"nerve:email.read"}, AuthMethod: "m2m_bearer",
+			},
+			allowed:   true,
+			wantTools: []string{"get_thread", "list_threads"},
+		},
+		{
+			name: "compose-enabled org state",
+			principal: auth.Principal{
+				Kind: auth.PrincipalM2MOrg, OrgID: "org-1", ClientID: "client-1", Generation: 1,
+				Scopes: []string{"nerve:email.compose"}, AuthMethod: "m2m_bearer",
+			},
+			allowed:   true,
+			wantTools: []string{"compose_email"},
+		},
+		{
+			name: "compose-denied org state",
+			principal: auth.Principal{
+				Kind: auth.PrincipalM2MOrg, OrgID: "org-1", ClientID: "client-1", Generation: 1,
+				Scopes: []string{"nerve:email.compose"}, AuthMethod: "m2m_bearer",
+			},
+			allowed:   false,
+			wantTools: nil,
+		},
+	}
+
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			policy.allowed = test.allowed
+			request := modernContractRequest(t, "tools/list", map[string]any{"_meta": modernOAuthMeta()})
+			request = request.WithContext(auth.WithPrincipal(request.Context(), test.principal))
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("tools/list status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			var response struct {
+				Result struct {
+					Tools []struct {
+						Name string `json:"name"`
+					} `json:"tools"`
+					CacheScope string `json:"cacheScope"`
+					TTLMs      int64  `json:"ttlMs"`
+				} `json:"result"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode tools/list response: %v: %s", err, recorder.Body.String())
+			}
+			if response.Result.CacheScope != "private" || response.Result.TTLMs != 5_000 {
+				t.Fatalf("cache metadata=%q/%d want private/5000", response.Result.CacheScope, response.Result.TTLMs)
+			}
+			gotTools := make([]string, 0, len(response.Result.Tools))
+			for _, tool := range response.Result.Tools {
+				gotTools = append(gotTools, tool.Name)
+			}
+			if !slices.Equal(gotTools, test.wantTools) {
+				t.Fatalf("tools=%v want=%v", gotTools, test.wantTools)
+			}
+		})
+	}
+}
+
 func TestModernToolScopeFailureReturnsOAuth403BeforeInvoker(t *testing.T) {
 	cfg := hostedRouterConfig()
 	authService := auth.NewService(cfg, nil)
@@ -556,11 +645,22 @@ type countingOutboundPolicyGate struct {
 	dispatchCalls atomic.Int32
 }
 
+type mutableOutboundPolicyGate struct {
+	allowed bool
+}
+
 func (gate *countingOutboundPolicyGate) Authorize(_ context.Context, _ auth.Principal, _ string, arguments json.RawMessage) error {
 	if arguments != nil {
 		gate.dispatchCalls.Add(1)
 	}
 	return nil
+}
+
+func (gate *mutableOutboundPolicyGate) Authorize(context.Context, auth.Principal, string, json.RawMessage) error {
+	if gate.allowed {
+		return nil
+	}
+	return &outboundPolicyError{Code: "test_policy_denied"}
 }
 
 func modernOAuthMeta() map[string]any {
