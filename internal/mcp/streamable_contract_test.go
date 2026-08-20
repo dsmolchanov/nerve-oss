@@ -26,46 +26,74 @@ import (
 const modernTestUUID = "11111111-1111-4111-8111-111111111111"
 
 func TestModernContractRejectsMetadataAndHeaderFailuresBeforeDispatch(t *testing.T) {
-	runtime := NewServer(config.Default(), nil, nil, nil)
-	handler := NewSDKHandler(runtime, true)
-	validMeta := map[string]any{
-		sdkmcp.MetaKeyProtocolVersion: ModernProtocolVersion,
-		sdkmcp.MetaKeyClientCapabilities: map[string]any{
-			"extensions": map[string]any{oauthClientCredentialsExtension: map[string]any{}},
-		},
-	}
-
 	tests := []struct {
-		name       string
-		meta       map[string]any
-		headerName string
-		headerTool string
-		wantCode   int
+		name              string
+		method            string
+		params            map[string]any
+		protocolHeaders   []string
+		methodHeaders     []string
+		nameHeaders       []string
+		wantCode          int
+		wantRequested     string
+		wantSupported     []string
+		wantOAuthRequired bool
 	}{
-		{name: "missing protocol", meta: map[string]any{sdkmcp.MetaKeyClientCapabilities: map[string]any{}}, headerName: "tools/list", wantCode: sdkmcp.CodeHeaderMismatch},
-		{name: "unsupported protocol", meta: map[string]any{sdkmcp.MetaKeyProtocolVersion: "2099-01-01", sdkmcp.MetaKeyClientCapabilities: map[string]any{}}, headerName: "tools/list", wantCode: sdkmcp.CodeUnsupportedProtocolVersion},
-		{name: "missing capabilities", meta: map[string]any{sdkmcp.MetaKeyProtocolVersion: ModernProtocolVersion}, headerName: "tools/list", wantCode: sdkmcp.CodeMissingRequiredClientCapabilities},
-		{name: "malformed client info", meta: mergeModernMeta(validMeta, sdkmcp.MetaKeyClientInfo, map[string]any{"name": "", "version": "0.3.0"}), headerName: "tools/list", wantCode: sdkmcp.CodeHeaderMismatch},
-		{name: "method mismatch", meta: validMeta, headerName: "resources/list", wantCode: sdkmcp.CodeHeaderMismatch},
-		{name: "name mismatch", meta: validMeta, headerName: "tools/call", headerTool: "wrong-tool", wantCode: sdkmcp.CodeHeaderMismatch},
-		{name: "unexpected name", meta: validMeta, headerName: "tools/list", headerTool: "stale-tool", wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "missing protocol header", method: "tools/call", params: modernListThreadsParams(modernOAuthMeta()), methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "duplicate protocol header", method: "tools/call", params: modernListThreadsParams(modernOAuthMeta()), protocolHeaders: []string{ModernProtocolVersion, ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "unsupported protocol header", method: "tools/call", params: modernListThreadsParams(modernOAuthMeta()), protocolHeaders: []string{"2099-01-01"}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeUnsupportedProtocolVersion, wantRequested: "2099-01-01", wantSupported: []string{LegacyProtocolVersion, ModernProtocolVersion}},
+		{name: "missing protocol metadata", method: "tools/call", params: modernListThreadsParams(map[string]any{sdkmcp.MetaKeyClientCapabilities: map[string]any{}}), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "null protocol metadata", method: "tools/call", params: modernListThreadsParams(map[string]any{sdkmcp.MetaKeyProtocolVersion: nil, sdkmcp.MetaKeyClientCapabilities: map[string]any{}}), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "non-string protocol metadata", method: "tools/call", params: modernListThreadsParams(map[string]any{sdkmcp.MetaKeyProtocolVersion: 20260728, sdkmcp.MetaKeyClientCapabilities: map[string]any{}}), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "empty protocol metadata", method: "tools/call", params: modernListThreadsParams(map[string]any{sdkmcp.MetaKeyProtocolVersion: "", sdkmcp.MetaKeyClientCapabilities: map[string]any{}}), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "header body protocol mismatch", method: "tools/call", params: modernListThreadsParams(map[string]any{sdkmcp.MetaKeyProtocolVersion: LegacyProtocolVersion, sdkmcp.MetaKeyClientCapabilities: map[string]any{}}), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeUnsupportedProtocolVersion, wantRequested: LegacyProtocolVersion, wantSupported: []string{ModernProtocolVersion}},
+		{name: "missing capabilities", method: "tools/call", params: modernListThreadsParams(map[string]any{sdkmcp.MetaKeyProtocolVersion: ModernProtocolVersion}), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeMissingRequiredClientCapabilities},
+		{name: "null capabilities", method: "tools/call", params: modernListThreadsParams(map[string]any{sdkmcp.MetaKeyProtocolVersion: ModernProtocolVersion, sdkmcp.MetaKeyClientCapabilities: nil}), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeMissingRequiredClientCapabilities},
+		{name: "array capabilities", method: "tools/call", params: modernListThreadsParams(map[string]any{sdkmcp.MetaKeyProtocolVersion: ModernProtocolVersion, sdkmcp.MetaKeyClientCapabilities: []any{}}), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeMissingRequiredClientCapabilities},
+		{name: "string capabilities", method: "tools/call", params: modernListThreadsParams(map[string]any{sdkmcp.MetaKeyProtocolVersion: ModernProtocolVersion, sdkmcp.MetaKeyClientCapabilities: "invalid"}), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeMissingRequiredClientCapabilities},
+		{name: "missing oauth extension", method: "tools/call", params: modernListThreadsParams(map[string]any{sdkmcp.MetaKeyProtocolVersion: ModernProtocolVersion, sdkmcp.MetaKeyClientCapabilities: map[string]any{}}), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeMissingRequiredClientCapabilities, wantOAuthRequired: true},
+		{name: "null extensions", method: "tools/call", params: modernListThreadsParams(map[string]any{sdkmcp.MetaKeyProtocolVersion: ModernProtocolVersion, sdkmcp.MetaKeyClientCapabilities: map[string]any{"extensions": nil}}), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeMissingRequiredClientCapabilities, wantOAuthRequired: true},
+		{name: "array extensions", method: "tools/call", params: modernListThreadsParams(map[string]any{sdkmcp.MetaKeyProtocolVersion: ModernProtocolVersion, sdkmcp.MetaKeyClientCapabilities: map[string]any{"extensions": []any{}}}), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeMissingRequiredClientCapabilities, wantOAuthRequired: true},
+		{name: "null oauth settings", method: "tools/call", params: modernListThreadsParams(map[string]any{sdkmcp.MetaKeyProtocolVersion: ModernProtocolVersion, sdkmcp.MetaKeyClientCapabilities: map[string]any{"extensions": map[string]any{oauthClientCredentialsExtension: nil}}}), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeMissingRequiredClientCapabilities, wantOAuthRequired: true},
+		{name: "array oauth settings", method: "tools/call", params: modernListThreadsParams(map[string]any{sdkmcp.MetaKeyProtocolVersion: ModernProtocolVersion, sdkmcp.MetaKeyClientCapabilities: map[string]any{"extensions": map[string]any{oauthClientCredentialsExtension: []any{}}}}), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeMissingRequiredClientCapabilities, wantOAuthRequired: true},
+		{name: "null client info", method: "tools/call", params: modernListThreadsParams(mergeModernMeta(modernOAuthMeta(), sdkmcp.MetaKeyClientInfo, nil)), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "non-object client info", method: "tools/call", params: modernListThreadsParams(mergeModernMeta(modernOAuthMeta(), sdkmcp.MetaKeyClientInfo, "nerve-email-python/0.3.0")), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "missing client name", method: "tools/call", params: modernListThreadsParams(mergeModernMeta(modernOAuthMeta(), sdkmcp.MetaKeyClientInfo, map[string]any{"version": "0.3.0"})), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "missing client version", method: "tools/call", params: modernListThreadsParams(mergeModernMeta(modernOAuthMeta(), sdkmcp.MetaKeyClientInfo, map[string]any{"name": "nerve-email-python"})), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "oversized client name", method: "tools/call", params: modernListThreadsParams(mergeModernMeta(modernOAuthMeta(), sdkmcp.MetaKeyClientInfo, map[string]any{"name": strings.Repeat("n", 129), "version": "0.3.0"})), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "oversized client version", method: "tools/call", params: modernListThreadsParams(mergeModernMeta(modernOAuthMeta(), sdkmcp.MetaKeyClientInfo, map[string]any{"name": "nerve-email-python", "version": strings.Repeat("v", 129)})), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "oversized client title", method: "tools/call", params: modernListThreadsParams(mergeModernMeta(modernOAuthMeta(), sdkmcp.MetaKeyClientInfo, map[string]any{"name": "nerve-email-python", "version": "0.3.0", "title": strings.Repeat("t", 257)})), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "oversized client description", method: "tools/call", params: modernListThreadsParams(mergeModernMeta(modernOAuthMeta(), sdkmcp.MetaKeyClientInfo, map[string]any{"name": "nerve-email-python", "version": "0.3.0", "description": strings.Repeat("d", 1_025)})), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "oversized client website", method: "tools/call", params: modernListThreadsParams(mergeModernMeta(modernOAuthMeta(), sdkmcp.MetaKeyClientInfo, map[string]any{"name": "nerve-email-python", "version": "0.3.0", "websiteUrl": strings.Repeat("w", 2_049)})), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "missing method header", method: "tools/call", params: modernListThreadsParams(modernOAuthMeta()), protocolHeaders: []string{ModernProtocolVersion}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "duplicate method header", method: "tools/call", params: modernListThreadsParams(modernOAuthMeta()), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call", "tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "method mismatch", method: "tools/call", params: modernListThreadsParams(modernOAuthMeta()), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"resources/list"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "missing name header", method: "tools/call", params: modernListThreadsParams(modernOAuthMeta()), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "duplicate name header", method: "tools/call", params: modernListThreadsParams(modernOAuthMeta()), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads", "list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "name mismatch", method: "tools/call", params: modernListThreadsParams(modernOAuthMeta()), protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"wrong-tool"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "missing body name", method: "tools/call", params: map[string]any{"_meta": modernOAuthMeta(), "arguments": map[string]any{}}, protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "malformed body name", method: "tools/call", params: map[string]any{"_meta": modernOAuthMeta(), "name": 42, "arguments": map[string]any{}}, protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/call"}, nameHeaders: []string{"list_threads"}, wantCode: sdkmcp.CodeHeaderMismatch},
+		{name: "unexpected name header", method: "tools/list", params: map[string]any{"_meta": modernOAuthMeta()}, protocolHeaders: []string{ModernProtocolVersion}, methodHeaders: []string{"tools/list"}, nameHeaders: []string{"stale-tool"}, wantCode: sdkmcp.CodeHeaderMismatch},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			method := "tools/list"
-			params := map[string]any{"_meta": test.meta}
-			if test.name == "name mismatch" {
-				method = "tools/call"
-				params["name"] = "list_threads"
-				params["arguments"] = map[string]any{}
+			cfg := hostedRouterConfig()
+			entitlementGate := &fakeEntitlementGate{preAuthErr: entitlements.ErrQuotaExceeded}
+			runtime := NewServer(cfg, nil, auth.NewService(cfg, nil), entitlementGate)
+			principal := auth.Principal{
+				Kind: auth.PrincipalM2MOrg, OrgID: "org-1", ClientID: "client-1", Generation: 1,
+				Scopes: []string{"nerve:email.read"}, AuthMethod: "m2m_bearer",
 			}
-			request := modernContractRequest(t, method, params)
-			request.Header.Set("Mcp-Method", test.headerName)
-			if test.headerTool != "" {
-				request.Header.Set("Mcp-Name", test.headerTool)
-			}
+			router := NewRouter(cfg, authenticatorFunc(func(*http.Request) (auth.Principal, error) {
+				return principal, nil
+			}), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				t.Fatal("invalid modern request reached legacy adapter")
+			}), NewSDKHandler(runtime, true))
+			request := modernContractRequest(t, test.method, test.params)
+			setHeaderValues(request.Header, "MCP-Protocol-Version", test.protocolHeaders)
+			setHeaderValues(request.Header, "Mcp-Method", test.methodHeaders)
+			setHeaderValues(request.Header, "Mcp-Name", test.nameHeaders)
 			recorder := httptest.NewRecorder()
-			handler.ServeHTTP(recorder, request)
+			router.ServeHTTP(recorder, request)
 			if recorder.Code != http.StatusBadRequest {
 				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 			}
@@ -76,10 +104,81 @@ func TestModernContractRejectsMetadataAndHeaderFailuresBeforeDispatch(t *testing
 			if response.Error == nil || response.Error.Code != test.wantCode {
 				t.Fatalf("error=%#v want code=%d", response.Error, test.wantCode)
 			}
+			assertModernContractErrorData(t, response.Error, test.wantRequested, test.wantSupported, test.wantOAuthRequired)
+			if entitlementGate.preAuthCalls != 0 {
+				t.Fatalf("contract failure reached entitlement gate %d times", entitlementGate.preAuthCalls)
+			}
 			if runtime.MemoryBudget.Used() != 0 {
 				t.Fatalf("contract failure leaked %d bytes", runtime.MemoryBudget.Used())
 			}
 		})
+	}
+}
+
+func modernListThreadsParams(meta map[string]any) map[string]any {
+	return map[string]any{
+		"_meta": meta,
+		"name":  "list_threads",
+		"arguments": map[string]any{
+			"inbox_id": modernTestUUID,
+			"limit":    1,
+		},
+	}
+}
+
+func setHeaderValues(header http.Header, name string, values []string) {
+	header.Del(name)
+	for _, value := range values {
+		header.Add(name, value)
+	}
+}
+
+func assertModernContractErrorData(t *testing.T, responseError *ResponseError, requested string, supported []string, oauthRequired bool) {
+	t.Helper()
+	if requested != "" {
+		data, ok := responseError.Data.(map[string]any)
+		if !ok || data["requested"] != requested {
+			t.Fatalf("unsupported-version data=%#v", responseError.Data)
+		}
+		gotSupported, ok := data["supported"].([]any)
+		if !ok || len(gotSupported) != len(supported) {
+			t.Fatalf("unsupported-version supported=%#v", data["supported"])
+		}
+		for index, version := range supported {
+			if gotSupported[index] != version {
+				t.Fatalf("unsupported-version supported=%#v want=%#v", gotSupported, supported)
+			}
+		}
+		return
+	}
+	if responseError.Code != sdkmcp.CodeMissingRequiredClientCapabilities {
+		if responseError.Data != nil {
+			t.Fatalf("unexpected error data=%#v", responseError.Data)
+		}
+		return
+	}
+	data, ok := responseError.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("missing-capabilities data=%#v", responseError.Data)
+	}
+	required, ok := data["requiredCapabilities"].(map[string]any)
+	if !ok {
+		t.Fatalf("required capabilities=%#v", data["requiredCapabilities"])
+	}
+	roots, hasRoots := required["roots"].(map[string]any)
+	if !hasRoots || len(roots) != 0 {
+		t.Fatalf("required roots shape=%#v", required["roots"])
+	}
+	extensions, hasExtensions := required["extensions"].(map[string]any)
+	if oauthRequired {
+		if !hasExtensions || len(required) != 2 {
+			t.Fatalf("OAuth extension requirement missing: %#v", required)
+		}
+		if _, ok := extensions[oauthClientCredentialsExtension].(map[string]any); !ok {
+			t.Fatalf("OAuth extension settings missing: %#v", extensions)
+		}
+	} else if hasExtensions || len(required) != 1 {
+		t.Fatalf("base capability error unexpectedly requires capabilities: %#v", required)
 	}
 }
 
