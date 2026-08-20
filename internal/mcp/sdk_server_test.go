@@ -271,6 +271,112 @@ func TestSDKHandlerEnforcesAndReleasesSharedMemoryBudget(t *testing.T) {
 	}
 }
 
+func TestSDKHandlerChunkedAndExceptionalReadsReleaseWorstCaseReservation(t *testing.T) {
+	newRuntime := func(t *testing.T) *Server {
+		t.Helper()
+		cfg := config.Default()
+		cfg.Memory.BudgetBytes = 64 << 20
+		return NewServer(cfg, nil, nil, nil)
+	}
+	serve := func(t *testing.T, runtime *Server, reader io.ReadCloser) *httptest.ResponseRecorder {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+		request.Body = reader
+		request.ContentLength = -1
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Accept", "application/json, text/event-stream")
+		recorder := httptest.NewRecorder()
+		NewSDKHandler(runtime, true).ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	t.Run("chunked request reserves worst case before read", func(t *testing.T) {
+		runtime := newRuntime(t)
+		reader := &budgetProbeReadCloser{budget: runtime.MemoryBudget, reader: strings.NewReader(`{}`)}
+		recorder := serve(t, runtime, reader)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("chunked invalid request status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		assertModernBudgetProbeReleased(t, runtime, reader)
+	})
+
+	t.Run("chunked request over wire limit returns 413", func(t *testing.T) {
+		runtime := newRuntime(t)
+		reader := &budgetProbeReadCloser{
+			budget: runtime.MemoryBudget,
+			reader: strings.NewReader(strings.Repeat("x", int(maxMCPBodyBytes)+1)),
+		}
+		recorder := serve(t, runtime, reader)
+		if recorder.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("chunked oversized request status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		assertModernBudgetProbeReleased(t, runtime, reader)
+	})
+
+	t.Run("canceled body read releases reservation", func(t *testing.T) {
+		runtime := newRuntime(t)
+		reader := &budgetProbeReadCloser{budget: runtime.MemoryBudget, readErr: context.Canceled}
+		recorder := serve(t, runtime, reader)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("canceled body status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		assertModernBudgetProbeReleased(t, runtime, reader)
+	})
+
+	t.Run("panicking body read releases reservation", func(t *testing.T) {
+		runtime := newRuntime(t)
+		reader := &budgetProbeReadCloser{budget: runtime.MemoryBudget, panicValue: "body reader panic"}
+		var recovered any
+		func() {
+			defer func() { recovered = recover() }()
+			_ = serve(t, runtime, reader)
+		}()
+		if recovered != reader.panicValue {
+			t.Fatalf("panic=%#v want=%#v", recovered, reader.panicValue)
+		}
+		assertModernBudgetProbeReleased(t, runtime, reader)
+	})
+}
+
+type budgetUsage interface {
+	Used() int64
+}
+
+type budgetProbeReadCloser struct {
+	budget     budgetUsage
+	reader     io.Reader
+	readErr    error
+	panicValue any
+	observed   int64
+	read       bool
+}
+
+func (reader *budgetProbeReadCloser) Read(buffer []byte) (int, error) {
+	if !reader.read {
+		reader.read = true
+		reader.observed = reader.budget.Used()
+	}
+	if reader.panicValue != nil {
+		panic(reader.panicValue)
+	}
+	if reader.readErr != nil {
+		return 0, reader.readErr
+	}
+	return reader.reader.Read(buffer)
+}
+
+func (*budgetProbeReadCloser) Close() error { return nil }
+
+func assertModernBudgetProbeReleased(t *testing.T, runtime *Server, reader *budgetProbeReadCloser) {
+	t.Helper()
+	if !reader.read || reader.observed != maxModernRequestMemoryBytes {
+		t.Fatalf("body read observed reservation=%d read=%t want=%d", reader.observed, reader.read, maxModernRequestMemoryBytes)
+	}
+	if runtime.MemoryBudget.Used() != 0 {
+		t.Fatalf("modern request leaked %d bytes", runtime.MemoryBudget.Used())
+	}
+}
+
 func TestModernOutputSchemasAcceptEmptySliceEncoding(t *testing.T) {
 	descriptors := modernToolCatalog(context.Background(), NewServer(config.Default(), nil, nil, nil), auth.Principal{})
 	for _, descriptor := range descriptors {
