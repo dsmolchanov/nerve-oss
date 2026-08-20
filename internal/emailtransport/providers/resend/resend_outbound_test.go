@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -91,6 +92,34 @@ func TestResendOutboundAdapterSendsWithIdempotencyHeader(t *testing.T) {
 	}
 	if second["filename"] != "second.pdf" || second["content"] != base64.StdEncoding.EncodeToString([]byte{0, 1, 2, 3}) {
 		t.Fatalf("second attachment=%#v", second)
+	}
+}
+
+func TestResendOutboundReplayPayloadIsByteStable(t *testing.T) {
+	var bodies [][]byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bodies = append(bodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"email_stable"}`))
+	}))
+	defer srv.Close()
+
+	adapter := NewOutboundAdapter(Config{APIKey: "re_test_key", BaseURL: srv.URL, HTTPClient: srv.Client()})
+	message := emailtransport.OutboundMessage{
+		From: "sender@example.com", To: []string{"to@example.com"}, Subject: "Stable", TextBody: "body",
+		Tags: map[string]string{"zeta": "last", "alpha": "first", "middle": "value"},
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := adapter.SendMessage(context.Background(), message, "same-operation"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(bodies) != 2 || string(bodies[0]) != string(bodies[1]) {
+		t.Fatalf("replay payload drifted:\nfirst=%s\nsecond=%s", bodies[0], bodies[1])
 	}
 }
 

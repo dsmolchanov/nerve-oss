@@ -33,15 +33,21 @@ type FeatureGate interface {
 	Enabled(ctx context.Context, flag string, orgID string) (bool, error)
 }
 
+type OutboundPolicyGate interface {
+	Authorize(ctx context.Context, principal auth.Principal, toolName string, arguments json.RawMessage) error
+}
+
 type Server struct {
-	Config       config.Config
-	Auth         *auth.Service
-	Entitlements EntitlementGate
-	Tools        *tools.Service
-	MemoryBudget *memguard.Budget
-	FeatureFlags FeatureGate
-	mu           sync.Mutex
-	sessions     map[string]time.Time
+	Config         config.Config
+	Auth           *auth.Service
+	Entitlements   EntitlementGate
+	Tools          *tools.Service
+	MemoryBudget   *memguard.Budget
+	FeatureFlags   FeatureGate
+	OutboundPolicy OutboundPolicyGate
+	Invoker        *Invoker
+	mu             sync.Mutex
+	sessions       map[string]time.Time
 }
 
 func NewServer(cfg config.Config, toolsSvc *tools.Service, authSvc *auth.Service, entitlementSvc EntitlementGate) *Server {
@@ -49,7 +55,12 @@ func NewServer(cfg config.Config, toolsSvc *tools.Service, authSvc *auth.Service
 	if err != nil {
 		budget, _ = memguard.New(64 << 20)
 	}
-	return &Server{Config: cfg, Auth: authSvc, Entitlements: entitlementSvc, Tools: toolsSvc, MemoryBudget: budget, sessions: make(map[string]time.Time)}
+	server := &Server{Config: cfg, Auth: authSvc, Entitlements: entitlementSvc, Tools: toolsSvc, MemoryBudget: budget, sessions: make(map[string]time.Time)}
+	if toolsSvc != nil && toolsSvc.Store != nil {
+		server.OutboundPolicy = &storeOutboundPolicyGate{store: boundaryPolicyStore{store: toolsSvc.Store}}
+	}
+	server.Invoker = &Invoker{server: server}
+	return server
 }
 
 const maxMCPBodyBytes int64 = 16 << 20
@@ -312,7 +323,11 @@ func (s *Server) dispatch(ctx context.Context, req Request) (any, error) {
 	case "tools/list":
 		return ListTools(s.attachmentsEnabled(ctx)), nil
 	case "tools/call":
-		return s.callTool(ctx, req)
+		invocation, err := ToolInvocationFromRequest(req)
+		if err != nil {
+			return nil, err
+		}
+		return s.Invoker.Invoke(ctx, invocation)
 	case "resources/list":
 		return ListResources(), nil
 	case "resources/read":
@@ -322,11 +337,8 @@ func (s *Server) dispatch(ctx context.Context, req Request) (any, error) {
 	}
 }
 
-func (s *Server) callTool(ctx context.Context, req Request) (any, error) {
-	var params ToolCallParams
-	if err := decodeParams(req.Params, &params); err != nil {
-		return nil, err
-	}
+func (invoker *Invoker) invokeTool(ctx context.Context, params ToolCallParams) (any, error) {
+	s := invoker.server
 	start := time.Now()
 	inputsHash := hashJSON(params.Arguments)
 	replayID := observability.NewReplayID()

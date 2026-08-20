@@ -93,3 +93,18 @@ func repeatAttachment(input AttachmentInput, count int) []AttachmentInput {
 	}
 	return inputs
 }
+
+func TestDecodeOutboundAttachmentsRejectsOversizedEncodingBeforeDecoding(t *testing.T) {
+	// One byte past what a legal attachment can encode to. Decoding this to
+	// discover the size is exactly the allocation the limit exists to prevent.
+	oversized := strings.Repeat("A", base64.StdEncoding.EncodedLen(maxAttachmentBytes)+1)
+
+	_, err := DecodeOutboundAttachments([]AttachmentInput{{
+		Filename: "big.pdf", ContentType: "application/pdf", ContentBase64: oversized,
+	}})
+
+	var inputErr *AttachmentInputError
+	if !errors.As(err, &inputErr) || inputErr.Code != "attachment_too_large" {
+		t.Fatalf("expected attachment_too_large, got %v", err)
+	}
+}

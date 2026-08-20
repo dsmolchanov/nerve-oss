@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net/mail"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -49,6 +51,23 @@ type ComposeEmailOptions struct {
 
 func NewService(cfg config.Config, store *store.Store, llmProvider llm.Provider, vectorStore vector.Store, policyObj policy.Policy, embedder embed.Provider, transport *emailtransport.Registry) *Service {
 	return &Service{Config: cfg, Store: store, LLM: llmProvider, Vector: vectorStore, Policy: policyObj, Embedder: embedder, Transport: transport}
+}
+
+// reevaluateOutboundPolicy re-reads the autonomous send policy inside the
+// enqueue transaction.
+//
+// The protocol boundary checks the same policy before dispatch, but that answer
+// is stale by the time this transaction runs: an org suspended, or stripped of
+// its compose evidence, in that window would otherwise still get an outbox row.
+// The decision that matters is the one taken from the snapshot that writes.
+func (s *Service) reevaluateOutboundPolicy(
+	ctx context.Context, st OutboundPolicyStore, principal auth.Principal, input OutboundPolicyInput,
+) error {
+	if !s.Config.Cloud.Mode || principal.Kind != auth.PrincipalM2MOrg {
+		return nil
+	}
+	input.OrgID = principal.OrgID
+	return EvaluateOutboundPolicy(ctx, st, input)
 }
 
 func (s *Service) withScopedStore(ctx context.Context, fn func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error)) (any, error) {
@@ -287,21 +306,79 @@ func (s *Service) SendReply(ctx context.Context, threadID string, body string, b
 	return s.SendReplyWithAttachments(ctx, threadID, body, bodyHTML, needsApproval, idempotencyKey, nil)
 }
 
-func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string, body string, bodyHTML string, needsApproval bool, idempotencyKey string, attachments []store.OutboundAttachment) (any, error) {
-	if needsApproval {
-		if !s.Config.Cloud.Mode {
-			if !s.Config.Security.AllowSendWithWarnings {
-				return nil, errors.New("send blocked: needs human approval")
-			}
-		} else {
-			reservation, ok := entitlements.ReservationFromContext(ctx)
-			if !ok {
-				return nil, errors.New("missing entitlement context")
-			}
-			if !entitlements.FeatureBool(reservation.Features, "email_autopilot_send_override", false) {
-				return nil, errors.New("send blocked: needs human approval")
-			}
+// approvalGate decides whether outbound content may leave without a human.
+//
+// needs_human_approval is caller-supplied, so a caller that omits it or sends
+// false must not thereby escape review: the final body is evaluated with server
+// policy and either verdict can require approval. A policy violation is refused
+// outright rather than downgraded to an approval request.
+func (s *Service) approvalGate(ctx context.Context, body, bodyHTML string, requested bool) error {
+	needsApproval := requested
+	principal, _ := auth.PrincipalFromContext(ctx)
+	if principal.Kind != auth.PrincipalM2MOrg {
+		return s.requireApprovalOverride(ctx, needsApproval)
+	}
+	// Both representations are evaluated: an HTML-only message would otherwise
+	// be judged on an empty string. A redaction is a refusal rather than a
+	// silent pass, because the sanitized text is not what this path enqueues,
+	// and a plain-text replacement cannot be spliced into HTML safely; the
+	// drafting tool is where redacted content is produced for review.
+	representations := []struct {
+		label string
+		text  string
+	}{{"body", body}}
+	if rendered := visibleText(bodyHTML); rendered != "" {
+		// The HTML is judged as a reader sees it. Raw markup is deliberately
+		// not evaluated: attribute values, URLs and stylesheet contents are not
+		// what the recipient reads, and matching them invents violations.
+		representations = append(representations, struct {
+			label string
+			text  string
+		}{"html body", rendered})
+	}
+	for _, representation := range representations {
+		if strings.TrimSpace(representation.text) == "" {
+			continue
 		}
+		adjusted, evaluated := policy.Evaluate(representation.text, s.Policy)
+		if !evaluated.Allowed {
+			reason := evaluated.Reason
+			if reason == "" {
+				reason = "content is not allowed by policy"
+			}
+			return errors.New("send blocked by policy: " + reason)
+		}
+		if adjusted != representation.text {
+			return errors.New("send blocked by policy: " + representation.label + " requires redaction")
+		}
+		needsApproval = needsApproval || evaluated.NeedsApproval
+	}
+	return s.requireApprovalOverride(ctx, needsApproval)
+}
+
+func (s *Service) requireApprovalOverride(ctx context.Context, needsApproval bool) error {
+	if !needsApproval {
+		return nil
+	}
+	if !s.Config.Cloud.Mode {
+		if !s.Config.Security.AllowSendWithWarnings {
+			return errors.New("send blocked: needs human approval")
+		}
+		return nil
+	}
+	reservation, ok := entitlements.ReservationFromContext(ctx)
+	if !ok {
+		return errors.New("missing entitlement context")
+	}
+	if !entitlements.FeatureBool(reservation.Features, "email_autopilot_send_override", false) {
+		return errors.New("send blocked: needs human approval")
+	}
+	return nil
+}
+
+func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string, body string, bodyHTML string, needsApproval bool, idempotencyKey string, attachments []store.OutboundAttachment) (any, error) {
+	if err := s.approvalGate(ctx, body, bodyHTML, needsApproval); err != nil {
+		return nil, err
 	}
 	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
 		if principal.OrgID != "" {
@@ -317,9 +394,26 @@ func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string,
 		if len(messages) == 0 {
 			return nil, errors.New("no messages in thread")
 		}
-		to := messages[len(messages)-1].From.Email
+		to, err := replyRecipient(scopedCtx, st, principal, thread, messages)
+		if err != nil {
+			return nil, err
+		}
 		if to == "" {
 			return nil, errors.New("missing recipient")
+		}
+
+		if err := s.reevaluateOutboundPolicy(scopedCtx, st, principal, OutboundPolicyInput{
+			Tool: "send_reply", ThreadID: threadID,
+		}); err != nil {
+			return nil, err
+		}
+		composeEnabled := false
+		if principal.Kind == auth.PrincipalM2MOrg {
+			var err error
+			composeEnabled, err = AutonomousComposeAllowed(scopedCtx, st, principal.OrgID, inboxID)
+			if err != nil {
+				return nil, &OutboundPolicyError{Code: "outbound_policy_unavailable"}
+			}
 		}
 
 		inbox, err := s.activeInboxRecord(scopedCtx, st, principal, inboxID)
@@ -362,19 +456,23 @@ func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string,
 		}
 
 		outboxID, err := st.EnqueueOutboxMessage(scopedCtx, store.OutboxMessage{
-			OrgID:          inbox.OrgID,
-			InboxID:        inboxID,
-			Provider:       provider,
-			IdempotencyKey: idempotencyKey,
-			To:             to,
-			From:           from,
-			Subject:        subject,
-			TextBody:       body,
-			HTMLBody:       bodyHTML,
-			Attachments:    attachments,
+			OrgID:                        inbox.OrgID,
+			InboxID:                      inboxID,
+			Provider:                     provider,
+			IdempotencyKey:               idempotencyKey,
+			AllowLegacyIdempotencyReplay: allowLegacyOutboundReplay(scopedCtx),
+			To:                           to,
+			From:                         from,
+			Subject:                      subject,
+			TextBody:                     body,
+			HTMLBody:                     bodyHTML,
+			Attachments:                  attachments,
+			AutonomousLimits: autonomousLimitInput(
+				principal, "send_reply", idempotencyKey, to, composeEnabled,
+			),
 		})
 		if err != nil {
-			return nil, err
+			return nil, translateOutboundLimitError(err)
 		}
 
 		if _, err := st.GetMessage(scopedCtx, outboxID); err == nil {
@@ -403,6 +501,36 @@ func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string,
 	})
 }
 
+type replyMessageStore interface {
+	GetMessage(context.Context, string) (store.Message, error)
+}
+
+func replyRecipient(ctx context.Context, messagesStore replyMessageStore, principal auth.Principal, thread store.Thread, messages []store.Message) (string, error) {
+	if len(messages) == 0 {
+		return "", errors.New("no messages in thread")
+	}
+	if principal.Kind != auth.PrincipalM2MOrg {
+		return messages[len(messages)-1].From.Email, nil
+	}
+	for index := len(messages) - 1; index >= 0; index-- {
+		candidate := messages[index]
+		if candidate.Direction != "inbound" || candidate.InboxID != thread.InboxID {
+			continue
+		}
+		message, err := messagesStore.GetMessage(ctx, candidate.ID)
+		if err != nil {
+			return "", err
+		}
+		if message.ThreadID == thread.ID && message.InboxID == thread.InboxID &&
+			message.Direction == "inbound" && message.ReceivedEmailID != "" {
+			if recipient := strings.TrimSpace(message.From.Email); recipient != "" {
+				return recipient, nil
+			}
+		}
+	}
+	return "", errors.New("no real inbound reply target")
+}
+
 func (s *Service) ComposeEmail(ctx context.Context, inboxID, toAddress, subject, body string, bodyHTML string, idempotencyKey string) (any, error) {
 	return s.ComposeEmailWithOptions(ctx, inboxID, toAddress, subject, body, bodyHTML, idempotencyKey, ComposeEmailOptions{})
 }
@@ -413,6 +541,11 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 	}
 	if body == "" && bodyHTML == "" {
 		return nil, errors.New("missing body")
+	}
+	// compose carries no needs_human_approval field at all, so without this the
+	// content policy governed replies but never new messages.
+	if err := s.approvalGate(ctx, body, bodyHTML, false); err != nil {
+		return nil, err
 	}
 	if toAddress == "" {
 		return nil, errors.New("missing recipient")
@@ -430,6 +563,12 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 			if err := s.ensureInboxBelongsToOrg(scopedCtx, st, principal.OrgID, inboxID); err != nil {
 				return nil, err
 			}
+		}
+
+		if err := s.reevaluateOutboundPolicy(scopedCtx, st, principal, OutboundPolicyInput{
+			Tool: "compose_email", InboxID: inboxID,
+		}); err != nil {
+			return nil, err
 		}
 
 		inbox, err := s.activeInboxRecord(scopedCtx, st, principal, inboxID)
@@ -471,19 +610,23 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 		}
 
 		outboxID, err := st.EnqueueOutboxMessage(scopedCtx, store.OutboxMessage{
-			OrgID:          inbox.OrgID,
-			InboxID:        inboxID,
-			Provider:       provider,
-			IdempotencyKey: idempotencyKey,
-			To:             toAddress,
-			From:           fromMailbox,
-			Subject:        subject,
-			TextBody:       body,
-			HTMLBody:       bodyHTML,
-			Attachments:    options.Attachments,
+			OrgID:                        inbox.OrgID,
+			InboxID:                      inboxID,
+			Provider:                     provider,
+			IdempotencyKey:               idempotencyKey,
+			AllowLegacyIdempotencyReplay: allowLegacyOutboundReplay(scopedCtx),
+			To:                           toAddress,
+			From:                         fromMailbox,
+			Subject:                      subject,
+			TextBody:                     body,
+			HTMLBody:                     bodyHTML,
+			Attachments:                  options.Attachments,
+			AutonomousLimits: autonomousLimitInput(
+				principal, "compose_email", idempotencyKey, toAddress, true,
+			),
 		})
 		if err != nil {
-			return nil, err
+			return nil, translateOutboundLimitError(err)
 		}
 
 		if existing, err := st.GetMessage(scopedCtx, outboxID); err == nil {
@@ -518,6 +661,31 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 			"status":     "queued",
 		}, nil
 	})
+}
+
+func autonomousLimitInput(
+	principal auth.Principal, toolName, idempotencyKey, recipient string, composeEnabled bool,
+) *store.OutboundLimitInput {
+	if principal.Kind != auth.PrincipalM2MOrg {
+		return nil
+	}
+	return &store.OutboundLimitInput{
+		ToolName: toolName, IdempotencyKey: idempotencyKey,
+		Recipient: recipient, ComposeEnabled: composeEnabled,
+	}
+}
+
+func allowLegacyOutboundReplay(ctx context.Context) bool {
+	reservation, ok := entitlements.ReservationFromContext(ctx)
+	return ok && reservation.LegacyOutboundReplay
+}
+
+func translateOutboundLimitError(err error) error {
+	var limitErr *store.OutboundLimitError
+	if errors.As(err, &limitErr) {
+		return &entitlements.RateLimitError{RetryAfterSeconds: limitErr.RetryAfterSeconds}
+	}
+	return err
 }
 
 func normalizeFromName(value string) (string, error) {
@@ -587,11 +755,33 @@ func (s *Service) activeInboxRecord(ctx context.Context, st *store.Store, princi
 	return inbox, nil
 }
 
+// schemaIDPattern keeps a schema id a single directory-free name. The id is
+// interpolated into a path and read from disk, so anything able to traverse
+// (`..`, a separator, a leading dot) would let a caller hand the model an
+// arbitrary readable JSON file as the extraction schema.
+var schemaIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+
 func LoadSchema(schemaID string) (map[string]any, error) {
 	if schemaID == "" {
 		return nil, errors.New("missing schema id")
 	}
+	if !schemaIDPattern.MatchString(schemaID) {
+		return nil, errors.New("invalid schema id")
+	}
 	path := fmt.Sprintf("configs/schemas/%s.json", schemaID)
+	// Defence in depth: the pattern already excludes traversal, but the read
+	// itself refuses anything that does not resolve beneath the directory.
+	resolved, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	root, err := filepath.Abs("configs/schemas")
+	if err != nil {
+		return nil, err
+	}
+	if filepath.Dir(resolved) != root {
+		return nil, errors.New("invalid schema id")
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err

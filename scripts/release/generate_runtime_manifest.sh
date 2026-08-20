@@ -9,8 +9,8 @@ BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 MCP_CONTRACT_PATH="${MCP_CONTRACT_PATH:-docs/MCP_Contract.md}"
 CORE_MIGRATIONS_PATH="${CORE_MIGRATIONS_PATH:-internal/store/migrations/core}"
 OUTBOUND_POLICY_PATH="${OUTBOUND_POLICY_PATH:-configs/policy/autonomous-outbound-v1.yaml}"
-CORE_SCHEMA_MIN_REQUIRED="28"
-CORE_SCHEMA_MAX_SUPPORTED="28"
+CORE_SCHEMA_MIN_REQUIRED="29"
+CORE_SCHEMA_MAX_SUPPORTED="29"
 
 hash_file() {
   local path="$1"

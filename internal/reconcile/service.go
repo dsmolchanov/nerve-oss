@@ -15,14 +15,15 @@ type Service struct {
 }
 
 type Report struct {
-	CountersRepaired          int
-	PeriodsRolled             int
-	OrgEventsFannedOut        int
-	AttachmentUsageSeeded     int
-	AttachmentUsageRepaired   int
-	OutboxAttachmentsReleased int
-	AttachmentBlobsDeleted    int
-	AttachmentBytesReleased   int64
+	CountersRepaired           int
+	PeriodsRolled              int
+	OrgEventsFannedOut         int
+	AttachmentUsageSeeded      int
+	AttachmentUsageRepaired    int
+	OutboxAttachmentsReleased  int
+	AttachmentBlobsDeleted     int
+	AttachmentBytesReleased    int64
+	OutboundRateBucketsDeleted int
 }
 
 func NewService(st *store.Store) *Service {
@@ -40,24 +41,29 @@ func (s *Service) Run(ctx context.Context) (Report, error) {
 		return report, nil
 	}
 
+	// Delete expired derived buckets before listing counters; otherwise every
+	// minute of M2M traffic permanently increases the reconciliation scan.
+	now := s.Now()
+	deletedBuckets, err := s.Store.DeleteExpiredOutboundUsageCounters(ctx, now.Add(-24*time.Hour))
+	if err != nil {
+		return report, err
+	}
+	report.OutboundRateBucketsDeleted = deletedBuckets
+
 	counters, err := s.Store.ListOrgUsageCounters(ctx)
 	if err != nil {
 		return report, err
 	}
 	for _, counter := range counters {
-		expected, err := s.Store.SumUsageEvents(ctx, counter.OrgID, counter.MeterName, counter.PeriodStart, counter.PeriodEnd)
+		_, changed, err := s.Store.ReconcileOrgUsageCounter(ctx, counter)
 		if err != nil {
 			return report, err
 		}
-		if expected != counter.Used {
-			if err := s.Store.SetOrgUsageCounterUsed(ctx, counter.OrgID, counter.MeterName, counter.PeriodStart, expected); err != nil {
-				return report, err
-			}
+		if changed {
 			report.CountersRepaired++
 		}
 	}
 
-	now := s.Now()
 	coreVersion, err := store.CurrentVersionCore(ctx, s.Store.DB())
 	if err != nil {
 		return report, err

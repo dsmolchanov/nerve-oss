@@ -127,6 +127,50 @@ func TestPreAuthorizeToolRollsUsagePeriodForward(t *testing.T) {
 	})
 }
 
+func TestM2MRateLimitIsSharedAcrossServiceInstances(t *testing.T) {
+	withTempStore(t, func(ctx context.Context, st *store.Store) {
+		orgID := uuid.NewString()
+		now := time.Date(2026, 8, 18, 20, 15, 30, 0, time.UTC)
+		periodStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+		periodEnd := periodStart.Add(30 * 24 * time.Hour)
+		insertEntitlementFixture(t, ctx, st, orgID, periodStart, periodEnd, 100, 1)
+
+		first := NewService(config.Default(), st, nil)
+		second := NewService(config.Default(), st, nil)
+		first.Now = func() time.Time { return now }
+		second.Now = func() time.Time { return now }
+		principal := auth.Principal{Kind: auth.PrincipalM2MOrg, OrgID: orgID}
+
+		if _, err := first.PreAuthorizeTool(ctx, principal, "list_threads", "rate-replay-1", ""); err != nil {
+			t.Fatalf("first replica reservation: %v", err)
+		}
+		_, err := second.PreAuthorizeTool(ctx, principal, "list_threads", "rate-replay-2", "")
+		var rateErr *RateLimitError
+		if !errors.As(err, &rateErr) {
+			t.Fatalf("second replica must observe the shared limit, got %v", err)
+		}
+		if rateErr.RetryAfterSeconds != 30 {
+			t.Fatalf("expected retry_after_seconds=30, got %d", rateErr.RetryAfterSeconds)
+		}
+
+		minuteStart := now.Truncate(time.Minute)
+		used, err := st.GetOrgUsageCounterUsed(ctx, orgID, store.MeterMCPRequestsPerMinute, minuteStart)
+		if err != nil {
+			t.Fatalf("read durable rate counter: %v", err)
+		}
+		if used != 1 {
+			t.Fatalf("expected one durable reservation, got %d", used)
+		}
+		events, err := st.SumUsageEvents(ctx, orgID, store.MeterMCPRequestsPerMinute, minuteStart, minuteStart.Add(time.Minute))
+		if err != nil {
+			t.Fatalf("sum durable rate events: %v", err)
+		}
+		if events != 1 {
+			t.Fatalf("expected one reconstructible rate event, got %d", events)
+		}
+	})
+}
+
 func TestPreAuthorizeToolDeniesSendToolsWhenSendDisabled(t *testing.T) {
 	withTempStore(t, func(ctx context.Context, st *store.Store) {
 		orgID := uuid.NewString()
@@ -192,6 +236,39 @@ func TestIdempotentReplayDoesNotDoubleChargeUnits(t *testing.T) {
 		}
 		if used2 != used1 {
 			t.Fatalf("expected used units to remain %d after replay, got %d", used1, used2)
+		}
+	})
+}
+
+func TestRecoveredOutboundIdempotencyEnablesLegacyReplayOnlyForRecoveredTool(t *testing.T) {
+	withTempStore(t, func(ctx context.Context, st *store.Store) {
+		orgID := uuid.NewString()
+		periodStart := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+		periodEnd := periodStart.Add(30 * 24 * time.Hour)
+		insertEntitlementFixture(t, ctx, st, orgID, periodStart, periodEnd, 100, 100000)
+
+		now := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
+		const rawKey = "legacy-recovery"
+		if err := st.MarkToolIdempotencyFailed(ctx, orgID, "send_reply", rawKey, now.Add(-time.Hour)); err != nil {
+			t.Fatalf("seed failed send_reply idempotency: %v", err)
+		}
+
+		svc := NewService(config.Default(), st, nil)
+		svc.Now = func() time.Time { return now }
+		recovered, err := svc.PreAuthorizeTool(ctx, auth.Principal{OrgID: orgID}, "send_reply", "recover-replay", rawKey)
+		if err != nil {
+			t.Fatalf("recover send_reply idempotency: %v", err)
+		}
+		if !recovered.LegacyOutboundReplay {
+			t.Fatal("recovered tool idempotency did not enable legacy outbox lookup")
+		}
+
+		fresh, err := svc.PreAuthorizeTool(ctx, auth.Principal{OrgID: orgID}, "compose_email", "fresh-replay", rawKey)
+		if err != nil {
+			t.Fatalf("authorize fresh compose_email with same raw key: %v", err)
+		}
+		if fresh.LegacyOutboundReplay {
+			t.Fatal("fresh cross-tool idempotency unexpectedly enabled legacy outbox lookup")
 		}
 	})
 }

@@ -17,10 +17,12 @@ import (
 )
 
 type fakeEntitlementGate struct {
-	preAuthErr error
+	preAuthErr   error
+	preAuthCalls int
 }
 
 func (f *fakeEntitlementGate) PreAuthorizeTool(_ context.Context, _ auth.Principal, _ string, _ string, _ string) (*entitlements.Reservation, error) {
+	f.preAuthCalls++
 	return nil, f.preAuthErr
 }
 
