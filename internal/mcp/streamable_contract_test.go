@@ -129,38 +129,66 @@ func TestModernContractAcceptsOmittedClientInfo(t *testing.T) {
 	}
 }
 
-func TestModernContractSupportsJSONAndSSEResponses(t *testing.T) {
+func TestModernContractJSONResponseModesEmitOneFinalResponse(t *testing.T) {
 	meta := map[string]any{
 		sdkmcp.MetaKeyProtocolVersion:    ModernProtocolVersion,
 		sdkmcp.MetaKeyClientCapabilities: map[string]any{},
 	}
-	for _, test := range []struct {
+	modes := []struct {
 		name         string
 		jsonResponse bool
 		contentType  string
 	}{
 		{name: "json", jsonResponse: true, contentType: "application/json"},
 		{name: "sse", jsonResponse: false, contentType: "text/event-stream"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			runtime := NewServer(config.Default(), nil, nil, nil)
-			request := modernContractRequest(t, "tools/list", map[string]any{"_meta": meta})
-			recorder := httptest.NewRecorder()
-			NewSDKHandler(runtime, test.jsonResponse).ServeHTTP(recorder, request)
-			if recorder.Code != http.StatusOK {
-				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
-			}
-			if got := recorder.Header().Get("Content-Type"); len(got) < len(test.contentType) || got[:len(test.contentType)] != test.contentType {
-				t.Fatalf("content type=%q want base %q", got, test.contentType)
-			}
-			if !bytes.Contains(recorder.Body.Bytes(), []byte(`"jsonrpc":"2.0"`)) ||
-				!bytes.Contains(recorder.Body.Bytes(), []byte(`"result"`)) {
-				t.Fatalf("missing final JSON-RPC result: %s", recorder.Body.String())
-			}
-			if err := validateModernResponseStream(request.Context(), recorder.Header().Get("Content-Type"), bytes.NewReader(recorder.Body.Bytes()), json.RawMessage(`1`)); err != nil {
-				t.Fatalf("handler response violated contract: %v body=%s", err, recorder.Body.String())
-			}
-		})
+	}
+	fixtures := []struct {
+		name       string
+		method     string
+		tool       string
+		arguments  map[string]any
+		wantMember string
+		wantBody   string
+	}{
+		{name: "success", method: "tools/list", wantMember: `"result"`},
+		{
+			name: "failure", method: "tools/call", tool: "compose_email", wantMember: `"result"`, wantBody: `"isError":true`,
+			arguments: map[string]any{"inbox_id": modernTestUUID, "to": "not-an-email", "subject": "subject", "body": "body"},
+		},
+	}
+	for _, mode := range modes {
+		for _, fixture := range fixtures {
+			t.Run(mode.name+"/"+fixture.name, func(t *testing.T) {
+				runtime := NewServer(config.Default(), nil, nil, nil)
+				params := map[string]any{"_meta": meta}
+				if fixture.tool != "" {
+					params["name"] = fixture.tool
+					params["arguments"] = fixture.arguments
+				}
+				request := modernContractRequest(t, fixture.method, params)
+				if fixture.tool != "" {
+					request.Header.Set("Mcp-Name", fixture.tool)
+				}
+				recorder := httptest.NewRecorder()
+				NewSDKHandler(runtime, mode.jsonResponse).ServeHTTP(recorder, request)
+				if recorder.Code != http.StatusOK {
+					t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+				}
+				if got := recorder.Header().Get("Content-Type"); len(got) < len(mode.contentType) || got[:len(mode.contentType)] != mode.contentType {
+					t.Fatalf("content type=%q want base %q", got, mode.contentType)
+				}
+				if !bytes.Contains(recorder.Body.Bytes(), []byte(`"jsonrpc":"2.0"`)) ||
+					!bytes.Contains(recorder.Body.Bytes(), []byte(fixture.wantMember)) {
+					t.Fatalf("missing final JSON-RPC %s member: %s", fixture.wantMember, recorder.Body.String())
+				}
+				if fixture.wantBody != "" && !bytes.Contains(recorder.Body.Bytes(), []byte(fixture.wantBody)) {
+					t.Fatalf("missing failure fixture %s: %s", fixture.wantBody, recorder.Body.String())
+				}
+				if err := validateModernResponseStream(request.Context(), recorder.Header().Get("Content-Type"), bytes.NewReader(recorder.Body.Bytes()), json.RawMessage(`1`)); err != nil {
+					t.Fatalf("handler response violated contract: %v body=%s", err, recorder.Body.String())
+				}
+			})
+		}
 	}
 }
 
@@ -220,15 +248,23 @@ func TestExplicitProtocolProfilesReturnFrozenLegacyAndModernWire(t *testing.T) {
 	}
 }
 
-func TestModernSSEContractFixtures(t *testing.T) {
+func TestModernJSONAndSSEContractFixtures(t *testing.T) {
 	validResponse := `{"jsonrpc":"2.0","id":1,"result":{}}`
+	validError := `{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}`
 	tests := []struct {
 		name        string
 		contentType string
 		body        string
 		wantError   bool
 	}{
+		{name: "JSON result", contentType: "application/json; charset=utf-8", body: validResponse},
+		{name: "JSON error", contentType: "application/json", body: validError},
+		{name: "malformed JSON", contentType: "application/json", body: `{"jsonrpc":"2.0","id":1`, wantError: true},
+		{name: "wrong JSON response ID", contentType: "application/json", body: `{"jsonrpc":"2.0","id":2,"result":{}}`, wantError: true},
+		{name: "JSON response without result or error", contentType: "application/json", body: `{"jsonrpc":"2.0","id":1}`, wantError: true},
+		{name: "duplicate JSON response", contentType: "application/json", body: validResponse + validResponse, wantError: true},
 		{name: "multiline comments and related notification", contentType: "text/event-stream; charset=utf-8", body: ": keepalive\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\ndata: \"method\":\"notifications/progress\",\"params\":{}}\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\ndata: \"id\":1,\"result\":{}}\n\n"},
+		{name: "SSE error", contentType: "text/event-stream", body: "data: " + validError + "\n\n"},
 		{name: "malformed event line", contentType: "text/event-stream", body: "not-an-sse-field\n\n", wantError: true},
 		{name: "truncated JSON", contentType: "text/event-stream", body: "data: {\"jsonrpc\":\"2.0\",\"id\":1", wantError: true},
 		{name: "wrong response ID", contentType: "text/event-stream", body: "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\n\n", wantError: true},
@@ -236,7 +272,6 @@ func TestModernSSEContractFixtures(t *testing.T) {
 		{name: "EOF without final response", contentType: "text/event-stream", body: "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n", wantError: true},
 		{name: "missing content type", body: validResponse, wantError: true},
 		{name: "unsupported content type", contentType: "text/plain", body: validResponse, wantError: true},
-		{name: "duplicate JSON response", contentType: "application/json", body: validResponse + validResponse, wantError: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
