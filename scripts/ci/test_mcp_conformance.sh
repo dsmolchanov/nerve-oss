@@ -9,6 +9,8 @@ readonly LOCAL_NPM_VERSION="10.9.2"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 temp_root=""
+# shellcheck source=mcp_conformance_paths.sh
+source "$repo_root/scripts/ci/mcp_conformance_paths.sh"
 
 cleanup() {
   if [[ -n "$temp_root" && -d "$temp_root" ]]; then
@@ -47,12 +49,7 @@ checkout_exact() {
 }
 
 if [[ -n "${MCP_CONFORMANCE_DIR:-}" || -n "${MCP_EXT_AUTH_DIR:-}" ]]; then
-  if [[ -z "${MCP_CONFORMANCE_DIR:-}" || -z "${MCP_EXT_AUTH_DIR:-}" ]]; then
-    echo "MCP_CONFORMANCE_DIR and MCP_EXT_AUTH_DIR must be set together" >&2
-    exit 1
-  fi
-  conformance_dir="$MCP_CONFORMANCE_DIR"
-  ext_auth_dir="$MCP_EXT_AUTH_DIR"
+  resolve_mcp_conformance_overrides "$repo_root"
 else
   temp_root="$(mktemp -d "${TMPDIR:-/tmp}/nerve-mcp-conformance.XXXXXX")"
   conformance_dir="$temp_root/conformance"
@@ -60,6 +57,8 @@ else
   checkout_exact "https://github.com/modelcontextprotocol/conformance.git" "$CONFORMANCE_REVISION" "$conformance_dir"
   checkout_exact "https://github.com/modelcontextprotocol/ext-auth.git" "$EXT_AUTH_REVISION" "$ext_auth_dir"
 fi
+
+"$repo_root/scripts/ci/test_mcp_conformance_paths.sh"
 
 if [[ "$(git -C "$conformance_dir" rev-parse HEAD)" != "$CONFORMANCE_REVISION" ]]; then
   echo "MCP conformance checkout is not pinned to $CONFORMANCE_REVISION" >&2
