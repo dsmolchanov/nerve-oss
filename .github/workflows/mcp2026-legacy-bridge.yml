@@ -1,0 +1,407 @@
+name: MCP 2026 Legacy Runtime Bridge
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/mcp2026-legacy-bridge.yml"
+      - "deploy/docker/cortex/Dockerfile.legacy-bridge"
+      - "internal/store/migrations/core/**"
+      - "schemas/mcp2026-legacy-bridge-receipt.schema.json"
+      - "scripts/ci/verify_mcp2026_legacy_bridge.py"
+      - "scripts/release/build_mcp2026_legacy_bridge.sh"
+      - "scripts/release/mcp2026-legacy-bridge-v0.0.17.patch"
+  workflow_dispatch:
+    inputs:
+      target_env:
+        description: "Protected environment receiving the content-addressed bridge mirror."
+        required: true
+        type: choice
+        options: [cloud-production]
+      confirm:
+        description: "Type BUILD-R0-v0.0.17-CORE28-29."
+        required: true
+        type: string
+
+concurrency:
+  group: mcp2026-legacy-runtime-bridge
+  cancel-in-progress: false
+
+jobs:
+  validate-authority:
+    name: Validate exact R0 authority
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Refuse non-main protected dispatch
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          TARGET_ENV: ${{ inputs.target_env }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          test "${DISPATCH_REF}" = refs/heads/main
+          test "${TARGET_ENV}" = cloud-production
+          test "${CONFIRM}" = BUILD-R0-v0.0.17-CORE28-29
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.0"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Verify receipt verifier negatives
+        run: ./scripts/ci/verify_mcp2026_legacy_bridge.py --self-test
+      - name: Prepare exact pinned source and reproducible binary
+        run: |
+          mkdir -p dist/r0
+          ./scripts/release/build_mcp2026_legacy_bridge.sh prepare \
+            dist/r0/source dist/r0/build-metadata.json
+          ./scripts/release/build_mcp2026_legacy_bridge.sh build-binary \
+            dist/r0/source dist/r0/binaries dist/r0/build-metadata.json
+          ./scripts/release/build_mcp2026_legacy_bridge.sh stage-image \
+            dist/r0/binaries/nerve-runtime dist/r0/image-context
+      - name: Build and inspect local derivative image
+        run: |
+          build_args=(
+            --build-arg RUNTIME_VERSION="$(jq -er '.runtime_version' dist/r0/build-metadata.json)"
+            --build-arg MCP_CONTRACT_HASH="$(jq -er '.mcp_contract_sha256' dist/r0/build-metadata.json)"
+            --build-arg CORE_SCHEMA_HASH="$(jq -er '.core_schema_sha256' dist/r0/build-metadata.json)"
+            --build-arg PATCH_SHA256="$(jq -er '.patch_sha256' dist/r0/build-metadata.json)"
+            --build-arg BUILD_COMMIT="$(jq -er '.source_revision' dist/r0/build-metadata.json)"
+            --build-arg BUILD_TIME="$(jq -er '.build_time' dist/r0/build-metadata.json)"
+            --build-arg SOURCE_DATE_EPOCH=1787097600
+          )
+          build_oci() {
+            local destination="$1"
+            docker buildx build --no-cache --platform linux/amd64 --provenance=false \
+              --file deploy/docker/cortex/Dockerfile.legacy-bridge \
+              --output "type=oci,dest=${destination},rewrite-timestamp=true" \
+              "${build_args[@]}" \
+              dist/r0/image-context
+          }
+          build_oci dist/r0/repro-first.oci.tar
+          build_oci dist/r0/repro-second.oci.tar
+          test "$(sha256sum dist/r0/repro-first.oci.tar | awk '{print $1}')" = \
+            "$(sha256sum dist/r0/repro-second.oci.tar | awk '{print $1}')"
+          first_platform_digest="$(tar -xOf dist/r0/repro-first.oci.tar index.json | jq -er '.manifests[0].digest')"
+          second_platform_digest="$(tar -xOf dist/r0/repro-second.oci.tar index.json | jq -er '.manifests[0].digest')"
+          test "${first_platform_digest}" = "${second_platform_digest}"
+          printf '%s\n' "${first_platform_digest}" > dist/r0/reproducible-platform-digest
+          docker buildx build --load --no-cache --platform linux/amd64 --provenance=false \
+            --file deploy/docker/cortex/Dockerfile.legacy-bridge \
+            --tag nerve-r0-authority:test \
+            "${build_args[@]}" \
+            dist/r0/image-context
+          ./scripts/release/build_mcp2026_legacy_bridge.sh verify-image \
+            nerve-r0-authority:test dist/r0/build-metadata.json
+          container="$(docker create nerve-r0-authority:test)"
+          trap 'docker rm -f "${container}" >/dev/null 2>&1 || true' EXIT
+          docker cp "${container}:/app/nerve-runtime" dist/r0/image-runtime
+          test "$(sha256sum dist/r0/image-runtime | awk '{print $1}')" = \
+            "$(cat dist/r0/binaries/nerve-runtime.sha256)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcp2026-r0-authority-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            dist/r0/build-metadata.json
+            dist/r0/binaries/nerve-runtime.sha256
+            dist/r0/reproducible-platform-digest
+
+  build-attest:
+    name: Build, execute and attest R0
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: validate-authority
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target_env }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      ADMIN_DSN: postgresql://postgres@127.0.0.1:5432/postgres?sslmode=disable
+    steps:
+      - name: Confirm protected bridge build
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          TARGET_ENV: ${{ inputs.target_env }}
+        run: |
+          test "${TARGET_ENV}" = cloud-production
+          test "${CONFIRM}" = BUILD-R0-v0.0.17-CORE28-29
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.0"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Prepare exact bridge bytes
+        id: bridge
+        run: |
+          mkdir -p dist/r0
+          ./scripts/release/build_mcp2026_legacy_bridge.sh outputs "$GITHUB_OUTPUT"
+          ./scripts/release/build_mcp2026_legacy_bridge.sh prepare \
+            dist/r0/source dist/r0/build-metadata.json
+          ./scripts/release/build_mcp2026_legacy_bridge.sh build-binary \
+            dist/r0/source dist/r0/binaries dist/r0/build-metadata.json
+          ./scripts/release/build_mcp2026_legacy_bridge.sh stage-image \
+            dist/r0/binaries/nerve-runtime dist/r0/image-context
+      - name: Build and push reproducibility candidate A
+        id: image_a
+        uses: docker/build-push-action@v6
+        with:
+          context: dist/r0/image-context
+          file: deploy/docker/cortex/Dockerfile.legacy-bridge
+          platforms: linux/amd64
+          no-cache: true
+          provenance: mode=max
+          sbom: true
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/nerve-runtime:r0-${{ steps.bridge.outputs.bridge_suffix }}-repro-a-${{ github.run_id }}-${{ github.run_attempt }},push=true,rewrite-timestamp=true
+          build-args: |
+            RUNTIME_VERSION=${{ steps.bridge.outputs.runtime_version }}
+            MCP_CONTRACT_HASH=${{ steps.bridge.outputs.mcp_contract_sha256 }}
+            CORE_SCHEMA_HASH=${{ steps.bridge.outputs.core_schema_sha256 }}
+            PATCH_SHA256=${{ steps.bridge.outputs.patch_sha256 }}
+            BUILD_COMMIT=${{ steps.bridge.outputs.source_revision }}
+            BUILD_TIME=${{ steps.bridge.outputs.build_time }}
+            SOURCE_DATE_EPOCH=1787097600
+      - name: Build and push reproducibility candidate B
+        id: image_b
+        uses: docker/build-push-action@v6
+        with:
+          context: dist/r0/image-context
+          file: deploy/docker/cortex/Dockerfile.legacy-bridge
+          platforms: linux/amd64
+          no-cache: true
+          provenance: mode=max
+          sbom: true
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/nerve-runtime:r0-${{ steps.bridge.outputs.bridge_suffix }}-repro-b-${{ github.run_id }}-${{ github.run_attempt }},push=true,rewrite-timestamp=true
+          build-args: |
+            RUNTIME_VERSION=${{ steps.bridge.outputs.runtime_version }}
+            MCP_CONTRACT_HASH=${{ steps.bridge.outputs.mcp_contract_sha256 }}
+            CORE_SCHEMA_HASH=${{ steps.bridge.outputs.core_schema_sha256 }}
+            PATCH_SHA256=${{ steps.bridge.outputs.patch_sha256 }}
+            BUILD_COMMIT=${{ steps.bridge.outputs.source_revision }}
+            BUILD_TIME=${{ steps.bridge.outputs.build_time }}
+            SOURCE_DATE_EPOCH=1787097600
+      - name: Prove platform reproducibility and publish canonical R0
+        id: resolved
+        env:
+          INDEX_A: ${{ steps.image_a.outputs.digest }}
+          INDEX_B: ${{ steps.image_b.outputs.digest }}
+          TAG_A: ghcr.io/${{ github.repository_owner }}/nerve-runtime:r0-${{ steps.bridge.outputs.bridge_suffix }}-repro-a-${{ github.run_id }}-${{ github.run_attempt }}
+          TAG_B: ghcr.io/${{ github.repository_owner }}/nerve-runtime:r0-${{ steps.bridge.outputs.bridge_suffix }}-repro-b-${{ github.run_id }}-${{ github.run_attempt }}
+          TAG: ghcr.io/${{ github.repository_owner }}/nerve-runtime:r0-${{ steps.bridge.outputs.bridge_suffix }}
+        run: |
+          resolve_platform() {
+            docker buildx imagetools inspect --raw "$1" | jq -er '
+              [.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")][0].digest
+            '
+          }
+          platform_a="$(resolve_platform "${TAG_A}@${INDEX_A}")"
+          platform_b="$(resolve_platform "${TAG_B}@${INDEX_B}")"
+          test "${platform_a}" = "${platform_b}"
+          docker buildx imagetools create --tag "${TAG}" "${TAG_A}@${INDEX_A}"
+          canonical_index="$(docker buildx imagetools inspect "${TAG}" --format '{{json .Manifest.Digest}}' | jq -er '.')"
+          canonical_platform="$(resolve_platform "${TAG}@${canonical_index}")"
+          test "${canonical_platform}" = "${platform_a}"
+          docker pull "${TAG}@${canonical_platform}"
+          docker tag "${TAG}@${canonical_platform}" nerve-r0-artifact:test
+          ./scripts/release/build_mcp2026_legacy_bridge.sh verify-image \
+            nerve-r0-artifact:test dist/r0/build-metadata.json
+          container="$(docker create nerve-r0-artifact:test)"
+          trap 'docker rm -f "${container}" >/dev/null 2>&1 || true' EXIT
+          docker cp "${container}:/app/nerve-runtime" dist/r0/image-runtime
+          image_binary_sha="$(sha256sum dist/r0/image-runtime | awk '{print $1}')"
+          test "${image_binary_sha}" = "$(cat dist/r0/binaries/nerve-runtime.sha256)"
+          {
+            echo "index_digest=${canonical_index}"
+            echo "platform_digest=${canonical_platform}"
+            echo "reproducible_platform_digest=${platform_b}"
+            echo "binary_sha256=${image_binary_sha}"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.13"
+      - name: Build current Core 0029 migration authority
+        run: |
+          mkdir -p dist/r0/current
+          GOCACHE="${RUNNER_TEMP}/r0-current-go-cache" go build \
+            -trimpath -buildvcs=false -o dist/r0/current/nerve-migrate ./cmd/nerve-migrate
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prepare immutable published SDK 0.2.0 fixture
+        run: |
+          mkdir -p dist/r0/sdk-wheel
+          pip download --no-deps --only-binary=:all: --dest dist/r0/sdk-wheel nerve-email==0.2.0
+          wheel_path="$(find dist/r0/sdk-wheel -maxdepth 1 -type f -name 'nerve_email-0.2.0-*.whl' -print -quit)"
+          test -n "${wheel_path}"
+          test "$(sha256sum "${wheel_path}" | awk '{print $1}')" = \
+            "9f0a7d6316bf47eef64236f96d1a7a151b5517641930422b1b16711da8b02540"
+          python -m venv dist/r0/sdk-0.2-venv
+          dist/r0/sdk-0.2-venv/bin/pip install "${wheel_path}"
+          test "$(dist/r0/sdk-0.2-venv/bin/python -c 'import nerve_email; print(nerve_email.__version__)')" = "0.2.0"
+      - name: Execute baseline and bridge on real PostgreSQL
+        run: |
+          ./scripts/release/build_mcp2026_legacy_bridge.sh test-artifacts \
+            "${{ steps.bridge.outputs.baseline_image }}" \
+            nerve-r0-artifact:test \
+            "${ADMIN_DSN}" \
+            dist/r0/current/nerve-migrate \
+            dist/r0/sdk-0.2-venv/bin/python \
+            dist/r0/verification.json
+      - name: Mirror exact tested platform bytes to Fly Registry
+        id: fly
+        env:
+          PLATFORM_DIGEST: ${{ steps.resolved.outputs.platform_digest }}
+          SOURCE_TAG: ghcr.io/${{ github.repository_owner }}/nerve-runtime:r0-${{ steps.bridge.outputs.bridge_suffix }}
+          FLY_IMAGE: registry.fly.io/nerve-runtime:r0-${{ steps.bridge.outputs.bridge_suffix }}
+        run: |
+          test -n "${FLY_API_TOKEN}"
+          printf '%s' "${FLY_API_TOKEN}" | docker login registry.fly.io --username x --password-stdin
+          docker buildx imagetools create --prefer-index=false \
+            --tag "${FLY_IMAGE}" "${SOURCE_TAG}@${PLATFORM_DIGEST}"
+          fly_digest="$(docker buildx imagetools inspect "${FLY_IMAGE}" --format '{{json .Manifest.Digest}}' | jq -er '.')"
+          test "${fly_digest}" = "${PLATFORM_DIGEST}"
+          echo "image=${FLY_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "digest=${fly_digest}" >> "$GITHUB_OUTPUT"
+      - name: Generate and fail-closed verify bridge receipt
+        env:
+          INDEX_DIGEST: ${{ steps.resolved.outputs.index_digest }}
+          PLATFORM_DIGEST: ${{ steps.resolved.outputs.platform_digest }}
+          REPRODUCIBLE_PLATFORM_DIGEST: ${{ steps.resolved.outputs.reproducible_platform_digest }}
+          BINARY_SHA256: ${{ steps.resolved.outputs.binary_sha256 }}
+          FLY_IMAGE: ${{ steps.fly.outputs.image }}
+          FLY_DIGEST: ${{ steps.fly.outputs.digest }}
+        run: |
+          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          jq -n \
+            --slurpfile metadata dist/r0/build-metadata.json \
+            --slurpfile verification dist/r0/verification.json \
+            --arg index_digest "${INDEX_DIGEST}" \
+            --arg platform_digest "${PLATFORM_DIGEST}" \
+            --arg reproducible_platform_digest "${REPRODUCIBLE_PLATFORM_DIGEST}" \
+            --arg binary_sha256 "${BINARY_SHA256}" \
+            --arg fly_image "${FLY_IMAGE}" \
+            --arg fly_digest "${FLY_DIGEST}" \
+            --arg authority_revision "${GITHUB_SHA}" \
+            --argjson run_id "${GITHUB_RUN_ID}" \
+            --argjson run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            --arg built_at "${built_at}" '
+            $metadata[0] as $m |
+            {
+              schema_version: 1,
+              kind: "mcp2026-legacy-runtime-bridge",
+              target_env: "cloud-production",
+              bridge_id: $m.bridge_id,
+              runtime_version: $m.runtime_version,
+              source: {
+                repository: "https://github.com/dsmolchanov/nerve-oss",
+                revision: $m.source_revision,
+                tree: $m.source_tree,
+                baseline_version: "v0.0.17",
+                baseline_image: $m.baseline_image
+              },
+              patch: {
+                path: $m.patch_path,
+                sha256: $m.patch_sha256,
+                allowed_paths: $m.allowed_paths,
+                before_sha256: $m.before_sha256,
+                after_sha256: $m.after_sha256
+              },
+              compatibility: {
+                core_schema_min_required: $m.core_schema_min_required,
+                core_schema_max_supported: $m.core_schema_max_supported,
+                core_schema_sha256: $m.core_schema_sha256,
+                mcp_contract_sha256: $m.mcp_contract_sha256,
+                startup_mode: "verify"
+              },
+              artifact: {
+                ghcr_image: ("ghcr.io/dsmolchanov/nerve-runtime@" + $index_digest),
+                index_digest: $index_digest,
+                linux_amd64_digest: $platform_digest,
+                reproducible_linux_amd64_digest: $reproducible_platform_digest,
+                binary_sha256: $binary_sha256,
+                reproducible_binary_sha256: $binary_sha256,
+                fly_image: $fly_image,
+                fly_digest: $fly_digest
+              },
+              verification: $verification[0],
+              producer: {
+                repository: "dsmolchanov/nerve-oss",
+                ref: "refs/heads/main",
+                workflow: ".github/workflows/mcp2026-legacy-bridge.yml",
+                run_id: $run_id,
+                run_attempt: $run_attempt,
+                authority_revision: $authority_revision
+              },
+              built_at: $built_at
+            }' > dist/r0/mcp2026-legacy-bridge-receipt.json
+          EXPECTED_AUTHORITY_REVISION="${GITHUB_SHA}" \
+          EXPECTED_BRIDGE_INDEX_DIGEST="${INDEX_DIGEST}" \
+          EXPECTED_BRIDGE_PLATFORM_DIGEST="${PLATFORM_DIGEST}" \
+            ./scripts/ci/verify_mcp2026_legacy_bridge.py \
+              dist/r0/mcp2026-legacy-bridge-receipt.json
+          sha256sum dist/r0/mcp2026-legacy-bridge-receipt.json > \
+            dist/r0/mcp2026-legacy-bridge-receipt.sha256
+      - name: Install pinned cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign receipt and exact bridge image
+        env:
+          INDEX_DIGEST: ${{ steps.resolved.outputs.index_digest }}
+        run: |
+          cosign sign-blob --yes \
+            --bundle dist/r0/mcp2026-legacy-bridge-receipt.sigstore.json \
+            dist/r0/mcp2026-legacy-bridge-receipt.json
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/mcp2026-legacy-bridge.yml@refs/heads/main"
+          cosign verify-blob \
+            --bundle dist/r0/mcp2026-legacy-bridge-receipt.sigstore.json \
+            --certificate-identity "${identity}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            dist/r0/mcp2026-legacy-bridge-receipt.json
+          cosign sign --yes "ghcr.io/${GITHUB_REPOSITORY_OWNER}/nerve-runtime@${INDEX_DIGEST}"
+          cosign attest --yes \
+            --type https://nerve.email/attestations/mcp2026-legacy-runtime-bridge/v1 \
+            --predicate dist/r0/mcp2026-legacy-bridge-receipt.json \
+            "ghcr.io/${GITHUB_REPOSITORY_OWNER}/nerve-runtime@${INDEX_DIGEST}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcp2026-legacy-runtime-bridge-${{ steps.bridge.outputs.bridge_suffix }}
+          if-no-files-found: error
+          retention-days: 90
+          path: |
+            dist/r0/build-metadata.json
+            dist/r0/binaries/nerve-runtime.sha256
+            dist/r0/verification.json
+            dist/r0/mcp2026-legacy-bridge-receipt.json
+            dist/r0/mcp2026-legacy-bridge-receipt.sha256
+            dist/r0/mcp2026-legacy-bridge-receipt.sigstore.json
