@@ -60,6 +60,8 @@ const immutableSDK02GoldenPython = `
 import asyncio
 import sys
 
+import httpx
+
 from nerve_email import NerveClient, __version__
 from nerve_email.exceptions import (
     NerveError,
@@ -79,19 +81,49 @@ def client(base_url):
     )
 
 
-async def expect_error(base_url, tool, expected_type, expected_code, retry_after=None):
+async def expect_error(
+    base_url,
+    tool,
+    expected_type,
+    expected_code,
+    sdk_retry_after=None,
+    wire_retry_after=None,
+):
+    observed_errors = []
+
+    async def observe(response):
+        await response.aread()
+        payload = response.json()
+        if payload.get("error"):
+            observed_errors.append(payload["error"])
+
     async with client(base_url) as sdk:
+        sdk._http = httpx.AsyncClient(
+            base_url=base_url,
+            headers={
+                "Content-Type": "application/json",
+                "MCP-Protocol-Version": "2025-11-25",
+                "X-Nerve-Cloud-Key": "immutable-sdk-0.2-proof",
+            },
+            timeout=15,
+            event_hooks={"response": [observe]},
+        )
         try:
             await sdk.execute_tool(tool, {})
-        except expected_type as exc:
+        except Exception as exc:
+            if type(exc) is not expected_type:
+                raise SystemExit(f"{tool} raised {type(exc).__name__}, want exact {expected_type.__name__}") from exc
             if exc.code != expected_code:
                 raise SystemExit(f"{tool} code={exc.code}, want {expected_code}")
-            if retry_after is not None and exc.retry_after != retry_after:
-                raise SystemExit(f"{tool} retry_after={exc.retry_after}, want {retry_after}")
-        except Exception as exc:
-            raise SystemExit(f"{tool} raised {type(exc).__name__}, want {expected_type.__name__}") from exc
+            if sdk_retry_after is not None and exc.retry_after != sdk_retry_after:
+                raise SystemExit(f"{tool} SDK retry_after={exc.retry_after}, want {sdk_retry_after}")
         else:
             raise SystemExit(f"{tool} did not raise {expected_type.__name__}")
+    if len(observed_errors) != 1:
+        raise SystemExit(f"{tool} observed wire errors={observed_errors}, want exactly one")
+    observed_retry = observed_errors[0].get("data", {}).get("retry_after_seconds")
+    if observed_retry != wire_retry_after:
+        raise SystemExit(f"{tool} wire retry_after={observed_retry}, want {wire_retry_after}")
 
 
 async def main():
@@ -116,8 +148,13 @@ async def main():
 
     await expect_error(base_url, "fixture_quota", NerveQuotaError, -32040)
     await expect_error(base_url, "fixture_subscription", NerveSubscriptionError, -32041)
-    await expect_error(base_url, "fixture_rate", NerveRateLimitError, -32042, retry_after=12)
-    await expect_error(base_url, "fixture_idempotency", NerveError, -32043)
+    await expect_error(
+        base_url, "fixture_rate", NerveRateLimitError, -32042,
+        sdk_retry_after=12, wire_retry_after=12,
+    )
+    await expect_error(
+        base_url, "fixture_idempotency", NerveError, -32043, wire_retry_after=3,
+    )
     print("immutable-sdk-0.2-golden-ok")
 
 
