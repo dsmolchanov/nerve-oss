@@ -1,80 +1,52 @@
 name: codex-review-window
+# This file is a STUB. The gate itself lives in dsmolchanov/codex-review-gate,
+# a PUBLIC repository holding the workflow and its executable tests
+# (tests/test_gate_behavior.py runs the gate's shell under a stubbed gh and
+# asserts exit codes). It must be public: a PUBLIC consumer cannot call a
+# reusable workflow from a private repository — the run fails with zero jobs
+# and no annotation. Verified by probe, not by documentation. Keeping the body here put one file in front of eight
+# independent reviewers at once and produced 21 blocking findings, no two
+# repositories agreeing and several asking for tests that exist in two of the
+# eight. A change to the gate is now reviewed once, where it can be tested.
+#
+# DO NOT paste the gate body back into this file. If you need to change the
+# gate, change it in dev-agent and move the tag below.
 on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
+  # A review that lands after the wait window expired must re-open the gate;
+  # `pull_request` events alone never fire again for a late review.
+  pull_request_review:
+    types: [submitted]
 
-# The job key below MUST match the required-status-check name in branch
-# protection. GitHub matches required checks against the job key (or the
-# reported check-run name), NOT a custom display name. Do not add `name:`
-# at the job level unless you also update branch protection.
-#
-# 2026-07-02: upgraded from a blind sleep to a real gate. The old soak lost
-# the race — e.g. BoardAI#146 merged at 08:43:38 and Codex posted a P1 19s
-# later. Now the check waits for the Codex review of the CURRENT head commit
-# and FAILS while it reports P1/[BLOCKER] findings, so auto-merge holds and
-# Auto-fix pushes re-run the loop until Codex is green.
+# `issue_comment` is DELIBERATELY ABSENT: a comment event runs from the default
+# branch, so its check run can never satisfy a PR's required check, and it would
+# cancel the real PR-associated run through the concurrency group below. The
+# gate posts its own anchor comment, which made an earlier revision
+# self-cancelling.
+concurrency:
+  group: codex-review-window-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
+  # The job key sets the check-run name branch protection matches. A reusable
+  # workflow reports as `<caller job> / <called job>`, so both are named
+  # `codex-review-window` and the required context becomes
+  # `codex-review-window / codex-review-window`. Renaming either half silently
+  # removes the gate — branch protection waits on a context that never reports.
   codex-review-window:
-    if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # PINNED TO A COMMIT SHA, not to `@v1`. This caller forwards
+    # CODEX_REQUEST_TOKEN, SLACK_WEBHOOK and a write-capable workflow token to
+    # whatever that ref resolves to. A tag is mutable: retagging `v1` — by
+    # compromise or by accident — would silently change the code holding those
+    # secrets in every consumer at once, with no diff anywhere to review.
+    # The SHA below is tag v1 of dsmolchanov/codex-review-gate. To move it,
+    # read the host diff first, then change this line: the bump is the review.
+    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-review-window.yml@8cafcd277cff80a4ae9b097a106afd252fea6af2  # v1
     permissions:
+      contents: read
+      issues: read
       pull-requests: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      REPO: ${{ github.repository }}
-      PR: ${{ github.event.pull_request.number }}
-      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      CODEX_BOT: chatgpt-codex-connector[bot]
-    steps:
-      - name: Fast-merge opt-out
-        if: ${{ contains(github.event.repository.topics, 'fast-merge') }}
-        run: echo "Repo has topic 'fast-merge'; Codex gate skipped."
-
-      - name: Gate on Codex verdict for this commit
-        if: ${{ !contains(github.event.repository.topics, 'fast-merge') }}
-        run: |
-          set -euo pipefail
-          echo "Waiting for Codex review of ${HEAD_SHA} on PR #${PR}"
-
-          review_id_for_head() {
-            gh api "repos/${REPO}/pulls/${PR}/reviews" --paginate \
-              --jq "[.[] | select(.user.login == \"${CODEX_BOT}\" and .commit_id == \"${HEAD_SHA}\")] | (last | .id) // empty"
-          }
-
-          # Codex auto-reviews on open/ready but NOT on pushes — ask for a
-          # re-review when a fix commit lands. If Codex ignores bot-authored
-          # mentions this is a no-op and we fall through to the timeout path.
-          if [ "${{ github.event.action }}" = "synchronize" ] && [ -z "$(review_id_for_head)" ]; then
-            gh api "repos/${REPO}/issues/${PR}/comments" -f body="@codex review" >/dev/null || true
-            echo "Posted '@codex review' to request a re-review of the new commit."
-          fi
-
-          DEADLINE=$((SECONDS + 480))
-          RID=""
-          while [ ${SECONDS} -lt ${DEADLINE} ]; do
-            RID="$(review_id_for_head)"
-            [ -n "${RID}" ] && break
-            sleep 20
-          done
-
-          if [ -z "${RID}" ]; then
-            echo "::warning::No Codex review for ${HEAD_SHA} within the window — passing (advisory fallback; repo may not be connected to Codex Cloud)."
-            exit 0
-          fi
-
-          # Give inline finding comments a moment to finish landing.
-          sleep 15
-
-          PATTERN='\[BLOCKER\]|badge/P1|P1 Badge'
-          INLINE=$(gh api "repos/${REPO}/pulls/${PR}/comments" --paginate \
-            --jq ".[] | select(.pull_request_review_id == ${RID}) | .body" \
-            | grep -cE "${PATTERN}" || true)
-          BODY=$(gh api "repos/${REPO}/pulls/${PR}/reviews/${RID}" --jq '.body' \
-            | grep -cE "${PATTERN}" || true)
-
-          if [ "$((INLINE + BODY))" -gt 0 ]; then
-            echo "::error::Codex review reports P1/[BLOCKER] finding(s) on ${HEAD_SHA} (inline hits: ${INLINE}). Auto-fix must push a fix commit; this check re-runs on the new head until Codex is green."
-            exit 1
-          fi
-          echo "Codex review is green for ${HEAD_SHA}."
+    secrets:
+      CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
