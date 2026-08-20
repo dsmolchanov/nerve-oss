@@ -101,17 +101,30 @@ func TestLegacyBusinessErrorWireGolden(t *testing.T) {
 }
 
 func TestModernTranslationTableNeverUsesLegacyCodes(t *testing.T) {
-	errorsToTranslate := []error{
-		entitlements.ErrQuotaExceeded,
-		entitlements.ErrSubscriptionInactive,
-		&entitlements.RateLimitError{RetryAfterSeconds: 12},
-		&entitlements.IdempotencyInProgressError{RetryAfterSeconds: 3},
-		errors.New("unexpected"),
+	tests := []struct {
+		name          string
+		err           error
+		wantCode      string
+		wantRetryable bool
+	}{
+		{name: "quota", err: entitlements.ErrQuotaExceeded, wantCode: "quota_exceeded"},
+		{name: "subscription", err: entitlements.ErrSubscriptionInactive, wantCode: "subscription_inactive"},
+		{name: "rate", err: &entitlements.RateLimitError{RetryAfterSeconds: 12}, wantCode: "rate_limited", wantRetryable: true},
+		{name: "idempotency", err: &entitlements.IdempotencyInProgressError{RetryAfterSeconds: 3}, wantCode: "idempotency_in_progress", wantRetryable: true},
+		{name: "unexpected", err: errors.New("unexpected"), wantCode: "tool_failed"},
 	}
-	for _, err := range errorsToTranslate {
-		translated := translateModernBusinessError(err)
-		if translated.Code == "-32040" || translated.Code == "-32041" || translated.Code == "-32042" || translated.Code == "-32043" {
-			t.Fatalf("modern translation reused legacy code for %v: %#v", err, translated)
-		}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			translated := translateModernBusinessError(test.err)
+			if translated.Code != test.wantCode || translated.Retryable != test.wantRetryable {
+				t.Fatalf("translation=%#v want code=%q retryable=%v", translated, test.wantCode, test.wantRetryable)
+			}
+			if test.wantRetryable != (translated.RetryAt != "") {
+				t.Fatalf("translation retry_at=%q want present=%v", translated.RetryAt, test.wantRetryable)
+			}
+			if translated.Code == "-32040" || translated.Code == "-32041" || translated.Code == "-32042" || translated.Code == "-32043" {
+				t.Fatalf("modern translation reused legacy code for %v: %#v", test.err, translated)
+			}
+		})
 	}
 }
