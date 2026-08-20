@@ -20,6 +20,24 @@ import (
 
 const pinnedMCPConformanceRevision = "81eb1c3edaed87d7fd585d7b80186da7a2960660"
 
+const pinnedServerConformanceEval = `
+import { pathToFileURL } from "node:url";
+void (async () => {
+  const runner = await import(pathToFileURL(process.env.MCP_CONFORMANCE_ENTRYPOINT).href);
+  const result = await runner.runServerConformanceTest(
+    process.env.NERVE_MCP_CONFORMANCE_URL,
+    "tools-list",
+    undefined,
+    process.env.NERVE_MCP_CONFORMANCE_VERSION,
+  );
+  const summary = runner.printServerResults(result.checks, result.scenarioDescription);
+  if (summary.failed > 0) process.exitCode = 1;
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+`
+
 func TestPinnedMCP2026ConformanceAcrossHandlerInstances(t *testing.T) {
 	conformanceCommand := os.Getenv("MCP_CONFORMANCE_COMMAND")
 	if conformanceCommand == "" {
@@ -79,11 +97,11 @@ func TestPinnedMCP2026ConformanceAcrossHandlerInstances(t *testing.T) {
 	// invocation can inherit process-local MCP session state from the other.
 	for run := 1; run <= len(handlers); run++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		command := exec.CommandContext(ctx, conformanceCommand, conformanceEntrypoint,
-			"server",
-			"--url", hosted.URL,
-			"--scenario", "tools-list",
-			"--spec-version", ModernProtocolVersion,
+		command := exec.CommandContext(ctx, conformanceCommand, "--eval", pinnedServerConformanceEval)
+		command.Env = append(os.Environ(),
+			"MCP_CONFORMANCE_ENTRYPOINT="+conformanceEntrypoint,
+			"NERVE_MCP_CONFORMANCE_URL="+hosted.URL,
+			"NERVE_MCP_CONFORMANCE_VERSION="+ModernProtocolVersion,
 		)
 		var output bytes.Buffer
 		command.Stdout = &output
