@@ -163,6 +163,62 @@ func TestModernContractSupportsJSONAndSSEResponses(t *testing.T) {
 	}
 }
 
+func TestExplicitProtocolProfilesReturnFrozenLegacyAndModernWire(t *testing.T) {
+	const frozenLegacyInitialize = `{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"resources":true,"tools":true},"protocolVersion":"2025-11-25","serverInfo":{"name":"nerve-runtime","version":"0.1.0"}}}` + "\n"
+
+	for _, test := range []struct {
+		name         string
+		jsonResponse bool
+		contentType  string
+	}{
+		{name: "modern JSON", jsonResponse: true, contentType: "application/json"},
+		{name: "modern SSE", jsonResponse: false, contentType: "text/event-stream"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config.Default()
+			runtime := NewServer(cfg, nil, nil, nil)
+			router := NewRouter(cfg, nil, NewLegacyHandler(runtime), NewSDKHandler(runtime, test.jsonResponse))
+
+			legacyRequest := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(
+				`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}`,
+			))
+			legacyRequest.Header.Set("MCP-Protocol-Version", LegacyProtocolVersion)
+			legacyRecorder := httptest.NewRecorder()
+			router.ServeHTTP(legacyRecorder, legacyRequest)
+			if legacyRecorder.Code != http.StatusOK || legacyRecorder.Body.String() != frozenLegacyInitialize {
+				t.Fatalf("explicit legacy wire changed: status=%d body=%s", legacyRecorder.Code, legacyRecorder.Body.String())
+			}
+			if legacyRecorder.Header().Get("MCP-Session-Id") == "" {
+				t.Fatal("explicit legacy profile did not establish its frozen session")
+			}
+
+			modernRequest := modernContractRequest(t, "tools/list", map[string]any{"_meta": map[string]any{
+				sdkmcp.MetaKeyProtocolVersion:    ModernProtocolVersion,
+				sdkmcp.MetaKeyClientCapabilities: map[string]any{},
+			}})
+			modernRecorder := httptest.NewRecorder()
+			router.ServeHTTP(modernRecorder, modernRequest)
+			if modernRecorder.Code != http.StatusOK {
+				t.Fatalf("explicit modern status=%d body=%s", modernRecorder.Code, modernRecorder.Body.String())
+			}
+			mediaType, _, err := mime.ParseMediaType(modernRecorder.Header().Get("Content-Type"))
+			if err != nil || mediaType != test.contentType {
+				t.Fatalf("explicit modern content type=%q want=%q err=%v", mediaType, test.contentType, err)
+			}
+			if err := validateModernResponseStream(
+				modernRequest.Context(), modernRecorder.Header().Get("Content-Type"),
+				bytes.NewReader(modernRecorder.Body.Bytes()), json.RawMessage(`1`),
+			); err != nil {
+				t.Fatalf("explicit modern wire violated contract: %v body=%s", err, modernRecorder.Body.String())
+			}
+			if !bytes.Contains(modernRecorder.Body.Bytes(), []byte(`"cacheScope":"private"`)) ||
+				bytes.Contains(modernRecorder.Body.Bytes(), []byte(`"protocolVersion":"2025-11-25"`)) {
+				t.Fatalf("explicit modern response did not retain the modern private shape: %s", modernRecorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestModernSSEContractFixtures(t *testing.T) {
 	validResponse := `{"jsonrpc":"2.0","id":1,"result":{}}`
 	tests := []struct {
