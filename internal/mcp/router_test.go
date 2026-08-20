@@ -95,6 +95,97 @@ func TestRouterAbsentOriginAcceptsNativePrincipalKinds(t *testing.T) {
 	}
 }
 
+func TestRouterProtocolCredentialOriginMatrix(t *testing.T) {
+	protocols := []struct {
+		name    string
+		version string
+		status  int
+	}{
+		{name: "legacy", version: LegacyProtocolVersion, status: http.StatusNoContent},
+		{name: "modern", version: ModernProtocolVersion, status: http.StatusAccepted},
+	}
+	credentials := []struct {
+		name      string
+		principal auth.Principal
+		err       error
+	}{
+		{name: "bootstrap", principal: auth.Principal{Kind: auth.PrincipalBootstrap}},
+		{name: "cloud-api-key", principal: auth.Principal{Kind: auth.PrincipalCloudAPIKey}},
+		{name: "legacy-jwt", principal: auth.Principal{Kind: auth.PrincipalLegacyJWT}},
+		{name: "m2m-onboarding", principal: auth.Principal{Kind: auth.PrincipalM2MOnboarding}},
+		{name: "m2m-org", principal: auth.Principal{Kind: auth.PrincipalM2MOrg}},
+		{name: "missing", err: auth.ErrUnauthenticated},
+	}
+	origins := []struct {
+		name       string
+		value      string
+		preAuth403 bool
+	}{
+		{name: "absent"},
+		{name: "allowed", value: "https://agent.example"},
+		{name: "hostile-scheme", value: "http://agent.example", preAuth403: true},
+		{name: "null", value: "null", preAuth403: true},
+		{name: "suffix-lookalike", value: "https://agent.example.evil", preAuth403: true},
+		{name: "prefix-lookalike", value: "https://evilagent.example", preAuth403: true},
+	}
+
+	for _, protocol := range protocols {
+		for _, credential := range credentials {
+			for _, origin := range origins {
+				name := protocol.name + "/" + credential.name + "/" + origin.name
+				t.Run(name, func(t *testing.T) {
+					cfg := hostedRouterConfig()
+					authCalls, legacyCalls, modernCalls := 0, 0, 0
+					authenticator := authenticatorFunc(func(*http.Request) (auth.Principal, error) {
+						authCalls++
+						return credential.principal, credential.err
+					})
+					adapter := func(w http.ResponseWriter, request *http.Request, wantVersion string, calls *int, status int) {
+						(*calls)++
+						principal, ok := auth.PrincipalFromContext(request.Context())
+						if !ok || principal.Kind != credential.principal.Kind {
+							t.Fatalf("adapter principal=%#v present=%v want=%q", principal, ok, credential.principal.Kind)
+						}
+						if version, ok := routedProtocolVersion(request.Context()); !ok || version != wantVersion {
+							t.Fatalf("routed protocol=%q present=%v want=%q", version, ok, wantVersion)
+						}
+						w.WriteHeader(status)
+					}
+					router := NewRouter(cfg, authenticator,
+						http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+							adapter(w, request, LegacyProtocolVersion, &legacyCalls, http.StatusNoContent)
+						}),
+						http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+							adapter(w, request, ModernProtocolVersion, &modernCalls, http.StatusAccepted)
+						}),
+					)
+
+					recorder := httptest.NewRecorder()
+					router.ServeHTTP(recorder, routedRequest(protocol.version, origin.value))
+					switch {
+					case origin.preAuth403:
+						if recorder.Code != http.StatusForbidden || authCalls != 0 || legacyCalls != 0 || modernCalls != 0 {
+							t.Fatalf("pre-auth rejection status=%d auth=%d legacy=%d modern=%d", recorder.Code, authCalls, legacyCalls, modernCalls)
+						}
+					case credential.err != nil:
+						if recorder.Code != http.StatusUnauthorized || authCalls != 1 || legacyCalls != 0 || modernCalls != 0 {
+							t.Fatalf("unauthenticated status=%d auth=%d legacy=%d modern=%d", recorder.Code, authCalls, legacyCalls, modernCalls)
+						}
+					case protocol.version == LegacyProtocolVersion:
+						if recorder.Code != protocol.status || authCalls != 1 || legacyCalls != 1 || modernCalls != 0 {
+							t.Fatalf("legacy route status=%d auth=%d legacy=%d modern=%d", recorder.Code, authCalls, legacyCalls, modernCalls)
+						}
+					default:
+						if recorder.Code != protocol.status || authCalls != 1 || legacyCalls != 0 || modernCalls != 1 {
+							t.Fatalf("modern route status=%d auth=%d legacy=%d modern=%d", recorder.Code, authCalls, legacyCalls, modernCalls)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestRouterRejectsAbsentOriginForUnknownPrincipal(t *testing.T) {
 	cfg := hostedRouterConfig()
 	handlerCalls := 0
