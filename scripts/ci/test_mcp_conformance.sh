@@ -85,6 +85,9 @@ grep -Fq '"private_key_jwt"' "$ext_auth_dir/specification/draft/oauth-client-cre
 "${npm_command[@]}" --prefix "$conformance_dir" ci --ignore-scripts
 "${npm_command[@]}" --prefix "$conformance_dir" test
 "${npm_command[@]}" --prefix "$conformance_dir" run build
+MCP_CONFORMANCE_BIN="$conformance_dir/dist/index.js" \
+  MCP_CONFORMANCE_REVISION="$CONFORMANCE_REVISION" \
+  go test -tags=conformance ./internal/mcp -run '^TestPinnedMCP2026ConformanceAcrossHandlerInstances$' -count=1
 "${npm_command[@]}" --prefix "$ext_auth_dir" ci --ignore-scripts
 "${npm_command[@]}" --prefix "$ext_auth_dir" run check:docs:format
 
