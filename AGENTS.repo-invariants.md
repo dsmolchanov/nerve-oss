@@ -34,4 +34,7 @@ makes a review loop unable to terminate.
 
 -->
 
-_None yet._
+- MCP conformance checkout overrides must be canonical absolute paths before
+  they are passed to a Go package test, whose working directory differs from
+  the repository root. Enforced by
+  `scripts/ci/test_mcp_conformance_paths.sh`.
