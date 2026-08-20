@@ -112,6 +112,48 @@ func TestModernContractRequiresOAuthExtensionOnlyForM2M(t *testing.T) {
 	}
 }
 
+func TestModernContractMissingOAuthExtensionFailsBeforeToolDispatch(t *testing.T) {
+	cfg := hostedRouterConfig()
+	entitlementGate := &fakeEntitlementGate{preAuthErr: entitlements.ErrQuotaExceeded}
+	runtime := NewServer(cfg, nil, auth.NewService(cfg, nil), entitlementGate)
+	meta := map[string]any{
+		sdkmcp.MetaKeyProtocolVersion:    ModernProtocolVersion,
+		sdkmcp.MetaKeyClientCapabilities: map[string]any{},
+	}
+	request := modernContractRequest(t, "tools/call", map[string]any{
+		"_meta": meta,
+		"name":  "list_threads",
+		"arguments": map[string]any{
+			"inbox_id": modernTestUUID,
+			"limit":    1,
+		},
+	})
+	request.Header.Set("Mcp-Name", "list_threads")
+	request = request.WithContext(auth.WithPrincipal(request.Context(), auth.Principal{
+		Kind: auth.PrincipalM2MOrg, OrgID: "org-1", ClientID: "client-1", Generation: 1,
+		Scopes: []string{"nerve:email.read"}, AuthMethod: "m2m_bearer",
+	}))
+	recorder := httptest.NewRecorder()
+	NewSDKHandler(runtime, true).ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("missing extension status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var denied Response
+	if err := json.Unmarshal(recorder.Body.Bytes(), &denied); err != nil {
+		t.Fatalf("decode missing extension response: %v body=%s", err, recorder.Body.String())
+	}
+	if denied.Error == nil || denied.Error.Code != sdkmcp.CodeMissingRequiredClientCapabilities || denied.Error.Message != "missing required client capabilities" {
+		t.Fatalf("missing extension response=%#v", denied.Error)
+	}
+	if entitlementGate.preAuthCalls != 0 {
+		t.Fatalf("missing extension reached entitlement gate %d times", entitlementGate.preAuthCalls)
+	}
+	if runtime.MemoryBudget.Used() != 0 {
+		t.Fatalf("missing extension leaked %d bytes", runtime.MemoryBudget.Used())
+	}
+}
+
 func TestModernContractAcceptsOmittedClientInfo(t *testing.T) {
 	runtime := NewServer(config.Default(), nil, nil, nil)
 	meta := map[string]any{
