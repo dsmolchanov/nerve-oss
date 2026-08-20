@@ -1,0 +1,27 @@
+ARG BASELINE_IMAGE=ghcr.io/dsmolchanov/nerve-runtime@sha256:eaab11e78806e3ed730367c311b1fc30c1360e5be9897d329ec9208912f81765
+ARG SOURCE_DATE_EPOCH=1787097600
+FROM ${BASELINE_IMAGE}
+
+ARG RUNTIME_VERSION
+ARG MCP_CONTRACT_HASH
+ARG CORE_SCHEMA_HASH
+ARG PATCH_SHA256
+ARG BUILD_COMMIT
+ARG BUILD_TIME
+
+USER root
+COPY --chmod=0555 nerve-runtime /app/nerve-runtime
+
+LABEL io.nerve.runtime.version="${RUNTIME_VERSION}" \
+      io.nerve.runtime.mcp-contract-sha256="${MCP_CONTRACT_HASH}" \
+      io.nerve.runtime.core-schema-sha256="${CORE_SCHEMA_HASH}" \
+      io.nerve.runtime.core-schema-min-required="28" \
+      io.nerve.runtime.core-schema-max-supported="29" \
+      io.nerve.runtime.legacy-bridge-source="${BUILD_COMMIT}" \
+      io.nerve.runtime.legacy-bridge-patch-sha256="${PATCH_SHA256}" \
+      io.nerve.runtime.build-commit="${BUILD_COMMIT}" \
+      io.nerve.runtime.build-time="${BUILD_TIME}"
+
+USER neuralmail
+ENTRYPOINT ["/app/nerve-runtime"]
+CMD ["serve"]

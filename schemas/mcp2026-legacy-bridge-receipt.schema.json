@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nerve.email/schemas/mcp2026-legacy-bridge-receipt.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "target_env",
+    "bridge_id",
+    "runtime_version",
+    "source",
+    "patch",
+    "compatibility",
+    "artifact",
+    "verification",
+    "producer",
+    "built_at"
+  ],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "kind": {"type": "string", "const": "mcp2026-legacy-runtime-bridge"},
+    "target_env": {"type": "string", "const": "cloud-production"},
+    "bridge_id": {"type": "string", "pattern": "^r0-v0\\.0\\.17-core28-29-[0-9a-f]{12}$"},
+    "runtime_version": {"type": "string", "pattern": "^r0-a794be9f-core28-29-[0-9a-f]{12}$"},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "revision", "tree", "baseline_version", "baseline_image"],
+      "properties": {
+        "repository": {"type": "string", "const": "https://github.com/dsmolchanov/nerve-oss"},
+        "revision": {"type": "string", "const": "a794be9f2697e0864d3a31da8f087577e9748f7e"},
+        "tree": {"type": "string", "const": "1fe63ae43617c1b426b20ead2cc252893165a90d"},
+        "baseline_version": {"type": "string", "const": "v0.0.17"},
+        "baseline_image": {"type": "string", "const": "ghcr.io/dsmolchanov/nerve-runtime@sha256:eaab11e78806e3ed730367c311b1fc30c1360e5be9897d329ec9208912f81765"}
+      }
+    },
+    "patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "allowed_paths", "before_sha256", "after_sha256"],
+      "properties": {
+        "path": {"type": "string", "const": "scripts/release/mcp2026-legacy-bridge-v0.0.17.patch"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "allowed_paths": {"type": "array", "const": ["internal/startup/migrations.go"]},
+        "before_sha256": {"type": "string", "const": "82e2e4f1e8e64f5ac622f582e70a81e9d0f5802f38e712527d504afe96837c00"},
+        "after_sha256": {"type": "string", "const": "bdb3c2e94338de0d07d93e7de2f2258efa6964ae9f951b3d10bf5107e03d154b"}
+      }
+    },
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["core_schema_min_required", "core_schema_max_supported", "core_schema_sha256", "mcp_contract_sha256", "startup_mode"],
+      "properties": {
+        "core_schema_min_required": {"type": "integer", "const": 28},
+        "core_schema_max_supported": {"type": "integer", "const": 29},
+        "core_schema_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "mcp_contract_sha256": {"type": "string", "const": "254bdc9366cba1ca6759a41bd4dfc902f4ccad4a8a224acfab843b8cd8b01b5c"},
+        "startup_mode": {"type": "string", "const": "verify"}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ghcr_image", "index_digest", "linux_amd64_digest", "reproducible_linux_amd64_digest", "binary_sha256", "reproducible_binary_sha256", "fly_image", "fly_digest"],
+      "properties": {
+        "ghcr_image": {"type": "string", "pattern": "^ghcr\\.io/dsmolchanov/nerve-runtime@sha256:[0-9a-f]{64}$"},
+        "index_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "linux_amd64_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "reproducible_linux_amd64_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "binary_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "reproducible_binary_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "fly_image": {"type": "string", "pattern": "^registry\\.fly\\.io/nerve-runtime:r0-[0-9a-f]{12}$"},
+        "fly_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baseline_core28", "bridge_core28", "bridge_core29", "baseline_core29_rejected", "core28_wire_equivalent", "core28_compatibility"],
+      "properties": {
+        "baseline_core28": {"$ref": "#/$defs/run"},
+        "bridge_core28": {"$ref": "#/$defs/run"},
+        "bridge_core29": {"$ref": "#/$defs/run"},
+        "baseline_core29_rejected": {"type": "boolean", "const": true},
+        "core28_wire_equivalent": {"type": "boolean", "const": true},
+        "core28_compatibility": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["fixture_version", "sdk_0_2_sha256", "baseline_transcript_sha256", "bridge_transcript_sha256"],
+          "properties": {
+            "fixture_version": {"type": "string", "const": "mcp2026-r0-core28-v1"},
+            "sdk_0_2_sha256": {"type": "string", "const": "9f0a7d6316bf47eef64236f96d1a7a151b5517641930422b1b16711da8b02540"},
+            "baseline_transcript_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "bridge_transcript_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        }
+      }
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "ref", "workflow", "run_id", "run_attempt", "authority_revision"],
+      "properties": {
+        "repository": {"type": "string", "const": "dsmolchanov/nerve-oss"},
+        "ref": {"type": "string", "const": "refs/heads/main"},
+        "workflow": {"type": "string", "const": ".github/workflows/mcp2026-legacy-bridge.yml"},
+        "run_id": {"type": "integer", "minimum": 1},
+        "run_attempt": {"type": "integer", "minimum": 1},
+        "authority_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+      }
+    },
+    "built_at": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"}
+  },
+  "$defs": {
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image", "core_schema_version", "startup_mode", "health", "legacy_initialize", "legacy_tools", "legacy_resources", "legacy_errors", "sdk_0_2", "sql_behavior", "enqueue", "claim", "delivery", "inspection"],
+      "properties": {
+        "image": {"type": "string", "enum": ["baseline-v0.0.17", "bridge-r0"]},
+        "core_schema_version": {"type": "integer", "enum": [28, 29]},
+        "startup_mode": {"type": "string", "const": "verify"},
+        "health": {"type": "boolean", "const": true},
+        "legacy_initialize": {"type": "boolean", "const": true},
+        "legacy_tools": {"type": "boolean", "const": true},
+        "legacy_resources": {"type": "boolean", "const": true},
+        "legacy_errors": {"type": "boolean", "const": true},
+        "sdk_0_2": {"type": "boolean", "const": true},
+        "sql_behavior": {"type": "boolean", "const": true},
+        "enqueue": {"type": "boolean", "const": true},
+        "claim": {"type": "boolean", "const": true},
+        "delivery": {"type": "boolean", "const": true},
+        "inspection": {"type": "boolean", "const": true}
+      }
+    }
+  }
+}

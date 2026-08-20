@@ -1,0 +1,7 @@
+diff --git a/internal/startup/migrations.go b/internal/startup/migrations.go
+index 80490b5..777174c 100644
+--- a/internal/startup/migrations.go
++++ b/internal/startup/migrations.go
+@@ -16 +16 @@ const (
+-	CoreMaxSupported         int64 = 28
++	CoreMaxSupported         int64 = 29
