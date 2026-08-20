@@ -21,9 +21,13 @@ import (
 const pinnedMCPConformanceRevision = "81eb1c3edaed87d7fd585d7b80186da7a2960660"
 
 func TestPinnedMCP2026ConformanceAcrossHandlerInstances(t *testing.T) {
-	conformanceBin := os.Getenv("MCP_CONFORMANCE_BIN")
-	if conformanceBin == "" {
-		t.Fatal("MCP_CONFORMANCE_BIN is required for the conformance build tag")
+	conformanceCommand := os.Getenv("MCP_CONFORMANCE_COMMAND")
+	if conformanceCommand == "" {
+		t.Fatal("MCP_CONFORMANCE_COMMAND is required for the conformance build tag")
+	}
+	conformanceEntrypoint := os.Getenv("MCP_CONFORMANCE_ENTRYPOINT")
+	if conformanceEntrypoint == "" {
+		t.Fatal("MCP_CONFORMANCE_ENTRYPOINT is required for the conformance build tag")
 	}
 	if got := os.Getenv("MCP_CONFORMANCE_REVISION"); got != pinnedMCPConformanceRevision {
 		t.Fatalf("MCP_CONFORMANCE_REVISION=%q want pinned %q", got, pinnedMCPConformanceRevision)
@@ -75,7 +79,7 @@ func TestPinnedMCP2026ConformanceAcrossHandlerInstances(t *testing.T) {
 	// invocation can inherit process-local MCP session state from the other.
 	for run := 1; run <= len(handlers); run++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		command := exec.CommandContext(ctx, "node", conformanceBin,
+		command := exec.CommandContext(ctx, conformanceCommand, conformanceEntrypoint,
 			"server",
 			"--url", hosted.URL,
 			"--scenario", "tools-list",
