@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -312,6 +313,90 @@ func TestSDKServerOnboardingProfileHasNoLifecycleToolsBeforePhase3(t *testing.T)
 	}
 	if len(listed.Tools) != 0 {
 		t.Fatalf("lifecycle tools registered before Phase 3: %#v", listed.Tools)
+	}
+}
+
+func TestSDKServerPhase2TypedM2MProfilesCannotListOrCallLifecycleTools(t *testing.T) {
+	cfg := config.Default()
+	runtime := NewServer(cfg, nil, nil, nil)
+	handler := NewSDKHandler(runtime, true)
+	lifecycleTools := []string{
+		"nerve_onboarding_start",
+		"nerve_onboarding_status",
+		"nerve_onboarding_verify_domain",
+		"nerve_onboarding_close",
+	}
+	profiles := []struct {
+		name      string
+		principal auth.Principal
+		wantTools int
+	}{
+		{
+			name: "onboarding",
+			principal: auth.Principal{
+				Kind: auth.PrincipalM2MOnboarding, ClientID: "client-1", Generation: 1,
+				Scopes: []string{"nerve:onboarding"}, AuthMethod: "m2m_bearer",
+			},
+		},
+		{
+			name: "organization",
+			principal: auth.Principal{
+				Kind: auth.PrincipalM2MOrg, OrgID: "org-1", ClientID: "client-1", Generation: 1,
+				Scopes: []string{"nerve:email.read"}, AuthMethod: "m2m_bearer",
+			},
+			wantTools: 8,
+		},
+	}
+	for _, profile := range profiles {
+		t.Run(profile.name, func(t *testing.T) {
+			listRequest := modernContractRequest(t, "tools/list", map[string]any{"_meta": modernOAuthMeta()})
+			listRequest = listRequest.WithContext(auth.WithPrincipal(listRequest.Context(), profile.principal))
+			listRecorder := httptest.NewRecorder()
+			handler.ServeHTTP(listRecorder, listRequest)
+			if listRecorder.Code != http.StatusOK {
+				t.Fatalf("tools/list status=%d body=%s", listRecorder.Code, listRecorder.Body.String())
+			}
+			var listed struct {
+				Result struct {
+					Tools []struct {
+						Name string `json:"name"`
+					} `json:"tools"`
+				} `json:"result"`
+			}
+			if err := json.Unmarshal(listRecorder.Body.Bytes(), &listed); err != nil {
+				t.Fatalf("decode tools/list: %v body=%s", err, listRecorder.Body.String())
+			}
+			if len(listed.Result.Tools) != profile.wantTools {
+				t.Fatalf("tools/list count=%d want=%d: %#v", len(listed.Result.Tools), profile.wantTools, listed.Result.Tools)
+			}
+			for _, listedTool := range listed.Result.Tools {
+				if slices.Contains(lifecycleTools, listedTool.Name) {
+					t.Fatalf("Phase 2 listed lifecycle tool %q", listedTool.Name)
+				}
+			}
+
+			for _, lifecycleTool := range lifecycleTools {
+				t.Run(lifecycleTool, func(t *testing.T) {
+					callRequest := modernContractRequest(t, "tools/call", map[string]any{
+						"_meta": modernOAuthMeta(), "name": lifecycleTool, "arguments": map[string]any{},
+					})
+					callRequest.Header.Set("Mcp-Name", lifecycleTool)
+					callRequest = callRequest.WithContext(auth.WithPrincipal(callRequest.Context(), profile.principal))
+					callRecorder := httptest.NewRecorder()
+					handler.ServeHTTP(callRecorder, callRequest)
+					if callRecorder.Code != http.StatusBadRequest {
+						t.Fatalf("unregistered lifecycle call status=%d body=%s", callRecorder.Code, callRecorder.Body.String())
+					}
+					var response Response
+					if err := json.Unmarshal(callRecorder.Body.Bytes(), &response); err != nil {
+						t.Fatalf("decode lifecycle rejection: %v body=%s", err, callRecorder.Body.String())
+					}
+					if response.Error == nil || response.Error.Code != -32602 || !strings.Contains(response.Error.Message, "unknown tool") {
+						t.Fatalf("lifecycle rejection=%#v", response.Error)
+					}
+				})
+			}
+		})
 	}
 }
 
