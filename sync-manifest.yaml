@@ -62,6 +62,9 @@
     "scripts/ci/fixtures/oauth-as-metadata-client-credentials.json",
     "scripts/ci/fixtures/oauth-as-metadata-invalid-empty-response-types.json",
     "scripts/ci/fixtures/oauth-as-metadata-invalid-fabricated-response-type.json",
+    "scripts/ci/mcp_conformance_paths.sh",
+    "scripts/ci/test_mcp_conformance_paths.sh",
+    "scripts/ci/test_mcp_conformance.sh",
     "docs/MCP_Contract.md"
   ],
   "patch-synced": [
