@@ -33,6 +33,9 @@ jobs:
           cache-dependency-path: |
             _mcp_conformance/package-lock.json
             _mcp_ext_auth/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Go fmt
         run: |
           unformatted="$(git ls-files -z '*.go' | xargs -0 -r gofmt -l)"
@@ -45,6 +48,8 @@ jobs:
         run: go test ./...
       - name: Targeted race suites
         run: go test -race ./internal/auth ./internal/mcp ./internal/memguard
+      - name: Prove SDK 0.2 and native MCP 2026 share one endpoint
+        run: ./scripts/ci/test_mcp_dual_profile_artifact.sh
       - name: Verify runtime boundaries
         run: ./scripts/ci/verify_runtime_boundaries.sh
       - name: Verify migration ownership
