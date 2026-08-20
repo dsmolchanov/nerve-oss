@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -50,6 +51,74 @@ async def main():
         if not tools:
             raise SystemExit("SDK 0.2 legacy tools/list was empty")
     print("immutable-sdk-0.2-ok")
+
+
+asyncio.run(main())
+`
+
+const immutableSDK02GoldenPython = `
+import asyncio
+import sys
+
+from nerve_email import NerveClient, __version__
+from nerve_email.exceptions import (
+    NerveError,
+    NerveQuotaError,
+    NerveRateLimitError,
+    NerveSubscriptionError,
+)
+
+
+def client(base_url):
+    return NerveClient(
+        base_url=base_url,
+        rest_base_url=base_url,
+        api_key="immutable-sdk-0.2-proof",
+        timeout=15,
+        max_retries=0,
+    )
+
+
+async def expect_error(base_url, tool, expected_type, expected_code, retry_after=None):
+    async with client(base_url) as sdk:
+        try:
+            await sdk.execute_tool(tool, {})
+        except expected_type as exc:
+            if exc.code != expected_code:
+                raise SystemExit(f"{tool} code={exc.code}, want {expected_code}")
+            if retry_after is not None and exc.retry_after != retry_after:
+                raise SystemExit(f"{tool} retry_after={exc.retry_after}, want {retry_after}")
+        except Exception as exc:
+            raise SystemExit(f"{tool} raised {type(exc).__name__}, want {expected_type.__name__}") from exc
+        else:
+            raise SystemExit(f"{tool} did not raise {expected_type.__name__}")
+
+
+async def main():
+    if __version__ != "0.2.0":
+        raise SystemExit(f"unexpected SDK version: {__version__}")
+    base_url = sys.argv[1]
+    async with client(base_url) as sdk:
+        tools = await sdk.list_tools()
+        names = [tool["name"] for tool in tools]
+        expected_names = [
+            "list_threads", "get_thread", "search_inbox", "triage_message",
+            "extract_to_schema", "draft_reply_with_policy", "send_reply", "compose_email",
+        ]
+        if names != expected_names:
+            raise SystemExit(f"legacy tools/list={names}, want {expected_names}")
+        resources = await sdk._rpc("resources/list", {})
+        expected_resources = {
+            "resources": [{"description": "List inbox IDs", "uri": "email://inboxes"}],
+        }
+        if resources != expected_resources:
+            raise SystemExit(f"legacy resources/list={resources}, want {expected_resources}")
+
+    await expect_error(base_url, "fixture_quota", NerveQuotaError, -32040)
+    await expect_error(base_url, "fixture_subscription", NerveSubscriptionError, -32041)
+    await expect_error(base_url, "fixture_rate", NerveRateLimitError, -32042, retry_after=12)
+    await expect_error(base_url, "fixture_idempotency", NerveError, -32043)
+    print("immutable-sdk-0.2-golden-ok")
 
 
 asyncio.run(main())
@@ -169,6 +238,123 @@ func TestImmutableSDK02AndNativeMCP2026ShareEndpoint(t *testing.T) {
 	}
 	if !barrier.sawBoth() {
 		t.Fatal("both protocol profiles did not reach the shared /mcp endpoint concurrently")
+	}
+	proveImmutableSDK02GoldenFixtures(t, python)
+}
+
+func proveImmutableSDK02GoldenFixtures(t *testing.T, python string) {
+	t.Helper()
+	fixture := &sdk02GoldenFixtureServer{seen: make(map[string]int)}
+	hosted := httptest.NewServer(fixture)
+	defer hosted.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, python, "-c", immutableSDK02GoldenPython, hosted.URL)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("immutable SDK 0.2 golden fixtures: %v; output=%s", err, output)
+	}
+	if !strings.Contains(string(output), "immutable-sdk-0.2-golden-ok") {
+		t.Fatalf("immutable SDK 0.2 golden marker missing: %s", output)
+	}
+	fixture.requireSeen(t, map[string]int{
+		"initialize":           5,
+		"tools/list":           1,
+		"resources/list":       1,
+		"fixture_quota":        1,
+		"fixture_subscription": 1,
+		"fixture_rate":         1,
+		"fixture_idempotency":  1,
+	})
+}
+
+type sdk02GoldenFixtureServer struct {
+	mu   sync.Mutex
+	seen map[string]int
+}
+
+func (fixture *sdk02GoldenFixtureServer) ServeHTTP(w http.ResponseWriter, request *http.Request) {
+	if request.URL.Path != "/mcp" || request.Method != http.MethodPost ||
+		request.Header.Get("MCP-Protocol-Version") != LegacyProtocolVersion ||
+		request.Header.Get("X-Nerve-Cloud-Key") != "immutable-sdk-0.2-proof" {
+		http.Error(w, "unexpected immutable SDK request boundary", http.StatusBadRequest)
+		return
+	}
+	var wire struct {
+		ID     int    `json:"id"`
+		Method string `json:"method"`
+		Params struct {
+			Name string `json:"name"`
+		} `json:"params"`
+	}
+	if err := json.NewDecoder(request.Body).Decode(&wire); err != nil {
+		http.Error(w, "invalid JSON-RPC request", http.StatusBadRequest)
+		return
+	}
+
+	key := wire.Method
+	response := ""
+	switch wire.Method {
+	case "initialize":
+		if wire.ID != 1 {
+			http.Error(w, "initialize fixture requires id 1", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("MCP-Session-Id", "frozen-session")
+		response = legacyInitializeWireGolden
+	case "tools/list":
+		if wire.ID != 2 {
+			http.Error(w, "tools/list fixture requires id 2", http.StatusBadRequest)
+			return
+		}
+		response = legacyToolsListWireGolden
+	case "resources/list":
+		if wire.ID != 3 {
+			http.Error(w, "resources/list fixture requires id 3", http.StatusBadRequest)
+			return
+		}
+		response = legacyResourcesListWireGolden
+	case "tools/call":
+		if wire.ID != 2 {
+			http.Error(w, "error fixture requires id 2", http.StatusBadRequest)
+			return
+		}
+		key = wire.Params.Name
+		response = map[string]string{
+			"fixture_quota":        legacyQuotaErrorWireGolden,
+			"fixture_subscription": legacySubscriptionErrorWireGolden,
+			"fixture_rate":         legacyRateErrorWireGolden,
+			"fixture_idempotency":  legacyIdempotencyErrorWireGolden,
+		}[key]
+	}
+	if response == "" {
+		http.Error(w, "unexpected immutable SDK JSON-RPC request", http.StatusBadRequest)
+		return
+	}
+	if wire.Method != "initialize" && request.Header.Get("MCP-Session-Id") != "frozen-session" {
+		http.Error(w, "missing frozen session", http.StatusBadRequest)
+		return
+	}
+	fixture.mu.Lock()
+	fixture.seen[key]++
+	fixture.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(response))
+}
+
+func (fixture *sdk02GoldenFixtureServer) requireSeen(t *testing.T, want map[string]int) {
+	t.Helper()
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if len(fixture.seen) != len(want) {
+		t.Fatalf("immutable SDK 0.2 fixture calls=%v want=%v", fixture.seen, want)
+	}
+	for key, count := range want {
+		if fixture.seen[key] != count {
+			t.Fatalf("immutable SDK 0.2 fixture %s calls=%d want=%d; all=%v", key, fixture.seen[key], count, fixture.seen)
+		}
 	}
 }
 
