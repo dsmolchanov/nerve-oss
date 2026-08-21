@@ -456,7 +456,7 @@ func validateDelegationEnvelope(statusCode int, decoded delegationResponse, expe
 		if statusCode < http.StatusBadRequest || statusCode > 599 {
 			return fmt.Errorf("onboarding delegation business error has inconsistent HTTP %d", statusCode)
 		}
-		if decoded.Error.Code == "" || len(decoded.Error.Code) > 128 || strings.ContainsAny(decoded.Error.Code, " \t\r\n") {
+		if !mcp.IsPublicOnboardingBusinessErrorCode(decoded.Error.Code) {
 			return errors.New("onboarding delegation business error code is invalid")
 		}
 		return nil
@@ -468,7 +468,8 @@ func validateDelegationEnvelope(statusCode int, decoded delegationResponse, expe
 	if result.ResultType != "complete" {
 		return errors.New("onboarding delegation resultType must be complete")
 	}
-	if _, err := uuid.Parse(result.OnboardingID); err != nil {
+	onboardingID, err := uuid.Parse(result.OnboardingID)
+	if err != nil || onboardingID == uuid.Nil || onboardingID.String() != result.OnboardingID {
 		return errors.New("onboarding delegation onboarding_id is invalid")
 	}
 	if result.Generation != expectedGeneration {

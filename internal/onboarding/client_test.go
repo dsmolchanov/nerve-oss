@@ -298,6 +298,11 @@ func TestClientRejectsSemanticallyInvalidEnvelopesForEveryOperation(t *testing.T
 			result["mode"] = "mailbox_pool"
 			return map[string]any{"result": result}
 		}},
+		{name: "nil onboarding UUID", statusCode: http.StatusOK, envelope: func() map[string]any {
+			result := validResult()
+			result["onboarding_id"] = "00000000-0000-0000-0000-000000000000"
+			return map[string]any{"result": result}
+		}},
 		{name: "result with error HTTP status", statusCode: http.StatusBadGateway, envelope: func() map[string]any {
 			return map[string]any{"result": validResult()}
 		}},
@@ -363,6 +368,7 @@ func TestClientRedactsProtocolParserDetailsForEveryOperation(t *testing.T) {
 	const secret = "SYNTHETIC_PROVIDER_SECRET"
 	for _, response := range []string{
 		`{"error":{"code":"retry","retryable":true,"retry_at":"` + secret + `"}}`,
+		`{"error":{"code":"sk_live_` + secret + `","retryable":false}}`,
 		`{"result":{"resultType":"complete","onboarding_id":"11111111-1111-4111-8111-111111111111","generation":7,"state":"active","mode":"managed_mailbox","reauthorize":false,"` + secret + `":true}}`,
 	} {
 		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {

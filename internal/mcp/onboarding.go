@@ -74,6 +74,38 @@ type OnboardingBusinessError struct {
 	RetryAt   *time.Time `json:"retry_at,omitempty"`
 }
 
+const (
+	OnboardingErrorInvalidRequest         = "onboarding_invalid_request"
+	OnboardingErrorIdempotencyConflict    = "onboarding_idempotency_conflict"
+	OnboardingErrorGenerationConflict     = "onboarding_generation_conflict"
+	OnboardingErrorMailboxModeNotAllowed  = "onboarding_mailbox_mode_not_allowed"
+	OnboardingErrorNotFound               = "onboarding_not_found"
+	OnboardingErrorInvalidState           = "onboarding_invalid_state"
+	OnboardingErrorDomainConflict         = "onboarding_domain_conflict"
+	OnboardingErrorDomainNotReady         = "onboarding_domain_not_ready"
+	OnboardingErrorBillingRequired        = "onboarding_billing_required"
+	OnboardingErrorPaymentActionRequired  = "onboarding_payment_action_required"
+	OnboardingErrorRateLimited            = "onboarding_rate_limited"
+	OnboardingErrorTemporarilyUnavailable = "onboarding_temporarily_unavailable"
+)
+
+var publicOnboardingBusinessErrorCodes = map[string]struct{}{
+	OnboardingErrorInvalidRequest: {}, OnboardingErrorIdempotencyConflict: {},
+	OnboardingErrorGenerationConflict: {}, OnboardingErrorMailboxModeNotAllowed: {},
+	OnboardingErrorNotFound: {}, OnboardingErrorInvalidState: {},
+	OnboardingErrorDomainConflict: {}, OnboardingErrorDomainNotReady: {},
+	OnboardingErrorBillingRequired: {}, OnboardingErrorPaymentActionRequired: {},
+	OnboardingErrorRateLimited: {}, OnboardingErrorTemporarilyUnavailable: {},
+}
+
+// IsPublicOnboardingBusinessErrorCode is the closed wire contract shared by
+// the runtime adapter and the control-plane delegation boundary. Unknown
+// upstream values are protocol failures and must never be reflected to agents.
+func IsPublicOnboardingBusinessErrorCode(code string) bool {
+	_, ok := publicOnboardingBusinessErrorCodes[code]
+	return ok
+}
+
 func (err *OnboardingBusinessError) Error() string {
 	if err == nil || err.Code == "" {
 		return "onboarding request failed"
