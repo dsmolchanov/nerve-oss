@@ -165,6 +165,49 @@ func TestClientResponseBodyTimeoutReturnsOutcomeUnknownForEveryOperation(t *test
 	}
 }
 
+func TestClientTransportDisconnectReturnsOutcomeUnknownForEveryOperation(t *testing.T) {
+	for _, failure := range []struct {
+		name    string
+		handler http.HandlerFunc
+	}{
+		{
+			name: "disconnect before headers",
+			handler: func(writer http.ResponseWriter, request *http.Request) {
+				_, _ = io.Copy(io.Discard, request.Body)
+				connection, _, err := writer.(http.Hijacker).Hijack()
+				if err != nil {
+					t.Errorf("hijack: %v", err)
+					return
+				}
+				_ = connection.Close()
+			},
+		},
+		{
+			name: "disconnect after partial body",
+			handler: func(writer http.ResponseWriter, request *http.Request) {
+				_, _ = io.Copy(io.Discard, request.Body)
+				writer.Header().Set("Content-Type", "application/json")
+				writer.Header().Set("Content-Length", "100")
+				writer.WriteHeader(http.StatusOK)
+				_, _ = writer.Write([]byte(`{"result":`))
+			},
+		},
+	} {
+		t.Run(failure.name, func(t *testing.T) {
+			server := httptest.NewServer(failure.handler)
+			defer server.Close()
+			client := newTestClient(t, server.URL, server.Client(), time.Unix(1_723_000_000, 0))
+			for name, operation := range clientOperations(client) {
+				t.Run(name, func(t *testing.T) {
+					if err := operation(); !errors.Is(err, mcp.ErrOnboardingOutcomeUnknown) {
+						t.Fatalf("disconnect error=%v", err)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestClientRejectsInvalidAuthorityAndDestinations(t *testing.T) {
 	validClient := newTestClient(t, "https://control.internal.example", nil, time.Unix(1_723_000_000, 0))
 	invalidCallers := []mcp.OnboardingCaller{
@@ -225,5 +268,30 @@ func testCaller() mcp.OnboardingCaller {
 			Kind: auth.PrincipalM2MOnboarding, ClientID: "client-1", Generation: 7, TokenID: "token-1",
 		},
 		Authorization: "Bearer original-token",
+	}
+}
+
+func clientOperations(client *Client) map[string]func() error {
+	return map[string]func() error{
+		"start": func() error {
+			_, err := client.Start(context.Background(), testCaller(), mcp.OnboardingStartInput{
+				IdempotencyKey: "start-1", OrganizationName: "Example", MailboxMode: mcp.OnboardingMailboxManaged,
+			})
+			return err
+		},
+		"status": func() error {
+			_, err := client.Status(context.Background(), testCaller())
+			return err
+		},
+		"verify domain": func() error {
+			_, err := client.VerifyDomain(context.Background(), testCaller())
+			return err
+		},
+		"close": func() error {
+			_, err := client.Close(context.Background(), testCaller(), mcp.OnboardingCloseInput{
+				IdempotencyKey: "close-1", ExpectedGeneration: 7,
+			})
+			return err
+		},
 	}
 }

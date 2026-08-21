@@ -179,19 +179,20 @@ func (client *Client) call(ctx context.Context, operation string, caller mcp.Onb
 
 	response, err := client.httpClient.Do(request)
 	if err != nil {
-		if delegationOutcomeUnknown(requestContext, err) {
-			return empty, mcp.ErrOnboardingOutcomeUnknown
-		}
-		return empty, fmt.Errorf("send onboarding delegation: %w", err)
+		// Once RoundTrip begins, the server may have consumed and committed the
+		// request even when no response headers reach us (EOF, reset, timeout,
+		// and similar transport failures).  Only validation and construction
+		// errors above this point are provably pre-dispatch.
+		return empty, mcp.ErrOnboardingOutcomeUnknown
 	}
 	defer response.Body.Close()
 	limited := io.LimitReader(response.Body, maxDelegationBodyBytes+1)
 	responseBody, err := io.ReadAll(limited)
 	if err != nil {
-		if delegationOutcomeUnknown(requestContext, err) {
-			return empty, mcp.ErrOnboardingOutcomeUnknown
-		}
-		return empty, fmt.Errorf("read onboarding delegation response: %w", err)
+		// Headers do not prove that a mutating handler did not commit.  A short
+		// or interrupted body therefore has the same poll-before-retry contract
+		// as a transport timeout.
+		return empty, mcp.ErrOnboardingOutcomeUnknown
 	}
 	if len(responseBody) > maxDelegationBodyBytes {
 		return empty, errors.New("onboarding delegation response exceeds 64 KiB")
@@ -210,10 +211,6 @@ func (client *Client) call(ctx context.Context, operation string, caller mcp.Onb
 		return empty, fmt.Errorf("onboarding delegation failed with HTTP %d", response.StatusCode)
 	}
 	return *decoded.Result, nil
-}
-
-func delegationOutcomeUnknown(ctx context.Context, err error) bool {
-	return ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 }
 
 func (client *Client) signature(method, escapedPath, nonce, timestamp, bodyHash string) string {
