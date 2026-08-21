@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -21,6 +22,7 @@ type recordingOnboardingProvisioner struct {
 	close     OnboardingCloseInput
 	calls     int
 	result    *OnboardingResult
+	err       error
 }
 
 type rejectOnboardingFeatureLookup struct {
@@ -48,20 +50,20 @@ func (provisioner *recordingOnboardingProvisioner) record(operation string, call
 
 func (provisioner *recordingOnboardingProvisioner) Start(_ context.Context, caller OnboardingCaller, input OnboardingStartInput) (OnboardingResult, error) {
 	provisioner.start = input
-	return provisioner.record("start", caller), nil
+	return provisioner.record("start", caller), provisioner.err
 }
 
 func (provisioner *recordingOnboardingProvisioner) Status(_ context.Context, caller OnboardingCaller) (OnboardingResult, error) {
-	return provisioner.record("status", caller), nil
+	return provisioner.record("status", caller), provisioner.err
 }
 
 func (provisioner *recordingOnboardingProvisioner) VerifyDomain(_ context.Context, caller OnboardingCaller) (OnboardingResult, error) {
-	return provisioner.record("verify_domain", caller), nil
+	return provisioner.record("verify_domain", caller), provisioner.err
 }
 
 func (provisioner *recordingOnboardingProvisioner) Close(_ context.Context, caller OnboardingCaller, input OnboardingCloseInput) (OnboardingResult, error) {
 	provisioner.close = input
-	return provisioner.record("close", caller), nil
+	return provisioner.record("close", caller), provisioner.err
 }
 
 func TestSDKServerRegistersOnlyFourOnboardingToolsAndPreservesBearer(t *testing.T) {
@@ -179,6 +181,97 @@ func TestSDKServerRegistersOnlyFourOnboardingToolsAndPreservesBearer(t *testing.
 	}
 	if provisioner.close.ExpectedGeneration != principal.Generation {
 		t.Fatalf("close input=%+v", provisioner.close)
+	}
+}
+
+func TestOnboardingHTTPFailuresStayInsideAdvertisedErrorSchema(t *testing.T) {
+	cfg := hostedRouterConfig()
+	runtime := NewServer(cfg, nil, auth.NewService(cfg, nil), nil)
+	provisioner := &recordingOnboardingProvisioner{}
+	runtime.Onboarding = provisioner
+	handler := NewSDKHandler(runtime, true)
+	principal := auth.Principal{
+		Kind: auth.PrincipalM2MOnboarding, ClientID: "client-1", Generation: 7, TokenID: "token-1",
+		Scopes: []string{"nerve:onboarding"}, AuthMethod: "m2m_bearer",
+	}
+
+	listRequest := onboardingModernRequest(t, principal, "tools/list", map[string]any{"_meta": modernOAuthMeta()}, "")
+	listRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(listRecorder, listRequest)
+	if listRecorder.Code != http.StatusOK {
+		t.Fatalf("tools/list status=%d body=%s", listRecorder.Code, listRecorder.Body.String())
+	}
+	var listed struct {
+		Result struct {
+			Tools []struct {
+				Name         string         `json:"name"`
+				OutputSchema map[string]any `json:"outputSchema"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(listRecorder.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("decode tools/list: %v body=%s", err, listRecorder.Body.String())
+	}
+	advertised := make(map[string]map[string]struct{}, len(listed.Result.Tools))
+	for _, tool := range listed.Result.Tools {
+		oneOf := tool.OutputSchema["oneOf"].([]any)
+		errorShape := oneOf[1].(map[string]any)
+		errorProperties := errorShape["properties"].(map[string]any)["error"].(map[string]any)["properties"].(map[string]any)
+		codes := errorProperties["code"].(map[string]any)["enum"].([]any)
+		advertised[tool.Name] = make(map[string]struct{}, len(codes))
+		for _, code := range codes {
+			advertised[tool.Name][code.(string)] = struct{}{}
+		}
+	}
+
+	tests := []struct {
+		name           string
+		tool           string
+		arguments      map[string]any
+		provisionerErr error
+		wantCode       string
+		wantRetryable  bool
+	}{
+		{name: "start generic", tool: "nerve_onboarding_start", arguments: managedStartArguments("start-1", "Example"), provisionerErr: errors.New("SYNTHETIC_PROVIDER_SECRET"), wantCode: OnboardingErrorTemporarilyUnavailable, wantRetryable: true},
+		{name: "status generic", tool: "nerve_onboarding_status", arguments: map[string]any{}, provisionerErr: errors.New("SYNTHETIC_PROVIDER_SECRET"), wantCode: OnboardingErrorTemporarilyUnavailable, wantRetryable: true},
+		{name: "verify generic", tool: "nerve_onboarding_verify_domain", arguments: map[string]any{}, provisionerErr: errors.New("SYNTHETIC_PROVIDER_SECRET"), wantCode: OnboardingErrorTemporarilyUnavailable, wantRetryable: true},
+		{name: "close generic", tool: "nerve_onboarding_close", arguments: map[string]any{"idempotency_key": "close-1", "expected_generation": 7}, provisionerErr: errors.New("SYNTHETIC_PROVIDER_SECRET"), wantCode: OnboardingErrorTemporarilyUnavailable, wantRetryable: true},
+		{name: "start semantic", tool: "nerve_onboarding_start", arguments: managedStartArguments("start-1", "   "), wantCode: OnboardingErrorInvalidRequest},
+		{name: "close semantic", tool: "nerve_onboarding_close", arguments: map[string]any{"idempotency_key": "close-1", "expected_generation": 8}, wantCode: OnboardingErrorInvalidRequest},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			provisioner.err = test.provisionerErr
+			request := onboardingModernRequest(t, principal, "tools/call", map[string]any{
+				"_meta": modernOAuthMeta(), "name": test.tool, "arguments": test.arguments,
+			}, test.tool)
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("call status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			var response struct {
+				Result struct {
+					IsError           bool `json:"isError"`
+					StructuredContent struct {
+						Error modernBusinessError `json:"error"`
+					} `json:"structuredContent"`
+				} `json:"result"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode call: %v body=%s", err, recorder.Body.String())
+			}
+			got := response.Result.StructuredContent.Error
+			if !response.Result.IsError || got.Code != test.wantCode || got.Retryable != test.wantRetryable {
+				t.Fatalf("structured failure=%+v isError=%t body=%s", got, response.Result.IsError, recorder.Body.String())
+			}
+			if _, ok := advertised[test.tool][got.Code]; !ok {
+				t.Fatalf("tool %s returned unadvertised code %q", test.tool, got.Code)
+			}
+			if strings.Contains(recorder.Body.String(), "SYNTHETIC_PROVIDER_SECRET") {
+				t.Fatalf("provider detail escaped response: %s", recorder.Body.String())
+			}
+		})
 	}
 }
 

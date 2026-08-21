@@ -22,6 +22,7 @@ import (
 	"neuralmail/internal/llm"
 	"neuralmail/internal/mcp"
 	"neuralmail/internal/observability"
+	onboardingclient "neuralmail/internal/onboarding"
 	"neuralmail/internal/policy"
 	"neuralmail/internal/queue"
 	"neuralmail/internal/startup"
@@ -45,6 +46,10 @@ type App struct {
 }
 
 func New(ctx context.Context, cfg config.Config) (*App, error) {
+	onboardingProvisioner, err := newOnboardingProvisioner(cfg)
+	if err != nil {
+		return nil, err
+	}
 	st, err := store.Open(cfg.Database.DSN)
 	if err != nil {
 		return nil, err
@@ -105,8 +110,10 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	authSvc := auth.NewService(cfg, st)
 	entitlementObserver := observability.NewEntitlementObserver(log.Default())
 	entitlementSvc := entitlements.NewService(cfg, st, entitlementObserver)
-	mcpServer := mcp.NewServer(cfg, toolSvc, authSvc, entitlementSvc)
-	mcpServer.FeatureFlags = featureflags.New(cfg.Cloud.Mode, st)
+	mcpServer := newMCPServer(
+		cfg, toolSvc, authSvc, entitlementSvc,
+		featureflags.New(cfg.Cloud.Mode, st), onboardingProvisioner,
+	)
 	mcpRouter := mcp.NewRouter(cfg, authSvc, mcp.NewLegacyHandler(mcpServer), mcp.NewSDKHandler(mcpServer, true))
 
 	return &App{
@@ -122,6 +129,42 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 
 		EmailTransport: transportRegistry,
 	}, nil
+}
+
+func newMCPServer(
+	cfg config.Config,
+	toolSvc *tools.Service,
+	authSvc *auth.Service,
+	entitlementSvc mcp.EntitlementGate,
+	featureGate mcp.FeatureGate,
+	onboardingProvisioner mcp.OnboardingProvisioner,
+) *mcp.Server {
+	server := mcp.NewServer(cfg, toolSvc, authSvc, entitlementSvc)
+	server.FeatureFlags = featureGate
+	server.Onboarding = onboardingProvisioner
+	return server
+}
+
+func newOnboardingProvisioner(cfg config.Config) (mcp.OnboardingProvisioner, error) {
+	baseURL := strings.TrimSpace(cfg.Onboarding.ControlPlaneURL)
+	keyID := strings.TrimSpace(cfg.Onboarding.DelegationKeyID)
+	secret := cfg.Onboarding.DelegationSecret
+	if baseURL == "" && keyID == "" && secret == "" {
+		return nil, nil
+	}
+	if baseURL == "" || keyID == "" || secret == "" {
+		return nil, errors.New("onboarding delegation configuration requires control-plane URL, key ID, and secret together")
+	}
+	client, err := onboardingclient.NewClient(onboardingclient.ClientConfig{
+		BaseURL: baseURL,
+		KeyID:   keyID,
+		Secret:  secret,
+		Timeout: cfg.Onboarding.Timeout,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("configure onboarding delegation: %w", err)
+	}
+	return client, nil
 }
 
 func (a *App) Close() error {

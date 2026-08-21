@@ -202,51 +202,70 @@ func onboardingToolDescriptors() []toolDescriptor {
 func invokeOnboardingTool(ctx context.Context, provisioner OnboardingProvisioner, caller OnboardingCaller, name string, arguments json.RawMessage) (OnboardingResult, error) {
 	var result OnboardingResult
 	if provisioner == nil {
-		return result, errors.New("onboarding provisioner is unavailable")
+		return result, onboardingTemporarilyUnavailable()
 	}
 	var err error
 	switch name {
 	case "nerve_onboarding_start":
 		var input OnboardingStartInput
 		if err := decodeOnboardingArguments(arguments, &input); err != nil {
-			return result, err
+			return result, onboardingInvalidRequest()
 		}
 		if err := normalizeOnboardingStartInput(&input); err != nil {
-			return result, err
+			return result, onboardingInvalidRequest()
 		}
 		result, err = provisioner.Start(ctx, caller, input)
 	case "nerve_onboarding_status":
 		if err := decodeOnboardingArguments(arguments, &struct{}{}); err != nil {
-			return result, err
+			return result, onboardingInvalidRequest()
 		}
 		result, err = provisioner.Status(ctx, caller)
 	case "nerve_onboarding_verify_domain":
 		if err := decodeOnboardingArguments(arguments, &struct{}{}); err != nil {
-			return result, err
+			return result, onboardingInvalidRequest()
 		}
 		result, err = provisioner.VerifyDomain(ctx, caller)
 	case "nerve_onboarding_close":
 		var input OnboardingCloseInput
 		if err := decodeOnboardingArguments(arguments, &input); err != nil {
-			return result, err
+			return result, onboardingInvalidRequest()
 		}
 		if err := validateOnboardingIdempotencyKey(input.IdempotencyKey); err != nil {
-			return result, err
+			return result, onboardingInvalidRequest()
 		}
 		if input.ExpectedGeneration != caller.Principal.Generation {
-			return result, errors.New("expected_generation must match the authenticated generation")
+			return result, onboardingInvalidRequest()
 		}
 		result, err = provisioner.Close(ctx, caller, input)
 	default:
-		return result, fmt.Errorf("unknown onboarding tool %q", name)
+		return result, onboardingInvalidRequest()
 	}
 	if err != nil {
-		return result, err
+		return result, sanitizeOnboardingProvisionerError(err)
 	}
 	if err := validateOnboardingToolResult(result, caller.Principal.Generation); err != nil {
-		return OnboardingResult{}, err
+		return OnboardingResult{}, onboardingTemporarilyUnavailable()
 	}
 	return result, nil
+}
+
+func onboardingInvalidRequest() error {
+	return &OnboardingBusinessError{Code: OnboardingErrorInvalidRequest, Retryable: false}
+}
+
+func onboardingTemporarilyUnavailable() error {
+	return &OnboardingBusinessError{Code: OnboardingErrorTemporarilyUnavailable, Retryable: true}
+}
+
+func sanitizeOnboardingProvisionerError(err error) error {
+	if errors.Is(err, ErrOnboardingOutcomeUnknown) {
+		return ErrOnboardingOutcomeUnknown
+	}
+	var businessError *OnboardingBusinessError
+	if errors.As(err, &businessError) && IsPublicOnboardingBusinessErrorCode(businessError.Code) {
+		return businessError
+	}
+	return onboardingTemporarilyUnavailable()
 }
 
 func validateOnboardingToolResult(result OnboardingResult, expectedGeneration int64) error {
