@@ -107,7 +107,7 @@ func IsPublicOnboardingBusinessErrorCode(code string) bool {
 }
 
 func (err *OnboardingBusinessError) Error() string {
-	if err == nil || err.Code == "" {
+	if err == nil || !IsPublicOnboardingBusinessErrorCode(err.Code) {
 		return "onboarding request failed"
 	}
 	return err.Code

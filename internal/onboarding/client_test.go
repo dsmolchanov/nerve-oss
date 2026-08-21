@@ -430,6 +430,14 @@ func TestClientReturnsTypedBusinessError(t *testing.T) {
 	}
 }
 
+func TestOnboardingBusinessErrorRedactsUnknownCode(t *testing.T) {
+	const secret = "sk_live_SYNTHETIC_PROVIDER_SECRET"
+	err := (&mcp.OnboardingBusinessError{Code: secret}).Error()
+	if strings.Contains(err, secret) || err != "onboarding request failed" {
+		t.Fatalf("unknown business error was not redacted: %q", err)
+	}
+}
+
 func TestDecodeDelegationResponseRejectsUnknownAndDuplicateFields(t *testing.T) {
 	for _, body := range []string{
 		`{"result":{"resultType":"complete","onboarding_id":"11111111-1111-4111-8111-111111111111","generation":7,"state":"active","mode":"managed_mailbox","reauthorize":false,"internal_owner_id":"secret"}}`,
