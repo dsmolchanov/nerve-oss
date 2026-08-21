@@ -279,8 +279,35 @@ func (s *Store) ensureInboxForOrgLocked(ctx context.Context, orgID, address, org
 	if err != nil {
 		return InboxRecord{}, false, err
 	}
-	if rec.OrgID != orgID || !strings.EqualFold(rec.Address, address) || rec.OrgDomainID.String != orgDomainID || rec.OutboundProvider != outboundProvider {
+	storedCanonical, _, _, canonicalErr := emailaddr.Canonicalize(rec.Address)
+	if canonicalErr != nil || rec.OrgID != orgID || storedCanonical != address || rec.OrgDomainID.String != orgDomainID || rec.OutboundProvider != outboundProvider {
 		return InboxRecord{}, false, ErrIdempotencyConflict
+	}
+	if rec.Address != storedCanonical {
+		result, updateErr := s.q.ExecContext(ctx, `
+			UPDATE inboxes
+			SET address = $2
+			WHERE id = $1
+			  AND NOT EXISTS (
+			    SELECT 1 FROM inboxes other
+			    WHERE other.id <> $1
+			      AND lower(btrim(other.address)) IN ($2, $2 || '.')
+			  )
+		`, rec.ID, storedCanonical)
+		if updateErr != nil {
+			if isCanonicalInboxAddressConflict(updateErr) {
+				return InboxRecord{}, false, ErrResourceConflict
+			}
+			return InboxRecord{}, false, updateErr
+		}
+		updated, updateErr := result.RowsAffected()
+		if updateErr != nil {
+			return InboxRecord{}, false, updateErr
+		}
+		if updated != 1 {
+			return InboxRecord{}, false, ErrResourceConflict
+		}
+		rec.Address = storedCanonical
 	}
 	return rec, false, nil
 }

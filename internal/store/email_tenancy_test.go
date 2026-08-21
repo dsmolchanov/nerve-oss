@@ -484,20 +484,50 @@ func TestInboxStoreCanonicalizesEveryCreationPath(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		created, err := st.CreateInboxForOrg(ctx, orgID, "Family@Abrolia.com.", "")
-		if err != nil {
-			t.Fatal(err)
+		paths := []struct {
+			name      string
+			canonical string
+			create    func(string) (string, error)
+		}{
+			{
+				name:      "CreateInboxForOrg",
+				canonical: "create@abrolia.com",
+				create: func(address string) (string, error) {
+					rec, createErr := st.CreateInboxForOrg(ctx, orgID, address, "")
+					return rec.ID, createErr
+				},
+			},
+			{
+				name:      "EnsureInboxForOrg",
+				canonical: "ensure@abrolia.com",
+				create: func(address string) (string, error) {
+					rec, _, createErr := st.EnsureInboxForOrg(ctx, orgID, address, "", "resend", "canonical-inbox")
+					return rec.ID, createErr
+				},
+			},
+			{name: "EnsureDefaultInbox", canonical: "default@abrolia.com", create: func(address string) (string, error) {
+				return st.EnsureDefaultInbox(ctx, address)
+			}},
+			{name: "EnsureInbox", canonical: "shared@abrolia.com", create: func(address string) (string, error) {
+				return st.EnsureInbox(ctx, address)
+			}},
 		}
-		if created.Address != "family@abrolia.com" {
-			t.Fatalf("created address=%q", created.Address)
-		}
-		ensured, wasCreated, err := st.EnsureInboxForOrg(ctx, orgID, "Agent@Example.com.", "", "resend", "canonical-inbox")
-		if err != nil || !wasCreated || ensured.Address != "agent@example.com" {
-			t.Fatalf("ensured=%+v created=%v err=%v", ensured, wasCreated, err)
-		}
-		replayed, wasCreated, err := st.EnsureInboxForOrg(ctx, orgID, "agent@example.com", "", "resend", "canonical-inbox")
-		if err != nil || wasCreated || replayed.ID != ensured.ID || replayed.Address != ensured.Address {
-			t.Fatalf("replayed=%+v created=%v err=%v", replayed, wasCreated, err)
+		for _, path := range paths {
+			t.Run(path.name, func(t *testing.T) {
+				parts := strings.SplitN(path.canonical, "@", 2)
+				input := strings.ToUpper(parts[0][:1]) + parts[0][1:] + "@" + strings.ToUpper(parts[1][:1]) + parts[1][1:] + "."
+				id, createErr := path.create(input)
+				if createErr != nil {
+					t.Fatal(createErr)
+				}
+				var stored string
+				if err := db.QueryRowContext(ctx, `SELECT address FROM inboxes WHERE id = $1`, id).Scan(&stored); err != nil {
+					t.Fatal(err)
+				}
+				if stored != path.canonical {
+					t.Fatalf("stored address=%q want=%q", stored, path.canonical)
+				}
+			})
 		}
 		for _, invalid := range []string{"local@extra@example.com", "missing-at.example.com"} {
 			if _, err := st.CreateInboxForOrg(ctx, orgID, invalid, ""); err == nil {
@@ -506,6 +536,73 @@ func TestInboxStoreCanonicalizesEveryCreationPath(t *testing.T) {
 			if _, _, err := st.EnsureInboxForOrg(ctx, orgID, invalid, "", "resend", "invalid-"+invalid); err == nil {
 				t.Fatalf("invalid ensured address %q was stored", invalid)
 			}
+		}
+	})
+}
+
+func TestEnsureInboxForOrgReplaysAndBackfillsLegacyAddress(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		orgID, err := st.CreateOrg(ctx, "legacy-canonical-inbox-owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+		inboxID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO inboxes (id, org_id, address, status, outbound_provider, external_ref)
+			VALUES ($1, $2, 'Agent@Example.com.', 'active', 'resend', 'legacy-canonical-inbox')
+		`, inboxID, orgID); err != nil {
+			t.Fatal(err)
+		}
+		replayed, created, err := st.EnsureInboxForOrg(
+			ctx, orgID, "agent@example.com", "", "resend", "legacy-canonical-inbox",
+		)
+		if err != nil || created || replayed.ID != inboxID || replayed.Address != "agent@example.com" {
+			t.Fatalf("replayed=%+v created=%v err=%v", replayed, created, err)
+		}
+		var stored string
+		if err := db.QueryRowContext(ctx, `SELECT address FROM inboxes WHERE id = $1`, inboxID).Scan(&stored); err != nil {
+			t.Fatal(err)
+		}
+		if stored != "agent@example.com" {
+			t.Fatalf("stored legacy address=%q", stored)
+		}
+	})
+}
+
+func TestEnsureInboxForOrgRefusesLegacyCanonicalCollision(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		orgID, err := st.CreateOrg(ctx, "legacy-canonical-collision-owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+		legacyID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO inboxes (id, org_id, address, status, outbound_provider, external_ref)
+			VALUES ($1, $2, 'Agent@Example.com.', 'active', 'resend', 'legacy-collision')
+		`, legacyID, orgID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO inboxes (id, org_id, address, status, outbound_provider)
+			VALUES ($1, $2, 'agent@example.com', 'disabled', 'resend')
+		`, uuid.NewString(), orgID); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := st.EnsureInboxForOrg(
+			ctx, orgID, "agent@example.com", "", "resend", "legacy-collision",
+		); !errors.Is(err, ErrResourceConflict) {
+			t.Fatalf("replay error=%v, want resource conflict", err)
+		}
+		var stored string
+		if err := db.QueryRowContext(ctx, `SELECT address FROM inboxes WHERE id = $1`, legacyID).Scan(&stored); err != nil {
+			t.Fatal(err)
+		}
+		if stored != "Agent@Example.com." {
+			t.Fatalf("collision mutated legacy address to %q", stored)
 		}
 	})
 }
