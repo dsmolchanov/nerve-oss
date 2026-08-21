@@ -291,7 +291,7 @@ func (s *Store) ensureInboxForDefaultOrg(ctx context.Context, orgID, address str
 		return "", fmt.Errorf("canonicalize inbox address: %w", err)
 	}
 	rows, err := s.q.QueryContext(ctx, `
-		SELECT id
+		SELECT id, org_id::text
 		FROM inboxes
 		WHERE lower(btrim(address)) IN ($1, $1 || '.')
 		ORDER BY id
@@ -300,12 +300,13 @@ func (s *Store) ensureInboxForDefaultOrg(ctx context.Context, orgID, address str
 		return "", err
 	}
 	var id string
+	var storedOrgID sql.NullString
 	for rows.Next() {
 		if id != "" {
 			_ = rows.Close()
 			return "", ErrResourceConflict
 		}
-		if err := rows.Scan(&id); err != nil {
+		if err := rows.Scan(&id, &storedOrgID); err != nil {
 			_ = rows.Close()
 			return "", err
 		}
@@ -322,12 +323,28 @@ func (s *Store) ensureInboxForDefaultOrg(ctx context.Context, orgID, address str
 		_, err = s.q.ExecContext(ctx, `INSERT INTO inboxes (id, org_id, address, status) VALUES ($1,$2,$3,'active')`, id, orgID, canonicalAddress)
 		return id, err
 	}
-	_, err = s.q.ExecContext(ctx, `
+	if storedOrgID.Valid && storedOrgID.String != orgID {
+		return "", ErrResourceConflict
+	}
+	result, err := s.q.ExecContext(ctx, `
 		UPDATE inboxes
 		SET address = $2, org_id = COALESCE(org_id, $3)
-		WHERE id = $1
+		WHERE id = $1 AND (org_id IS NULL OR org_id = $3)
 	`, id, canonicalAddress, orgID)
-	return id, err
+	if err != nil {
+		if isCanonicalInboxAddressConflict(err) {
+			return "", ErrResourceConflict
+		}
+		return "", err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if updated != 1 {
+		return "", ErrResourceConflict
+	}
+	return id, nil
 }
 
 func (s *Store) ListInboxes(ctx context.Context) ([]string, error) {
