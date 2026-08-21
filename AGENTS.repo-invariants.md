@@ -38,3 +38,14 @@ makes a review loop unable to terminate.
   they are passed to a Go package test, whose working directory differs from
   the repository root. Enforced by
   `scripts/ci/test_mcp_conformance_paths.sh`.
+- After an onboarding lifecycle mutation (`Start`, `VerifyDomain`, or `Close`)
+  may have reached the control plane, does every transport, body-read,
+  protocol, or semantically invalid-envelope failure that is not a validated
+  durable result or business error return `ErrOnboardingOutcomeUnknown`?
+  `Status` is the intentional read-only exception for protocol diagnostics.
+  Enforced by the table-driven
+  `TestClientResponseBodyTimeoutReturnsOutcomeUnknownForEveryOperation`,
+  `TestClientTransportDisconnectReturnsOutcomeUnknownForEveryOperation`,
+  `TestClientInvalidPostCommitResponseReturnsOutcomeUnknownForEveryMutation`,
+  and `TestClientRejectsSemanticallyInvalidEnvelopesForEveryOperation` tests in
+  `internal/onboarding/client_test.go`.
