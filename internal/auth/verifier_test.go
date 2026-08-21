@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -134,7 +135,7 @@ func TestAuthenticateRequestM2MPrincipalKinds(t *testing.T) {
 			token := signedM2MJWT(t, privateKey, "access-key-1", jwt.SigningMethodPS256, jwt.MapClaims{
 				"iss": "https://auth.nerve.email", "aud": "https://api.nerve.email/mcp",
 				"exp": expires, "nbf": 1000, "iat": 1000, "jti": "token-1",
-				"sub": "client-1", "client_id": "client-1", "generation": 2,
+				"sub": "client-1", "client_id": "client-1", "client_kid": strings.Repeat("A", 43), "generation": 2,
 				"token_use": string(test.kind), "org_id": test.orgID, "scope": test.scopes,
 			})
 			req, reqErr := http.NewRequest(http.MethodPost, "/mcp", nil)
@@ -146,7 +147,7 @@ func TestAuthenticateRequestM2MPrincipalKinds(t *testing.T) {
 			if authErr != nil {
 				t.Fatalf("authenticate M2M request: %v", authErr)
 			}
-			if principal.Kind != test.kind || principal.ClientID != "client-1" || principal.Generation != 2 || principal.OrgID != test.orgID {
+			if principal.Kind != test.kind || principal.ClientID != "client-1" || principal.ClientKeyID != strings.Repeat("A", 43) || principal.Generation != 2 || principal.OrgID != test.orgID {
 				t.Fatalf("unexpected M2M principal: %+v", principal)
 			}
 		})
@@ -162,7 +163,7 @@ func TestAuthenticateRequestM2MOrgRequiresExactDurableTokenBinding(t *testing.T)
 	token := signedM2MJWT(t, privateKey, "access-key-1", jwt.SigningMethodPS256, jwt.MapClaims{
 		"iss": "https://auth.nerve.email", "aud": "https://api.nerve.email/mcp",
 		"exp": 1900, "nbf": 1000, "iat": 1000, "jti": "org-token-1",
-		"sub": "client-1", "client_id": "client-1", "generation": 2,
+		"sub": "client-1", "client_id": "client-1", "client_kid": strings.Repeat("A", 43), "generation": 2,
 		"token_use": "m2m_org", "org_id": "org-1", "scope": "nerve:email.read nerve:email.reply",
 	})
 	validRow := store.ServiceToken{
@@ -255,7 +256,7 @@ func TestAuthenticateRequestM2MRejectsAlgorithmAndClaimConfusion(t *testing.T) {
 	base := jwt.MapClaims{
 		"iss": "https://auth.nerve.email", "aud": "https://api.nerve.email/mcp",
 		"exp": 1300, "nbf": 1000, "iat": 1000, "jti": "token-1", "sub": "client-1",
-		"client_id": "client-1", "generation": 1, "token_use": "m2m_onboarding",
+		"client_id": "client-1", "client_kid": strings.Repeat("A", 43), "generation": 1, "token_use": "m2m_onboarding",
 		"scope": "nerve:onboarding",
 	}
 	tests := map[string]struct {
@@ -296,6 +297,12 @@ func TestAuthenticateRequestM2MRejectsAlgorithmAndClaimConfusion(t *testing.T) {
 		"unknown scope": {method: jwt.SigningMethodPS256, kid: "access-key-1", mutate: func(claims jwt.MapClaims) {
 			claims["scope"] = "nerve:unknown"
 		}},
+		"missing client key id": {method: jwt.SigningMethodPS256, kid: "access-key-1", mutate: func(claims jwt.MapClaims) {
+			delete(claims, "client_kid")
+		}},
+		"invalid client key id": {method: jwt.SigningMethodPS256, kid: "access-key-1", mutate: func(claims jwt.MapClaims) {
+			claims["client_kid"] = "not-a-thumbprint"
+		}},
 		"noncanonical scope order": {method: jwt.SigningMethodPS256, kid: "access-key-1", mutate: func(claims jwt.MapClaims) {
 			claims["token_use"] = "m2m_org"
 			claims["org_id"] = "org-1"
@@ -334,6 +341,65 @@ func TestAuthenticateRequestM2MRejectsAlgorithmAndClaimConfusion(t *testing.T) {
 				t.Fatalf("expected fail-closed rejection, got %v", authErr)
 			}
 		})
+	}
+}
+
+func TestValidM2MClientKIDRequiresCanonicalSHA256ThumbprintEncoding(t *testing.T) {
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	const canonicalFinalCharacters = "AEIMQUYcgkosw048"
+	prefix := strings.Repeat("A", 42)
+	for _, finalCharacter := range alphabet {
+		value := prefix + string(finalCharacter)
+		want := strings.ContainsRune(canonicalFinalCharacters, finalCharacter)
+		if got := validM2MClientKID(value); got != want {
+			t.Fatalf("final character %q: valid=%t want=%t", finalCharacter, got, want)
+		}
+	}
+	for _, value := range []string{
+		strings.Repeat("A", 42) + "B",
+		strings.Repeat("A", 42) + "/",
+		strings.Repeat("A", 43) + "=",
+		strings.Repeat("A", 42),
+	} {
+		if validM2MClientKID(value) {
+			t.Fatalf("accepted noncanonical client key id %q", value)
+		}
+	}
+}
+
+func TestAuthenticateRequestM2MRejectsWhitespaceAroundClientKIDForEveryTokenKind(t *testing.T) {
+	privateKey := mustRSAKey(t)
+	keys, err := ParseRSAPublicJWKS(mustJWKS(t, "access-key-1", &privateKey.PublicKey, "PS256"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := &Service{M2M: &M2MTokenVerifier{
+		Issuer: "https://auth.nerve.email", Audience: "https://api.nerve.email/mcp",
+		Keys: keys, Now: func() time.Time { return time.Unix(1000, 0) },
+	}}
+	canonicalKID := strings.Repeat("A", 43)
+	for _, tokenKind := range []PrincipalKind{PrincipalM2MOnboarding, PrincipalM2MOrg} {
+		for _, whitespace := range []string{" ", "\t", "\n", "\r", "\u00a0", "\u2003"} {
+			for _, clientKID := range []string{whitespace + canonicalKID, canonicalKID + whitespace} {
+				claims := jwt.MapClaims{
+					"iss": "https://auth.nerve.email", "aud": "https://api.nerve.email/mcp",
+					"exp": 1300, "nbf": 1000, "iat": 1000, "jti": "token-1", "sub": "client-1",
+					"client_id": "client-1", "client_kid": clientKID, "generation": 1,
+					"token_use": string(tokenKind), "scope": "nerve:onboarding",
+				}
+				if tokenKind == PrincipalM2MOrg {
+					claims["org_id"] = "org-1"
+					claims["scope"] = "nerve:email.read"
+					claims["exp"] = 1900
+				}
+				token := signedM2MJWT(t, privateKey, "access-key-1", jwt.SigningMethodPS256, claims)
+				req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+				req.Header.Set("Authorization", "Bearer "+token)
+				if _, authErr := svc.AuthenticateRequest(req); !errors.Is(authErr, ErrUnauthenticated) {
+					t.Fatalf("kind=%s client_kid=%q accepted: %v", tokenKind, clientKID, authErr)
+				}
+			}
+		}
 	}
 }
 

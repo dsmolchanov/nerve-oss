@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -328,6 +329,10 @@ func (v *M2MTokenVerifier) Verify(ctx context.Context, rawToken string) (Princip
 	if clientID == "" || clientID != claimString(claims["sub"]) {
 		return Principal{}, ErrUnauthenticated
 	}
+	clientKeyID, ok := claims["client_kid"].(string)
+	if !ok || !validM2MClientKID(clientKeyID) {
+		return Principal{}, ErrUnauthenticated
+	}
 	generation, ok := claimPositiveInt64(claims["generation"])
 	if !ok {
 		return Principal{}, ErrUnauthenticated
@@ -337,14 +342,15 @@ func (v *M2MTokenVerifier) Verify(ctx context.Context, rawToken string) (Princip
 		return Principal{}, ErrUnauthenticated
 	}
 	principal := Principal{
-		OrgID:      claimString(claims["org_id"]),
-		ActorID:    clientID,
-		TokenID:    claimString(claims["jti"]),
-		ClientID:   clientID,
-		Generation: generation,
-		Scopes:     scopes,
-		ExpiresAt:  expiresAt.Time,
-		AuthMethod: "m2m_bearer",
+		OrgID:       claimString(claims["org_id"]),
+		ActorID:     clientID,
+		TokenID:     claimString(claims["jti"]),
+		ClientID:    clientID,
+		ClientKeyID: clientKeyID,
+		Generation:  generation,
+		Scopes:      scopes,
+		ExpiresAt:   expiresAt.Time,
+		AuthMethod:  "m2m_bearer",
 	}
 	if principal.TokenID == "" || len(principal.Scopes) == 0 {
 		return Principal{}, ErrUnauthenticated
@@ -366,6 +372,14 @@ func (v *M2MTokenVerifier) Verify(ctx context.Context, rawToken string) (Princip
 		return Principal{}, ErrUnauthenticated
 	}
 	return principal, nil
+}
+
+func validM2MClientKID(value string) bool {
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(value)
+	if err != nil || len(decoded) != sha256.Size {
+		return false
+	}
+	return base64.RawURLEncoding.EncodeToString(decoded) == value
 }
 
 func canonicalM2MScopes(claim any) ([]string, bool) {
