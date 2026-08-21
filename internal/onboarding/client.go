@@ -201,16 +201,133 @@ func (client *Client) call(ctx context.Context, operation string, caller mcp.Onb
 		return empty, delegationProtocolFailure(operation, errors.New("onboarding delegation response is not application/json"))
 	}
 	var decoded delegationResponse
-	if err := json.Unmarshal(responseBody, &decoded); err != nil {
+	if err := decodeDelegationResponse(responseBody, &decoded); err != nil {
 		return empty, delegationProtocolFailure(operation, fmt.Errorf("decode onboarding delegation response: %w", err))
+	}
+	if err := validateDelegationEnvelope(response.StatusCode, decoded, caller.Principal.Generation); err != nil {
+		return empty, delegationProtocolFailure(operation, err)
 	}
 	if decoded.Error != nil {
 		return empty, decoded.Error
 	}
-	if decoded.Result != nil {
-		return *decoded.Result, nil
+	return *decoded.Result, nil
+}
+
+func decodeDelegationResponse(body []byte, target *delegationResponse) error {
+	if err := rejectDuplicateJSONFields(body); err != nil {
+		return err
 	}
-	return empty, delegationProtocolFailure(operation, fmt.Errorf("onboarding delegation failed with HTTP %d and no durable result", response.StatusCode))
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("onboarding delegation response contains multiple JSON values")
+	}
+	return nil
+}
+
+func rejectDuplicateJSONFields(body []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	var walk func() error
+	walk = func() error {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		delimiter, ok := token.(json.Delim)
+		if !ok {
+			return nil
+		}
+		switch delimiter {
+		case '{':
+			seen := make(map[string]struct{})
+			for decoder.More() {
+				keyToken, err := decoder.Token()
+				if err != nil {
+					return err
+				}
+				key, ok := keyToken.(string)
+				if !ok {
+					return errors.New("onboarding delegation response has a non-string object key")
+				}
+				if _, duplicate := seen[key]; duplicate {
+					return fmt.Errorf("onboarding delegation response repeats field %q", key)
+				}
+				seen[key] = struct{}{}
+				if err := walk(); err != nil {
+					return err
+				}
+			}
+			closing, err := decoder.Token()
+			if err != nil || closing != json.Delim('}') {
+				return errors.New("onboarding delegation response has an unterminated object")
+			}
+		case '[':
+			for decoder.More() {
+				if err := walk(); err != nil {
+					return err
+				}
+			}
+			closing, err := decoder.Token()
+			if err != nil || closing != json.Delim(']') {
+				return errors.New("onboarding delegation response has an unterminated array")
+			}
+		default:
+			return errors.New("onboarding delegation response starts with an unexpected delimiter")
+		}
+		return nil
+	}
+	if err := walk(); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("onboarding delegation response contains multiple JSON values")
+	}
+	return nil
+}
+
+func validateDelegationEnvelope(statusCode int, decoded delegationResponse, expectedGeneration int64) error {
+	if (decoded.Result == nil) == (decoded.Error == nil) {
+		return errors.New("onboarding delegation response must contain exactly one result or error")
+	}
+	if decoded.Error != nil {
+		if statusCode < http.StatusBadRequest || statusCode > 599 {
+			return fmt.Errorf("onboarding delegation business error has inconsistent HTTP %d", statusCode)
+		}
+		if decoded.Error.Code == "" || len(decoded.Error.Code) > 128 || strings.ContainsAny(decoded.Error.Code, " \t\r\n") {
+			return errors.New("onboarding delegation business error code is invalid")
+		}
+		return nil
+	}
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("onboarding delegation result has inconsistent HTTP %d", statusCode)
+	}
+	result := decoded.Result
+	if result.ResultType != "complete" {
+		return errors.New("onboarding delegation resultType must be complete")
+	}
+	if _, err := uuid.Parse(result.OnboardingID); err != nil {
+		return errors.New("onboarding delegation onboarding_id is invalid")
+	}
+	if result.Generation != expectedGeneration {
+		return errors.New("onboarding delegation generation does not match the authenticated principal")
+	}
+	switch result.State {
+	case "provisioning", "dns_pending", "active", "deprovisioning", "closed":
+	default:
+		return errors.New("onboarding delegation state is invalid")
+	}
+	switch result.Mode {
+	case mcp.OnboardingMailboxManaged, mcp.OnboardingMailboxCustomDomain:
+	default:
+		return errors.New("onboarding delegation mode is invalid")
+	}
+	if len(result.Address) > 320 {
+		return errors.New("onboarding delegation address exceeds 320 bytes")
+	}
+	return nil
 }
 
 // Post-dispatch invariant: once a lifecycle mutation may have reached the

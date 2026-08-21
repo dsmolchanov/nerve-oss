@@ -55,7 +55,7 @@ func TestClientSignsFixedDestinationAndAuthenticatedGeneration(t *testing.T) {
 		}
 		writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(writer).Encode(map[string]any{"result": map[string]any{
-			"resultType": "complete", "onboarding_id": "onboarding-1", "generation": 7, "state": "provisioning",
+			"resultType": "complete", "onboarding_id": "11111111-1111-4111-8111-111111111111", "generation": 7, "state": "provisioning",
 			"mode": "managed_mailbox", "reauthorize": false,
 		}})
 	}))
@@ -68,7 +68,7 @@ func TestClientSignsFixedDestinationAndAuthenticatedGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	if result.ResultType != "complete" || result.OnboardingID != "onboarding-1" || result.Generation != 7 || result.State != "provisioning" {
+	if result.ResultType != "complete" || result.OnboardingID != "11111111-1111-4111-8111-111111111111" || result.Generation != 7 || result.State != "provisioning" {
 		t.Fatalf("result=%+v", result)
 	}
 	var envelope struct {
@@ -267,6 +267,70 @@ func TestClientInvalidPostCommitResponseReturnsOutcomeUnknownForEveryMutation(t 
 	}
 }
 
+func TestClientRejectsSemanticallyInvalidEnvelopesForEveryOperation(t *testing.T) {
+	validResult := func() map[string]any {
+		return map[string]any{
+			"resultType": "complete", "onboarding_id": "11111111-1111-4111-8111-111111111111",
+			"generation": 7, "state": "provisioning", "mode": "managed_mailbox", "reauthorize": false,
+		}
+	}
+	for _, failure := range []struct {
+		name       string
+		statusCode int
+		envelope   func() map[string]any
+	}{
+		{name: "partial result", statusCode: http.StatusOK, envelope: func() map[string]any { return map[string]any{"result": map[string]any{}} }},
+		{name: "contradictory result and error", statusCode: http.StatusConflict, envelope: func() map[string]any {
+			return map[string]any{"result": validResult(), "error": map[string]any{"code": "conflict", "retryable": false}}
+		}},
+		{name: "wrong generation", statusCode: http.StatusOK, envelope: func() map[string]any {
+			result := validResult()
+			result["generation"] = 8
+			return map[string]any{"result": result}
+		}},
+		{name: "invalid state", statusCode: http.StatusOK, envelope: func() map[string]any {
+			result := validResult()
+			result["state"] = "failed"
+			return map[string]any{"result": result}
+		}},
+		{name: "invalid mode", statusCode: http.StatusOK, envelope: func() map[string]any {
+			result := validResult()
+			result["mode"] = "mailbox_pool"
+			return map[string]any{"result": result}
+		}},
+		{name: "result with error HTTP status", statusCode: http.StatusBadGateway, envelope: func() map[string]any {
+			return map[string]any{"result": validResult()}
+		}},
+		{name: "error with success HTTP status", statusCode: http.StatusOK, envelope: func() map[string]any {
+			return map[string]any{"error": map[string]any{"code": "conflict", "retryable": false}}
+		}},
+	} {
+		t.Run(failure.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				writer.WriteHeader(failure.statusCode)
+				_ = json.NewEncoder(writer).Encode(failure.envelope())
+			}))
+			defer server.Close()
+			client := newTestClient(t, server.URL, server.Client(), time.Unix(1_723_000_000, 0))
+			for name, operation := range clientOperations(client) {
+				t.Run(name, func(t *testing.T) {
+					err := operation()
+					if name == "status" {
+						if err == nil || errors.Is(err, mcp.ErrOnboardingOutcomeUnknown) {
+							t.Fatalf("status protocol error=%v", err)
+						}
+						return
+					}
+					if !errors.Is(err, mcp.ErrOnboardingOutcomeUnknown) {
+						t.Fatalf("mutation protocol error=%v", err)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestClientRejectsInvalidAuthorityAndDestinations(t *testing.T) {
 	validClient := newTestClient(t, "https://control.internal.example", nil, time.Unix(1_723_000_000, 0))
 	invalidCallers := []mcp.OnboardingCaller{
@@ -305,6 +369,18 @@ func TestClientReturnsTypedBusinessError(t *testing.T) {
 	var businessError *mcp.OnboardingBusinessError
 	if !errors.As(err, &businessError) || businessError.Code != "onboarding_idempotency_conflict" || businessError.Retryable || businessError.RetryAt == nil || !businessError.RetryAt.Equal(retryAt) {
 		t.Fatalf("business error=%#v err=%v", businessError, err)
+	}
+}
+
+func TestDecodeDelegationResponseRejectsUnknownAndDuplicateFields(t *testing.T) {
+	for _, body := range []string{
+		`{"result":{"resultType":"complete","onboarding_id":"11111111-1111-4111-8111-111111111111","generation":7,"state":"active","mode":"managed_mailbox","reauthorize":false,"internal_owner_id":"secret"}}`,
+		`{"error":{"code":"conflict","retryable":false,"code":"other"}}`,
+	} {
+		var decoded delegationResponse
+		if err := decodeDelegationResponse([]byte(body), &decoded); err == nil {
+			t.Fatalf("ambiguous response accepted: %s", body)
+		}
 	}
 }
 
