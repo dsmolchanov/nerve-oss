@@ -208,6 +208,65 @@ func TestClientTransportDisconnectReturnsOutcomeUnknownForEveryOperation(t *test
 	}
 }
 
+func TestClientInvalidPostCommitResponseReturnsOutcomeUnknownForEveryMutation(t *testing.T) {
+	for _, failure := range []struct {
+		name  string
+		write func(http.ResponseWriter)
+	}{
+		{
+			name: "proxy 5xx without durable result",
+			write: func(writer http.ResponseWriter) {
+				writer.Header().Set("Content-Type", "application/json")
+				writer.WriteHeader(http.StatusBadGateway)
+				_, _ = writer.Write([]byte(`{"proxy":"failed"}`))
+			},
+		},
+		{
+			name: "oversized body",
+			write: func(writer http.ResponseWriter) {
+				writer.Header().Set("Content-Type", "application/json")
+				_, _ = writer.Write([]byte(`{"result":"` + strings.Repeat("x", maxDelegationBodyBytes) + `"}`))
+			},
+		},
+		{
+			name: "unexpected content type",
+			write: func(writer http.ResponseWriter) {
+				writer.Header().Set("Content-Type", "text/plain")
+				_, _ = writer.Write([]byte("upstream failed"))
+			},
+		},
+		{
+			name: "malformed JSON",
+			write: func(writer http.ResponseWriter) {
+				writer.Header().Set("Content-Type", "application/json")
+				_, _ = writer.Write([]byte(`{"result":`))
+			},
+		},
+	} {
+		t.Run(failure.name, func(t *testing.T) {
+			var committed atomic.Int64
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				_, _ = io.Copy(io.Discard, request.Body)
+				committed.Add(1)
+				failure.write(writer)
+			}))
+			defer server.Close()
+			client := newTestClient(t, server.URL, server.Client(), time.Unix(1_723_000_000, 0))
+			for name, operation := range mutatingClientOperations(client) {
+				t.Run(name, func(t *testing.T) {
+					before := committed.Load()
+					if err := operation(); !errors.Is(err, mcp.ErrOnboardingOutcomeUnknown) {
+						t.Fatalf("post-commit protocol error=%v", err)
+					}
+					if committed.Load() != before+1 {
+						t.Fatalf("handler commit count=%d want=%d", committed.Load(), before+1)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestClientRejectsInvalidAuthorityAndDestinations(t *testing.T) {
 	validClient := newTestClient(t, "https://control.internal.example", nil, time.Unix(1_723_000_000, 0))
 	invalidCallers := []mcp.OnboardingCaller{
@@ -281,6 +340,27 @@ func clientOperations(client *Client) map[string]func() error {
 		},
 		"status": func() error {
 			_, err := client.Status(context.Background(), testCaller())
+			return err
+		},
+		"verify domain": func() error {
+			_, err := client.VerifyDomain(context.Background(), testCaller())
+			return err
+		},
+		"close": func() error {
+			_, err := client.Close(context.Background(), testCaller(), mcp.OnboardingCloseInput{
+				IdempotencyKey: "close-1", ExpectedGeneration: 7,
+			})
+			return err
+		},
+	}
+}
+
+func mutatingClientOperations(client *Client) map[string]func() error {
+	return map[string]func() error{
+		"start": func() error {
+			_, err := client.Start(context.Background(), testCaller(), mcp.OnboardingStartInput{
+				IdempotencyKey: "start-1", OrganizationName: "Example", MailboxMode: mcp.OnboardingMailboxManaged,
+			})
 			return err
 		},
 		"verify domain": func() error {

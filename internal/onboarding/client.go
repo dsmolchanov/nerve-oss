@@ -195,22 +195,34 @@ func (client *Client) call(ctx context.Context, operation string, caller mcp.Onb
 		return empty, mcp.ErrOnboardingOutcomeUnknown
 	}
 	if len(responseBody) > maxDelegationBodyBytes {
-		return empty, errors.New("onboarding delegation response exceeds 64 KiB")
+		return empty, delegationProtocolFailure(operation, errors.New("onboarding delegation response exceeds 64 KiB"))
 	}
 	if mediaType := strings.ToLower(strings.TrimSpace(strings.Split(response.Header.Get("Content-Type"), ";")[0])); mediaType != "application/json" {
-		return empty, errors.New("onboarding delegation response is not application/json")
+		return empty, delegationProtocolFailure(operation, errors.New("onboarding delegation response is not application/json"))
 	}
 	var decoded delegationResponse
 	if err := json.Unmarshal(responseBody, &decoded); err != nil {
-		return empty, fmt.Errorf("decode onboarding delegation response: %w", err)
+		return empty, delegationProtocolFailure(operation, fmt.Errorf("decode onboarding delegation response: %w", err))
 	}
 	if decoded.Error != nil {
 		return empty, decoded.Error
 	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 || decoded.Result == nil {
-		return empty, fmt.Errorf("onboarding delegation failed with HTTP %d", response.StatusCode)
+	if decoded.Result != nil {
+		return *decoded.Result, nil
 	}
-	return *decoded.Result, nil
+	return empty, delegationProtocolFailure(operation, fmt.Errorf("onboarding delegation failed with HTTP %d and no durable result", response.StatusCode))
+}
+
+// Post-dispatch invariant: once a lifecycle mutation may have reached the
+// control plane, only a decoded durable result or business error is definitive.
+// Every other response/protocol failure is ambiguous and requires polling the
+// same generation/key before retrying. Status is read-only and may retain a
+// diagnostic protocol error.
+func delegationProtocolFailure(operation string, err error) error {
+	if operation == "status" {
+		return err
+	}
+	return fmt.Errorf("%w: %v", mcp.ErrOnboardingOutcomeUnknown, err)
 }
 
 func (client *Client) signature(method, escapedPath, nonce, timestamp, bodyHash string) string {
