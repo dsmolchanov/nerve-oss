@@ -16,15 +16,16 @@ const (
 )
 
 type Principal struct {
-	OrgID      string
-	ActorID    string
-	TokenID    string
-	ClientID   string
-	Generation int64
-	Scopes     []string
-	ExpiresAt  time.Time
-	Kind       PrincipalKind
-	AuthMethod string // jwt or cloud_api_key
+	OrgID       string
+	ActorID     string
+	TokenID     string
+	ClientID    string
+	ClientKeyID string
+	Generation  int64
+	Scopes      []string
+	ExpiresAt   time.Time
+	Kind        PrincipalKind
+	AuthMethod  string // jwt or cloud_api_key
 }
 
 func (p Principal) IsM2M() bool {

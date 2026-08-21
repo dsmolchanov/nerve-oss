@@ -191,9 +191,11 @@ func TestImmutableSDK02AndNativeMCP2026ShareEndpoint(t *testing.T) {
 		tokenID  = "dual-profile-token"
 	)
 	expiresAt := now.Add(15 * time.Minute)
+	clientKeyThumbprint := sha256.Sum256([]byte("dual-profile-client-key"))
+	clientKeyID := base64.RawURLEncoding.EncodeToString(clientKeyThumbprint[:])
 	m2mToken := jwt.NewWithClaims(jwt.SigningMethodPS256, jwt.MapClaims{
 		"iss": issuer, "aud": audience, "exp": expiresAt.Unix(), "nbf": now.Unix(), "iat": now.Unix(),
-		"jti": tokenID, "sub": clientID, "client_id": clientID, "generation": 1,
+		"jti": tokenID, "sub": clientID, "client_id": clientID, "client_kid": clientKeyID, "generation": 1,
 		"token_use": string(auth.PrincipalM2MOrg), "org_id": orgID, "scope": "nerve:email.read",
 	})
 	m2mToken.Header["kid"] = keyID
