@@ -475,6 +475,41 @@ func TestCreateInboxCanonicalAddressConflict(t *testing.T) {
 	})
 }
 
+func TestInboxStoreCanonicalizesEveryCreationPath(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		orgID, err := st.CreateOrg(ctx, "canonical-inbox-owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		created, err := st.CreateInboxForOrg(ctx, orgID, "Family@Abrolia.com.", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if created.Address != "family@abrolia.com" {
+			t.Fatalf("created address=%q", created.Address)
+		}
+		ensured, wasCreated, err := st.EnsureInboxForOrg(ctx, orgID, "Agent@Example.com.", "", "resend", "canonical-inbox")
+		if err != nil || !wasCreated || ensured.Address != "agent@example.com" {
+			t.Fatalf("ensured=%+v created=%v err=%v", ensured, wasCreated, err)
+		}
+		replayed, wasCreated, err := st.EnsureInboxForOrg(ctx, orgID, "agent@example.com", "", "resend", "canonical-inbox")
+		if err != nil || wasCreated || replayed.ID != ensured.ID || replayed.Address != ensured.Address {
+			t.Fatalf("replayed=%+v created=%v err=%v", replayed, wasCreated, err)
+		}
+		for _, invalid := range []string{"local@extra@example.com", "missing-at.example.com"} {
+			if _, err := st.CreateInboxForOrg(ctx, orgID, invalid, ""); err == nil {
+				t.Fatalf("invalid address %q was stored", invalid)
+			}
+			if _, _, err := st.EnsureInboxForOrg(ctx, orgID, invalid, "", "resend", "invalid-"+invalid); err == nil {
+				t.Fatalf("invalid ensured address %q was stored", invalid)
+			}
+		}
+	})
+}
+
 func TestEnsureOrgWebhookSerializesWithOrgDeletion(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToLatest(t, ctx, db)

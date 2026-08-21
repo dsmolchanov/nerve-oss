@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"neuralmail/internal/domains"
+	"neuralmail/internal/emailaddr"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -167,13 +167,17 @@ func (s *Store) CreateInboxForOrg(ctx context.Context, orgID string, address str
 }
 
 func (s *Store) createInboxForOrg(ctx context.Context, orgID string, address string, orgDomainID string, outboundProvider string, externalRef string) (InboxRecord, error) {
+	canonicalAddress, _, _, err := emailaddr.Canonicalize(address)
+	if err != nil {
+		return InboxRecord{}, err
+	}
 	if outboundProvider == "" {
 		outboundProvider = "smtp"
 	}
 	rec := InboxRecord{
 		ID:      uuid.NewString(),
 		OrgID:   orgID,
-		Address: address,
+		Address: canonicalAddress,
 		Status:  "active",
 
 		InboundProvider:  "jmap",
@@ -212,7 +216,7 @@ func (s *Store) EnsureInboxForOrg(ctx context.Context, orgID, address, orgDomain
 	var rec InboxRecord
 	created := false
 	err := s.withTx(ctx, func(scoped *Store) error {
-		canonicalDomain, err := inboxCanonicalDomain(address)
+		canonicalAddress, _, canonicalDomain, err := emailaddr.Canonicalize(address)
 		if err != nil {
 			return err
 		}
@@ -224,20 +228,11 @@ func (s *Store) EnsureInboxForOrg(ctx context.Context, orgID, address, orgDomain
 		}
 		var ensureErr error
 		rec, created, ensureErr = scoped.ensureInboxForOrgLocked(
-			ctx, orgID, address, orgDomainID, outboundProvider, externalRef,
+			ctx, orgID, canonicalAddress, orgDomainID, outboundProvider, externalRef,
 		)
 		return ensureErr
 	})
 	return rec, created, err
-}
-
-func inboxCanonicalDomain(address string) (string, error) {
-	address = strings.TrimSpace(address)
-	separator := strings.LastIndexByte(address, '@')
-	if separator <= 0 || separator == len(address)-1 {
-		return "", errors.New("inbox address must contain a local part and domain")
-	}
-	return domains.CanonicalizeDomain(address[separator+1:])
 }
 
 func (s *Store) ensureInboxForOrgLocked(ctx context.Context, orgID, address, orgDomainID, outboundProvider, externalRef string) (InboxRecord, bool, error) {
