@@ -112,7 +112,7 @@ func TestClientRejectsRedirectsAndUnboundedResponses(t *testing.T) {
 	}))
 	defer large.Close()
 	client = newTestClient(t, large.URL, large.Client(), time.Unix(1_723_000_000, 0))
-	if _, err := client.Status(context.Background(), testCaller()); err == nil || !strings.Contains(err.Error(), "exceeds 64 KiB") {
+	if _, err := client.Status(context.Background(), testCaller()); err == nil || err.Error() != "onboarding delegation protocol error" {
 		t.Fatalf("oversized response error=%v", err)
 	}
 }
@@ -331,6 +331,58 @@ func TestClientRejectsSemanticallyInvalidEnvelopesForEveryOperation(t *testing.T
 	}
 }
 
+func TestClientRejectsCaseFoldedResponseAliasesForEveryOperation(t *testing.T) {
+	valid := `{"resultType":"complete","onboarding_id":"11111111-1111-4111-8111-111111111111","generation":7,"state":"active","mode":"managed_mailbox","reauthorize":false}`
+	for _, response := range []string{
+		`{"Result":` + valid + `}`,
+		`{"result":` + valid + `,"Result":` + valid + `}`,
+		`{"result":{"resultType":"complete","onboarding_id":"11111111-1111-4111-8111-111111111111","generation":7,"state":"active","mode":"managed_mailbox","reauthorize":false,"DNS_Records":[]}}`,
+		`{"error":{"code":"conflict","retryable":false,"Retryable":true}}`,
+	} {
+		assertProtocolFailureForEveryOperation(t, http.StatusOK, response)
+	}
+}
+
+func TestClientRequiresCompleteResponseDTOForEveryOperation(t *testing.T) {
+	for _, failure := range []struct {
+		status int
+		body   string
+	}{
+		{status: http.StatusOK, body: `{"result":{"resultType":"complete","onboarding_id":"11111111-1111-4111-8111-111111111111","generation":7,"state":"active","mode":"managed_mailbox"}}`},
+		{status: http.StatusOK, body: `{"result":{"resultType":"complete","onboarding_id":"11111111-1111-4111-8111-111111111111","generation":7,"state":"active","mode":"managed_mailbox","reauthorize":false,"dns_records":[{}]}}`},
+		{status: http.StatusOK, body: `{"result":{"resultType":"complete","onboarding_id":"11111111-1111-4111-8111-111111111111","generation":7,"state":"active","mode":"managed_mailbox","reauthorize":false,"dns_checks":[{}]}}`},
+		{status: http.StatusOK, body: `{"result":{"resultType":"complete","onboarding_id":"11111111-1111-4111-8111-111111111111","generation":7,"state":"active","mode":"managed_mailbox","reauthorize":false,"dns_records":[{"type":"MX","name":"example.com","value":"mx.example.com","priority":65536}]}}`},
+		{status: http.StatusOK, body: `{"result":{"resultType":"complete","onboarding_id":"11111111-1111-4111-8111-111111111111","generation":7,"state":"active","mode":"managed_mailbox","reauthorize":false,"dns_records":null}}`},
+		{status: http.StatusConflict, body: `{"error":{"code":"conflict"}}`},
+	} {
+		assertProtocolFailureForEveryOperation(t, failure.status, failure.body)
+	}
+}
+
+func TestClientRedactsProtocolParserDetailsForEveryOperation(t *testing.T) {
+	const secret = "SYNTHETIC_PROVIDER_SECRET"
+	for _, response := range []string{
+		`{"error":{"code":"retry","retryable":true,"retry_at":"` + secret + `"}}`,
+		`{"result":{"resultType":"complete","onboarding_id":"11111111-1111-4111-8111-111111111111","generation":7,"state":"active","mode":"managed_mailbox","reauthorize":false,"` + secret + `":true}}`,
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusConflict)
+			_, _ = writer.Write([]byte(response))
+		}))
+		client := newTestClient(t, server.URL, server.Client(), time.Unix(1_723_000_000, 0))
+		for name, operation := range clientOperations(client) {
+			t.Run(name, func(t *testing.T) {
+				err := operation()
+				if err == nil || strings.Contains(err.Error(), secret) {
+					t.Fatalf("unredacted protocol error=%v", err)
+				}
+			})
+		}
+		server.Close()
+	}
+}
+
 func TestClientRejectsInvalidAuthorityAndDestinations(t *testing.T) {
 	validClient := newTestClient(t, "https://control.internal.example", nil, time.Unix(1_723_000_000, 0))
 	invalidCallers := []mcp.OnboardingCaller{
@@ -381,6 +433,31 @@ func TestDecodeDelegationResponseRejectsUnknownAndDuplicateFields(t *testing.T) 
 		if err := decodeDelegationResponse([]byte(body), &decoded); err == nil {
 			t.Fatalf("ambiguous response accepted: %s", body)
 		}
+	}
+}
+
+func assertProtocolFailureForEveryOperation(t *testing.T, status int, response string) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(status)
+		_, _ = writer.Write([]byte(response))
+	}))
+	defer server.Close()
+	client := newTestClient(t, server.URL, server.Client(), time.Unix(1_723_000_000, 0))
+	for name, operation := range clientOperations(client) {
+		t.Run(name, func(t *testing.T) {
+			err := operation()
+			if name == "status" {
+				if err == nil || errors.Is(err, mcp.ErrOnboardingOutcomeUnknown) || err.Error() != "onboarding delegation protocol error" {
+					t.Fatalf("status protocol error=%v", err)
+				}
+				return
+			}
+			if !errors.Is(err, mcp.ErrOnboardingOutcomeUnknown) || strings.Contains(err.Error(), response) {
+				t.Fatalf("mutation protocol error=%v", err)
+			}
+		})
 	}
 }
 

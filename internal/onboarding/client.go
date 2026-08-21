@@ -79,6 +79,43 @@ type delegationResponse struct {
 	Error  *mcp.OnboardingBusinessError `json:"error,omitempty"`
 }
 
+type delegationResponseWire struct {
+	Result *onboardingResultWire        `json:"result,omitempty"`
+	Error  *onboardingBusinessErrorWire `json:"error,omitempty"`
+}
+
+type onboardingResultWire struct {
+	ResultType   *string                    `json:"resultType"`
+	OnboardingID *string                    `json:"onboarding_id"`
+	Generation   *int64                     `json:"generation"`
+	State        *string                    `json:"state"`
+	Mode         *mcp.OnboardingMailboxMode `json:"mode"`
+	Address      string                     `json:"address,omitempty"`
+	DNSRecords   []onboardingDNSRecordWire  `json:"dns_records,omitempty"`
+	DNSChecks    []onboardingDNSCheckWire   `json:"dns_checks,omitempty"`
+	NextAction   string                     `json:"next_action,omitempty"`
+	RetryAt      *time.Time                 `json:"retry_at,omitempty"`
+	Reauthorize  *bool                      `json:"reauthorize"`
+}
+
+type onboardingDNSRecordWire struct {
+	Type     *string `json:"type"`
+	Name     *string `json:"name"`
+	Value    *string `json:"value"`
+	Priority *int    `json:"priority,omitempty"`
+}
+
+type onboardingDNSCheckWire struct {
+	Name   *string `json:"name"`
+	Status *string `json:"status"`
+}
+
+type onboardingBusinessErrorWire struct {
+	Code      *string    `json:"code"`
+	Retryable *bool      `json:"retryable"`
+	RetryAt   *time.Time `json:"retry_at,omitempty"`
+}
+
 func NewClient(cfg ClientConfig) (*Client, error) {
 	baseURL, err := validateBaseURL(cfg.BaseURL)
 	if err != nil {
@@ -217,14 +254,23 @@ func decodeDelegationResponse(body []byte, target *delegationResponse) error {
 	if err := rejectDuplicateJSONFields(body); err != nil {
 		return err
 	}
+	if err := validateDelegationResponseFieldNames(body); err != nil {
+		return err
+	}
+	var wire delegationResponseWire
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
+	if err := decoder.Decode(&wire); err != nil {
 		return err
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return errors.New("onboarding delegation response contains multiple JSON values")
 	}
+	decoded, err := wire.response()
+	if err != nil {
+		return err
+	}
+	*target = decoded
 	return nil
 }
 
@@ -252,10 +298,11 @@ func rejectDuplicateJSONFields(body []byte) error {
 				if !ok {
 					return errors.New("onboarding delegation response has a non-string object key")
 				}
-				if _, duplicate := seen[key]; duplicate {
+				foldedKey := strings.ToLower(key)
+				if _, duplicate := seen[foldedKey]; duplicate {
 					return fmt.Errorf("onboarding delegation response repeats field %q", key)
 				}
-				seen[key] = struct{}{}
+				seen[foldedKey] = struct{}{}
 				if err := walk(); err != nil {
 					return err
 				}
@@ -286,6 +333,119 @@ func rejectDuplicateJSONFields(body []byte) error {
 		return errors.New("onboarding delegation response contains multiple JSON values")
 	}
 	return nil
+}
+
+func validateDelegationResponseFieldNames(body []byte) error {
+	top, err := decodeExactJSONObject(body, "response", "result", "error")
+	if err != nil {
+		return err
+	}
+	if raw, ok := top["result"]; ok {
+		result, err := decodeExactJSONObject(raw, "result",
+			"resultType", "onboarding_id", "generation", "state", "mode", "address",
+			"dns_records", "dns_checks", "next_action", "retry_at", "reauthorize")
+		if err != nil {
+			return err
+		}
+		if rawRecords, ok := result["dns_records"]; ok {
+			if err := validateExactJSONArrayObjects(rawRecords, "dns_records", "type", "name", "value", "priority"); err != nil {
+				return err
+			}
+		}
+		if rawChecks, ok := result["dns_checks"]; ok {
+			if err := validateExactJSONArrayObjects(rawChecks, "dns_checks", "name", "status"); err != nil {
+				return err
+			}
+		}
+	}
+	if raw, ok := top["error"]; ok {
+		if _, err := decodeExactJSONObject(raw, "error", "code", "retryable", "retry_at"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func decodeExactJSONObject(raw []byte, name string, allowed ...string) (map[string]json.RawMessage, error) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return nil, fmt.Errorf("onboarding delegation %s must be an object", name)
+	}
+	allowedFields := make(map[string]struct{}, len(allowed))
+	for _, field := range allowed {
+		allowedFields[field] = struct{}{}
+	}
+	for field := range object {
+		if _, ok := allowedFields[field]; !ok {
+			return nil, fmt.Errorf("onboarding delegation %s has an invalid field", name)
+		}
+		if bytes.Equal(bytes.TrimSpace(object[field]), []byte("null")) {
+			return nil, fmt.Errorf("onboarding delegation %s contains a null field", name)
+		}
+	}
+	return object, nil
+}
+
+func validateExactJSONArrayObjects(raw []byte, name string, allowed ...string) error {
+	var entries []json.RawMessage
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return fmt.Errorf("onboarding delegation %s must be an array", name)
+	}
+	for _, entry := range entries {
+		if _, err := decodeExactJSONObject(entry, name+" entry", allowed...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (wire delegationResponseWire) response() (delegationResponse, error) {
+	var response delegationResponse
+	if wire.Result != nil {
+		result, err := wire.Result.result()
+		if err != nil {
+			return response, err
+		}
+		response.Result = &result
+	}
+	if wire.Error != nil {
+		if wire.Error.Code == nil || wire.Error.Retryable == nil {
+			return response, errors.New("onboarding delegation business error omits a required field")
+		}
+		response.Error = &mcp.OnboardingBusinessError{
+			Code: *wire.Error.Code, Retryable: *wire.Error.Retryable, RetryAt: wire.Error.RetryAt,
+		}
+	}
+	return response, nil
+}
+
+func (wire onboardingResultWire) result() (mcp.OnboardingResult, error) {
+	if wire.ResultType == nil || wire.OnboardingID == nil || wire.Generation == nil || wire.State == nil || wire.Mode == nil || wire.Reauthorize == nil {
+		return mcp.OnboardingResult{}, errors.New("onboarding delegation result omits a required field")
+	}
+	result := mcp.OnboardingResult{
+		ResultType: *wire.ResultType, OnboardingID: *wire.OnboardingID, Generation: *wire.Generation,
+		State: *wire.State, Mode: *wire.Mode, Address: wire.Address, NextAction: wire.NextAction,
+		RetryAt: wire.RetryAt, Reauthorize: *wire.Reauthorize,
+	}
+	for _, record := range wire.DNSRecords {
+		if record.Type == nil || record.Name == nil || record.Value == nil || *record.Type == "" || *record.Name == "" || *record.Value == "" {
+			return mcp.OnboardingResult{}, errors.New("onboarding delegation DNS record omits a required field")
+		}
+		if record.Priority != nil && (*record.Priority < 0 || *record.Priority > 65535) {
+			return mcp.OnboardingResult{}, errors.New("onboarding delegation DNS record priority is invalid")
+		}
+		result.DNSRecords = append(result.DNSRecords, mcp.OnboardingDNSRecord{
+			Type: *record.Type, Name: *record.Name, Value: *record.Value, Priority: record.Priority,
+		})
+	}
+	for _, check := range wire.DNSChecks {
+		if check.Name == nil || check.Status == nil || *check.Name == "" || *check.Status == "" {
+			return mcp.OnboardingResult{}, errors.New("onboarding delegation DNS check omits a required field")
+		}
+		result.DNSChecks = append(result.DNSChecks, mcp.OnboardingDNSCheck{Name: *check.Name, Status: *check.Status})
+	}
+	return result, nil
 }
 
 func validateDelegationEnvelope(statusCode int, decoded delegationResponse, expectedGeneration int64) error {
@@ -335,11 +495,12 @@ func validateDelegationEnvelope(statusCode int, decoded delegationResponse, expe
 // Every other response/protocol failure is ambiguous and requires polling the
 // same generation/key before retrying. Status is read-only and may retain a
 // diagnostic protocol error.
-func delegationProtocolFailure(operation string, err error) error {
+func delegationProtocolFailure(operation string, _ error) error {
+	const publicMessage = "onboarding delegation protocol error"
 	if operation == "status" {
-		return err
+		return errors.New(publicMessage)
 	}
-	return fmt.Errorf("%w: %v", mcp.ErrOnboardingOutcomeUnknown, err)
+	return fmt.Errorf("%w: %s", mcp.ErrOnboardingOutcomeUnknown, publicMessage)
 }
 
 func (client *Client) signature(method, escapedPath, nonce, timestamp, bodyHash string) string {
