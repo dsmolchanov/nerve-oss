@@ -475,6 +475,219 @@ func TestCreateInboxCanonicalAddressConflict(t *testing.T) {
 	})
 }
 
+func TestInboxStoreCanonicalizesEveryCreationPath(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		orgID, err := st.CreateOrg(ctx, "canonical-inbox-owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		paths := []struct {
+			name      string
+			canonical string
+			create    func(string) (string, error)
+		}{
+			{
+				name:      "CreateInboxForOrg",
+				canonical: "create@abrolia.com",
+				create: func(address string) (string, error) {
+					rec, createErr := st.CreateInboxForOrg(ctx, orgID, address, "")
+					return rec.ID, createErr
+				},
+			},
+			{
+				name:      "EnsureInboxForOrg",
+				canonical: "ensure@abrolia.com",
+				create: func(address string) (string, error) {
+					rec, _, createErr := st.EnsureInboxForOrg(ctx, orgID, address, "", "resend", "canonical-inbox")
+					return rec.ID, createErr
+				},
+			},
+			{name: "EnsureDefaultInbox", canonical: "default@abrolia.com", create: func(address string) (string, error) {
+				return st.EnsureDefaultInbox(ctx, address)
+			}},
+			{name: "EnsureInbox", canonical: "shared@abrolia.com", create: func(address string) (string, error) {
+				return st.EnsureInbox(ctx, address)
+			}},
+			{name: "EnsureDefaults", canonical: "defaults@abrolia.com", create: func(address string) (string, error) {
+				return st.EnsureDefaults(ctx, address)
+			}},
+		}
+		for _, path := range paths {
+			t.Run(path.name, func(t *testing.T) {
+				parts := strings.SplitN(path.canonical, "@", 2)
+				input := strings.ToUpper(parts[0][:1]) + parts[0][1:] + "@" + strings.ToUpper(parts[1][:1]) + parts[1][1:] + "."
+				id, createErr := path.create(input)
+				if createErr != nil {
+					t.Fatal(createErr)
+				}
+				var stored string
+				if err := db.QueryRowContext(ctx, `SELECT address FROM inboxes WHERE id = $1`, id).Scan(&stored); err != nil {
+					t.Fatal(err)
+				}
+				if stored != path.canonical {
+					t.Fatalf("stored address=%q want=%q", stored, path.canonical)
+				}
+			})
+		}
+		for _, invalid := range []string{"local@extra@example.com", "missing-at.example.com"} {
+			if _, err := st.CreateInboxForOrg(ctx, orgID, invalid, ""); err == nil {
+				t.Fatalf("invalid address %q was stored", invalid)
+			}
+			if _, _, err := st.EnsureInboxForOrg(ctx, orgID, invalid, "", "resend", "invalid-"+invalid); err == nil {
+				t.Fatalf("invalid ensured address %q was stored", invalid)
+			}
+		}
+	})
+}
+
+func TestDefaultInboxEntryPointsPreserveTenantOwnership(t *testing.T) {
+	entryPoints := []struct {
+		name   string
+		ensure func(context.Context, *Store, string) (string, error)
+	}{
+		{name: "EnsureInbox", ensure: func(ctx context.Context, st *Store, address string) (string, error) {
+			return st.EnsureInbox(ctx, address)
+		}},
+		{name: "EnsureDefaultInbox", ensure: func(ctx context.Context, st *Store, address string) (string, error) {
+			return st.EnsureDefaultInbox(ctx, address)
+		}},
+		{name: "EnsureDefaults", ensure: func(ctx context.Context, st *Store, address string) (string, error) {
+			return st.EnsureDefaults(ctx, address)
+		}},
+	}
+	owners := []string{"same", "unowned", "foreign"}
+	for _, entryPoint := range entryPoints {
+		for _, owner := range owners {
+			entryPoint, owner := entryPoint, owner
+			t.Run(entryPoint.name+"/"+owner, func(t *testing.T) {
+				withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+					migrateToLatest(t, ctx, db)
+					st := &Store{db: db, q: db}
+					defaultOrgID, err := st.CreateOrg(ctx, "default-owner")
+					if err != nil {
+						t.Fatal(err)
+					}
+					foreignOrgID, err := st.CreateOrg(ctx, "foreign-owner")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := db.ExecContext(ctx, `
+						UPDATE orgs
+						SET created_at = CASE id WHEN $1 THEN '2000-01-01T00:00:00Z'::timestamptz ELSE '2001-01-01T00:00:00Z'::timestamptz END
+						WHERE id IN ($1, $2)
+					`, defaultOrgID, foreignOrgID); err != nil {
+						t.Fatal(err)
+					}
+					var seededOrg any = defaultOrgID
+					switch owner {
+					case "unowned":
+						seededOrg = nil
+					case "foreign":
+						seededOrg = foreignOrgID
+					}
+					seededID := uuid.NewString()
+					if _, err := db.ExecContext(ctx, `
+						INSERT INTO inboxes (id, org_id, address, status)
+						VALUES ($1, $2, 'Agent@Example.com.', 'active')
+					`, seededID, seededOrg); err != nil {
+						t.Fatal(err)
+					}
+					gotID, err := entryPoint.ensure(ctx, st, "agent@example.com")
+					if owner == "foreign" {
+						if !errors.Is(err, ErrResourceConflict) || gotID != "" {
+							t.Fatalf("foreign result id=%q err=%v", gotID, err)
+						}
+					} else if err != nil || gotID != seededID {
+						t.Fatalf("owned result id=%q err=%v want=%q", gotID, err, seededID)
+					}
+					var storedAddress string
+					var storedOrg sql.NullString
+					if err := db.QueryRowContext(ctx, `SELECT address, org_id::text FROM inboxes WHERE id=$1`, seededID).Scan(&storedAddress, &storedOrg); err != nil {
+						t.Fatal(err)
+					}
+					if owner == "foreign" {
+						if storedAddress != "Agent@Example.com." || !storedOrg.Valid || storedOrg.String != foreignOrgID {
+							t.Fatalf("foreign inbox mutated address=%q org=%+v", storedAddress, storedOrg)
+						}
+					} else if storedAddress != "agent@example.com" || !storedOrg.Valid || storedOrg.String != defaultOrgID {
+						t.Fatalf("owned inbox address=%q org=%+v", storedAddress, storedOrg)
+					}
+				})
+			})
+		}
+	}
+}
+
+func TestEnsureInboxForOrgReplaysAndBackfillsLegacyAddress(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		orgID, err := st.CreateOrg(ctx, "legacy-canonical-inbox-owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+		inboxID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO inboxes (id, org_id, address, status, outbound_provider, external_ref)
+			VALUES ($1, $2, 'Agent@Example.com.', 'active', 'resend', 'legacy-canonical-inbox')
+		`, inboxID, orgID); err != nil {
+			t.Fatal(err)
+		}
+		replayed, created, err := st.EnsureInboxForOrg(
+			ctx, orgID, "agent@example.com", "", "resend", "legacy-canonical-inbox",
+		)
+		if err != nil || created || replayed.ID != inboxID || replayed.Address != "agent@example.com" {
+			t.Fatalf("replayed=%+v created=%v err=%v", replayed, created, err)
+		}
+		var stored string
+		if err := db.QueryRowContext(ctx, `SELECT address FROM inboxes WHERE id = $1`, inboxID).Scan(&stored); err != nil {
+			t.Fatal(err)
+		}
+		if stored != "agent@example.com" {
+			t.Fatalf("stored legacy address=%q", stored)
+		}
+	})
+}
+
+func TestEnsureInboxForOrgRefusesLegacyCanonicalCollision(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		orgID, err := st.CreateOrg(ctx, "legacy-canonical-collision-owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+		legacyID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO inboxes (id, org_id, address, status, outbound_provider, external_ref)
+			VALUES ($1, $2, 'Agent@Example.com.', 'active', 'resend', 'legacy-collision')
+		`, legacyID, orgID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO inboxes (id, org_id, address, status, outbound_provider)
+			VALUES ($1, $2, 'agent@example.com', 'disabled', 'resend')
+		`, uuid.NewString(), orgID); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := st.EnsureInboxForOrg(
+			ctx, orgID, "agent@example.com", "", "resend", "legacy-collision",
+		); !errors.Is(err, ErrResourceConflict) {
+			t.Fatalf("replay error=%v, want resource conflict", err)
+		}
+		var stored string
+		if err := db.QueryRowContext(ctx, `SELECT address FROM inboxes WHERE id = $1`, legacyID).Scan(&stored); err != nil {
+			t.Fatal(err)
+		}
+		if stored != "Agent@Example.com." {
+			t.Fatalf("collision mutated legacy address to %q", stored)
+		}
+	})
+}
+
 func TestEnsureOrgWebhookSerializesWithOrgDeletion(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToLatest(t, ctx, db)

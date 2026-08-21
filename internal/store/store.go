@@ -5,10 +5,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+
 	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"neuralmail/internal/emailaddr"
 )
 
 type Store struct {
@@ -278,19 +282,69 @@ func (s *Store) EnsureInbox(ctx context.Context, address string) (string, error)
 	if err != nil {
 		return "", err
 	}
-	var id string
-	row := s.q.QueryRowContext(ctx, `SELECT id FROM inboxes WHERE address = $1`, address)
-	switch err := row.Scan(&id); err {
-	case nil:
-		_, _ = s.q.ExecContext(ctx, `UPDATE inboxes SET org_id = COALESCE(org_id, $2) WHERE id = $1`, id, orgID)
-		return id, nil
-	case sql.ErrNoRows:
-		id = uuid.NewString()
-		_, err = s.q.ExecContext(ctx, `INSERT INTO inboxes (id, org_id, address, status) VALUES ($1,$2,$3,'active')`, id, orgID, address)
-		return id, err
-	default:
+	return s.ensureInboxForDefaultOrg(ctx, orgID, address)
+}
+
+func (s *Store) ensureInboxForDefaultOrg(ctx context.Context, orgID, address string) (string, error) {
+	canonicalAddress, _, _, err := emailaddr.Canonicalize(address)
+	if err != nil {
+		return "", fmt.Errorf("canonicalize inbox address: %w", err)
+	}
+	rows, err := s.q.QueryContext(ctx, `
+		SELECT id, org_id::text
+		FROM inboxes
+		WHERE lower(btrim(address)) IN ($1, $1 || '.')
+		ORDER BY id
+	`, canonicalAddress)
+	if err != nil {
 		return "", err
 	}
+	var id string
+	var storedOrgID sql.NullString
+	for rows.Next() {
+		if id != "" {
+			_ = rows.Close()
+			return "", ErrResourceConflict
+		}
+		if err := rows.Scan(&id, &storedOrgID); err != nil {
+			_ = rows.Close()
+			return "", err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return "", err
+	}
+	if err := rows.Close(); err != nil {
+		return "", err
+	}
+	if id == "" {
+		id = uuid.NewString()
+		_, err = s.q.ExecContext(ctx, `INSERT INTO inboxes (id, org_id, address, status) VALUES ($1,$2,$3,'active')`, id, orgID, canonicalAddress)
+		return id, err
+	}
+	if storedOrgID.Valid && storedOrgID.String != orgID {
+		return "", ErrResourceConflict
+	}
+	result, err := s.q.ExecContext(ctx, `
+		UPDATE inboxes
+		SET address = $2, org_id = COALESCE(org_id, $3)
+		WHERE id = $1 AND (org_id IS NULL OR org_id = $3)
+	`, id, canonicalAddress, orgID)
+	if err != nil {
+		if isCanonicalInboxAddressConflict(err) {
+			return "", ErrResourceConflict
+		}
+		return "", err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if updated != 1 {
+		return "", ErrResourceConflict
+	}
+	return id, nil
 }
 
 func (s *Store) ListInboxes(ctx context.Context) ([]string, error) {
