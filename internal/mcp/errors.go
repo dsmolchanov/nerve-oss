@@ -23,7 +23,20 @@ func translateModernBusinessError(err error) modernBusinessError {
 	var enqueuePolicyErr *tools.OutboundPolicyError
 	var rateErr *entitlements.RateLimitError
 	var inProgressErr *entitlements.IdempotencyInProgressError
+	var onboardingErr *OnboardingBusinessError
 	switch {
+	case errors.As(err, &onboardingErr):
+		if !IsPublicOnboardingBusinessErrorCode(onboardingErr.Code) {
+			return translated
+		}
+		translated.Code = onboardingErr.Code
+		translated.Retryable = onboardingErr.Retryable
+		if onboardingErr.RetryAt != nil {
+			translated.RetryAt = onboardingErr.RetryAt.UTC().Format(time.RFC3339)
+		}
+	case errors.Is(err, ErrOnboardingOutcomeUnknown):
+		translated.Code = OnboardingErrorOutcomeUnknown
+		translated.Retryable = true
 	case errors.As(err, &policyErr):
 		translated.Code = policyErr.Code
 	case errors.As(err, &enqueuePolicyErr):

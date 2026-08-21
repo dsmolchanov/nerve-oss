@@ -156,6 +156,8 @@ func (gate *storeOutboundPolicyGate) Authorize(ctx context.Context, principal au
 
 func requiredToolScope(principal auth.Principal, toolName string) string {
 	switch toolName {
+	case "nerve_onboarding_start", "nerve_onboarding_status", "nerve_onboarding_verify_domain", "nerve_onboarding_close":
+		return "nerve:onboarding"
 	case "list_threads", "get_thread":
 		return "nerve:email.read"
 	case "search_inbox":

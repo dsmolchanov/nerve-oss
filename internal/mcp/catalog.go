@@ -14,13 +14,20 @@ type toolDescriptor struct {
 	Description string
 	InputSchema any
 	OutputShape map[string]any
+	ErrorCodes  []string
 }
 
 func modernToolCatalog(ctx context.Context, server *Server, principal auth.Principal) []toolDescriptor {
 	if principal.Kind == auth.PrincipalM2MOnboarding {
-		// Lifecycle tools are registered only when Phase 3 supplies the delegated
-		// onboarding implementation. An empty list is a fail-closed profile.
-		return nil
+		if server.Onboarding == nil {
+			// An empty list is the fail-closed profile until the delegated
+			// onboarding implementation is configured.
+			return nil
+		}
+		if server.Config.Cloud.Mode && (server.Auth == nil || server.Auth.ValidateScopes(principal, "nerve:onboarding") != nil) {
+			return nil
+		}
+		return onboardingToolDescriptors()
 	}
 	tools := modernToolDescriptors(ctx, server, principal)
 	if !server.Config.Cloud.Mode || server.Auth == nil {
@@ -179,7 +186,11 @@ func composeQueuedMessageOutput() map[string]any {
 	}, "thread_id", "message_id", "status")
 }
 
-func modernErrorOutput() map[string]any {
+func modernErrorOutput(errorCodes []string) map[string]any {
+	code := stringProperty(1)
+	if len(errorCodes) > 0 {
+		code["enum"] = append([]string(nil), errorCodes...)
+	}
 	return map[string]any{
 		"type":                 "object",
 		"additionalProperties": false,
@@ -188,7 +199,7 @@ func modernErrorOutput() map[string]any {
 				"type":                 "object",
 				"additionalProperties": false,
 				"properties": map[string]any{
-					"code":      stringProperty(1),
+					"code":      code,
 					"retryable": map[string]any{"type": "boolean"},
 					"retry_at":  map[string]any{"type": "string", "format": "date-time"},
 				},
@@ -205,7 +216,7 @@ func sdkTool(descriptor toolDescriptor) *sdkmcp.Tool {
 		InputSchema: descriptor.InputSchema,
 		OutputSchema: map[string]any{
 			"$schema": "https://json-schema.org/draft/2020-12/schema",
-			"oneOf":   []any{descriptor.OutputShape, modernErrorOutput()},
+			"oneOf":   []any{descriptor.OutputShape, modernErrorOutput(descriptor.ErrorCodes)},
 		},
 	}
 }

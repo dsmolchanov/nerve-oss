@@ -45,6 +45,7 @@ type Server struct {
 	MemoryBudget   *memguard.Budget
 	FeatureFlags   FeatureGate
 	OutboundPolicy OutboundPolicyGate
+	Onboarding     OnboardingProvisioner
 	Invoker        *Invoker
 	mu             sync.Mutex
 	sessions       map[string]time.Time
