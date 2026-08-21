@@ -25,6 +25,10 @@ func TestLoadEnvOverrides(t *testing.T) {
 	t.Setenv("NM_STRIPE_WEBHOOK_SECRET", "whsec_test_123")
 	t.Setenv("NM_METER_TOOL_COST_PATH", "configs/meters/custom_costs.yaml")
 	t.Setenv("NM_METER_PAST_DUE_GRACE_DAYS", "14")
+	t.Setenv("NM_ONBOARDING_CONTROL_PLANE_URL", "https://control.internal.nerve.email")
+	t.Setenv("NM_ONBOARDING_DELEGATION_KEY_ID", "runtime-current")
+	t.Setenv("NM_ONBOARDING_DELEGATION_SECRET", "delegation-secret")
+	t.Setenv("NM_ONBOARDING_TIMEOUT", "3s")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -75,6 +79,11 @@ func TestLoadEnvOverrides(t *testing.T) {
 	if cfg.Metering.PastDueGraceDays != 14 {
 		t.Fatalf("expected metering grace-day override")
 	}
+	if cfg.Onboarding.ControlPlaneURL != "https://control.internal.nerve.email" ||
+		cfg.Onboarding.DelegationKeyID != "runtime-current" ||
+		cfg.Onboarding.DelegationSecret != "delegation-secret" || cfg.Onboarding.Timeout != 3*time.Second {
+		t.Fatalf("unexpected onboarding delegation config: %+v", cfg.Onboarding)
+	}
 
 	_ = os.Unsetenv("NM_JMAP_URL")
 }
@@ -86,6 +95,8 @@ func TestLoadEnvOverridesPrefersNERVEPrefix(t *testing.T) {
 	t.Setenv("NERVE_SMTP_FROM", "modern@local.nerve.email")
 	t.Setenv("NM_CLOUD_MODE", "false")
 	t.Setenv("NERVE_CLOUD_MODE", "true")
+	t.Setenv("NM_ONBOARDING_CONTROL_PLANE_URL", "https://legacy.internal")
+	t.Setenv("NERVE_ONBOARDING_CONTROL_PLANE_URL", "https://control.internal.nerve.email")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -99,6 +110,9 @@ func TestLoadEnvOverridesPrefersNERVEPrefix(t *testing.T) {
 	}
 	if !cfg.Cloud.Mode {
 		t.Fatalf("expected NERVE_CLOUD_MODE to override NM_CLOUD_MODE")
+	}
+	if cfg.Onboarding.ControlPlaneURL != "https://control.internal.nerve.email" {
+		t.Fatalf("expected NERVE onboarding URL precedence, got %q", cfg.Onboarding.ControlPlaneURL)
 	}
 }
 
@@ -118,6 +132,9 @@ func TestDefaultUsesModernLocalDomain(t *testing.T) {
 	}
 	if cfg.Memory.BudgetBytes != 64<<20 {
 		t.Fatalf("expected 64 MiB memory budget, got %d", cfg.Memory.BudgetBytes)
+	}
+	if cfg.Onboarding.Timeout != 4*time.Second {
+		t.Fatalf("expected 4s onboarding timeout, got %s", cfg.Onboarding.Timeout)
 	}
 	if cfg.SMTP.From != "dev@local.nerve.email" {
 		t.Fatalf("expected modern SMTP default, got %q", cfg.SMTP.From)

@@ -74,6 +74,9 @@ func NewSDKHandler(runtime *Server, jsonResponse bool) http.Handler {
 		if !authorizeModernRequest(w, request, body, runtime) {
 			return
 		}
+		if principal, ok := auth.PrincipalFromContext(request.Context()); ok && principal.Kind == auth.PrincipalM2MOnboarding {
+			request = request.WithContext(withOnboardingAuthorization(request.Context(), request.Header.Get("Authorization")))
+		}
 		sdkHandler.ServeHTTP(w, request)
 	})
 }
@@ -282,15 +285,29 @@ func newSDKServer(requestContext context.Context, runtime *Server) *sdkmcp.Serve
 			return result, err
 		}
 	})
-	for _, descriptor := range modernToolDescriptors(requestContext, runtime, principal) {
+	var descriptors []toolDescriptor
+	if principal.Kind == auth.PrincipalM2MOnboarding {
+		descriptors = modernToolCatalog(requestContext, runtime, principal)
+	} else {
+		descriptors = modernToolDescriptors(requestContext, runtime, principal)
+	}
+	for _, descriptor := range descriptors {
 		descriptor := descriptor
 		sdkmcp.AddTool[map[string]any, any](server, sdkTool(descriptor), func(ctx context.Context, request *sdkmcp.CallToolRequest, _ map[string]any) (*sdkmcp.CallToolResult, any, error) {
 			if hasPrincipal {
 				ctx = auth.WithPrincipal(ctx, principal)
 			}
-			result, err := runtime.Invoker.Invoke(ctx, ToolInvocation{
-				Name: request.Params.Name, Arguments: request.Params.Arguments,
-			})
+			var result any
+			var err error
+			if principal.Kind == auth.PrincipalM2MOnboarding {
+				result, err = invokeOnboardingTool(ctx, runtime.Onboarding, OnboardingCaller{
+					Principal: principal, Authorization: onboardingAuthorizationFromContext(requestContext),
+				}, request.Params.Name, request.Params.Arguments)
+			} else {
+				result, err = runtime.Invoker.Invoke(ctx, ToolInvocation{
+					Name: request.Params.Name, Arguments: request.Params.Arguments,
+				})
+			}
 			if err != nil {
 				translated := translateModernBusinessError(err)
 				structured := map[string]any{"error": translated}

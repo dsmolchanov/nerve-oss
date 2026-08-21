@@ -98,6 +98,12 @@ type Config struct {
 		ProtocolVersion string   `yaml:"protocol_version"`
 		AllowOrigins    []string `yaml:"allow_origins"`
 	} `yaml:"mcp"`
+	Onboarding struct {
+		ControlPlaneURL  string        `yaml:"control_plane_url"`
+		DelegationKeyID  string        `yaml:"delegation_key_id"`
+		DelegationSecret string        `yaml:"delegation_secret"`
+		Timeout          time.Duration `yaml:"timeout"`
+	} `yaml:"onboarding"`
 	Security struct {
 		APIKey                  string   `yaml:"api_key"`
 		TokenSigningKey         string   `yaml:"token_signing_key"`
@@ -133,6 +139,7 @@ func Default() Config {
 	cfg.Metering.ToolCostPath = "configs/meters/tool_costs.yaml"
 	cfg.Metering.PastDueGraceDays = 7
 	cfg.MCP.ProtocolVersion = "2025-11-25"
+	cfg.Onboarding.Timeout = 4 * time.Second
 	cfg.Log.Level = "info"
 	return cfg
 }
@@ -222,6 +229,10 @@ func applyPreferredEnvAliases() []string {
 		"NM_POLICY_PATH",
 		"NM_MCP_PROTOCOL_VERSION",
 		"NM_MCP_ALLOW_ORIGINS",
+		"NM_ONBOARDING_CONTROL_PLANE_URL",
+		"NM_ONBOARDING_DELEGATION_KEY_ID",
+		"NM_ONBOARDING_DELEGATION_SECRET",
+		"NM_ONBOARDING_TIMEOUT",
 		"NM_API_KEY",
 		"NM_ALLOW_OUTBOUND",
 		"NM_ALLOW_SEND_WITH_WARNINGS",
@@ -414,6 +425,20 @@ func applyEnv(cfg *Config) {
 	}
 	if v := os.Getenv("NM_MCP_ALLOW_ORIGINS"); v != "" {
 		cfg.MCP.AllowOrigins = splitCSV(v)
+	}
+	if v := os.Getenv("NM_ONBOARDING_CONTROL_PLANE_URL"); v != "" {
+		cfg.Onboarding.ControlPlaneURL = v
+	}
+	if v := os.Getenv("NM_ONBOARDING_DELEGATION_KEY_ID"); v != "" {
+		cfg.Onboarding.DelegationKeyID = v
+	}
+	if v := os.Getenv("NM_ONBOARDING_DELEGATION_SECRET"); v != "" {
+		cfg.Onboarding.DelegationSecret = v
+	}
+	if v := os.Getenv("NM_ONBOARDING_TIMEOUT"); v != "" {
+		if duration, err := time.ParseDuration(v); err == nil && duration > 0 {
+			cfg.Onboarding.Timeout = duration
+		}
 	}
 	if v := os.Getenv("NM_API_KEY"); v != "" {
 		cfg.Security.APIKey = v
