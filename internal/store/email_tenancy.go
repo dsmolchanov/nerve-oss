@@ -480,6 +480,10 @@ func (s *Store) GetActiveOrgDomainForInboxOrg(ctx context.Context, orgID, domain
 // ResolveReceivingInbox performs global routing before a tenant is known. The
 // returned inbox owns the eventual message even when the domain is platform-owned.
 func (s *Store) ResolveReceivingInbox(ctx context.Context, address string) (InboxRecord, OrgDomain, error) {
+	canonicalAddress, _, err := canonicalInboxAddress(address)
+	if err != nil {
+		return InboxRecord{}, OrgDomain{}, err
+	}
 	var inbox InboxRecord
 	var domain OrgDomain
 	row := s.q.QueryRowContext(ctx, `
@@ -500,8 +504,8 @@ func (s *Store) ResolveReceivingInbox(ctx context.Context, address string) (Inbo
 		  AND d.status = 'active'
 		  AND d.resend_receiving_enabled = true
 		LIMIT 1
-	`, strings.TrimSpace(address))
-	err := row.Scan(
+	`, canonicalAddress)
+	err = row.Scan(
 		&inbox.ID, &inbox.OrgID, &inbox.OrgDomainID, &inbox.Address, &inbox.Status, &inbox.CreatedAt,
 		&inbox.InboundProvider, &inbox.OutboundProvider,
 		&inbox.InboundProviderConfigRef, &inbox.OutboundProviderConfigRef, &inbox.ForwardTo,
