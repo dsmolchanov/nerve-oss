@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"neuralmail/internal/domains"
+	"neuralmail/internal/emailaddr"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -128,6 +128,10 @@ func (s *Store) ListInboxRecordsByOrg(ctx context.Context, orgID string) ([]Inbo
 }
 
 func (s *Store) GetInboxByAddress(ctx context.Context, address string) (InboxRecord, error) {
+	canonicalAddress, _, err := canonicalInboxAddress(address)
+	if err != nil {
+		return InboxRecord{}, err
+	}
 	var rec InboxRecord
 	row := s.q.QueryRowContext(ctx, `
 		SELECT id, org_id, org_domain_id::text, address, status, created_at,
@@ -138,7 +142,7 @@ func (s *Store) GetInboxByAddress(ctx context.Context, address string) (InboxRec
 		WHERE lower(address) = lower($1) AND status = 'active'
 		ORDER BY created_at DESC
 		LIMIT 1
-	`, address)
+	`, canonicalAddress)
 	if err := row.Scan(
 		&rec.ID,
 		&rec.OrgID,
@@ -159,11 +163,15 @@ func (s *Store) GetInboxByAddress(ctx context.Context, address string) (InboxRec
 }
 
 func (s *Store) CreateInboxForOrg(ctx context.Context, orgID string, address string, orgDomainID string, outboundProviders ...string) (InboxRecord, error) {
+	canonicalAddress, _, err := canonicalInboxAddress(address)
+	if err != nil {
+		return InboxRecord{}, err
+	}
 	outboundProvider := "smtp"
 	if len(outboundProviders) > 0 && strings.TrimSpace(outboundProviders[0]) != "" {
 		outboundProvider = outboundProviders[0]
 	}
-	return s.createInboxForOrg(ctx, orgID, address, orgDomainID, outboundProvider, "")
+	return s.createInboxForOrg(ctx, orgID, canonicalAddress, orgDomainID, outboundProvider, "")
 }
 
 func (s *Store) createInboxForOrg(ctx context.Context, orgID string, address string, orgDomainID string, outboundProvider string, externalRef string) (InboxRecord, error) {
@@ -203,19 +211,19 @@ func (s *Store) createInboxForOrg(ctx context.Context, orgID string, address str
 }
 
 // EnsureInboxForOrg is the idempotent provisioning path. The external_ref may
-// be replayed only with the exact same org/address/domain/provider tuple.
+// be replayed only with the same org/canonical-address/domain/provider tuple.
 func (s *Store) EnsureInboxForOrg(ctx context.Context, orgID, address, orgDomainID, outboundProvider, externalRef string) (InboxRecord, bool, error) {
+	canonicalAddress, canonicalDomain, err := canonicalInboxAddress(address)
+	if err != nil {
+		return InboxRecord{}, false, err
+	}
 	externalRef = strings.TrimSpace(externalRef)
 	if externalRef == "" {
 		return InboxRecord{}, false, errors.New("missing external_ref")
 	}
 	var rec InboxRecord
 	created := false
-	err := s.withTx(ctx, func(scoped *Store) error {
-		canonicalDomain, err := inboxCanonicalDomain(address)
-		if err != nil {
-			return err
-		}
+	err = s.withTx(ctx, func(scoped *Store) error {
 		if err := scoped.lockCanonicalDomain(ctx, canonicalDomain); err != nil {
 			return err
 		}
@@ -224,20 +232,19 @@ func (s *Store) EnsureInboxForOrg(ctx context.Context, orgID, address, orgDomain
 		}
 		var ensureErr error
 		rec, created, ensureErr = scoped.ensureInboxForOrgLocked(
-			ctx, orgID, address, orgDomainID, outboundProvider, externalRef,
+			ctx, orgID, canonicalAddress, orgDomainID, outboundProvider, externalRef,
 		)
 		return ensureErr
 	})
 	return rec, created, err
 }
 
-func inboxCanonicalDomain(address string) (string, error) {
-	address = strings.TrimSpace(address)
-	separator := strings.LastIndexByte(address, '@')
-	if separator <= 0 || separator == len(address)-1 {
-		return "", errors.New("inbox address must contain a local part and domain")
+func canonicalInboxAddress(address string) (string, string, error) {
+	canonicalAddress, _, canonicalDomain, err := emailaddr.Canonicalize(address)
+	if err != nil {
+		return "", "", err
 	}
-	return domains.CanonicalizeDomain(address[separator+1:])
+	return canonicalAddress, canonicalDomain, nil
 }
 
 func (s *Store) ensureInboxForOrgLocked(ctx context.Context, orgID, address, orgDomainID, outboundProvider, externalRef string) (InboxRecord, bool, error) {
@@ -284,7 +291,8 @@ func (s *Store) ensureInboxForOrgLocked(ctx context.Context, orgID, address, org
 	if err != nil {
 		return InboxRecord{}, false, err
 	}
-	if rec.OrgID != orgID || !strings.EqualFold(rec.Address, address) || rec.OrgDomainID.String != orgDomainID || rec.OutboundProvider != outboundProvider {
+	storedAddress, _, canonicalErr := canonicalInboxAddress(rec.Address)
+	if canonicalErr != nil || rec.OrgID != orgID || storedAddress != address || rec.OrgDomainID.String != orgDomainID || rec.OutboundProvider != outboundProvider {
 		return InboxRecord{}, false, ErrIdempotencyConflict
 	}
 	return rec, false, nil
