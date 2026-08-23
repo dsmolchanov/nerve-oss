@@ -1,6 +1,7 @@
 package domains
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -17,6 +18,11 @@ func TestCanonicalizeDomain(t *testing.T) {
 		{input: "sub.acme.com", want: "sub.acme.com"},
 		{input: "SUB.ACME.COM.", want: "sub.acme.com"},
 		{input: "my-domain.co.uk", want: "my-domain.co.uk"},
+		{input: "bücher.example", want: "xn--bcher-kva.example"},
+		{input: "BÜCHER.Example.", want: "xn--bcher-kva.example"},
+		{input: "XN--BCHER-KVA.EXAMPLE", want: "xn--bcher-kva.example"},
+		{input: "例え.テスト", want: "xn--r8jz45g.xn--zckzah"},
+		{input: "XN--R8JZ45G.XN--ZCKZAH", want: "xn--r8jz45g.xn--zckzah"},
 
 		// Invalid cases
 		{input: "", wantErr: true},
@@ -48,5 +54,27 @@ func TestCanonicalizeDomain(t *testing.T) {
 				t.Fatalf("CanonicalizeDomain(%q) = %q, want %q", tc.input, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestCanonicalizeDomainRejectsIDNThatExceedsDNSLabelLimit(t *testing.T) {
+	if got, err := CanonicalizeDomain(strings.Repeat("é", 64) + ".example"); err == nil {
+		t.Fatalf("oversized IDN label canonicalized to %q", got)
+	}
+}
+
+func TestIsExactProviderResourceID(t *testing.T) {
+	for _, value := range []string{"rd-a", "a"} {
+		if !IsExactProviderResourceID(value, len(value)) {
+			t.Fatalf("valid provider identity %q rejected", value)
+		}
+	}
+	for _, value := range []string{"", " rd-a", "rd-a ", "rd/a", `rd\\a`, "rd?a", "rd#a"} {
+		if IsExactProviderResourceID(value, 256) {
+			t.Fatalf("invalid provider identity %q accepted", value)
+		}
+	}
+	if IsExactProviderResourceID("rd-a", 0) || IsExactProviderResourceID("rd-a", 3) {
+		t.Fatal("invalid provider identity bound accepted")
 	}
 }
