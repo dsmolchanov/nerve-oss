@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 
+	"neuralmail/internal/domains"
+	"neuralmail/internal/emailaddr"
 	"neuralmail/internal/store"
 )
 
@@ -133,10 +135,11 @@ func hasReadyOwnedComposeInbox(
 		if err != nil {
 			continue
 		}
-		at := strings.LastIndexByte(inbox.Address, '@')
+		_, _, inboxDomain, addressErr := emailaddr.Canonicalize(inbox.Address)
+		canonicalDomain, domainErr := domains.CanonicalizeDomain(domain.Domain)
 		if domain.Status == "active" && domain.MXVerified && domain.SPFVerified && domain.DKIMVerified &&
 			domain.InboundEnabled && domain.ResendReceivingEnabled &&
-			at >= 0 && strings.EqualFold(inbox.Address[at+1:], domain.Domain) {
+			addressErr == nil && domainErr == nil && inboxDomain == canonicalDomain {
 			return true, nil
 		}
 	}

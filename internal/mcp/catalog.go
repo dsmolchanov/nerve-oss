@@ -79,6 +79,9 @@ func modernToolDescriptors(ctx context.Context, server *Server, principal auth.P
 		{Name: "send_reply", Description: "Send a reply", InputSchema: modernSendReplyInputSchema(attachmentsEnabled), OutputShape: queuedMessageOutput()},
 		{Name: "compose_email", Description: "Compose and send a new email (not a reply)", InputSchema: modernComposeEmailInputSchema(attachmentsEnabled), OutputShape: composeQueuedMessageOutput()},
 	}
+	if billingToolAvailable(server, principal) {
+		tools = append(tools, billingToolDescriptor())
+	}
 	return tools
 }
 

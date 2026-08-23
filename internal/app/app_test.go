@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"neuralmail/internal/config"
+	"neuralmail/internal/mcp"
 )
 
 func TestNewOnboardingProvisionerIsFailClosedUntilFullyConfigured(t *testing.T) {
@@ -34,6 +35,13 @@ func TestNewOnboardingProvisionerBuildsBoundedFixedOriginClient(t *testing.T) {
 	runtime := newMCPServer(cfg, nil, nil, nil, nil, provisioner)
 	if runtime.Onboarding == nil {
 		t.Fatal("production MCP server did not register the configured onboarding provisioner")
+	}
+	delegated, err := newDelegationClient(cfg)
+	if err != nil {
+		t.Fatalf("delegation client: %v", err)
+	}
+	if _, ok := any(delegated).(mcp.BillingProvisioner); !ok {
+		t.Fatal("production delegation client does not implement billing provisioner")
 	}
 
 	cfg.Onboarding.ControlPlaneURL = "http://control.internal.nerve.email"

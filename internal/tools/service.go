@@ -19,6 +19,7 @@ import (
 
 	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
+	"neuralmail/internal/emailaddr"
 	"neuralmail/internal/emailtransport"
 	"neuralmail/internal/embed"
 	"neuralmail/internal/entitlements"
@@ -426,6 +427,11 @@ func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string,
 			if from == "" {
 				from = "dev@local.nerve.email"
 			}
+		} else {
+			from, err = canonicalOutboundInboxAddress(inbox.Address)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		if idempotencyKey == "" {
@@ -581,6 +587,11 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 			if fromAddress == "" {
 				fromAddress = "dev@local.nerve.email"
 			}
+		} else {
+			fromAddress, err = canonicalOutboundInboxAddress(inbox.Address)
+			if err != nil {
+				return nil, err
+			}
 		}
 		fromMailbox, senderAddress, err := formatSenderMailbox(fromAddress, fromName)
 		if err != nil {
@@ -709,6 +720,14 @@ func formatSenderMailbox(value string, fromName string) (string, string, error) 
 		return mailbox, address, nil
 	}
 	return (&mail.Address{Name: fromName, Address: address}).String(), address, nil
+}
+
+func canonicalOutboundInboxAddress(value string) (string, error) {
+	canonical, _, _, err := emailaddr.Canonicalize(value)
+	if err != nil {
+		return "", errors.New("invalid sender address")
+	}
+	return canonical, nil
 }
 
 func domainAllowed(addr string, allowlist []string) bool {

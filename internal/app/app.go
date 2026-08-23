@@ -46,9 +46,15 @@ type App struct {
 }
 
 func New(ctx context.Context, cfg config.Config) (*App, error) {
-	onboardingProvisioner, err := newOnboardingProvisioner(cfg)
+	delegationClient, err := newDelegationClient(cfg)
 	if err != nil {
 		return nil, err
+	}
+	var onboardingProvisioner mcp.OnboardingProvisioner
+	var billingProvisioner mcp.BillingProvisioner
+	if delegationClient != nil {
+		onboardingProvisioner = delegationClient
+		billingProvisioner = delegationClient
 	}
 	st, err := store.Open(cfg.Database.DSN)
 	if err != nil {
@@ -114,6 +120,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		cfg, toolSvc, authSvc, entitlementSvc,
 		featureflags.New(cfg.Cloud.Mode, st), onboardingProvisioner,
 	)
+	mcpServer.Billing = billingProvisioner
 	mcpRouter := mcp.NewRouter(cfg, authSvc, mcp.NewLegacyHandler(mcpServer), mcp.NewSDKHandler(mcpServer, true))
 
 	return &App{
@@ -146,6 +153,14 @@ func newMCPServer(
 }
 
 func newOnboardingProvisioner(cfg config.Config) (mcp.OnboardingProvisioner, error) {
+	client, err := newDelegationClient(cfg)
+	if err != nil || client == nil {
+		return nil, err
+	}
+	return client, nil
+}
+
+func newDelegationClient(cfg config.Config) (*onboardingclient.Client, error) {
 	baseURL := strings.TrimSpace(cfg.Onboarding.ControlPlaneURL)
 	keyID := strings.TrimSpace(cfg.Onboarding.DelegationKeyID)
 	secret := cfg.Onboarding.DelegationSecret

@@ -46,6 +46,7 @@ type Server struct {
 	FeatureFlags   FeatureGate
 	OutboundPolicy OutboundPolicyGate
 	Onboarding     OnboardingProvisioner
+	Billing        BillingProvisioner
 	Invoker        *Invoker
 	mu             sync.Mutex
 	sessions       map[string]time.Time

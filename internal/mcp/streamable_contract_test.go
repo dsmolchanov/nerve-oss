@@ -571,6 +571,8 @@ func TestModernToolArgumentsFailSchemaBeforeInvokerSideEffects(t *testing.T) {
 		{"inbox_id": modernTestUUID, "to": "not-an-email", "subject": "subject", "body": "body"},
 		{"inbox_id": strings.Repeat("i", 129), "to": "valid@example.com", "subject": "subject", "body": "body"},
 		{"inbox_id": "not-a-uuid", "to": "valid@example.com", "subject": "subject", "body": "body"},
+		{"inbox_id": modernTestUUID, "to": "valid@example.com", "from": "spoofed@example.com", "subject": "subject", "body": "body"},
+		{"inbox_id": modernTestUUID, "to": "valid@example.com", "authentication_results": "dkim=pass", "subject": "subject", "body": "body"},
 	} {
 		request := modernContractRequest(t, "tools/call", map[string]any{
 			"_meta": meta, "name": "compose_email", "arguments": arguments,
@@ -763,6 +765,114 @@ func TestModernToolsListChangesWithPrincipalAndPolicyStateAndStaysPrivate(t *tes
 	}
 }
 
+func TestModernLockedOrgListsReadDraftAndReplyButNeverCompose(t *testing.T) {
+	cfg := hostedRouterConfig()
+	runtime := NewServer(cfg, nil, auth.NewService(cfg, nil), nil)
+	runtime.OutboundPolicy = replyOnlyOutboundPolicyGate{}
+	handler := NewSDKHandler(runtime, true)
+	principal := auth.Principal{
+		Kind: auth.PrincipalM2MOrg, OrgID: "org-1", ClientID: "client-1", Generation: 1,
+		Scopes:     []string{"nerve:email.read", "nerve:email.search", "nerve:email.draft", "nerve:email.reply", "nerve:email.compose"},
+		AuthMethod: "m2m_bearer",
+	}
+
+	request := modernContractRequest(t, "tools/list", map[string]any{"_meta": modernOAuthMeta()})
+	request = request.WithContext(auth.WithPrincipal(request.Context(), principal))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("tools/list status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Result struct {
+			Tools []struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	listed := map[string]bool{}
+	for _, tool := range response.Result.Tools {
+		listed[tool.Name] = true
+	}
+	for _, required := range []string{"list_threads", "get_thread", "search_inbox", "triage_message", "extract_to_schema", "draft_reply_with_policy", "send_reply"} {
+		if !listed[required] {
+			t.Fatalf("locked org omitted allowed tool %q: %v", required, listed)
+		}
+	}
+	if listed["compose_email"] {
+		t.Fatalf("locked org listed compose: %v", listed)
+	}
+
+	call := modernContractRequest(t, "tools/call", map[string]any{
+		"_meta": modernOAuthMeta(), "name": "compose_email",
+		"arguments": map[string]any{"inbox_id": modernTestUUID, "to": "recipient@example.net", "subject": "subject", "body": "body"},
+	})
+	call.Header.Set("Mcp-Name", "compose_email")
+	call = call.WithContext(auth.WithPrincipal(call.Context(), principal))
+	callRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(callRecorder, call)
+	if callRecorder.Code != http.StatusOK ||
+		!bytes.Contains(callRecorder.Body.Bytes(), []byte(`"isError":true`)) ||
+		!bytes.Contains(callRecorder.Body.Bytes(), []byte(`email_compose_org_enabled_denied`)) {
+		t.Fatalf("locked compose call was not denied: status=%d body=%s", callRecorder.Code, callRecorder.Body.String())
+	}
+}
+
+func TestModernCachedComposeAuthorityIsRevokedByLiveSuspensionState(t *testing.T) {
+	cfg := hostedRouterConfig()
+	runtime := NewServer(cfg, nil, auth.NewService(cfg, nil), nil)
+	policy := &mutableOutboundPolicyGate{allowed: true}
+	runtime.OutboundPolicy = policy
+	handler := NewSDKHandler(runtime, true)
+	principal := auth.Principal{
+		Kind: auth.PrincipalM2MOrg, OrgID: "org-1", ClientID: "client-1", Generation: 1,
+		Scopes: []string{"nerve:email.compose"}, AuthMethod: "m2m_bearer",
+	}
+
+	list := func() *httptest.ResponseRecorder {
+		request := modernContractRequest(t, "tools/list", map[string]any{"_meta": modernOAuthMeta()})
+		request = request.WithContext(auth.WithPrincipal(request.Context(), principal))
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("tools/list status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		return recorder
+	}
+	if recorder := list(); !bytes.Contains(recorder.Body.Bytes(), []byte(`"compose_email"`)) {
+		t.Fatalf("compose missing before suspension: %s", recorder.Body.String())
+	}
+
+	// The principal models an already-issued generation-bound token. A live
+	// complaint changes policy state, not token bytes, so both discovery and
+	// direct invocation must consult the new state on the next request.
+	policy.allowed = false
+	if recorder := list(); bytes.Contains(recorder.Body.Bytes(), []byte(`"compose_email"`)) {
+		t.Fatalf("cached compose remained visible after suspension: %s", recorder.Body.String())
+	}
+
+	call := modernContractRequest(t, "tools/call", map[string]any{
+		"_meta": modernOAuthMeta(),
+		"name":  "compose_email",
+		"arguments": map[string]any{
+			"inbox_id": modernTestUUID, "to": "recipient@example.net",
+			"subject": "subject", "body": "body",
+		},
+	})
+	call.Header.Set("Mcp-Name", "compose_email")
+	call = call.WithContext(auth.WithPrincipal(call.Context(), principal))
+	callRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(callRecorder, call)
+	if callRecorder.Code != http.StatusOK ||
+		!bytes.Contains(callRecorder.Body.Bytes(), []byte(`"isError":true`)) ||
+		!bytes.Contains(callRecorder.Body.Bytes(), []byte(`test_policy_denied`)) {
+		t.Fatalf("cached compose call was not denied: status=%d body=%s", callRecorder.Code, callRecorder.Body.String())
+	}
+}
+
 func TestModernToolScopeFailureReturnsOAuth403BeforeInvoker(t *testing.T) {
 	cfg := hostedRouterConfig()
 	authService := auth.NewService(cfg, nil)
@@ -815,6 +925,15 @@ func TestModernResourceIDsAreValidatedBeforeRead(t *testing.T) {
 
 type denyOutboundPolicyGate struct {
 	code string
+}
+
+type replyOnlyOutboundPolicyGate struct{}
+
+func (replyOnlyOutboundPolicyGate) Authorize(_ context.Context, _ auth.Principal, tool string, _ json.RawMessage) error {
+	if tool == "compose_email" {
+		return &outboundPolicyError{Code: "email_compose_org_enabled_denied"}
+	}
+	return nil
 }
 
 type countingOutboundPolicyGate struct {

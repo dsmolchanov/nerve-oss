@@ -12,6 +12,7 @@ require (
 	github.com/pressly/goose/v3 v3.26.0
 	github.com/redis/go-redis/v9 v9.6.3
 	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1
+	golang.org/x/net v0.51.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
