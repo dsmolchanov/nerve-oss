@@ -25,3 +25,15 @@ Legacy HS256 tokens, Cloud API keys, and the explicitly configured bootstrap key
 remain distinct typed principals. Algorithm or header metadata never selects a
 different principal kind, and routed protocol metadata is checked against the
 initialize body before session creation or tool dispatch.
+
+The MCP 2026 billing boundary is capability- and profile-gated. The runtime
+registers `nerve_billing_subscribe` only for a configured `m2m_org` principal
+with a complete org/client/generation binding, `m2m_bearer` authentication, and
+the exact `nerve:billing.subscribe` scope. Its public input is only a bounded
+plan code and idempotency key. Client/org/generation authority and Stripe
+customer, payment-method, and mandate references travel out-of-band from the
+authenticated principal and protected registration; caller overrides are
+rejected. Results expose only closed payment-readiness states, never provider
+bodies, hosted action URLs, client secrets, card data, or payment identifiers.
+An unconfigured provisioner is hidden and denied, unknown failures are
+sanitized, and `requires_action` never enables compose.
