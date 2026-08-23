@@ -360,6 +360,12 @@ func TestOutboundLimitConstantsMatchVersionedPolicy(t *testing.T) {
 				FirstRecipients int64 `yaml:"first_time_recipients_per_utc_day"`
 			} `yaml:"compose"`
 		} `yaml:"compose_profiles"`
+		Abuse struct {
+			HardBounceSuspension struct {
+				MinimumAttempts int64   `yaml:"minimum_attempts_per_utc_day"`
+				RateGTE         float64 `yaml:"rate_gte"`
+			} `yaml:"hard_bounce_suspension"`
+		} `yaml:"abuse"`
 	}
 	if err := yaml.Unmarshal(raw, &document); err != nil {
 		t.Fatalf("parse outbound policy: %v", err)
@@ -367,8 +373,10 @@ func TestOutboundLimitConstantsMatchVersionedPolicy(t *testing.T) {
 	if document.ComposeProfiles.ReplyOnly.Replies != limitReplyPerDay ||
 		document.ComposeProfiles.ReplyOnly.PerRecipient != limitReplyPerRecipientDay ||
 		document.ComposeProfiles.Compose.Sends != limitSendPerDay ||
-		document.ComposeProfiles.Compose.FirstRecipients != limitFirstRecipientsPerDay {
-		t.Fatalf("compiled limits drifted from autonomous-outbound-v1.yaml: %#v", document.ComposeProfiles)
+		document.ComposeProfiles.Compose.FirstRecipients != limitFirstRecipientsPerDay ||
+		document.Abuse.HardBounceSuspension.MinimumAttempts != limitHardBounceAttempts ||
+		int64(document.Abuse.HardBounceSuspension.RateGTE*10_000) != limitHardBounceBasisPoints {
+		t.Fatalf("compiled limits drifted from autonomous-outbound-v1.yaml: compose=%#v abuse=%#v", document.ComposeProfiles, document.Abuse)
 	}
 }
 

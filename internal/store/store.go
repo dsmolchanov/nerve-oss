@@ -7,7 +7,6 @@ import (
 	"errors"
 	"time"
 
-	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -274,27 +273,7 @@ func (s *Store) HealthSummary(ctx context.Context) (map[string]string, error) {
 // Shared inbox helpers used by multiple files
 
 func (s *Store) EnsureInbox(ctx context.Context, address string) (string, error) {
-	canonicalAddress, _, err := canonicalInboxAddress(address)
-	if err != nil {
-		return "", err
-	}
-	orgID, err := s.EnsureDefaultOrg(ctx)
-	if err != nil {
-		return "", err
-	}
-	var id string
-	row := s.q.QueryRowContext(ctx, `SELECT id FROM inboxes WHERE address = $1`, canonicalAddress)
-	switch err := row.Scan(&id); err {
-	case nil:
-		_, _ = s.q.ExecContext(ctx, `UPDATE inboxes SET org_id = COALESCE(org_id, $2) WHERE id = $1`, id, orgID)
-		return id, nil
-	case sql.ErrNoRows:
-		id = uuid.NewString()
-		_, err = s.q.ExecContext(ctx, `INSERT INTO inboxes (id, org_id, address, status) VALUES ($1,$2,$3,'active')`, id, orgID, canonicalAddress)
-		return id, err
-	default:
-		return "", err
-	}
+	return s.ensureInbox(ctx, address)
 }
 
 func (s *Store) ListInboxes(ctx context.Context) ([]string, error) {

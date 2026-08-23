@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"neuralmail/internal/emailtransport"
@@ -188,4 +190,100 @@ func TestResendOutboundAdapterNoRetryOnClientError(t *testing.T) {
 	if attempts != 1 {
 		t.Fatalf("should not retry 403, got %d attempts", attempts)
 	}
+}
+
+func TestResendOutboundAdapterRedactsProviderErrorBodies(t *testing.T) {
+	const (
+		secretMarker    = "re_live_response_secret"
+		oversizedMarker = "OVERSIZED_PROVIDER_SECRET"
+		malformedMarker = "MALFORMED_PROVIDER_SECRET"
+	)
+	tests := []struct {
+		name   string
+		body   string
+		marker string
+	}{
+		{name: "secret JSON", body: `{"message":"` + secretMarker + `"}`, marker: secretMarker},
+		{
+			name:   "oversized body",
+			body:   strings.Repeat(oversizedMarker, (1<<20)/len(oversizedMarker)+1),
+			marker: oversizedMarker,
+		},
+		{
+			name:   "malformed body",
+			body:   string([]byte{0xff, 0xfe, 0xfd}) + malformedMarker,
+			marker: malformedMarker,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &http.Client{Transport: outboundRoundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusForbidden,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(tc.body)),
+				}, nil
+			})}
+			adapter := NewOutboundAdapter(Config{
+				APIKey: "re_request_secret", BaseURL: "https://api.resend.invalid", HTTPClient: client,
+			})
+
+			_, err := adapter.SendMessage(context.Background(), emailtransport.OutboundMessage{
+				From: "sender@example.com", To: []string{"to@example.com"}, Subject: "Hello", TextBody: "body",
+			}, "redaction-test")
+			if err == nil {
+				t.Fatal("expected provider error")
+			}
+			var providerErr *emailtransport.ProviderError
+			if !errors.As(err, &providerErr) {
+				t.Fatalf("error type=%T, want *emailtransport.ProviderError", err)
+			}
+			if !providerErr.Permanent || providerErr.StatusCode != http.StatusForbidden || providerErr.Reason != "forbidden" {
+				t.Fatalf("provider error=%+v", providerErr)
+			}
+			got := err.Error()
+			want := "resend send failed: status=403 reason=forbidden retryable=false"
+			if got != want {
+				t.Fatalf("error=%q, want %q", got, want)
+			}
+			if len(got) > maxResendOutboundErrorBytes {
+				t.Fatalf("error length=%d, max=%d", len(got), maxResendOutboundErrorBytes)
+			}
+			if strings.Contains(got, tc.marker) || strings.Contains(got, "re_request_secret") {
+				t.Fatalf("provider/request secret leaked in error: %q", got)
+			}
+		})
+	}
+}
+
+func TestResendOutboundProviderErrorHasBoundedRetryDetails(t *testing.T) {
+	tests := []struct {
+		status    int
+		permanent bool
+		reason    string
+		retryable string
+	}{
+		{status: http.StatusForbidden, permanent: true, reason: "forbidden", retryable: "retryable=false"},
+		{status: http.StatusTooManyRequests, permanent: false, reason: "rate_limited", retryable: "retryable=true"},
+		{status: http.StatusServiceUnavailable, permanent: false, reason: "server_error", retryable: "retryable=true"},
+	}
+	for _, tc := range tests {
+		err := newResendSendProviderError(tc.status)
+		if err.StatusCode != tc.status || err.Permanent != tc.permanent || err.Reason != tc.reason {
+			t.Fatalf("status %d: provider error=%+v", tc.status, err)
+		}
+		if len(err.Error()) > maxResendOutboundErrorBytes {
+			t.Fatalf("status %d: error length=%d, max=%d", tc.status, len(err.Error()), maxResendOutboundErrorBytes)
+		}
+		if !strings.Contains(err.Error(), tc.retryable) {
+			t.Fatalf("status %d: error=%q, want %q", tc.status, err.Error(), tc.retryable)
+		}
+	}
+}
+
+type outboundRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn outboundRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
 }
