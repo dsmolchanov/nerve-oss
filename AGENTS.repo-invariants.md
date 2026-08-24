@@ -49,3 +49,20 @@ makes a review loop unable to terminate.
   `TestClientInvalidPostCommitResponseReturnsOutcomeUnknownForEveryMutation`,
   and `TestClientRejectsSemanticallyInvalidEnvelopesForEveryOperation` tests in
   `internal/onboarding/client_test.go`.
+- Do all inbox address lookup, receiving resolution, create, ensure, and
+  reactivate paths use the one canonical-equivalence rule, prefer a single
+  active row before disabled history where replay is supported, fail closed on
+  ambiguity within that selected tier, serialize canonical-variant writers,
+  preserve stored legacy bytes, and canonicalize those bytes before outbound
+  policy comparison or sender emission? Enforced by
+  `TestCanonicalInboxAddressSQLMatchesGoCanonicalization`,
+  `TestLegacyCanonicalInboxAddressMatrix`,
+  `TestCanonicalInboxDisabledHistorySemantics`,
+  `TestInboxInsertHelpersRequireTransaction`,
+  `TestCanonicalInboxAddressBoundariesRejectAmbiguousLegacyRows`,
+  `TestResolveReceivingInboxRejectsAmbiguityBeforeReadinessFilter`,
+  `TestReactivateInboxForOrgUsesCanonicalIdentityWithoutRewritingLegacyBytes`,
+  `TestReactivateInboxForOrgMapsCanonicalUniqueBackstop`,
+  `TestCanonicalVariantWritersSerializeBeforePreinsertCheck`,
+  `TestOutboundPolicyCanonicalizesLegacyInboxAddressForOwnedDomainProof`, and
+  `TestCanonicalOutboundInboxAddressPreservesStorageOnlyInternally`.

@@ -480,9 +480,17 @@ func (s *Store) GetActiveOrgDomainForInboxOrg(ctx context.Context, orgID, domain
 // ResolveReceivingInbox performs global routing before a tenant is known. The
 // returned inbox owns the eventual message even when the domain is platform-owned.
 func (s *Store) ResolveReceivingInbox(ctx context.Context, address string) (InboxRecord, OrgDomain, error) {
-	var inbox InboxRecord
-	var domain OrgDomain
-	row := s.q.QueryRowContext(ctx, `
+	canonicalAddress, _, err := canonicalInboxAddress(address)
+	if err != nil {
+		return InboxRecord{}, OrgDomain{}, err
+	}
+	rows, err := s.q.QueryContext(ctx, `
+		WITH canonical_inboxes AS (
+		  SELECT i.*, count(*) OVER () AS canonical_match_count
+		  FROM inboxes i
+		  WHERE `+canonicalInboxAddressSQL("i.address")+` = $1
+		    AND i.status = 'active'
+		)
 		SELECT i.id, i.org_id, i.org_domain_id::text, i.address, i.status, i.created_at,
 		       i.inbound_provider, i.outbound_provider,
 		       i.inbound_provider_config_ref, i.outbound_provider_config_ref, i.forward_to,
@@ -492,26 +500,62 @@ func (s *Store) ResolveReceivingInbox(ctx context.Context, address string) (Inbo
 		       d.dkim_method, d.last_check_at, d.verified_at, d.expires_at,
 		       d.resend_domain_id, d.resend_domain_status, d.resend_dns_records,
 		       d.resend_receiving_enabled, d.catch_all_enabled, d.forward_to,
-		       d.created_at, d.updated_at
-		FROM inboxes i
+		       d.created_at, d.updated_at, i.canonical_match_count
+		FROM canonical_inboxes i
 		JOIN org_domains d ON d.id = i.org_domain_id
-		WHERE lower(i.address) = lower($1)
-		  AND i.status = 'active'
-		  AND d.status = 'active'
+		WHERE d.status = 'active'
 		  AND d.resend_receiving_enabled = true
-		LIMIT 1
-	`, strings.TrimSpace(address))
-	err := row.Scan(
-		&inbox.ID, &inbox.OrgID, &inbox.OrgDomainID, &inbox.Address, &inbox.Status, &inbox.CreatedAt,
-		&inbox.InboundProvider, &inbox.OutboundProvider,
-		&inbox.InboundProviderConfigRef, &inbox.OutboundProviderConfigRef, &inbox.ForwardTo,
-		&domain.ID, &domain.OrgID, &domain.Domain, &domain.Status, &domain.VerificationToken,
-		&domain.MXVerified, &domain.SPFVerified, &domain.DKIMVerified, &domain.DMARCVerified,
-		&domain.InboundEnabled, &domain.DKIMSelector, &domain.DKIMPrivateKeyEnc, &domain.DKIMPublicKey,
-		&domain.DKIMMethod, &domain.LastCheckAt, &domain.VerifiedAt, &domain.ExpiresAt,
-		&domain.ResendDomainID, &domain.ResendStatus, &domain.ResendDNSRecords,
-		&domain.ResendReceivingEnabled, &domain.CatchAllEnabled, &domain.ForwardTo,
-		&domain.CreatedAt, &domain.UpdatedAt,
-	)
-	return inbox, domain, err
+		ORDER BY i.created_at, i.id
+		LIMIT 2
+	`, canonicalAddress)
+	if err != nil {
+		return InboxRecord{}, OrgDomain{}, err
+	}
+	defer rows.Close()
+
+	var matches []struct {
+		inbox            InboxRecord
+		domain           OrgDomain
+		canonicalMatches int64
+	}
+	for rows.Next() {
+		var match struct {
+			inbox            InboxRecord
+			domain           OrgDomain
+			canonicalMatches int64
+		}
+		if err := rows.Scan(
+			&match.inbox.ID, &match.inbox.OrgID, &match.inbox.OrgDomainID,
+			&match.inbox.Address, &match.inbox.Status, &match.inbox.CreatedAt,
+			&match.inbox.InboundProvider, &match.inbox.OutboundProvider,
+			&match.inbox.InboundProviderConfigRef, &match.inbox.OutboundProviderConfigRef,
+			&match.inbox.ForwardTo,
+			&match.domain.ID, &match.domain.OrgID, &match.domain.Domain, &match.domain.Status,
+			&match.domain.VerificationToken, &match.domain.MXVerified, &match.domain.SPFVerified,
+			&match.domain.DKIMVerified, &match.domain.DMARCVerified, &match.domain.InboundEnabled,
+			&match.domain.DKIMSelector, &match.domain.DKIMPrivateKeyEnc,
+			&match.domain.DKIMPublicKey, &match.domain.DKIMMethod, &match.domain.LastCheckAt,
+			&match.domain.VerifiedAt, &match.domain.ExpiresAt, &match.domain.ResendDomainID,
+			&match.domain.ResendStatus, &match.domain.ResendDNSRecords,
+			&match.domain.ResendReceivingEnabled, &match.domain.CatchAllEnabled,
+			&match.domain.ForwardTo, &match.domain.CreatedAt, &match.domain.UpdatedAt,
+			&match.canonicalMatches,
+		); err != nil {
+			return InboxRecord{}, OrgDomain{}, err
+		}
+		if match.canonicalMatches > 1 {
+			return InboxRecord{}, OrgDomain{}, ErrCanonicalInboxAddressAmbiguous
+		}
+		matches = append(matches, match)
+	}
+	if err := rows.Err(); err != nil {
+		return InboxRecord{}, OrgDomain{}, err
+	}
+	if len(matches) == 0 {
+		return InboxRecord{}, OrgDomain{}, sql.ErrNoRows
+	}
+	if len(matches) > 1 {
+		return InboxRecord{}, OrgDomain{}, ErrCanonicalInboxAddressAmbiguous
+	}
+	return matches[0].inbox, matches[0].domain, nil
 }

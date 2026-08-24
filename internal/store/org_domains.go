@@ -394,6 +394,26 @@ func (s *Store) UpdateOrgDomainVerification(ctx context.Context, id string, mx, 
 		if err := scoped.requireDomainWritesEnabled(ctx); err != nil {
 			return err
 		}
+		// A DNS observation is obtained outside the transaction. Once cleanup
+		// has fenced the row, that stale observation must not resurrect the
+		// domain or move its ownership claim back to provider_owned.
+		if identity.Status == "failed" {
+			return ErrResourceConflict
+		}
+		if schema9 {
+			var claimState string
+			if err := scoped.q.QueryRowContext(ctx, `
+				SELECT state
+				FROM domain_ownership_claims
+				WHERE canonical_domain=$1 AND org_domain_id=$2::uuid AND owner_kind='legacy'
+				FOR UPDATE
+			`, identity.Canonical, id).Scan(&claimState); err != nil {
+				return err
+			}
+			if claimState == "releasing" {
+				return ErrResourceConflict
+			}
+		}
 		if _, err := scoped.q.ExecContext(ctx, `
 			UPDATE org_domains
 			SET mx_verified = $2, spf_verified = $3, dkim_verified = $4, dmarc_verified = $5,
@@ -521,10 +541,10 @@ func (s *Store) BeginOrgDomainReleaseForOrg(ctx context.Context, orgID, id strin
 	return domain, releaseStarted, err
 }
 
-// FinalizeOrgDomainReleaseForOrg removes a legacy claim and its Core row only
-// after the caller has obtained a definitive provider-absent result. Unknown
-// provider outcomes must use DeleteOrgDomainForOrg's retained releasing state
-// instead so a retry/reconciler still has durable ownership provenance.
+// FinalizeOrgDomainReleaseForOrg preserves the pre-Cloud-9 signature for local
+// domains that never attempted provider work. A provider-backed Cloud-9 row
+// must use FinalizeLegacyDomainProviderAbsence with its exact-ID authoritative
+// absence receipt; this compatibility method cannot carry that proof.
 func (s *Store) FinalizeOrgDomainReleaseForOrg(ctx context.Context, orgID, id string) (bool, error) {
 	deleted := false
 	err := s.withLockedLegacyDomain(ctx, id, orgID, func(scoped *Store, identity legacyDomainIdentity, schema9 bool) error {
@@ -537,10 +557,27 @@ func (s *Store) FinalizeOrgDomainReleaseForOrg(ctx context.Context, orgID, id st
 			deleted = n == 1
 			return err
 		}
+		var providerAttempted bool
+		if err := scoped.q.QueryRowContext(ctx, `
+			SELECT d.resend_domain_id IS NOT NULL
+			    OR d.resend_domain_status IS NOT NULL
+			    OR d.resend_dns_records IS NOT NULL
+			    OR d.resend_receiving_enabled
+			    OR c.lease_owner IS NOT NULL
+			FROM org_domains d
+			JOIN domain_ownership_claims c ON c.org_domain_id=d.id
+			WHERE d.id=$1 AND d.org_id=$2
+			  AND c.canonical_domain=$3 AND c.owner_kind='legacy'
+		`, id, orgID, identity.Canonical).Scan(&providerAttempted); err != nil {
+			return err
+		}
+		if providerAttempted {
+			return ErrLegacyDomainProviderAbsenceRequired
+		}
 		result, err := scoped.q.ExecContext(ctx, `
 			DELETE FROM domain_ownership_claims
 			WHERE canonical_domain = $1 AND org_domain_id = $2
-			  AND org_id = $3 AND owner_kind = 'legacy'
+			  AND org_id = $3 AND owner_kind = 'legacy' AND state='releasing'
 		`, identity.Canonical, id, orgID)
 		if err != nil {
 			return err

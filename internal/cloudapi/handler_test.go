@@ -571,8 +571,20 @@ func TestOrgDomainsResendProvisioningAndVerification(t *testing.T) {
 				_, _ = w.Write([]byte(`{"data":{"id":"d_abc","name":"acme.com","status":"pending","records":[]}}`))
 				return
 			case r.Method == http.MethodGet && r.URL.Path == "/domains/d_abc":
+				// After an accepted DELETE the only acceptable local-finalization
+				// evidence is an authoritative exact-ID absence readback.
+				if providerDeleted {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusNotFound)
+					_, _ = w.Write([]byte(`{"name":"not_found","message":"domain not found"}`))
+					return
+				}
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"data":{"id":"d_abc","name":"acme.com","status":"verified","records":[{"record":"SPF","name":"send","type":"MX","value":"feedback-smtp.us-east-1.amazonses.com","ttl":"Auto","status":"verified","priority":10},{"record":"SPF","name":"send","type":"TXT","value":"v=spf1 include:amazonses.com ~all","ttl":"Auto","status":"verified"},{"record":"DKIM","name":"dkim._domainkey","type":"CNAME","value":"dkim.resend.com","ttl":"Auto","status":"verified"}]}}`))
+				_, _ = w.Write([]byte(`{"data":{"id":"d_abc","name":"acme.com","status":"verified","records":[{"record":"SPF","name":"send","type":"MX","value":"feedback-smtp.us-east-1.amazonses.com","ttl":"Auto","status":"verified","priority":10},{"record":"SPF","name":"send","type":"TXT","value":"v=spf1 include:amazonses.com ~all","ttl":"Auto","status":"verified"},{"record":"DKIM","name":"dkim._domainkey","type":"CNAME","value":"dkim.resend.com","ttl":"Auto","status":"verified"}],"capabilities":{"sending":"enabled","receiving":"enabled"}}}`))
+				return
+			case r.Method == http.MethodPatch && r.URL.Path == "/domains/d_abc":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"data":{"id":"d_abc","name":"acme.com","status":"verified","capabilities":{"sending":"enabled","receiving":"disabled"}}}`))
 				return
 			case r.Method == http.MethodDelete && r.URL.Path == "/domains/d_abc":
 				providerDeleted = true

@@ -714,9 +714,42 @@ func (h *Handler) handleDomainByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Pre-Cloud-9 standalone databases keep the legacy immediate-delete
+	// contract. Cloud-9+ databases finalize only through the proof-aware
+	// orchestrator: DELETE 2xx alone never removes the durable ownership
+	// claim and Core row without an authoritative exact-ID absence readback.
+	schema9, err := h.Store.CloudSchemaSupportsM2M(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !schema9 {
+		h.releasePreSchema9Domain(w, r, orgID, domainID)
+		return
+	}
+
+	deleted, err := h.releaseLegacyDomainProvider(r.Context(), orgID, domainID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSON(w, http.StatusOK, map[string]any{"status": "absent"})
+			return
+		}
+		writeLegacyDomainProviderError(w, err)
+		return
+	}
+	if !deleted {
+		writeLegacyDomainProviderError(w, errLegacyDomainProviderNotConfirmed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted"})
+}
+
+// releasePreSchema9Domain preserves the pre-Cloud-9 delete behavior for
+// standalone databases that lack the provider lifecycle objects entirely.
+func (h *Handler) releasePreSchema9Domain(w http.ResponseWriter, r *http.Request, orgID, domainID string) {
 	var domain store.OrgDomain
 	var releaseStarted bool
-	err = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
+	err := h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
 		var err error
 		domain, releaseStarted, err = scoped.BeginOrgDomainReleaseForOrg(r.Context(), orgID, domainID)
 		return err
@@ -741,10 +774,8 @@ func (h *Handler) handleDomainByID(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// On Cloud 0009 this removes the durable ownership claim and Core row only
-	// after the provider has confirmed absence. On Cloud 0008 the first call
-	// preserves the legacy immediate-delete behavior, so this is an idempotent
-	// no-op and the compatibility contract remains intact.
+	// On a pre-Cloud-9 database this is an idempotent immediate delete, so the
+	// compatibility contract remains intact without provider absence proof.
 	err = h.withOrgStore(r.Context(), orgID, func(scoped *store.Store) error {
 		_, err := scoped.FinalizeOrgDomainReleaseForOrg(r.Context(), orgID, domainID)
 		return err
@@ -754,6 +785,327 @@ func (h *Handler) handleDomainByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted"})
+}
+
+var (
+	errLegacyDomainProviderAwaitingProof  = errors.New("provider operation is awaiting authoritative exact-id proof")
+	errLegacyDomainProviderInFlight       = errors.New("provider operation is already in progress")
+	errLegacyDomainProviderNotConfirmed   = errors.New("provider operation was not confirmed by authoritative readback")
+	errLegacyDomainProviderOutcomeUnknown = errors.New("provider operation outcome is unknown")
+	errLegacyDomainProviderCredentials    = errors.New("domain release is pending provider credentials")
+)
+
+type legacyDomainProviderProjection struct {
+	DomainState      string
+	MXVerified       *bool
+	SPFVerified      *bool
+	DKIMVerified     *bool
+	DMARCVerified    *bool
+	ReceivingEnabled *bool
+}
+
+func legacyDomainProviderDispositionError(intent store.LegacyDomainProviderIntent) error {
+	switch intent.Disposition {
+	case store.LegacyDomainProviderAwaitingProof:
+		return errLegacyDomainProviderAwaitingProof
+	case store.LegacyDomainProviderInFlight:
+		return errLegacyDomainProviderInFlight
+	default:
+		return fmt.Errorf("provider operation is not authorized: disposition=%s", intent.Disposition)
+	}
+}
+
+func (h *Handler) beginLegacyDomainProviderOperation(
+	ctx context.Context,
+	orgID string,
+	domainID string,
+	operation store.LegacyDomainProviderOperation,
+) (store.LegacyDomainProviderIntent, error) {
+	var intent store.LegacyDomainProviderIntent
+	err := h.withOrgStore(ctx, orgID, func(scoped *store.Store) error {
+		var beginErr error
+		intent, beginErr = scoped.BeginLegacyDomainProviderOperation(ctx, store.LegacyDomainProviderBegin{
+			OrgID: orgID, OrgDomainID: domainID, Operation: operation,
+		})
+		return beginErr
+	})
+	return intent, err
+}
+
+func validateObservedResendDomain(
+	intent store.LegacyDomainProviderIntent,
+	providerDomain resendprovider.Domain,
+) error {
+	if resendprovider.ValidateDomainID(providerDomain.ID) != nil {
+		return store.ErrLegacyDomainProviderResultInvalid
+	}
+	if intent.Operation != store.LegacyDomainProviderCreate && providerDomain.ID != intent.ProviderDomainID {
+		return store.ErrLegacyDomainProviderResultInvalid
+	}
+	canonical, err := domains.CanonicalizeDomain(providerDomain.Name)
+	if err != nil || canonical != intent.CanonicalDomain {
+		return store.ErrLegacyDomainProviderResultInvalid
+	}
+	return nil
+}
+
+func (h *Handler) applyLegacyDomainProviderUnknown(
+	ctx context.Context,
+	intent store.LegacyDomainProviderIntent,
+	providerID string,
+	providerCanonicalDomain string,
+) (store.LegacyDomainProviderApplyResult, error) {
+	var applied store.LegacyDomainProviderApplyResult
+	err := h.withOrgStore(ctx, intent.OrgID, func(scoped *store.Store) error {
+		var applyErr error
+		applied, applyErr = scoped.ApplyLegacyDomainProviderResult(ctx, store.LegacyDomainProviderResult{
+			Intent:                  intent,
+			Outcome:                 store.LegacyDomainProviderUnknown,
+			ProviderDomainID:        strings.TrimSpace(providerID),
+			ProviderCanonicalDomain: strings.TrimSpace(providerCanonicalDomain),
+		})
+		return applyErr
+	})
+	return applied, err
+}
+
+func marshalResendDomainRecords(providerDomain resendprovider.Domain) (json.RawMessage, error) {
+	records := providerDomain.Records
+	if records == nil {
+		records = []resendprovider.DomainRecord{}
+	}
+	raw, err := json.Marshal(records)
+	if err != nil {
+		return nil, fmt.Errorf("marshal provider dns records: %w", err)
+	}
+	return raw, nil
+}
+
+func (h *Handler) applyObservedLegacyResendDomain(
+	ctx context.Context,
+	intent store.LegacyDomainProviderIntent,
+	providerDomain resendprovider.Domain,
+	projection legacyDomainProviderProjection,
+) (store.LegacyDomainProviderApplyResult, error) {
+	if err := validateObservedResendDomain(intent, providerDomain); err != nil {
+		return store.LegacyDomainProviderApplyResult{}, err
+	}
+	records, err := marshalResendDomainRecords(providerDomain)
+	if err != nil {
+		return store.LegacyDomainProviderApplyResult{}, err
+	}
+	var applied store.LegacyDomainProviderApplyResult
+	err = h.withOrgStore(ctx, intent.OrgID, func(scoped *store.Store) error {
+		var applyErr error
+		applied, applyErr = scoped.ApplyLegacyDomainProviderResult(ctx, store.LegacyDomainProviderResult{
+			Intent:                  intent,
+			Outcome:                 store.LegacyDomainProviderObserved,
+			ProviderDomainID:        strings.TrimSpace(providerDomain.ID),
+			ProviderCanonicalDomain: providerDomain.Name,
+			ProviderStatus:          strings.TrimSpace(providerDomain.Status),
+			DNSRecords:              records,
+			DomainState:             projection.DomainState,
+			MXVerified:              projection.MXVerified,
+			SPFVerified:             projection.SPFVerified,
+			DKIMVerified:            projection.DKIMVerified,
+			DMARCVerified:           projection.DMARCVerified,
+			ReceivingEnabled:        projection.ReceivingEnabled,
+		})
+		return applyErr
+	})
+	return applied, err
+}
+
+func (h *Handler) recordLegacyDomainProviderUnknown(
+	ctx context.Context,
+	intent store.LegacyDomainProviderIntent,
+	providerID string,
+	providerCanonicalDomain string,
+	providerErr error,
+) error {
+	if _, err := h.applyLegacyDomainProviderUnknown(
+		ctx, intent, providerID, providerCanonicalDomain,
+	); err != nil {
+		return fmt.Errorf("persist provider_unknown result after provider failure: %w", err)
+	}
+	return fmt.Errorf("%w: %v", errLegacyDomainProviderOutcomeUnknown, providerErr)
+}
+
+// recordLegacyResendIdentityMismatchUnknown fails closed on a provider object
+// whose identity does not match the delete lease. The scheduled reconciler
+// retries unknown outcomes, so recording one here keeps the mismatch visible
+// to operators without adopting or mutating by name.
+func (h *Handler) recordLegacyResendIdentityMismatchUnknown(
+	ctx context.Context,
+	intent store.LegacyDomainProviderIntent,
+	providerDomain resendprovider.Domain,
+	providerErr error,
+) error {
+	return h.recordLegacyDomainProviderUnknown(ctx, intent, intent.ProviderDomainID, "", providerErr)
+}
+
+func legacyDomainProviderResultCannotBeApplied(err error) bool {
+	return errors.Is(err, store.ErrLegacyDomainProviderResultInvalid)
+}
+
+// finalizeLegacyDomainAbsence deletes the local row/claim only through the
+// exact-ID authoritative absence receipt.
+func (h *Handler) finalizeLegacyDomainAbsence(
+	ctx context.Context,
+	orgID string,
+	intent store.LegacyDomainProviderIntent,
+) (bool, error) {
+	var deleted bool
+	err := h.withOrgStore(ctx, orgID, func(scoped *store.Store) error {
+		var inner error
+		deleted, inner = scoped.FinalizeLegacyDomainProviderAbsence(
+			ctx,
+			store.LegacyDomainProviderAbsenceReceipt{
+				Intent: intent, ProviderDomainID: intent.ProviderDomainID,
+				Proof: store.LegacyDomainExactIDAuthoritativeAbsence,
+			},
+		)
+		return inner
+	})
+	if err != nil {
+		return false, err
+	}
+	return deleted, nil
+}
+
+// releaseLegacyDomainProvider is the only legacy HTTP deletion orchestrator.
+// Begin(Delete) first commits the dependent check and local release fence. Its
+// exact-ID cleanup lease then authorizes a bounded identity preflight followed
+// by disable/delete/readback. DELETE 2xx (or an ambiguous DELETE error) is never
+// treated as absence evidence. Provider identity discrepancies are recorded as
+// unknown outcomes for the reconciler; the quarantine table is Cloud-owned and
+// is deliberately not written from this surface.
+func (h *Handler) releaseLegacyDomainProvider(
+	ctx context.Context,
+	orgID string,
+	domainID string,
+) (bool, error) {
+	intent, err := h.beginLegacyDomainProviderOperation(
+		ctx, orgID, domainID, store.LegacyDomainProviderDelete,
+	)
+	if err != nil {
+		return false, err
+	}
+	switch intent.Disposition {
+	case store.LegacyDomainProviderLocalOnly:
+		var deleted bool
+		finalizeErr := h.withOrgStore(ctx, orgID, func(scoped *store.Store) error {
+			var inner error
+			deleted, inner = scoped.FinalizeLegacyDomainLocalOnlyRelease(ctx, intent)
+			return inner
+		})
+		return deleted, finalizeErr
+	case store.LegacyDomainProviderCallAuthorized:
+		// Continue below.
+	case store.LegacyDomainProviderAwaitingProof:
+		// A no-ID create may materialize after an ambiguous response. Manual
+		// delete cannot adopt or mutate by name, so it stays fail-closed while
+		// the releasing local claim is retained for scheduled cleanup.
+		if intent.ProviderDomainID != "" {
+			return false, errLegacyDomainProviderAwaitingProof
+		}
+		if strings.TrimSpace(h.Config.Resend.APIKey) == "" {
+			return false, errLegacyDomainProviderCredentials
+		}
+		return false, errLegacyDomainProviderAwaitingProof
+	default:
+		return false, legacyDomainProviderDispositionError(intent)
+	}
+	if strings.TrimSpace(h.Config.Resend.APIKey) == "" {
+		if _, applyErr := h.applyLegacyDomainProviderUnknown(
+			ctx, intent, intent.ProviderDomainID, "",
+		); applyErr != nil {
+			return false, applyErr
+		}
+		return false, errLegacyDomainProviderCredentials
+	}
+
+	client := h.resendDomainsClient()
+	providerDomain, preflightErr := client.GetDomain(ctx, intent.ProviderDomainID)
+	if resendprovider.IsNotFound(preflightErr) {
+		return h.finalizeLegacyDomainAbsence(ctx, orgID, intent)
+	}
+	if preflightErr != nil {
+		return false, h.recordLegacyDomainProviderUnknown(
+			ctx, intent, intent.ProviderDomainID, "", preflightErr,
+		)
+	}
+	if identityErr := validateObservedResendDomain(intent, providerDomain); identityErr != nil {
+		return false, h.recordLegacyResendIdentityMismatchUnknown(
+			ctx, intent, providerDomain, identityErr,
+		)
+	}
+
+	disabledDomain, disableErr := client.SetReceiving(ctx, intent.ProviderDomainID, false)
+	if disableErr == nil {
+		if identityErr := validateObservedResendDomain(intent, disabledDomain); identityErr != nil {
+			return false, h.recordLegacyResendIdentityMismatchUnknown(
+				ctx, intent, disabledDomain, identityErr,
+			)
+		}
+	}
+	deleteErr := client.DeleteDomain(ctx, intent.ProviderDomainID)
+	providerDomain, readErr := client.GetDomain(ctx, intent.ProviderDomainID)
+	if resendprovider.IsNotFound(readErr) {
+		return h.finalizeLegacyDomainAbsence(ctx, orgID, intent)
+	}
+	if readErr == nil {
+		if _, applyErr := h.applyObservedLegacyResendDomain(
+			ctx, intent, providerDomain, legacyDomainProviderProjection{},
+		); applyErr != nil {
+			if legacyDomainProviderResultCannotBeApplied(applyErr) {
+				if validateObservedResendDomain(intent, providerDomain) != nil {
+					return false, h.recordLegacyResendIdentityMismatchUnknown(
+						ctx, intent, providerDomain, applyErr,
+					)
+				}
+				if unknownErr := h.recordLegacyDomainProviderUnknown(
+					ctx, intent, intent.ProviderDomainID, providerDomain.Name, applyErr,
+				); !errors.Is(unknownErr, errLegacyDomainProviderOutcomeUnknown) {
+					return false, unknownErr
+				}
+			}
+			return false, applyErr
+		}
+		if deleteErr != nil {
+			return false, fmt.Errorf("%w after delete failure: exact provider id remains present", errLegacyDomainProviderNotConfirmed)
+		}
+		if disableErr != nil {
+			return false, fmt.Errorf("%w after receiving uncertainty: exact provider id remains present", errLegacyDomainProviderNotConfirmed)
+		}
+		return false, fmt.Errorf("%w: exact provider id remains present", errLegacyDomainProviderNotConfirmed)
+	}
+
+	if _, applyErr := h.applyLegacyDomainProviderUnknown(
+		ctx, intent, intent.ProviderDomainID, "",
+	); applyErr != nil {
+		return false, applyErr
+	}
+	if deleteErr != nil {
+		return false, fmt.Errorf("provider delete and exact-id readback outcomes unknown: %w", readErr)
+	}
+	return false, fmt.Errorf("provider exact-id absence was not confirmed: %w", readErr)
+}
+
+func writeLegacyDomainProviderError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		http.Error(w, "domain not found", http.StatusNotFound)
+	case errors.Is(err, store.ErrResourceConflict),
+		errors.Is(err, store.ErrLegacyDomainProviderCASConflict):
+		http.Error(w, err.Error(), http.StatusConflict)
+	case errors.Is(err, store.ErrDomainWritesFenced):
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	case errors.Is(err, errLegacyDomainProviderCredentials):
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	default:
+		http.Error(w, err.Error(), http.StatusBadGateway)
+	}
 }
 
 func (h *Handler) handleCreateDomain(w http.ResponseWriter, r *http.Request) {

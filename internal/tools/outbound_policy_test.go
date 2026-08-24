@@ -204,6 +204,77 @@ func TestOutboundPolicyDeniesComposeWithoutReadyOwnedDomain(t *testing.T) {
 	}
 }
 
+func TestOutboundPolicyNeverDerivesComposeFromInboundTraffic(t *testing.T) {
+	flags := allowedFlags()
+	flags["email_compose_org_enabled"] = boolPtr(false)
+	messages := make([]store.Message, 1000)
+	for index := range messages {
+		messages[index] = store.Message{
+			ID: "inbound", InboxID: "inbox-1", Direction: "inbound",
+			ReceivedEmailID: "received", From: store.Participant{Email: "agent@example.test"},
+		}
+	}
+	stub := &policyStoreStub{
+		flags:    flags,
+		inbox:    store.InboxRecord{ID: "inbox-1", OrgID: "org-1", Status: "active", Address: "agent@example.test"},
+		domain:   store.OrgDomain{Domain: "example.test", Status: "pending"},
+		messages: messages,
+		message:  messages[0],
+	}
+
+	err := EvaluateOutboundPolicy(context.Background(), stub, OutboundPolicyInput{
+		Tool: "compose_email", OrgID: "org-1", InboxID: "inbox-1",
+	})
+	if got := policyCode(t, err); got != "email_compose_org_enabled_denied" {
+		t.Fatalf("self-mail/inbound volume unlocked compose: %q", got)
+	}
+}
+
+func TestOutboundPolicyCanonicalizesLegacyInboxAddressForOwnedDomainProof(t *testing.T) {
+	flags := allowedFlags()
+	flags["email_compose_org_enabled"] = boolPtr(false)
+	readyDomain := store.OrgDomain{
+		Domain: "\u00a0Example.TEST.\u3000", Status: "active", MXVerified: true, SPFVerified: true,
+		DKIMVerified: true, InboundEnabled: true, ResendReceivingEnabled: true,
+	}
+	for _, address := range []string{
+		"Agent@Example.TEST",
+		"\u00a0\u2003agent@example.test\u3000",
+		"agent@example.test.",
+	} {
+		t.Run(address, func(t *testing.T) {
+			stub := &policyStoreStub{
+				flags: flags,
+				inbox: store.InboxRecord{
+					Status: "active", Address: address,
+					OrgDomainID: sql.NullString{String: "domain-1", Valid: true},
+				},
+				domain: readyDomain,
+			}
+			if err := EvaluateOutboundPolicy(context.Background(), stub, OutboundPolicyInput{
+				Tool: "compose_email", OrgID: "org-1", InboxID: "inbox-1",
+			}); err != nil {
+				t.Fatalf("canonical-equivalent legacy address was denied: %v", err)
+			}
+		})
+	}
+
+	stub := &policyStoreStub{
+		flags: flags,
+		inbox: store.InboxRecord{
+			Status: "active", Address: "agent@@example.test",
+			OrgDomainID: sql.NullString{String: "domain-1", Valid: true},
+		},
+		domain: readyDomain,
+	}
+	err := EvaluateOutboundPolicy(context.Background(), stub, OutboundPolicyInput{
+		Tool: "compose_email", OrgID: "org-1", InboxID: "inbox-1",
+	})
+	if got := policyCode(t, err); got != "email_compose_org_enabled_denied" {
+		t.Fatalf("invalid legacy address denial=%q", got)
+	}
+}
+
 // The enqueue transaction must ask again rather than trust the boundary answer.
 func TestServiceReevaluatesPolicyForAutonomousPrincipals(t *testing.T) {
 	cfg := config.Default()

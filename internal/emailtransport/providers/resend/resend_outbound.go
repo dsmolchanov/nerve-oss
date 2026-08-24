@@ -29,6 +29,11 @@ type OutboundAdapter struct {
 	client *http.Client
 }
 
+const (
+	maxResendErrorDrainBytes    = 64 << 10
+	maxResendOutboundErrorBytes = 128
+)
+
 func NewOutboundAdapter(cfg Config) *OutboundAdapter {
 	base := strings.TrimSpace(cfg.BaseURL)
 	if base == "" {
@@ -122,7 +127,6 @@ func (a *OutboundAdapter) SendMessage(ctx context.Context, msg emailtransport.Ou
 	}
 
 	var lastStatus int
-	var lastBody []byte
 
 	for attempt := 0; attempt < maxResendRequestAttempts; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.base+"/emails", bytes.NewReader(body))
@@ -139,10 +143,12 @@ func (a *OutboundAdapter) SendMessage(ctx context.Context, msg emailtransport.Ou
 		if err != nil {
 			return "", err
 		}
-		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			respBody, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if readErr != nil {
+				return "", errors.New("read resend send response")
+			}
 			var parsed struct {
 				ID string `json:"id"`
 			}
@@ -155,8 +161,13 @@ func (a *OutboundAdapter) SendMessage(ctx context.Context, msg emailtransport.Ou
 			return parsed.ID, nil
 		}
 
+		// Provider error bodies are untrusted and may contain credentials,
+		// addresses, message content, or an attacker-sized payload. Drain only a
+		// bounded prefix for connection hygiene and never retain or surface it.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResendErrorDrainBytes))
+		resp.Body.Close()
+
 		lastStatus = resp.StatusCode
-		lastBody = respBody
 
 		if !isRetryableResendStatus(resp.StatusCode) || attempt == maxResendRequestAttempts-1 {
 			break
@@ -170,12 +181,20 @@ func (a *OutboundAdapter) SendMessage(ctx context.Context, msg emailtransport.Ou
 		}
 	}
 
-	permanent, reason := emailtransport.ClassifyHTTPStatus(lastStatus)
-	return "", &emailtransport.ProviderError{
+	return "", newResendSendProviderError(lastStatus)
+}
+
+func newResendSendProviderError(status int) *emailtransport.ProviderError {
+	permanent, reason := emailtransport.ClassifyHTTPStatus(status)
+	detail := fmt.Sprintf("resend send failed: status=%d reason=%s retryable=%t", status, reason, !permanent)
+	if len(detail) > maxResendOutboundErrorBytes {
+		detail = detail[:maxResendOutboundErrorBytes]
+	}
+	return &emailtransport.ProviderError{
 		Permanent:  permanent,
-		StatusCode: lastStatus,
+		StatusCode: status,
 		Reason:     reason,
-		Cause:      fmt.Errorf("resend send failed: status=%d body=%s", lastStatus, strings.TrimSpace(string(lastBody))),
+		Cause:      errors.New(detail),
 	}
 }
 

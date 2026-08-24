@@ -461,6 +461,89 @@ Output schema:
 }
 ```
 
+### 9) nerve_billing_subscribe (MCP 2026 only)
+
+Create or replay the authenticated generation's paid-subscription workflow.
+This tool is registered only when the runtime has a `BillingProvisioner` and
+the authenticated principal is an active `m2m_org` token carrying
+`nerve:billing.subscribe`. An onboarding token, legacy principal, incomplete
+org binding, missing scope, or unconfigured provisioner cannot list or invoke
+it.
+
+Input schema:
+
+```json
+{
+  "$id": "neuralmail/tools/nerve_billing_subscribe.input.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "plan_code": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+    },
+    "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128}
+  },
+  "required": ["plan_code", "idempotency_key"]
+}
+```
+
+The object accepts exactly those two fields. Client, organization, onboarding,
+generation, Stripe customer, payment method, mandate, payment-intent, client
+secret, Checkout URL, and equivalent authority or payment overrides are
+rejected. The control plane derives them from the authenticated principal and
+the protected client registration. Duplicate JSON fields, surrounding/control
+characters in the idempotency key, and noncanonical plan codes are also
+rejected.
+
+Successful output schema:
+
+```json
+{
+  "$id": "neuralmail/tools/nerve_billing_subscribe.output.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "resultType": {"type": "string", "const": "complete"},
+    "state": {
+      "type": "string",
+      "enum": ["processing", "provider_unknown", "requires_action", "active"]
+    },
+    "plan_code": {"type": "string", "minLength": 1, "maxLength": 64},
+    "compose_enabled": {"type": "boolean"},
+    "retry_at": {"type": "string", "format": "date-time"}
+  },
+  "required": ["resultType", "state", "plan_code", "compose_enabled"]
+}
+```
+
+`active` is returned only after authoritative provider readback and committed
+paid evidence, and is the only state with `compose_enabled=true`.
+`processing`, `provider_unknown`, and `requires_action` are complete results
+with compose still denied. They never contain a hosted action URL, card input,
+client secret, provider body, or payment/authority identifier. The agent may
+repeat the same idempotency key to observe the same durable workflow; changing
+the plan under that key conflicts. A `requires_action` result is fail closed:
+an operator must repair the preauthorized off-session mandate before a clean
+retry, rather than completing an SCA challenge through MCP.
+
+The modern error result is closed to:
+
+- `billing_invalid_request`
+- `billing_idempotency_conflict`
+- `billing_mandate_unavailable`
+- `billing_plan_not_allowed`
+- `billing_invalid_state`
+- `billing_rate_limited`
+- `billing_temporarily_unavailable`
+
+Unknown provisioner errors and invalid provisioner results are sanitized to
+`billing_temporarily_unavailable`; raw provider responses are never reflected.
+
 The `attachments` input is available only when the org-scoped `attachments`
 feature flag is enabled. When disabled, `tools/list` omits the property and a
 producer that still sends it receives `attachment_feature_disabled`.
@@ -471,6 +554,33 @@ is strict. Validation errors use the stable codes
 `attachment_count_exceeded`, `attachment_too_large`, `attachment_empty`,
 `attachment_total_too_large`, `attachment_invalid_filename`,
 `attachment_type_not_allowed`, and `attachment_invalid_encoding`.
+
+## MCP 2026 delegated onboarding profile
+
+An authenticated `m2m_onboarding` principal carrying only `nerve:onboarding`
+sees the closed tool set `nerve_onboarding_start`,
+`nerve_onboarding_status`, `nerve_onboarding_verify_domain`, and
+`nerve_onboarding_close`. The delegated generation, client, and token identity
+come from the authenticated envelope; tool arguments cannot override them.
+
+For `custom_domain`, `nerve_onboarding_start` durably claims the canonical
+domain before any provider call and returns an ordinary complete result. While
+the state is `provisioning` or `dns_pending`, that result can include
+`dns_records` with `type`, `name`, `value`, optional `ttl`/`priority`, `purpose`,
+and provider-observed `status`; `dns_checks` reports `ownership`, `spf`, `dkim`,
+`mx`, `provider_verified`, and `receiving_enabled`. The caller must publish the
+records through a separate DNS-provider connector, then call
+`nerve_onboarding_verify_domain` or poll status according to `retry_at`.
+
+Nerve never requests, accepts, or stores registrar or DNS-provider credentials
+through these tools. The agent must not place such credentials in any tool
+argument. A caller-supplied verified flag is not accepted. The mailbox becomes
+`active` and receives an `address` only after authoritative readback proves the
+ownership challenge, all required SPF and DKIM records, receiving MX, aggregate
+provider verification, and receiving enabled. An authoritative later loss
+returns the generation to `dns_pending` and removes effective compose authority
+while retaining the generation-owned inbox for recovery; an unknown transport
+outcome preserves the last authoritative state and remains retryable.
 
 ## Error Shape
 All tools should return errors in a consistent shape when possible.

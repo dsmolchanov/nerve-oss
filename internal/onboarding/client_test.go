@@ -87,6 +87,73 @@ func TestClientSignsFixedDestinationAndAuthenticatedGeneration(t *testing.T) {
 	}
 }
 
+func TestClientDelegatesBillingWithExactGenerationAndOrgAuthority(t *testing.T) {
+	now := time.Unix(1_723_000_000, 0).UTC()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/internal/v1/agent-billing/subscribe" || request.Method != http.MethodPost {
+			t.Fatalf("request target=%s %s", request.Method, request.URL.Path)
+		}
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Fatalf("read request: %v", err)
+		}
+		var envelope struct {
+			Principal delegationPrincipal       `json:"principal"`
+			Input     mcp.BillingSubscribeInput `json:"input"`
+		}
+		if err := json.Unmarshal(body, &envelope); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if envelope.Principal.Kind != auth.PrincipalM2MOrg || envelope.Principal.ClientID != "client-1" ||
+			envelope.Principal.OrgID != "org-1" || envelope.Principal.Generation != 7 || envelope.Principal.TokenID != "token-1" {
+			t.Fatalf("principal=%+v", envelope.Principal)
+		}
+		if envelope.Input.PlanCode != "pro" || envelope.Input.IdempotencyKey != "billing-1" {
+			t.Fatalf("input=%+v", envelope.Input)
+		}
+		bodyHash := sha256.Sum256(body)
+		bodyHashHex := hex.EncodeToString(bodyHash[:])
+		canonical := strings.Join([]string{"runtime-current", "nonce-1", "1723000000", http.MethodPost,
+			"/internal/v1/agent-billing/subscribe", bodyHashHex}, "\n")
+		mac := hmac.New(sha256.New, []byte("delegation-secret"))
+		_, _ = mac.Write([]byte(canonical))
+		if request.Header.Get(delegationSignatureHeader) != hex.EncodeToString(mac.Sum(nil)) ||
+			request.Header.Get("Authorization") != "Bearer original-token" {
+			t.Fatalf("delegation headers=%v", request.Header)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(map[string]any{"result": map[string]any{
+			"resultType": "complete", "state": "processing", "plan_code": "pro", "compose_enabled": false,
+		}})
+	}))
+	defer server.Close()
+	client := newTestClient(t, server.URL, server.Client(), now)
+	result, err := client.Subscribe(context.Background(), testBillingCaller(), mcp.BillingSubscribeInput{PlanCode: "pro", IdempotencyKey: "billing-1"})
+	if err != nil || result.State != mcp.BillingSubscribeProcessing || result.ComposeEnabled {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestClientBillingFailsClosedOnInvalidAuthorityAndResponse(t *testing.T) {
+	client := newTestClient(t, "https://control.internal.example", nil, time.Unix(1_723_000_000, 0))
+	for _, caller := range []mcp.BillingCaller{{}, {Principal: auth.Principal{Kind: auth.PrincipalM2MOrg, ClientID: "client-1", OrgID: "org-1", Generation: 7}, Authorization: "Bearer token"}} {
+		if _, err := client.Subscribe(context.Background(), caller, mcp.BillingSubscribeInput{PlanCode: "pro", IdempotencyKey: "billing-1"}); err == nil {
+			t.Fatalf("invalid caller accepted: %+v", caller)
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"result":{"resultType":"complete","state":"active","plan_code":"pro","compose_enabled":false}}`))
+	}))
+	defer server.Close()
+	client = newTestClient(t, server.URL, server.Client(), time.Unix(1_723_000_000, 0))
+	_, err := client.Subscribe(context.Background(), testBillingCaller(), mcp.BillingSubscribeInput{PlanCode: "pro", IdempotencyKey: "billing-1"})
+	var businessError *mcp.BillingBusinessError
+	if !errors.As(err, &businessError) || businessError.Code != mcp.BillingErrorTemporarilyUnavailable || !businessError.Retryable {
+		t.Fatalf("invalid response error=%#v raw=%v", businessError, err)
+	}
+}
+
 func TestClientRejectsRedirectsAndUnboundedResponses(t *testing.T) {
 	var redirected atomic.Bool
 	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
@@ -492,6 +559,16 @@ func testCaller() mcp.OnboardingCaller {
 	return mcp.OnboardingCaller{
 		Principal: auth.Principal{
 			Kind: auth.PrincipalM2MOnboarding, ClientID: "client-1", Generation: 7, TokenID: "token-1",
+		},
+		Authorization: "Bearer original-token",
+	}
+}
+
+func testBillingCaller() mcp.BillingCaller {
+	return mcp.BillingCaller{
+		Principal: auth.Principal{
+			Kind: auth.PrincipalM2MOrg, AuthMethod: "m2m_bearer", ClientID: "client-1", OrgID: "org-1",
+			Generation: 7, TokenID: "token-1", Scopes: []string{"nerve:billing.subscribe"},
 		},
 		Authorization: "Bearer original-token",
 	}

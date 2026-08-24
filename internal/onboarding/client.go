@@ -61,10 +61,12 @@ type ClientConfig struct {
 }
 
 var _ mcp.OnboardingProvisioner = (*Client)(nil)
+var _ mcp.BillingProvisioner = (*Client)(nil)
 
 type delegationPrincipal struct {
 	Kind       auth.PrincipalKind `json:"kind"`
 	ClientID   string             `json:"client_id"`
+	OrgID      string             `json:"org_id,omitempty"`
 	Generation int64              `json:"generation"`
 	TokenID    string             `json:"token_id"`
 }
@@ -111,6 +113,30 @@ type onboardingDNSCheckWire struct {
 }
 
 type onboardingBusinessErrorWire struct {
+	Code      *string    `json:"code"`
+	Retryable *bool      `json:"retryable"`
+	RetryAt   *time.Time `json:"retry_at,omitempty"`
+}
+
+type billingDelegationResponse struct {
+	Result *mcp.BillingSubscribeResult `json:"result,omitempty"`
+	Error  *mcp.BillingBusinessError   `json:"error,omitempty"`
+}
+
+type billingDelegationResponseWire struct {
+	Result *billingResultWire `json:"result,omitempty"`
+	Error  *billingErrorWire  `json:"error,omitempty"`
+}
+
+type billingResultWire struct {
+	ResultType     *string                    `json:"resultType"`
+	State          *mcp.BillingSubscribeState `json:"state"`
+	PlanCode       *string                    `json:"plan_code"`
+	ComposeEnabled *bool                      `json:"compose_enabled"`
+	RetryAt        *time.Time                 `json:"retry_at,omitempty"`
+}
+
+type billingErrorWire struct {
 	Code      *string    `json:"code"`
 	Retryable *bool      `json:"retryable"`
 	RetryAt   *time.Time `json:"retry_at,omitempty"`
@@ -170,6 +196,146 @@ func (client *Client) VerifyDomain(ctx context.Context, caller mcp.OnboardingCal
 
 func (client *Client) Close(ctx context.Context, caller mcp.OnboardingCaller, input mcp.OnboardingCloseInput) (mcp.OnboardingResult, error) {
 	return client.call(ctx, "close", caller, input)
+}
+
+func (client *Client) Subscribe(ctx context.Context, caller mcp.BillingCaller, input mcp.BillingSubscribeInput) (mcp.BillingSubscribeResult, error) {
+	var empty mcp.BillingSubscribeResult
+	if err := validateBillingCaller(caller); err != nil {
+		return empty, err
+	}
+	requestBody, err := json.Marshal(delegationRequest{
+		Principal: delegationPrincipal{
+			Kind: caller.Principal.Kind, ClientID: caller.Principal.ClientID, OrgID: caller.Principal.OrgID,
+			Generation: caller.Principal.Generation, TokenID: caller.Principal.TokenID,
+		},
+		Input: input,
+	})
+	if err != nil || len(requestBody) > maxDelegationBodyBytes {
+		return empty, &mcp.BillingBusinessError{Code: mcp.BillingErrorTemporarilyUnavailable, Retryable: true}
+	}
+	requestContext, cancel := context.WithTimeout(ctx, client.timeout)
+	defer cancel()
+	endpoint := *client.baseURL
+	endpoint.Path = "/internal/v1/agent-billing/subscribe"
+	request, err := http.NewRequestWithContext(requestContext, http.MethodPost, endpoint.String(), bytes.NewReader(requestBody))
+	if err != nil {
+		return empty, &mcp.BillingBusinessError{Code: mcp.BillingErrorTemporarilyUnavailable, Retryable: true}
+	}
+	timestamp := strconv.FormatInt(client.now().UTC().Unix(), 10)
+	nonce := client.nonce()
+	if nonce == "" || strings.ContainsAny(nonce, "\r\n") {
+		return empty, &mcp.BillingBusinessError{Code: mcp.BillingErrorTemporarilyUnavailable, Retryable: true}
+	}
+	bodyHash := sha256.Sum256(requestBody)
+	bodyHashHex := hex.EncodeToString(bodyHash[:])
+	request.Header.Set("Authorization", strings.TrimSpace(caller.Authorization))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set(delegationKeyIDHeader, client.keyID)
+	request.Header.Set(delegationNonceHeader, nonce)
+	request.Header.Set(delegationTimestampHeader, timestamp)
+	request.Header.Set(delegationBodyHashHeader, bodyHashHex)
+	request.Header.Set(delegationSignatureHeader, client.signature(request.Method, request.URL.EscapedPath(), nonce, timestamp, bodyHashHex))
+	response, err := client.httpClient.Do(request)
+	if err != nil {
+		return empty, &mcp.BillingBusinessError{Code: mcp.BillingErrorTemporarilyUnavailable, Retryable: true}
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxDelegationBodyBytes+1))
+	if err != nil || len(responseBody) > maxDelegationBodyBytes ||
+		strings.ToLower(strings.TrimSpace(strings.Split(response.Header.Get("Content-Type"), ";")[0])) != "application/json" {
+		return empty, &mcp.BillingBusinessError{Code: mcp.BillingErrorTemporarilyUnavailable, Retryable: true}
+	}
+	decoded, err := decodeBillingDelegationResponse(responseBody)
+	if err != nil || (decoded.Result == nil) == (decoded.Error == nil) {
+		return empty, &mcp.BillingBusinessError{Code: mcp.BillingErrorTemporarilyUnavailable, Retryable: true}
+	}
+	if decoded.Error != nil {
+		if response.StatusCode < 400 || response.StatusCode > 599 || !validDelegatedBillingError(decoded.Error) {
+			return empty, &mcp.BillingBusinessError{Code: mcp.BillingErrorTemporarilyUnavailable, Retryable: true}
+		}
+		return empty, decoded.Error
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 || !validDelegatedBillingResult(*decoded.Result, input.PlanCode) {
+		return empty, &mcp.BillingBusinessError{Code: mcp.BillingErrorTemporarilyUnavailable, Retryable: true}
+	}
+	return *decoded.Result, nil
+}
+
+func decodeBillingDelegationResponse(body []byte) (billingDelegationResponse, error) {
+	var response billingDelegationResponse
+	if err := rejectDuplicateJSONFields(body); err != nil {
+		return response, err
+	}
+	top, err := decodeExactJSONObject(body, "billing response", "result", "error")
+	if err != nil {
+		return response, err
+	}
+	if raw, ok := top["result"]; ok {
+		if _, err := decodeExactJSONObject(raw, "billing result", "resultType", "state", "plan_code", "compose_enabled", "retry_at"); err != nil {
+			return response, err
+		}
+	}
+	if raw, ok := top["error"]; ok {
+		if _, err := decodeExactJSONObject(raw, "billing error", "code", "retryable", "retry_at"); err != nil {
+			return response, err
+		}
+	}
+	var wire billingDelegationResponseWire
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return response, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return response, errors.New("billing delegation response contains multiple JSON values")
+	}
+	if wire.Result != nil {
+		if wire.Result.ResultType == nil || wire.Result.State == nil || wire.Result.PlanCode == nil || wire.Result.ComposeEnabled == nil {
+			return response, errors.New("billing delegation result omits a required field")
+		}
+		response.Result = &mcp.BillingSubscribeResult{
+			ResultType: *wire.Result.ResultType, State: *wire.Result.State, PlanCode: *wire.Result.PlanCode,
+			ComposeEnabled: *wire.Result.ComposeEnabled, RetryAt: wire.Result.RetryAt,
+		}
+	}
+	if wire.Error != nil {
+		if wire.Error.Code == nil || wire.Error.Retryable == nil {
+			return response, errors.New("billing delegation error omits a required field")
+		}
+		response.Error = &mcp.BillingBusinessError{Code: *wire.Error.Code, Retryable: *wire.Error.Retryable, RetryAt: wire.Error.RetryAt}
+	}
+	return response, nil
+}
+
+func validDelegatedBillingResult(result mcp.BillingSubscribeResult, expectedPlan string) bool {
+	if result.ResultType != "complete" || result.PlanCode != expectedPlan {
+		return false
+	}
+	switch result.State {
+	case mcp.BillingSubscribeActive:
+		return result.ComposeEnabled && result.RetryAt == nil
+	case mcp.BillingSubscribeProcessing, mcp.BillingSubscribeProviderUnknown:
+		return !result.ComposeEnabled
+	case mcp.BillingSubscribeRequiresAction:
+		return !result.ComposeEnabled && result.RetryAt == nil
+	default:
+		return false
+	}
+}
+
+func validDelegatedBillingError(businessError *mcp.BillingBusinessError) bool {
+	if businessError == nil || !mcp.IsPublicBillingBusinessErrorCode(businessError.Code) {
+		return false
+	}
+	switch businessError.Code {
+	case mcp.BillingErrorRateLimited:
+		return businessError.Retryable && businessError.RetryAt != nil
+	case mcp.BillingErrorTemporarilyUnavailable:
+		return businessError.Retryable
+	default:
+		return !businessError.Retryable && businessError.RetryAt == nil
+	}
 }
 
 func (client *Client) call(ctx context.Context, operation string, caller mcp.OnboardingCaller, input any) (mcp.OnboardingResult, error) {
@@ -519,6 +685,27 @@ func validateCaller(caller mcp.OnboardingCaller) error {
 	parts := strings.Fields(authorization)
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" || strings.ContainsAny(authorization, "\r\n") {
 		return errors.New("onboarding caller bearer is required")
+	}
+	return nil
+}
+
+func validateBillingCaller(caller mcp.BillingCaller) error {
+	principal := caller.Principal
+	if principal.Kind != auth.PrincipalM2MOrg || principal.AuthMethod != "m2m_bearer" ||
+		principal.ClientID == "" || principal.OrgID == "" || principal.Generation <= 0 || principal.TokenID == "" {
+		return errors.New("billing caller is not a generation-bound M2M organization principal")
+	}
+	hasScope := false
+	for _, scope := range principal.Scopes {
+		if scope == "nerve:billing.subscribe" {
+			hasScope = true
+			break
+		}
+	}
+	authorization := strings.TrimSpace(caller.Authorization)
+	parts := strings.Fields(authorization)
+	if !hasScope || len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" || strings.ContainsAny(authorization, "\r\n") {
+		return errors.New("billing caller bearer is required")
 	}
 	return nil
 }

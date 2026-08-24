@@ -1,17 +1,18 @@
 ---
 title: MCP 2026 and Autonomous Agent Onboarding
 status: draft
-revision: 13
+revision: 21
 created_at: 2026-08-06 12:49:07 CEST
-enhanced_at: 2026-08-19
+enhanced_at: 2026-08-23
 repository: nerve-cloud
 branch: main
-commit: 016dd09fae2960c3cbdefc3df5d0ee22c8e3fe92
+commit: 4c01c66713f35dd35693612f3c44106bcde16cba
 runtime_baseline: v0.0.17
 runtime_source_revision: a794be9f2697e0864d3a31da8f087577e9748f7e
 core_schema_baseline: 0028
 core_schema_target: 0029
 cloud_schema_baseline: 0009
+cloud_schema_target: 0010
 ---
 
 # MCP 2026 and Autonomous Agent Onboarding Implementation Plan
@@ -43,7 +44,7 @@ The one-time registration of the machine identity, the one-time configuration of
 | Initial outbound | Inbound, reading, drafting, and replies are available immediately | A reply must target the latest real inbound sender in that tenant-owned thread |
 | New-message outbound | compose_email unlocks after verified custom domain or confirmed paid subscription | Tool scope is a ceiling; durable send policy is re-evaluated on every enqueue and inbound traffic never changes trust in V1 |
 | Protocol rollout | Hybrid router on one /mcp endpoint | SDK 0.2.0 remains sessionful; MCP 2026 is stateless and uses the official Go SDK |
-| Schema ownership | Cloud 0009 plus OSS-authority additive Core 0029 | Runtime never reads Cloud onboarding tables; Core 0029 owns only the shared outbox policy fence required at provider start |
+| Schema ownership | Historical Cloud 0009, forward-only Cloud 0010, and OSS-authority additive Core 0029 | Runtime never reads Cloud onboarding tables; Core 0029 owns only the shared outbox policy fence, while Cloud 0010 owns hosted canonical inbox identity and managed-namespace enforcement |
 | OAuth origin | Dedicated https://auth.nerve.email control-plane origin | Avoid dashboard login middleware and path-rewrite coupling |
 | DNS automation | Agent uses its own DNS connector | Nerve returns records and verifies them; it never accepts DNS credentials |
 | Async readiness | Explicit status and verify tools plus the existing reconciler | Do not require optional MCP Tasks support in the first release |
@@ -62,7 +63,7 @@ The one-time registration of the machine identity, the one-time configuration of
 
 - Cloud main is commit 99092688c3213af3cf7dc8e72cc28bd89983f6a1.
 - deploy/cloud/runtime.lock pins runtime v0.0.17 from nerve-oss revision a794be9f2697e0864d3a31da8f087577e9748f7e.
-- Production is Core 0028 and Cloud 0009 behind proven Artifact A, with M2M issuance disabled. Immutable runtime v0.0.17 is compiled for Core `[28,28]` and cannot start on Core 29. Phase 9 must therefore deploy and prove a distinct legacy bridge R0 with Core `[28,29]` before applying 0029; the final runtime/C pair contracts to Core 29/Cloud 9.
+- Production is Core 0028 and Cloud 0009 behind proven Artifact A, with M2M issuance disabled. Immutable runtime v0.0.17 is compiled for Core `[28,28]` and cannot start on Core 29. Phase 9 must therefore deploy and prove a distinct legacy bridge R0 with Core `[28,29]`, install feature-complete B on Cloud 9, apply forward-only Cloud 0010, and only then apply Core 0029; the final runtime/C pair contracts to Core 29/Cloud 10.
 - Runtime is deployed before control plane after explicit migrations in .github/workflows/deploy.yml. This order means a new runtime may consume only control-plane capabilities that were already deployed in an earlier release.
 - The runtime has one active and one stopped Fly Machine. The process-local MCP session map is therefore not safe for more than one active Machine without affinity or shared session state.
 - Exact-mirror CI currently derives source authority from deploy/cloud/runtime.lock, which also pins the deployed artifact. That coupling prevents an OSS-first shared-auth tranche from becoming authoritative before a new runtime image exists; source authority and deployed-artifact authority need separate locks.
@@ -96,7 +97,7 @@ The one-time registration of the machine identity, the one-time configuration of
 - Custom-domain creation already returns DNS records and provider state, but Nerve cannot edit a customer's DNS.
 - The existing domain readiness path can mark a domain active after SPF and DKIM while a receiving-enable error is only logged. Autonomous activation must require ownership, SPF/DKIM, inbound MX, provider verification, and provider receiving to be operational.
 - core/0024 introduced org_domain_grants and enforces that an active inbox uses either an org-owned domain or a domain actively granted to that org.
-- An active inbox address is unique only while the inbox remains active. A separate permanent alias registry is required to ensure that an address is never reused after cleanup.
+- Core 0024 makes only `lower(address)` unique while an inbox remains active. Supported Store paths must additionally serialize and compare the complete canonical identity without rewriting valid legacy bytes, while Cloud 0010 replaces the hosted active-address index with the same functional identity. A separate permanent alias registry is still required to ensure that an address is never reused after cleanup.
 - Ordinary inbox create/reactivate paths and inbound catch-all do not consult such a registry, so a retired managed address requires a database-enforced tombstone, not only an application check.
 - Current domain locking is org-scoped, does not treat every foreign unexpired pending claim as conflicting, and legacy pending-domain GC deletes rows directly. Legacy and autonomous ownership therefore need one canonical-domain claim and lock protocol.
 - A successful Resend domain create followed by a local persistence failure can leave a provider-only domain because internal/cloudapi/handler_domains.go:356-410 removes the local row but does not compensate at the provider. Canonical-name lookup cannot distinguish such an orphan from this workflow's own timed-out create.
@@ -128,6 +129,7 @@ The one-time registration of the machine identity, the one-time configuration of
 - `cmd/nerve-reconcile` begins mutating work without the startup compatibility check used by the web binary.
 - runtime manifests omit outbound-policy provenance; the OSS tag workflow publishes immediately; and the SDK publish workflow can be dispatched without production combination evidence.
 - Runtime deploy verifies a pre-existing Fly mirror but no current workflow creates the candidate mirror before release-set construction. The signed v0.0.17 baseline is valid historical/provenance evidence only: its compiled Core window rejects Core 29. A distinct attested legacy bridge R0 must be built, proven, and embedded as the authorized below-vNext rollback member before the additive migration.
+- Cloud CI still rebuilds and publishes every main SHA as Artifact A. Once the Core tree advances to 0029, that creates an impossible manifest (`head=29`, A window `[28,28]`) and would mutate a historical artifact identity. Post-transition CI must instead build a local-only `validation` role that follows the checked-in schema head, is never published or accepted by deploy workflows, and refuses normal process startup.
 - Cloud's repository token cannot create OSS tags/releases or retag OSS GHCR, while the current OSS `v*` workflow rebuilds the image. Publication therefore needs an OSS-side no-rebuild workflow and a least-privilege cross-repository handoff.
 - scripts/deploy/cloud_deploy.sh and parts of the runbook still contain obsolete Core 19 / Cloud 7 defaults.
 - The public dashboard origin rewrites only /v1 paths and its middleware protects other paths with Supabase. OAuth endpoints should therefore use the dedicated auth.nerve.email origin rather than depend on dashboard rewrites.
@@ -209,7 +211,7 @@ The feature is complete only when the production contract workflow proves both j
       v
     control-plane internal onboarding API
       |
-      +--> PostgreSQL: Cloud 0009 state plus existing Core resources
+      +--> PostgreSQL: Cloud 0009/0010 state plus existing Core resources
       +--> Resend domain API
       +--> Stripe subscription API through a preauthorized client billing mandate
       +--> scheduled nerve-reconcile
@@ -217,7 +219,7 @@ The feature is complete only when the production contract workflow proves both j
     Custom-domain branch only:
     external agent --> separate DNS MCP/API --> DNS provider
 
-The runtime remains the public MCP resource server and OSS authority. It does not import or query Cloud 0009. A small `OnboardingProvisioner` interface in OSS delegates modern onboarding calls to a fixed control-plane endpoint. Each delegated request carries:
+The runtime remains the public MCP resource server and OSS authority. It does not import or query any Cloud schema. A small `OnboardingProvisioner` interface in OSS delegates modern onboarding calls to a fixed control-plane endpoint. Each delegated request carries:
 
 - the original bearer token;
 - a timestamp and nonce;
@@ -288,9 +290,9 @@ Under the client lock, onboarding-token issuance selects the current non-closed 
 
 `tools/list` is private-cache scoped with a short TTL and is advisory only. `tools/call` repeats every authorization and policy check. A hidden tool call is denied even when a client cached an older list.
 
-### Durable Cloud 0009 model
+### Durable Cloud 0009 model and Cloud 0010 canonical boundary
 
-Create `internal/store/migrations/cloud/0009_m2m_oauth_and_onboarding.sql`. It is the only schema migration in this plan and may create Cloud-owned tables, constraints, and triggers over existing Core tables in the same database.
+Create `internal/store/migrations/cloud/0009_m2m_oauth_and_onboarding.sql` as the durable model transition. Forward-only Cloud 0010 later strengthens canonical inbox identity over these tables without rewriting legacy bytes, and OSS-authority Core 0029 separately owns only the outbox provider fence. No other schema migration is authorized by this plan.
 
 #### OAuth and delegation tables
 
@@ -324,7 +326,7 @@ Workers claim with `SELECT ... FOR UPDATE SKIP LOCKED` plus CAS over state and `
 - Platform registration snapshots every pre-existing inbox on the canonical domain and permanently backfills each address as `legacy_reserved_active` or `legacy_reserved_disabled` before writer enable. These rows have no onboarding owner and can never be allocated, reactivated under another inbox ID, or deleted.
 - No production path deletes an alias. A retired address remains reserved forever, including for its former inbox ID.
 - Allocation generates a lowercase Base32 encoding of 128 random bits with fixed `agent-` prefix, inserts `reserved`, creates the inbox with the pre-generated matching ID, and marks `active` in one transaction.
-- A Cloud 0009 database trigger on inbox insert/update/address/status permits a registered address to activate only for its matching reserved/active inbox ID; `retired` always fails. This covers ordinary create, ensure, reactivate, direct SQL, and catch-all races.
+- Cloud 0009 installs the first inbox alias trigger. Forward-only Cloud 0010 replaces it after a serialized preflight, makes hosted active-address uniqueness use the same byte-preserving canonical equivalence as shared Store paths, rejects new noncanonical storage, and permits a registered managed address to activate only for its matching reserved/active inbox ID; `retired` always fails. This covers ordinary create, ensure, reactivate, direct SQL, and catch-all races without rewriting valid legacy address bytes.
 - A database constraint/trigger prevents `catch_all_enabled=true` for a registered platform domain. Inbound fallback also recognizes the platform-domain registry and drops unknown recipients before the generic catch-all branch.
 
 #### domain_ownership_claims
@@ -356,7 +358,7 @@ Workers claim with `SELECT ... FOR UPDATE SKIP LOCKED` plus CAS over state and `
 - Payment evidence requires both a qualifying paid invoice/payment and authoritative current provider state. `invoice.paid` never directly maps a subscription to active; stale or ambiguous events trigger a Stripe subscription GET outside the transaction followed by a fenced CAS. A close/cancellation fence is monotonic and always wins over late payment or older subscription events.
 - Reconciliation recomputes the same projection and never infers trust from inbound mail.
 
-The Cloud 0009 down migration refuses when any durable client, key, assertion, nonce, activation approval, onboarding, alias, domain claim, rate, billing-workflow, or evidence row exists.
+The Cloud 0009 down migration refuses when any durable client, key, assertion, nonce, activation approval, onboarding, alias, domain claim, rate, billing-workflow, or evidence row exists. Cloud 0010 is unconditionally forward-only because restoring the incomplete trigger/index would reopen the canonical-identity boundary.
 
 ### Existing Core state and Core 0029 used by runtime
 
@@ -558,7 +560,7 @@ Make every later migration, protocol, rollback, and production assertion executa
 
 - Build the image once in successful main CI and publish its immutable source digest plus a control-plane manifest.
 - OCI labels and the manifest pin source revision; Core/Cloud migration hashes and heads; compiled min/max windows; policy hash; build time; and SHA256 for every shipped database-mutating executable: `/app/nerve-control-plane`, `/app/nerve-reconcile`, `/app/nerve-migrate`, `/app/nerve-flags`, `/app/nerve-drill`, and, once added in Phase 1, `/app/nerve-oauth-clients`. CI fails if an executable in the image is absent from the manifest or allowlist.
-- Give every shipped database-mutating binary a shared read-only `compatibility --json` entry point before its first listener, lease, provider call, or mutation. The immutable build manifest carries `artifact_role=A|B|C` and `release_set_required` (`A=false`, `B/C=true`), so an absent environment marker can never downgrade B/C to transition behavior. The manifest-bound binary reports its own build identity. For B/C deployments, the workflow injects `NERVE_RELEASE_SET_SHA` and `NERVE_RELEASE_SET_ENVELOPE_B64`, whose decoded maximum is 64 KiB and which contains the canonical signed release-set bytes plus offline DSSE/Sigstore verification bundle. The shared verifier caps and decodes the envelope, verifies canonical SHA and signature plus pinned repository/ref/workflow identity using vendored trust material, hashes its own executable/manifest, and proves exact role/image/manifest/binary/window membership before reporting the runtime-bound release-set identity. A SHA without the signed bytes/bundle is never sufficient, and the release-set identity is never compiled into an artifact that the set itself hashes. Environment may tighten verification but cannot disable the manifest requirement.
+- Give every shipped database-mutating binary a shared read-only `compatibility --json` entry point before its first listener, lease, provider call, or mutation. The immutable build manifest carries `artifact_role=validation|A|B|C` and `release_set_required` (`validation/A=false`, `B/C=true`). Validation is CI-only and always refuses normal startup; an absent environment marker can never downgrade B/C to transition behavior. The manifest-bound binary reports its own build identity. For B/C deployments, the workflow injects `NERVE_RELEASE_SET_SHA` and `NERVE_RELEASE_SET_ENVELOPE_B64`, whose decoded maximum is 64 KiB and which contains the canonical signed release-set bytes plus offline DSSE/Sigstore verification bundle. The shared verifier caps and decodes the envelope, verifies canonical SHA and signature plus pinned repository/ref/workflow identity using vendored trust material, hashes its own executable/manifest, and proves exact role/image/manifest/binary/window membership before reporting the runtime-bound release-set identity. A SHA without the signed bytes/bundle is never sufficient, and the release-set identity is never compiled into an artifact that the set itself hashes. Environment may tighten verification but cannot disable the manifest requirement.
 - Deployment derives the image only from a verified CI artifact, validates its attestation/manifest, and proves the resolved digest and compatibility output for every active and stopped web Machine and the scheduled reconciler Machine.
 - Replace free-form control-plane image inputs with an artifact run identity and manifest SHA.
 
@@ -598,6 +600,9 @@ Make every later migration, protocol, rollback, and production assertion executa
 - new `schemas/mcp2026-release-set.schema.json`
 - new `scripts/release/build_mcp2026_release_set.sh`
 - new `scripts/ci/verify_mcp2026_release_set.sh`
+- new `scripts/release/generate_mcp2026_release_set_envelope.py`
+- new `scripts/ci/verify_mcp2026_release_set_envelope.py`
+- new `scripts/ci/test_mcp2026_release_set_envelope.sh`
 - new `schemas/mcp2026-runtime-mirror-receipt.schema.json`
 - new `scripts/ci/verify_mcp2026_runtime_mirror_receipt.py`
 - new `schemas/mcp2026-legacy-runtime-baseline.schema.json`
@@ -624,18 +629,19 @@ Make every later migration, protocol, rollback, and production assertion executa
 
 - Define an attested `mcp2026-transition-bundle.json` available in Phase 1 before B/C/runtime/SDK exist. It pins only Cloud SHA, Artifact A image/manifest and all six shipped database-mutating binary hashes/windows, Cloud/Core migration hashes/heads, issuance-off state, source CI/workflow identity, and the production target. The Phase 1 transition accepts only its artifact run ID plus SHA.
 - Define and verify an attested transition-receipt schema. The receipt binds the transition-bundle digest, exact A manifest/image/binary identities, pre/post schema evidence, every active/stopped/scheduled Machine identity and resolved digest, issuance-off proof, target, workflow identity, and timestamps.
-- Define one attested `mcp2026-release-set.json` pinning Cloud and OSS SHAs; a preselected final unused runtime semver; runtime candidate index and linux/amd64 digests; runtime-manifest SHA and MCP/Core windows; a verified pre-release Fly-mirror receipt and resolved Machine digest; the signed historical v0.0.17 baseline receipt; a distinct signed R0 legacy-bridge receipt and its index/platform/Fly digests; control-plane A/B/C digests and manifest SHAs; every shipped binary hash/window; Cloud and Core migration heads/hashes; SDK 0.3 filename/SHA; immutable SDK 0.2 SHA; outbound-policy version/SHA; conformance commit; and producing workflow identities.
-- The final release set embeds the verified transition-bundle digest and Phase 1 transition-receipt digest so A identity/provenance cannot be substituted later.
-- Verify GitHub OIDC/Sigstore attestations, repository/ref/workflow identity, and subject digest. Only Phase 1 transition consumes transition-bundle inputs. Phase 9 candidate deployment and every Phase 10 artifact-selection path accept only `release_set_run_id` plus `release_set_sha`—never component overrides—and derive build/deploy components from that set. Phase 10 may additionally accept independently attested lifecycle, soak, promotion, or one-use approval evidence created after deployment only when each artifact names the same release-set SHA and its expected protected producer/workflow identity.
+- After the signed A transition receipt exists, stop rebuilding or publishing A from later main SHAs. The ordinary `control-plane-artifact` CI job builds a distinct local-only `validation` manifest/image with windows covering the checked-in migration heads, verifies every binary through `compatibility --json`, uploads only validation evidence, and has no GHCR/sign/deploy output. The validation role is accepted only by offline manifest verification and fails `VerifyStartup` before listener or mutation.
+- Define one attested `mcp2026-release-set.json` pinning final Cloud and OSS producer SHAs; a preselected final unused runtime semver; runtime candidate index and linux/amd64 digests; runtime-manifest SHA and MCP/Core windows; a verified pre-release Fly-mirror receipt and resolved Machine digest; the signed historical v0.0.17 baseline receipt; a required distinct signed R0 legacy-bridge receipt and its index/platform/Fly digests; historical A Core `[28,28]`/Cloud `[8,9]`; future B Core `[28,29]`/Cloud `[9,10]`; future C Core `[29,29]`/Cloud `[10,10]`; each A/B/C member's own manifest-derived Cloud source revision, exact Core/Cloud windows, OCI index digest, linux/amd64 digest, equal resolved Fly Machine digest, manifest/binary identities, and protected producer; Core 29 and Cloud 10 migration heads/hashes; exact release-set issuance-off and Cloud 0010 transition specifications plus both protected producer identities; SDK 0.3 filename/SHA; immutable SDK 0.2 SHA; outbound-policy version/SHA; conformance commit; and producing workflow identities. Verification rejects a role whose member source/window differs from its immutable manifest and enforces the exact allowlisted B→C contraction diff.
+- The final release set embeds the verified transition-bundle and Phase 1 transition-receipt digests plus immutable protected artifact locators for each: producing run ID, artifact name, object filename, expected SHA, repository/ref/workflow identity, and attestation identity. Later workflows derive and reverify the canonical historical objects from those locators without caller-supplied receipt inputs, so A identity/provenance cannot be substituted later.
+- Verify GitHub OIDC/Sigstore attestations, repository/ref/workflow identity, and subject digest. Only Phase 1 transition consumes transition-bundle inputs. Phase 9 and 10 component selection accepts only `release_set_run_id` plus `release_set_sha`—never component overrides—and derives build/deploy components from that set. The Phase 9 Cloud 0010 transition may additionally accept only the fresh independently attested pre-0010 release-set issuance-off receipt run ID/SHA; it derives the historical 0009 receipt from the release set rather than caller input, and its receipt binds both predecessor receipt digests. Phase 10 paths may additionally accept or derive the independently attested 0010 transition, issuance-control enable/post-disable, lifecycle, soak, promotion, or one-use approval evidence required by that action only when each artifact names the same release-set SHA and its expected protected producer/workflow identity.
 - Add the policy YAML to OSS exact mirror, runtime manifest, and OCI labels. Control-plane manifest pins the same hash; mismatch is fatal.
-- Support a separate pre-tag `runtime-candidate.lock` at a digest-addressed OCI/artifact locator. Before its Phase 8 build, select and prove one final runtime semver unused across git tags, GitHub Releases, and public OCI tags; freeze that value into the candidate manifest/OCI labels and later release set without creating the tag. Production `runtime.lock` keeps its strict released-artifact contract and describes v0.0.17 only until the protected R0 bridge deployment. R0 uses its own release-set/receipt identity and never reuses or rewrites the public v0.0.17 lock, tag, version, or digest.
+- Support a separate pre-tag `runtime-candidate.lock` at a digest-addressed OCI/artifact locator. Before its Phase 8 build, select and prove one final runtime semver unused across git tags, GitHub Releases, and public OCI tags; freeze that value into the candidate manifest/OCI labels and later release set without creating the tag. Production `runtime.lock` keeps its strict released-artifact contract and physically describes v0.0.17 through R0 and candidate deployment, but ceases to select the deployed runtime once protected release-set evidence selects R0. R0 uses its own release-set/receipt identity and never reuses or rewrites the public v0.0.17 lock, tag, version, or digest.
 - Remove `runtime.lock` from any automatic rollout path filter. Runtime deployment is called explicitly with verified release-set evidence; changing candidate/public lock metadata alone cannot restart Machines.
 - OSS candidate build pushes immutable bytes/digests without a semver tag or GitHub Release. Post-soak promotion retags that already-tested digest and publishes the exact manifest without rebuild.
 - Remove direct SDK publish dispatch. SDK 0.3 publication is callable only by post-soak promotion with matching release-set evidence.
 - Capture the current v0.0.17 production state before runtime.lock changes: exact source revision, GitHub Release manifest/assets, GHCR index/platform digests, current Fly content-addressed tag/Machine digest, contract/core hashes, and verification workflow identity. The signed baseline receipt is immutable and later embedded in the final release set.
 - Build a distinct non-semver R0 legacy bridge from the pinned v0.0.17 source plus one machine-verified allowlisted patch that widens only the compiled Core window from `[28,28]` to `[28,29]` and adds the required build/attestation wiring. A protected OSS workflow must reject every other source, dependency, API, protocol, SQL, policy, or manifest-behavior delta; build reproducibly; and emit a signed receipt binding source, patch digest, exact diff allowlist, index/platform/Fly digests, Core window, and producer identity.
 - Run the actual R0 binary with production `NM_MIGRATE_ON_START=verify`: first against Core 28, where its legacy HTTP/MCP/SDK 0.2 and SQL behavior must match the immutable v0.0.17 artifact, then against additive Core 29, where startup, enqueue, claim, delivery, and inspection must pass. A hand-written legacy-SQL fixture proves only schema/statement compatibility and can never substitute for these artifact-level executions.
-- The dedicated below-vNext rollback workflow accepts only the final release set, an issuance-off receipt, and a complete lifecycle-drain receipt. It derives R0 solely from the embedded bridge member, keeps control plane B, deploys the exact content-addressed R0 Fly image, and verifies every Machine; it accepts no raw image/tag/version input and never depends on later `runtime.lock` contents. Immutable v0.0.17 is not an authorized target after Core 0029.
+- The dedicated below-vNext rollback workflow accepts only the final release set, a fresh Phase-10 post-disable issuance-control receipt, and a complete lifecycle-drain receipt. It derives R0 solely from the embedded bridge member, keeps control plane B, deploys the exact content-addressed R0 Fly image, and verifies every Machine; it rejects historical/pre-0010 issuance-off evidence, accepts no raw image/tag/version input, and never depends on later `runtime.lock` contents. Immutable v0.0.17 is not an authorized target after Core 0029.
 - Add a protected Phase 0 operator rehearsal under the shared `deploy-<environment>` lock. It accepts only a successful main Artifact A run and exact manifest SHA, verifies its Sigstore identity and manifests, mirrors those exact bytes to Fly Registry, creates a stopped ephemeral Machine, proves its resolved digest before start, executes every manifest-listed `compatibility --json` entry point, validates the non-deploying candidate-locator fixture independently from `runtime.lock`, emits signed evidence, and destroys the exact Machine on every exit. It never deploys a durable service or applies a migration.
 
 #### 0.5 Pin protocol conformance tooling
@@ -691,12 +697,12 @@ Make every later migration, protocol, rollback, and production assertion executa
 - [x] Read-only migration verification accepts exactly 8/head9/pending9 without applying it.
 - [x] Steady deploy refuses an 8-to-9 transition.
 - [x] Candidate-lock verification works without a semver release while independent production runtime-lock verification for v0.0.17 remains green.
-- [x] Release-set schema rejects omitted or free-form component identities and freezes a still-unused final runtime semver without changing candidate manifest bytes later.
+- [ ] Release-set schema/build/verification reject omitted or free-form component identities, require the independently proven R0 member, enforce the exact A/B/C/runtime window matrix through Cloud 10, bind the release-set issuance-off and 0010 transition specifications/producers, and freeze a still-unused final runtime semver without changing candidate manifest bytes later.
 - [x] `oss-source.lock` and `runtime.lock` are independently verified; exact-mirror CI follows only source authority, deploy follows only artifact authority, and an attempted cross-use fails.
 - [x] The OSS-first shared-auth commit and manifest entry exist before Artifact A's source SHA; Cloud copies are byte-identical.
 - [x] The client-credentials-only metadata fixture passes every pinned ext-auth client while empty/fabricated `response_types_supported` fixtures fail.
 - [x] The signed v0.0.17 baseline receipt resolves the current Release/GHCR/Fly bytes and rejects every digest/source/manifest substitution.
-- [ ] The protected R0 workflow proves an exact allowlisted v0.0.17-source delta, reproducible distinct bytes, legacy equivalence on Core 28, and actual production-startup compatibility on Core 29; its receipt rejects any substituted patch, source, digest, window, or workflow identity.
+- [x] The protected R0 workflow proves an exact allowlisted v0.0.17-source delta, reproducible distinct bytes, legacy equivalence on Core 28, and actual production-startup compatibility on Core 29; its receipt rejects any substituted patch, source, digest, window, or workflow identity.
 
 #### Operator verification
 
@@ -708,6 +714,12 @@ Make every later migration, protocol, rollback, and production assertion executa
 - Legacy runtime baseline: protected main workflow run `31370208433`, Actions artifact `9055729218`, receipt SHA-256 `ab616874e51835aa0e2096e07c52d4c748aaca6105ceec5b5fd609b02e6bb268`. The signed member binds `target_env=cloud-production`, `fly.app=nerve-runtime`, v0.0.17 Release assets, source `a794be9f2697e0864d3a31da8f087577e9748f7e`, GHCR/Fly digest `sha256:eaab11e78806e3ed730367c311b1fc30c1360e5be9897d329ec9208912f81765`, and both production runtime Machine IDs. The protected workflow and an independent downloaded-artifact verification both accepted the exact bytes; negative tests reject substituted environment, app, digest, source, and manifest identities.
 - Artifact A authority: protected main Cloud CI run `31366330167`, image `ghcr.io/dsmolchanov/nerve-cloud/control-plane@sha256:cc46c364dd99017d25afd6e6a70350cbebedfebc08eea08e90d5f688d1aaa39b`, manifest SHA-256 `1de234082197d4c94530c80929fa0ffecba0122388c4f12e402596000ab171e6`. The private-repository Sigstore producer completed successfully on main.
 - Fly rehearsal: protected main workflow run `31368751660`, Actions artifact `9055204919`, receipt SHA-256 `60c706a844369216ba9182c7873a635328e2f23effc0c76e14a0d6f8435fd8c2`. It held `deploy-cloud-production`, verified the independent production/candidate locator paths and runbook invariants, resolved ephemeral Machine `847559f27d3d78` to the exact Artifact A digest, ran all five manifest-listed compatibility commands successfully, confirmed deletion of that exact Machine, and signed the evidence before upload.
+
+#### Phase 0 R0 bridge evidence (2026-08-20)
+
+- Protected OSS main workflow run `32373481690`, Actions artifact `9408193056`, and receipt SHA-256 `b9e2e3be43c6e8c5b33b67eb40b1c9d4663f58e783f4dc4c798346a9ca6ce985` close the R0 proof gate. The signed receipt binds OSS authority `bb3dda964e14bd38653a608616682064b25c7748`, immutable v0.0.17 source `a794be9f2697e0864d3a31da8f087577e9748f7e`, the sole allowlisted patch `dc62d8ee0cde5d19d152c71b7cafe8d98070fee2372b14fa2546186a447f2cd4`, and Core window `[28,29]`.
+- Two independent no-cache builds produced the same linux/amd64 manifest `sha256:74168fcd93e70b5eb896a54dbd595648fb3a865a41a3224c30d4037196ea23d0`; the exact bytes were published as GHCR index `sha256:12d1a1bf3cded708c2892c0f69f1a1d9be235af9613141c5bd4c6680f8c8d129` and mirrored to `registry.fly.io/nerve-runtime:r0-dc62d8ee0cde` with the same platform digest. The protected job signed both the receipt and exact GHCR image and recorded the receipt in Rekor under the main-workflow identity.
+- The immutable published SDK 0.2.0 wheel (`sha256:9f0a7d6316bf47eef64236f96d1a7a151b5517641930422b1b16711da8b02540`) produced the same Core 28 transcript for v0.0.17 and R0 (`sha256:dca908101b346ddf24db0bc114fc3a02056ce2c0e62b443ec0909e38c15542da`). The actual R0 image then passed startup, enqueue, claim, fake-provider delivery, inspection, resources, and legacy errors on Core 29 while immutable v0.0.17 was rejected. Independent artifact download re-ran the fail-closed receipt verifier and reproduced its SHA.
 
 **Phase gate:** Do not author or apply Cloud 0009 until every proof above is green.
 
@@ -734,8 +746,19 @@ Author the complete Cloud-only durable model, implement OAuth behind issuance-of
 - new `internal/store/agent_billing_workflows.go`
 - new `internal/store/agent_outbound_evidence.go`
 - new `internal/store/provider_domain_quarantine.go`
+- new `scripts/deploy/canonicalize_provider_domains.go`
 - new `scripts/deploy/preflight_provider_domains.py`
 - new `schemas/provider-domain-preflight-receipt.schema.json`
+- new `schemas/provider-domain-adoption-receipt.schema.json`
+- new `schemas/provider-domain-deletion-receipt.schema.json`
+- new `scripts/release/generate_provider_domain_adoption_receipt.py`
+- new `scripts/release/generate_provider_domain_deletion_receipt.py`
+- new `scripts/ci/verify_provider_domain_adoption_receipt.py`
+- new `scripts/ci/verify_provider_domain_deletion_receipt.py`
+- new `scripts/ci/test_provider_domain_adoption_receipt.sh`
+- new `scripts/ci/test_provider_domain_deletion_receipt.sh`
+- `scripts/ci/verify_cloud_deploy_order.sh`
+- `.github/workflows/ci.yml`
 - `internal/domains/canonical.go`
 - `internal/store/org_domains.go`
 - `internal/cloudapi/handler_domains.go`
@@ -749,6 +772,7 @@ Author the complete Cloud-only durable model, implement OAuth behind issuance-of
 - Add every table, trigger, constraint, lease/version field, index, and refusal-style down guard specified in the durable model.
 - Add a read-only SQL preflight that canonicalizes existing domain rows and fails on ambiguous duplicate non-expired pending/provider-owned claims before migration.
 - Add the operational Resend-inventory preflight/quarantine described above. Hold the domain-writer fence continuously from provider snapshot through migration/backfill/writer enable; an unknown or mismatched provider-only domain must be deleted or explicitly adopted with an audited receipt.
+- Build one bounded batch canonicalizer from `internal/domains` and require the Python inventory preflight to send every local, provider, and resolution domain through it. Python's built-in IDNA codec is not an identity authority: U-label/A-label, case, trailing-dot, and transitional-character behavior must be byte-identical to the revision-17 Go Lookup/UTS-46 profile, including `straße.de` → `xn--strae-oqa.de`.
 - Backfill one ownership claim per existing live domain and enable writers only after the backfill passes.
 - Use bounded error/status fields; never persist raw provider bodies or secrets.
 - Store APIs for assertions, generation allocation, lifecycle transitions, billing workflows, claim mutation, alias activation, and evidence projection require an explicit transaction.
@@ -826,13 +850,37 @@ Author the complete Cloud-only durable model, implement OAuth behind issuance-of
 - Recovery checkpoint note (2026-08-12): run `31594799522` proved the signed incident authorization, quiesced all predecessor writers, installed `domain_writes=false`, and converged every durable Machine to Artifact A, but stopped before provider inventory because `flyctl deploy --now` preserved the maintenance-stopped web state. The transition now explicitly starts only the already verified Artifact A web Machine versions, requires restored proxy autostart, pins the original web ID set through a bounded state wait, and repeats the same proof after the schema-9 redeploy. Unknown roles, digest/ID drift, `created` or undocumented states, missing web/reconciler Machines, or timeout fail while the writer fence remains installed.
 - OAuth readiness checkpoint note (2026-08-12): runs `31600768850` and `31601167956` reached exact-A/schema-9 convergence and then failed the first public OAuth discovery assertion immediately after redeploy, while the same strict metadata, JWKS, TLS, and cache checks passed independently against the public endpoint. Keep the writer fence installed and make the complete strict smoke a bounded 60-second post-redeploy convergence gate with last-attempt diagnostics. No assertion is weakened and the fence is released only after one entire attempt passes.
 
+#### 1.6 Bind protected provider-quarantine resolution
+
+**Files**
+
+- new `.github/workflows/provider-domain-quarantine-adopt.yml`
+- new `.github/workflows/provider-domain-quarantine-delete.yml`
+- new `schemas/provider-domain-adoption-receipt.schema.json`
+- new `schemas/provider-domain-deletion-receipt.schema.json`
+- new `scripts/release/generate_provider_domain_adoption_receipt.py`
+- new `scripts/release/generate_provider_domain_deletion_receipt.py`
+- new `scripts/ci/verify_provider_domain_adoption_receipt.py`
+- new `scripts/ci/verify_provider_domain_deletion_receipt.py`
+- new `scripts/ci/test_provider_domain_adoption_receipt.sh`
+- new `scripts/ci/test_provider_domain_deletion_receipt.sh`
+
+**Changes**
+
+- The offline schema/generator/verifier binds the exact open-quarantine snapshot and bytes, an unbound local domain/claim target snapshot and workflow version, a fresh (at most five-minute-old) exact-ID/canonical provider observation, the exact canonicalizer binary SHA, protected approver, bounded reason, source revision, workflow run/attempt, and `domain-writes-global+canonical-domain` lock scope. Missing or substituted protected receipt/canonicalizer SHA, run/source/approver, stale target bytes, rewritten provider IDs, canonical mismatch, resolved quarantine, already-bound target, and stale/future observations fail closed.
+- The protected workflow is the only adoption producer. It derives all three snapshots itself while holding the global writer fence plus canonical-domain lock, verifies the signed receipt by its protected run and exact SHA, and atomically rechecks the same quarantine/target versions before binding the exact provider ID and resolving the ledger. It never accepts caller-selected snapshot files, raw provider identity, canonical name, target org/domain, workflow version, or receipt SHA as unverified mutation authority.
+- A receipt alone never makes the inventory safe. After adoption commits, the workflow captures a fresh complete provider/local inventory, proves that the adopted exact ID is now the local canonical pair and that no finding remains, then signs the converged preflight receipt before writer enable. A provider-only object with no valid target, any uncertainty, or any changed snapshot remains quarantined.
+- Landing the offline receipt contract does not construct or authorize the mutation workflow. Production adoption remains absent until explicit activation approval and protected-environment review.
+- The deletion receipt separately binds the exact open quarantine, exact canonicalizer binary, a fenced local-reference snapshot proving zero local provider-ID references, zero active-inbox dependents, and zero provider-owned claims, plus one exact-ID deletion/readback observation. DELETE acknowledgement is non-authoritative: only a fresh same-ID GET 404 after the recorded delete attempt proves absence. Snapshot/hash/identity substitution, nonzero local references, wrong ID/canonical name, readback other than 404, reordered timestamps, and observations older than five minutes fail closed.
+- The protected deletion producer derives and rechecks the local-reference snapshot under the same writer/canonical lock before provider mutation, performs DELETE and final exact-ID GET outside database transactions, and resolves the ledger only after the signed receipt and unchanged quarantine snapshot verify. Provider uncertainty retains the open quarantine and writer fence. Landing this offline contract does not construct or authorize provider deletion.
+
 ### Dedicated Compatibility Transition
 
 Run `.github/workflows/cloud-0009-transition.yml` under the shared production deploy lock as one resumable state machine:
 
 1. Accept only `transition_bundle_run_id` plus `transition_bundle_sha`, verify its attestation/target/workflow identity, and derive Artifact A from it: Core `[28,28]`, Cloud `[8,9]`, head 0009, issuance off. Raw A image/manifest inputs and final release-set inputs are rejected.
 2. Rehearse a production snapshot at exact Cloud `current=0008`, `head=0009`, `pending=[0009]` and Core `current=head=0028`, `pending=[]`; run SQL claim preflight and a recorded provider-inventory fixture containing local, provider-only, and mismatched-ID cases.
-3. In production, take the global domain-writer fence, run both the SQL preflight and full Resend inventory comparison, and abort/quarantine on any unresolved provider-only or mismatched object. Keep the fence through step 7 so inventory and writer enable are one transition.
+3. In production, take the global domain-writer fence, run both the SQL preflight and full Resend inventory comparison through the exact Go Lookup/UTS-46 batch canonicalizer, and abort/quarantine on any unresolved provider-only or mismatched object. Keep the fence through step 7 so inventory and writer enable are one transition.
 4. Deploy A web on schema 8, explicitly start every exact A web Machine after the maintenance stop, and prove the pinned web ID set, restored proxy autostart, started state, digest, and window; execute read-only compatibility for `nerve-flags`, `nerve-drill`, and `nerve-oauth-clients` from the same image and prove none queries 0009 or mutates.
 5. Converge the scheduled reconciler to A, execute only its read-only compatibility command on schema 8, and prove digest/window.
 6. Apply 0009 with `/app/nerve-migrate` from the same A image. Cloud pre-state is exactly 0008/head0009/[0009]; post-state is exactly 0009/head0009/[]. Core remains 0028/head0028/[].
@@ -846,27 +894,28 @@ Retry accepts only `schema8 + old/A` or `schema9 + A` states and converges forwa
 
 #### Automated verification
 
-- [ ] 0009 migrates from a production-shaped 0008 snapshot and backfills unambiguous claims.
-- [ ] Preflight rejects duplicate live canonical-domain claims.
-- [ ] Provider inventory rejects/quarantines provider-only and canonical/provider-ID mismatches, and a two-connection test proves no domain mutation can enter between inventory and writer enable.
-- [ ] Down succeeds only with no durable rows and refuses for every protected table class.
-- [ ] Migration tests exercise alias/catch-all triggers, state/uniqueness constraints, and claim serialization.
+- [x] 0009 migrates from a production-shaped 0008 snapshot and backfills unambiguous claims.
+- [x] Preflight rejects duplicate live canonical-domain claims.
+- [ ] Provider inventory uses the exact Go canonical identity for local/provider/resolution rows, rejects/quarantines provider-only and canonical/provider-ID mismatches, rejects IDNA2003/Lookup substitutions, and a two-connection test proves no domain mutation can enter between inventory and writer enable.
+- [ ] Adoption/deletion receipt tests bind exact open-quarantine, canonicalizer, protected producer/approver, and snapshot hashes. Adoption additionally binds an unbound target/claim plus fresh exact-ID presence; deletion binds zero local references plus final same-ID GET 404. Substitutions fail, and protected workflows prove exact-CAS resolution plus a fresh zero-finding inventory before writer enable.
+- [x] Down succeeds only with no durable rows and refuses for every protected table class.
+- [x] Migration tests exercise alias/catch-all triggers, state/uniqueness constraints, and claim serialization.
 - [ ] Artifact A on schema 9 exercises legacy domain create, verify, delete, and expiry and proves every live Core domain has exactly one canonical claim; Artifact A on schema 8 never queries the claim table.
-- [ ] Assertion tests reject wrong identity, audience/resource, key/algorithm/window, replay, and scope mixing.
-- [ ] Key tests reject reordered/optional-member aliases, another kid, another client, concurrent duplicate registration, and reuse after retirement/revocation; `kid` always equals the RFC 7638 thumbprint.
-- [ ] JTI boundary tests cover first use and replay at `exp-1`, `exp`, and `exp+29s`, exact `retain_until`, and cleanup only after the accepted skew window.
-- [ ] Golden token-form tests accept omitted `client_id`, accept a matching field, reject a mismatch/duplicate, and pin every OAuth HTTP status, error body/header, and cache directive.
-- [ ] Body/field/segment tests cover every numerical boundary, chunked and false Content-Length requests, duplicate fields, and rejection before decode/crypto/DB.
-- [ ] Metadata golden tests omit `response_types_supported`, reject empty/fabricated values, and pass the pinned client-credentials conformance consumers.
-- [ ] Decoded JWT fixtures pin PS256/current issuer `kid`, the complete common claim set, exact five/fifteen-minute lifetimes, onboarding absence of `org_id`, and org-token presence of the locked `org_id`.
-- [ ] JWKS rotation fixtures prove current/next publication, overlap/retirement after lifetime plus skew, no client assertion key exposure, and access-token alg/kid independence from RS256/PS256 client assertions.
-- [ ] Token endpoint cannot accept caller-selected org/generation or scopes outside registration/state.
-- [ ] Missing/off/wrong-release issuance control rejects before client lookup; concurrent enable/exchange and disable/exchange tests have one global-lock linearization point.
-- [ ] Two-connection barrier tests split token authority precisely: close versus email-token issuance leaves no usable email token; close versus onboarding-token issuance may leave only a short-lived token bound to that same generation with status/idempotent-close access; `revoke-client` versus either issuance leaves neither token usable, in both commit orders.
-- [ ] Client revocation drives pending/active generation toward closed.
-- [ ] Client-class tests reject reclassification, unprotected synthetic/operator assignment, duplicate synthetic identity, and every activation path outside the protected cohort workflow.
+- [x] Assertion tests reject wrong identity, audience/resource, key/algorithm/window, replay, and scope mixing.
+- [x] Key tests reject reordered/optional-member aliases, another kid, another client, concurrent duplicate registration, and reuse after retirement/revocation; `kid` always equals the RFC 7638 thumbprint.
+- [x] JTI boundary tests cover first use and replay at `exp-1`, `exp`, and `exp+29s`, exact `retain_until`, and cleanup only after the accepted skew window.
+- [x] Golden token-form tests accept omitted `client_id`, accept a matching field, reject a mismatch/duplicate, and pin every OAuth HTTP status, error body/header, and cache directive.
+- [x] Body/field/segment tests cover every numerical boundary, chunked and false Content-Length requests, duplicate fields, and rejection before decode/crypto/DB.
+- [x] Metadata golden tests omit `response_types_supported`, reject empty/fabricated values, and pass the pinned client-credentials conformance consumers.
+- [x] Decoded JWT fixtures pin PS256/current issuer `kid`, the complete common claim set, exact five/fifteen-minute lifetimes, onboarding absence of `org_id`, and org-token presence of the locked `org_id`.
+- [x] JWKS rotation fixtures prove current/next publication, overlap/retirement after lifetime plus skew, no client assertion key exposure, and access-token alg/kid independence from RS256/PS256 client assertions.
+- [x] Token endpoint cannot accept caller-selected org/generation or scopes outside registration/state.
+- [x] Missing/off/wrong-release issuance control rejects before client lookup; concurrent enable/exchange and disable/exchange tests have one global-lock linearization point.
+- [x] Two-connection barrier tests split token authority precisely: close versus email-token issuance leaves no usable email token; close versus onboarding-token issuance may leave only a short-lived token bound to that same generation with status/idempotent-close access; `revoke-client` versus either issuance leaves neither token usable, in both commit orders.
+- [x] Client revocation drives pending/active generation toward closed.
+- [x] Client-class tests reject reclassification, unprotected synthetic/operator assignment, duplicate synthetic identity, and every activation path outside the protected cohort workflow.
 - [ ] Artifact A passes compatibility for all six manifest-listed database-mutating binaries on both schema 8 and 9 before any mutation-specific behavior.
-- [ ] Normal deploy cannot perform the transition and transition retry rejects unknown states.
+- [x] Normal deploy cannot perform the transition and transition retry rejects unknown states.
 - [x] Web-start convergence tests cover stopped/suspended recovery, already-started idempotency, missing web, digest/ID drift, disabled autostart, unsafe `created` state, and timeout; the transition invokes this proof before provider inventory and after schema-9 redeploy.
 
 #### Operator verification
@@ -876,6 +925,12 @@ Retry accepts only `schema8 + old/A` or `schema9 + A` states and converges forwa
 - [x] The signed transition receipt is stored with the release evidence.
 
 **Phase gate:** Pause on schema 9 with Artifact A proven and issuance off. Record A as the temporary boundary floor; do not activate a client.
+
+#### Phase 1 token-boundary completion evidence (2026-08-22, local WIP)
+
+- Endpoint-level assertion tests inject the actual acceptance clock at `exp-1`, `exp`, and `exp+29s`, prove first-use acceptance, replay rejection, exact `retain_until=exp+30s`, and deletion only after that retained window.
+- A strictly validated optional previous PS256 public JWK remains published with current/next until the fleet-wide stopped-signing timestamp plus the fifteen-minute access-token lifetime and thirty-second skew. Retirement changes the JWKS ETag; partial configuration, unsafe material, thumbprint mismatch, and duplicate keys fail startup.
+- Real-PostgreSQL two-connection fixtures cover enable and disable against token exchange with both exchange-first and control-first commit orders. These local bytes pass the affected package tests; remote merge/release evidence remains pending.
 
 ---
 
@@ -998,24 +1053,108 @@ Upgrade nerve-oss to Go 1.25, isolate the frozen 2025 adapter from the 2026 Go S
 
 #### Automated verification
 
-- [ ] Immutable SDK 0.2.0 passes all golden legacy tool/resource/error fixtures byte-for-byte.
-- [ ] Modern requests are stateless across handler instances and pass pinned conformance.
-- [ ] JSONResponse true/false pass JSON/SSE final-response and failure fixtures.
-- [ ] A translation table proves no modern response emits `-32040...-32043`.
-- [ ] Route matrix covers both versions, all credentials, and absent/allowed/hostile/null/lookalike Origin; hostile Origin never reaches a handler.
-- [ ] Valid native auth with absent Origin succeeds; allowed Origin without auth returns 401; hostile Origin with valid auth returns 403.
-- [ ] Phase 2 proves typed `m2m_onboarding` and `m2m_org` principals route independently, but lifecycle dispatch remains absent until Phase 3 registration; calling or listing an unregistered lifecycle tool cannot succeed.
-- [ ] Missing extension capability fails before dispatch.
-- [ ] Missing/malformed `protocolVersion` or `clientCapabilities`, malformed-present `clientInfo`, absent OAuth extension for M2M, and every header/body version or method/name mismatch fail with the exact modern code before dispatch; omitted `clientInfo` succeeds for a conformant external agent.
-- [ ] HS256/RS256 confusion and unknown-kid/stale-cache cases fail closed.
-- [ ] Memory and 413/503 tests are deterministic and leak-free.
-- [ ] Runtime/policy/contract hashes match exact-mirror sources.
+- [x] Immutable SDK 0.2.0 passes all golden legacy tool/resource/error fixtures byte-for-byte.
+- [x] Modern requests are stateless across handler instances and pass pinned conformance.
+- [x] JSONResponse true/false pass JSON/SSE final-response and failure fixtures.
+- [x] A translation table proves no modern response emits `-32040...-32043`.
+- [x] Route matrix covers both versions, all credentials, and absent/allowed/hostile/null/lookalike Origin; hostile Origin never reaches a handler.
+- [x] Valid native auth with absent Origin succeeds; allowed Origin without auth returns 401; hostile Origin with valid auth returns 403.
+- [x] Phase 2 proves typed `m2m_onboarding` and `m2m_org` principals route independently, but lifecycle dispatch remains absent until Phase 3 registration; calling or listing an unregistered lifecycle tool cannot succeed.
+- [x] Missing extension capability fails before dispatch.
+- [x] Missing/malformed `protocolVersion` or `clientCapabilities`, malformed-present `clientInfo`, absent OAuth extension for M2M, and every header/body version or method/name mismatch fail with the exact modern code before dispatch; omitted `clientInfo` succeeds for a conformant external agent.
+- [x] HS256/RS256 confusion and unknown-kid/stale-cache cases fail closed.
+- [x] Memory and 413/503 tests are deterministic and leak-free.
+- [x] Runtime/policy/contract hashes match exact-mirror sources.
 
 #### Manual verification
 
-- [ ] Explicit 2025 returns the frozen shape; explicit 2026 returns modern JSON or SSE.
-- [ ] SDK 0.2.0 and a native M2M client use the same `/mcp` URL concurrently.
-- [ ] Modern `tools/list` changes with principal/state while cache scope remains private.
+- [x] Explicit 2025 returns the frozen shape; explicit 2026 returns modern JSON or SSE.
+- [x] SDK 0.2.0 and a native M2M client use the same `/mcp` URL concurrently.
+- [x] Modern `tools/list` changes with principal/state while cache scope remains private.
+
+#### Phase 2.4 dual-profile endpoint evidence (2026-08-20)
+
+- OSS authority PR `dsmolchanov/nerve-oss#51` merged as `4458b1abe6d4fb66e73ab29b3fb14da67af97ccc`. Its build-tagged artifact test and `scripts/ci/test_mcp_dual_profile_artifact.sh` download the immutable published SDK 0.2.0 wheel, require SHA-256 `9f0a7d6316bf47eef64236f96d1a7a151b5517641930422b1b16711da8b02540`, and run it against the real hybrid router.
+- The manual proof ran the immutable SDK and the native MCP 2026 Go client concurrently against one test-server `/mcp`. A rendezvous barrier held dispatch until both explicit protocol profiles arrived; the legacy leg authenticated through the real Cloud-key path, while the modern leg presented a valid PS256 bearer that passed the real M2M verifier, issuer/audience/claim validation, and durable service-token binding before `tools/list` returned a private non-empty catalog.
+- The proof remains manual in Phase 2 as planned; it is not a PyPI-dependent required CI gate. Phase 8 owns promotion of exact SDK artifacts into the mandatory candidate contract matrix. Post-merge OSS-to-Cloud sync run `32379539516` reported `no shared paths changed`, as expected for OSS-only proof code.
+
+#### Phase 2.4 explicit wire-shape evidence (2026-08-20)
+
+- OSS authority PR `dsmolchanov/nerve-oss#52` merged as `f4974bcf0587ef5a5731d47271ae5f01bdf4f188`. `TestExplicitProtocolProfilesReturnFrozenLegacyAndModernWire` drives the real shared `NewRouter` with explicit protocol selection for both profiles.
+- The 2025 leg requires HTTP 200, a nonempty `MCP-Session-Id`, and the exact frozen initialize bytes for protocol `2025-11-25`. Through the same router, the explicit 2026 leg exercises both `application/json` and `text/event-stream`, validates one complete final JSON-RPC response, requires private `cacheScope`, and rejects any legacy protocol marker in the modern response.
+- Targeted, full-suite, vet, race, and diff checks passed; required GitHub CI and `codex-review-window` were green before merge. Post-merge OSS-to-Cloud sync run `32410709432` succeeded and reported `no shared paths changed`, as expected for the OSS-only contract proof. No runtime behavior, dependency, workflow, release tag, or deployment changed.
+
+#### Phase 2.4 dynamic private-catalog evidence (2026-08-20)
+
+- OSS authority PR `dsmolchanov/nerve-oss#53` merged as `022f0d2542216af24fffee63fc3c64274ca52b7b`. `TestModernToolsListChangesWithPrincipalAndPolicyStateAndStaysPrivate` reuses one real modern handler and issues successive `tools/list` requests as an onboarding principal, a read-only org principal, a compose-capable org in an allowed state, and the same compose-capable org after policy denial.
+- The observed catalogs change from empty to `get_thread,list_threads`, then to `compose_email`, then back to empty. Every response independently requires `cacheScope=private` and `ttlMs=5000`, proving the list remains advisory and cannot become shared while principal or live policy state changes.
+- Targeted, full-suite, vet, race, and diff checks passed; required GitHub CI and `codex-review-window` were green before merge. Post-merge OSS-to-Cloud sync run `32412378739` succeeded and reported `no shared paths changed`, as expected for the OSS-only proof. No runtime behavior, dependency, workflow, release tag, or deployment changed.
+
+#### Phase 2 immutable SDK 0.2.0 golden evidence (2026-08-20)
+
+- OSS authority PR `dsmolchanov/nerve-oss#54` merged as `1a6c29cb600d88c69f472e1fafaa7e7b2fb67175`. It keeps the immutable `nerve-email==0.2.0` wheel pinned to SHA-256 `9f0a7d6316bf47eef64236f96d1a7a151b5517641930422b1b16711da8b02540` and reuses one set of exact newline-terminated golden bytes between the real legacy handler tests and the artifact-level SDK consumer proof.
+- The wheel's real `NerveClient` consumes the frozen initialize, `tools/list`, and `resources/list` responses and requires the exact ordered catalog and resource values. Separate fresh sessions consume all four frozen business-error fixtures: exact `NerveQuotaError/-32040`, `NerveSubscriptionError/-32041`, `NerveRateLimitError/-32042` with SDK and wire retry `12`, and exact generic `NerveError/-32043` with raw wire retry `3`. The last distinction is intentional and honest: immutable SDK 0.2.0 has no dedicated idempotency exception and does not expose that retry field on its generic exception, while the frozen wire metadata remains verified byte-for-byte.
+- Artifact-tagged SDK execution, legacy wire goldens, full-suite, vet, race, and diff checks passed. Codex's first review caught the imprecise idempotency assertion; fix commit `bd6bf84c066d519a295328e452e3c6526fff967d` requires the exact generic type and independently inspects raw retry metadata. All required gates were green before merge. Post-merge OSS-to-Cloud sync run `32414830385` succeeded and reported `no shared paths changed`; no runtime behavior, dependency, workflow, release tag, or deployment changed.
+
+#### Phase 2 cross-instance stateless and pinned conformance evidence (2026-08-20)
+
+- OSS authority PR `dsmolchanov/nerve-oss#55` merged as `f37149df623163858965088c29cf0e211d45642d`. A single modern SDK client sends its `server/discover` probe and subsequent `tools/list` request through a round-robin boundary to two separately constructed `NewSDKHandler` and runtime instances; each instance receives exactly one request, so the second request cannot depend on process-local bootstrap or session state.
+- The same tagged test then runs the official server consumer from pinned conformance commit `81eb1c3edaed87d7fd585d7b80186da7a2960660` twice at protocol `2026-07-28`, once against each instance, and requires every `tools-list` and wire-schema check to pass without an expected-failure baseline. The gate imports the pinned runner module directly because that snapshot's aggregate CLI imports a Node-22-only tier-check helper even though repository CI intentionally runs Node 20; this keeps the official scenario/validation implementation while avoiding an unrelated CLI import failure.
+- Full pinned conformance/ext-auth, Go full-suite, vet, MCP race, shell-path, and diff checks passed locally and in required GitHub CI. Two reviews found the same relative override-path class; fix `07e5c17bd395230b5962ddd3b65c6297840e0350` canonicalizes both checkout overrides, adds relative/absolute regression coverage, and records the permanent repository invariant. The final `codex-review-window` passed before auto-merge. Post-merge OSS-to-Cloud sync run `32420125208` succeeded and reported `no shared paths changed`; no runtime behavior, dependency, release tag, or deployment changed.
+
+#### Phase 2 JSON/SSE final-response and failure evidence (2026-08-20)
+
+- OSS authority PR `dsmolchanov/nerve-oss#56` merged as `41bdc0405e08cdace8926d0121b53c4eedfb0d03`. `TestModernContractJSONResponseModesEmitOneFinalResponse` drives the real modern handler with `JSONResponse=true` and `false`; each mode must emit its expected base media type and exactly one matching final JSON-RPC response for both a successful `tools/list` and a schema-rejected `compose_email` tool result with `isError=true`.
+- `TestModernJSONAndSSEContractFixtures` provides the parser-side matrix for both media types. It accepts result and JSON-RPC error finals, including multiline SSE with comments and an unrelated notification, and rejects malformed or truncated JSON, wrong IDs, missing result/error members, duplicate finals, malformed SSE fields, EOF without a final response, and missing or unsupported content types.
+- Targeted and full-suite Go tests, vet, MCP race, and diff checks passed locally; required GitHub CI and `codex-review-window` were green before auto-merge. Post-merge OSS-to-Cloud sync run `32421456346` succeeded and reported `no shared paths changed`, as expected for OSS-only contract tests. No runtime behavior, dependency, workflow, release tag, or deployment changed.
+
+#### Phase 2 modern error-partition evidence (2026-08-21)
+
+- OSS authority PR `dsmolchanov/nerve-oss#57` merged as `5befd381c764deb0b416617b923cc677242bce83`. The explicit translation table maps quota, inactive subscription, rate limit, idempotency-in-progress, and unexpected failures to modern string codes and exact retryability metadata; none can reuse the frozen legacy JSON-RPC range `-32040...-32043`.
+- The real modern SDK handler is exercised for quota, subscription, rate, and idempotency failures in both `JSONResponse=true` and `false` modes. A recording transport captures the actual request ID, base media type, and raw JSON or SSE response bytes; each raw response must contain exactly one matching final JSON-RPC response, a `CallToolResult` with `isError=true`, the expected structured error and retry metadata, and no legacy code anywhere on the emitted wire.
+- Codex review correctly rejected the first proof's re-marshalling of the SDK-decoded result as insufficient raw-wire evidence. Fix `8a8294f7c0fdf02505362f31516bc50a405bc415` added the recording transport and two-mode wire matrix; targeted and full-suite tests, vet, MCP race, required GitHub CI, and the final `codex-review-window` passed. Post-merge OSS-to-Cloud sync run `32423156914` succeeded and reported `no shared paths changed`; no runtime behavior, dependency, workflow, release tag, or deployment changed.
+
+#### Phase 2 protocol, credential, and Origin route-matrix evidence (2026-08-21)
+
+- OSS authority PR `dsmolchanov/nerve-oss#58` merged as `98651082e15e16285748c949e9a8d0b5be7b4477`. `TestRouterProtocolCredentialOriginMatrix` executes the full cross-product of legacy `2025-11-25` and modern `2026-07-28`; the five typed principals produced by the supported bootstrap, Cloud API key, legacy JWT, M2M onboarding, and M2M organization credential paths plus missing authentication; and absent, allowed, hostile-scheme, `null`, suffix-lookalike, and prefix-lookalike Origin states.
+- Every valid native principal with absent or allowed Origin authenticates exactly once, retains the same typed principal in context, receives the exact routed protocol marker, and reaches only the selected adapter. Missing authentication with absent or allowed Origin returns 401 without adapter dispatch. Every hostile, `null`, or lookalike Origin returns 403 before authentication and before either adapter, including cases whose configured authenticator would otherwise return a valid principal.
+- Targeted and full-suite tests, vet, MCP race, diff checks, required GitHub CI, and `codex-review-window` passed before auto-merge. Post-merge OSS-to-Cloud sync run `32423671705` succeeded and reported `no shared paths changed`; no runtime behavior, dependency, workflow, release tag, or deployment changed.
+
+#### Phase 2 typed-principal lifecycle-absence evidence (2026-08-21)
+
+- OSS authority PR `dsmolchanov/nerve-oss#59` merged as `6582721bce82c1c6bc6fb88ab68eb679ef99da3c`. `TestSDKServerPhase2TypedM2MProfilesCannotListOrCallLifecycleTools` drives separately typed `m2m_onboarding` and `m2m_org` principals through the real modern handler. The onboarding profile lists zero tools while the organization profile retains the existing eight-tool catalog, proving that the principal kinds select independent profiles before Phase 3.
+- Neither profile can list any of `nerve_onboarding_start`, `nerve_onboarding_status`, `nerve_onboarding_verify_domain`, or `nerve_onboarding_close`. Direct `tools/call` attempts for all four names under both principals must return HTTP 400 with exact JSON-RPC `-32602` and `unknown tool`; no lifecycle callback is registered or reachable.
+- Targeted and full-suite tests, vet, MCP race, diff checks, required GitHub CI, and `codex-review-window` passed before auto-merge. Post-merge OSS-to-Cloud sync run `32424308026` succeeded and reported `no shared paths changed`; no runtime behavior, dependency, workflow, release tag, or deployment changed.
+
+#### Phase 2 missing-extension pre-dispatch evidence (2026-08-21)
+
+- OSS authority PR `dsmolchanov/nerve-oss#60` merged as `1c5a6ff81638400559a9ce41d71f7943aefc0716`. `TestModernContractMissingOAuthExtensionFailsBeforeToolDispatch` sends a schema-valid modern `list_threads` call as a typed `m2m_org` principal with the required read scope but without the OAuth client-credentials extension.
+- The real modern handler must return HTTP 400 with exact SDK `MissingRequiredClientCapabilities` (`-32021`) and the stable `missing required client capabilities` message. A deliberately failing entitlement gate remains at zero calls, proving capability negotiation rejected the request before authorization or tool dispatch, and the shared memory budget returns to zero.
+- Full-suite tests, vet, targeted MCP race, diff checks, required GitHub CI, and `codex-review-window` passed before auto-merge. Post-merge OSS-to-Cloud sync run `32424934000` succeeded and reported `no shared paths changed`; no runtime behavior, dependency, workflow, release tag, or deployment changed.
+
+#### Phase 2 modern metadata and header matrix evidence (2026-08-21)
+
+- OSS authority PR `dsmolchanov/nerve-oss#61` merged as `956cc62686c87d3f96a14b0482867f97628cf4ca`. The 35-case `TestModernContractRejectsMetadataAndHeaderFailuresBeforeDispatch` matrix drives the real Cloud router and modern handler with a typed `m2m_org` principal and a schema-valid `list_threads` call whenever tool dispatch is applicable.
+- The matrix covers missing, duplicate, and unsupported protocol headers; missing, null, non-string, empty, and header-mismatched protocol metadata; missing or non-object capabilities; absent or malformed OAuth extension/settings shapes; malformed and over-bound `clientInfo`; and missing, duplicate, malformed, or mismatched method/name headers and body fields. Every failure requires the applicable exact SDK `-32020`, `-32021`, or `-32022` code and exact structured version/capability data, zero entitlement dispatch, and a fully released memory budget.
+- The companion tests retain the conformant omitted-`clientInfo` success path, prove the extension is M2M-only, and cover the inverse legacy initialize header/body version mismatch before session creation. Full-suite tests, vet, targeted MCP race, diff checks, required GitHub CI, and `codex-review-window` passed before auto-merge. Post-merge OSS-to-Cloud sync run `32425806766` proved base `1c5a6ff81638400559a9ce41d71f7943aefc0716` to head `956cc62686c87d3f96a14b0482867f97628cf4ca` and reported `no shared paths changed`; no runtime behavior, dependency, workflow, release tag, or deployment changed.
+
+#### Phase 2 authentication algorithm isolation evidence (2026-08-21)
+
+- OSS authority PR `dsmolchanov/nerve-oss#62` merged as `2d284544b451fc0e7d4d8aa976f4cedf586dd1b2`. `TestAuthenticateRequestM2MRejectsAlgorithmAndClaimConfusion` proves issuer access tokens accept only PS256, reject RS256 and unknown `kid`, and fail closed on principal/claim confusion. `TestRemoteJWKSRefreshAndBoundedStaleUse` proves an unknown `kid` receives one bounded refresh and is never authorized from stale cache, while a known key is usable only inside the explicit stale bound.
+- The same authority change closes the downgrade path in the legacy verifier: `TestAuthenticateRequestRejectsHS256M2MClaimDowngrade` rejects M2M `token_use`/`token_kind`, `client_id`, and `generation` markers on an otherwise valid HS256 token while retaining the documented legacy HS256 `token_use=service` compatibility path. Full-suite tests, vet, targeted auth race, required GitHub CI, and `codex-review-window` passed before auto-merge.
+- Cloud sync PR `dsmolchanov/nerve-cloud#124` merged as `6ecd1c0fd9ff7035ea4bfe717722446e7937f104` with source lock `2d284544b451fc0e7d4d8aa976f4cedf586dd1b2`. Its non-required conformance job exposed that the Cloud-consumed script was not anchored to the OSS checkout and was absent from the exact-mirror manifest. OSS follow-ups `#63` (`46f85b1b9910d372afee216364f334bbc0f4efd4`) and `#64` (`5dcc69168792394c56bfdf25892594d6a3f16fd6`) fixed both boundaries. Successor Cloud sync PR `#125` merged as `1d8705acf73d6fdcd1a3b299e78b07b3058b3f21` with that exact OSS source lock; `exact-mirror`, `go-checks`, `mcp-conformance`, and the fail-closed review window all passed. No release tag or deployment changed.
+
+#### Phase 2 bounded-memory failure evidence (2026-08-21)
+
+- OSS authority PR `dsmolchanov/nerve-oss#65` merged as `666d681fc4255cd5b7d305eb1a63fdeadfe43102`. `TestSDKHandlerChunkedAndExceptionalReadsReleaseWorstCaseReservation` drives the real modern handler with unknown-length bodies and observes the full `maxModernRequestMemoryBytes` reservation before the first read.
+- The matrix proves an over-limit chunked body returns HTTP 413 and that normal parse failure, `context.Canceled`, and a panicking body reader all return or unwind with `MemoryBudget.Used()==0`. The existing deterministic shared-budget matrix retains the complementary HTTP 503 plus `Retry-After` exhaustion path and successful-release/reacquisition proof.
+- Full-suite tests, vet, the targeted MCP/memguard race suites, conformance, runtime-manifest generation, Docker policy-artifact verification, required GitHub CI, and `codex-review-window` passed before auto-merge. Post-merge OSS-to-Cloud sync run `32428834350` proved base `5dcc69168792394c56bfdf25892594d6a3f16fd6` to head `666d681fc4255cd5b7d305eb1a63fdeadfe43102` and reported `no shared paths changed`; no Cloud source lock, runtime behavior, release tag, or deployment changed.
+
+#### Phase 2 exact-mirror runtime hash evidence (2026-08-21)
+
+- OSS authority PR `dsmolchanov/nerve-oss#66` merged as `f51cc9682568a40ec966e6a527117dfa5d27a1e4`. `TestGenerateRuntimeManifestScript` now recomputes the MCP contract and autonomous outbound policy SHA-256 values directly from the repository bytes, compares them to the generated runtime manifest, and proves both source paths remain members of `sync-manifest.yaml`'s `exact-mirror` set.
+- The first review correctly found that ambient source-path overrides could make the default-source proof nondeterministic. The merged head isolates all generator inputs, explicitly binds the default proof to repository contract/policy/Core paths, and adds `TestGenerateRuntimeManifestScriptHonorsSourceOverrides` to exercise contract and policy overrides together. A local regression invocation with all three ambient source paths set to nonexistent files passed, proving the tests neither ignore supported explicit overrides nor inherit unrelated process configuration.
+- Full-suite tests, vet, targeted race suites, exact-mirror validation, conformance, runtime-manifest generation/export, Docker build, policy artifact verification, required GitHub CI, and the fresh-head fail-closed review window passed before auto-merge. Post-merge OSS-to-Cloud sync run `32429670477` proved base `666d681fc4255cd5b7d305eb1a63fdeadfe43102` to head `f51cc9682568a40ec966e6a527117dfa5d27a1e4` and reported `no shared paths changed`; the already-proven Cloud source lock remains `5dcc69168792394c56bfdf25892594d6a3f16fd6`, and no runtime artifact, release tag, or deployment changed.
 
 **Phase gate:** Do not tag the runtime. Onboarding lifecycle, provider fencing, mailbox creation, and outbound enforcement must enter the same tested candidate.
 
@@ -1100,24 +1239,42 @@ Connect the four generation-bound modern tools to Cloud 0009 through one replay-
 
 #### Automated verification
 
-- [ ] Concurrent same-key start creates one graph and returns one onboarding ID.
-- [ ] Same key with different normalized input is a typed conflict.
-- [ ] Different key while a generation is live cannot create a second org.
-- [ ] A DB failure at every graph step rolls back org, entitlement, usage, and flags.
-- [ ] Lost MCP/internal HTTP response followed by status returns the persisted graph.
-- [ ] Onboarding token cannot submit or override client ID, org ID, owner org ID, domain ID, inbox ID, or generation.
-- [ ] Delegation rejects bad signature, stale timestamp, nonce replay, redirect, or mismatched bearer/client.
-- [ ] After the first token expires, a new onboarding-scope exchange selects the same live generation and can status/verify/close it.
-- [ ] A token bound to closed generation N cannot start N+1; a fresh assertion exchange plus new key can.
-- [ ] With N+1 live, a still-unexpired N token can read only N's closed result, verify is rejected for closed N, and idempotent close returns only N; it cannot observe, verify, close, or otherwise affect N+1.
-- [ ] `m2m_org` never exposes lifecycle tools and mixed onboarding/email scope exchange is rejected.
-- [ ] After Phase 3 registration, `m2m_onboarding` lists exactly Start/Status/VerifyDomain/Close, hidden lifecycle calls from `m2m_org` fail, and every profile assertion is cache-private.
-- [ ] Reconciler retries and assertion-JTI cleanup are exercised with a real PostgreSQL service.
+- [x] Concurrent same-key start creates one graph and returns one onboarding ID.
+- [x] Same key with different normalized input is a typed conflict.
+- [x] Different key while a generation is live cannot create a second org.
+- [x] A DB failure at every graph step rolls back org, entitlement, usage, and flags.
+- [x] Lost MCP/internal HTTP response followed by status returns the persisted graph.
+- [x] Onboarding token cannot submit or override client ID, org ID, owner org ID, domain ID, inbox ID, or generation.
+- [x] Delegation rejects bad signature, stale timestamp, nonce replay, redirect, or mismatched bearer/client.
+- [x] After the first token expires, a new onboarding-scope exchange selects the same live generation and can status/verify/close it.
+- [x] A token bound to closed generation N cannot start N+1; a fresh assertion exchange plus new key can.
+- [x] With N+1 live, a still-unexpired N token can read only N's closed result, verify is rejected for closed N, and idempotent close returns only N; it cannot observe, verify, close, or otherwise affect N+1.
+- [x] `m2m_org` never exposes lifecycle tools and mixed onboarding/email scope exchange is rejected.
+- [x] After Phase 3 registration, `m2m_onboarding` lists exactly Start/Status/VerifyDomain/Close, hidden lifecycle calls from `m2m_org` fail, and every profile assertion is cache-private.
+- [x] Reconciler retries and assertion-JTI cleanup are exercised with a real PostgreSQL service.
 
 #### Manual verification
 
 - [ ] A canary onboarding client sees only four tools and creates the durable graph without any API-key response.
 - [ ] Email-scope exchange is denied before active while onboarding-scope exchange remains available.
+
+#### Phase 3.1 OSS onboarding interface and lifecycle-tool evidence (2026-08-21)
+
+- OSS foundation PR `dsmolchanov/nerve-oss#67` merged as `2a69ea3aabdebc0d3a9fb810713767006d5b6edb`. It added the fixed-origin, no-redirect, HMAC-signed delegation client; bounded request/response envelopes; original-bearer and generation-bound authority forwarding; timeout-as-outcome-unknown behavior; closed/redacted business-error decoding; and client-level coverage for all four operations. Eight fail-closed Codex review generations completed before merge, including fixes for post-dispatch transport ambiguity, presence-aware response decoding, canonical non-nil UUIDs, and the closed public error enum.
+- OSS registration PR `dsmolchanov/nerve-oss#68` merged as `a079350e444fbb7a9da86df7c8af49f1d2c87307`. The production app now constructs the bounded delegation client only from a complete onboarding configuration, fails startup on partial or unsafe configuration, and registers it on the real MCP server before the handler is built. An unconfigured runtime remains fail-closed with no lifecycle tools.
+- The real modern HTTP handler proves that `m2m_onboarding` lists exactly Start/Status/VerifyDomain/Close with private caching, preserves the original bearer and typed principal for delegation, and rejects authority-bearing input. Every `m2m_org` profile lists none of the lifecycle tools and direct hidden calls cannot reach the provisioner. Semantic failures and untyped failures from every provisioner method are redacted into codes admitted by each tool's published output schema.
+- Targeted and full-suite Go tests, vet, MCP race, conformance, runtime-boundary and manifest checks, Docker build, policy-artifact verification, and migration image smoke passed. The first review of PR `#68` found the missing production wiring and an unclosed error schema; fix `67b810be54522bec26e378b73df39e0abf8d90c8` closed both classes in one commit, and the second review returned no P0/P1 before auto-merge. No runtime tag or production deployment changed.
+
+#### Phase 3.2 Cloud delegated boundary and atomic graph evidence (2026-08-21)
+
+- Cloud PR `dsmolchanov/nerve-cloud#129` merged as `55f6f072b075799bbaacf4a33dd7f427c028cd89`. It added the four-operation internal HMAC boundary, durable one-use delegation nonces, strict presence-aware input/result validation, generation-exact service dispatch, and the single-transaction organization/trial/usage/attachment/policy graph with rollback injection at every mutation seam. No Cloud API key is minted.
+- The first Cloud review found that a five-minute onboarding bearer did not identify the client assertion key that minted it. OSS authority PR `dsmolchanov/nerve-oss#69` merged as `759a99514b026147cfd8758a3b7cc25f3cf3cee2`; four OSS review generations closed canonical raw-base64url thumbprint validation, whitespace normalization, and the build-tagged dual-profile producer. Cloud `#129` then atomically advanced `oss-source.lock`, emitted the mandatory `client_kid` claim, rejected revoked keys before nonce consumption, and rechecked the same key under the client lifecycle lock before every mutation.
+- The final Cloud head proved all four operations reject a bearer whose issuing client key was revoked without consuming the delegation nonce or reaching the executor. Exact-mirror, MCP conformance including the immutable SDK 0.2 dual-profile artifact, full Go/PostgreSQL, vet, race, Cloud E2E, security, and artifact checks passed before auto-merge. Automated sync PR `#130` was closed only after its four blobs were proven byte-identical in `#129`.
+
+#### Phase 3 token-maintenance completion evidence (2026-08-22, local WIP)
+
+- A real OAuth/JWT/PostgreSQL matrix expires the first onboarding token, reacquires the same live generation, closes N, rejects stale-N start, creates N+1 only from a fresh assertion exchange, and proves a still-live N token can observe or idempotently close only N while every attempted N+1 override is rejected without changing its row.
+- Scheduled reconciliation now removes assertion-JTI rows in bounded committed batches, reports a follow-up when the batch budget is exhausted, and retries the remaining backlog on the next run while retaining not-yet-expired rows. The focused token/reconciler/CLI packages and vet pass on the integrated local bytes; remote merge and operator-canary evidence remain pending.
 
 ---
 
@@ -1133,6 +1290,9 @@ Run every external operation through a lease/version fence and make cleanup—in
 
 **Cloud files**
 
+- `internal/store/agent_onboardings.go`
+- `internal/store/agent_onboarding_leases.go`
+- `internal/store/agent_onboarding_leases_test.go`
 - `internal/onboarding/service.go`
 - `internal/onboarding/state.go`
 - `internal/reconcile/service.go`
@@ -1140,13 +1300,20 @@ Run every external operation through a lease/version fence and make cleanup—in
 
 **Changes**
 
-- Workers claim bounded batches with `SKIP LOCKED` and acquire a time-bounded lease by CAS over onboarding ID, state, and workflow version.
+- Workers discover bounded batches without row locks, acquire client advisory and parent-row locks in deterministic client order, then recheck and claim with `SKIP LOCKED`; lease update and audit remain atomic. This preserves the lifecycle parent-before-child lock order used by close and revocation and prevents an audit-FK deadlock.
 - Before an external call, persist provider intent, stable operation ID, and workflow version, commit, then call without holding a DB transaction.
-- Apply a result only when state, workflow version, provider operation, and lease still match.
+- Every claim increments a monotonic claim attempt used as a per-lease token. Persist, defer, rotate, and result application require that exact attempt in addition to state, workflow version, provider operation, owner, and live lease, so reclaim by the same logical worker still fences every stale handle.
+- Apply a result only through the explicit forward lifecycle matrix. In particular, deprovisioning can never return to provisioning, DNS-pending, or active even when every supplied fence otherwise matches.
 - Lease expiry permits takeover by provider lookup and stable identity rather than blind recreation.
-- `close` increments workflow version and enters deprovisioning, fencing every verifier/provisioner already in flight.
+- `close` and client revocation increment workflow version, clear any earlier-stage retry delay, and enter deprovisioning, fencing every verifier/provisioner already in flight while making cleanup immediately claimable.
 - A stale success that created or enabled a resource schedules compensating disable/delete and cannot reactivate the generation.
 - Permanent failures store a bounded terminal reason and enter deprovisioning. There is no `failed` state outside live uniqueness and cleanup.
+
+#### Phase 4.1 fenced provider lifecycle evidence (2026-08-21)
+
+- Cloud PR `dsmolchanov/nerve-cloud#131` merged as `18b04e8b3fe024d769bc9507d7a44a90597f7737`. It added bounded PostgreSQL-clock leases, stable provider operation identities, per-claim monotonic attempt fences, exact-result CAS, provider-unknown deferral/readback, fenced cleanup-intent rotation, and atomic audit evidence.
+- Four fail-closed review generations closed: cleanup identity rotation after a workflow-version transition; same-owner lease takeover; the explicit forward-only provider transition matrix; immediate cleanup after an earlier retry delay; and deterministic client-parent-before-onboarding lock order that removes the audit-FK deadlock with close/revoke. PostgreSQL barrier tests cover both lifecycle parents, every stale mutation handle, and `SKIP LOCKED` behavior.
+- Full Cloud Go/PostgreSQL, race, vet, exact-mirror, MCP conformance, SDK 0.2 compatibility, Cloud E2E, security, artifact, and release-lock checks passed before auto-merge. No deployment or activation state changed.
 
 #### 4.2 Linearize token shutdown and cleanup start
 
@@ -1154,8 +1321,11 @@ Run every external operation through a lease/version fence and make cleanup—in
 
 - `internal/onboarding/service.go`
 - `internal/store/agent_onboardings.go`
+- `internal/store/agent_onboarding_close_test.go`
+- `internal/store/oauth_lifecycle_barrier_test.go`
 - `internal/store/store_tokens.go`
 - `internal/oauth/issuer.go`
+- `internal/oauth/token_test.go`
 - `cmd/nerve-oauth-clients/main.go`
 
 **Changes**
@@ -1166,14 +1336,25 @@ Run every external operation through a lease/version fence and make cleanup—in
 - `revoke-client` performs the same lifecycle transition, marks the client unusable, and thereby invalidates both onboarding and org tokens before the reconciler finishes cleanup.
 - No email-scope token can be issued after the transition commits.
 
+#### Phase 4.2 token-shutdown evidence (2026-08-21)
+
+- Cloud PR `dsmolchanov/nerve-cloud#132` merged as `1504bc8877eaa35b059d39c244ecde2170416d66`. Close, key revoke, client revoke, onboarding-token issuance, and email-token issuance now share the client/generation lock order and recheck authority under the same transaction.
+- Two-connection PostgreSQL barriers cover close and client revocation against both onboarding- and email-token issuance in both commit orders. Close leaves at most a same-generation poll/close token, while client/key revocation leaves no newly issued usable token; targeted org-token revocation and outbound suspension commit before later provider cleanup.
+- Full Cloud Go/PostgreSQL, exact-mirror, MCP conformance, SDK, Cloud E2E, security, artifact, runtime-lock, and fail-closed Codex review gates passed before merge. No production deployment or activation state changed.
+
 #### 4.3 Fence subscription creation and cancel generation-owned Stripe state
 
 **Cloud files**
 
 - `internal/onboarding/service.go`
 - `internal/billing/stripe.go`
+- `internal/billing/stripe_test.go`
 - `internal/store/store_billing.go`
 - `internal/store/agent_billing_workflows.go`
+- `internal/store/agent_billing_workflows_test.go`
+- `internal/store/agent_onboardings.go`
+- `internal/store/agent_outbound_evidence.go`
+- `internal/store/oauth_machine_clients.go`
 - `internal/reconcile/service.go`
 - `cmd/nerve-reconcile/main.go`
 
@@ -1188,6 +1369,15 @@ Run every external operation through a lease/version fence and make cleanup—in
 - Revoke paid evidence when close starts. Never transfer subscription, quota, evidence, or entitlement to generation N+1.
 - Permanent Stripe API failure raises an alert and DLQ record but cannot produce a false `closed` state.
 
+#### Phase 4.3 generation-owned billing evidence (2026-08-21)
+
+- The Cloud implementation persists the generation-, workflow-, billing-profile-, and exact resolved-price-bound Stripe intent before dispatch; the versioned stable create identity carries the bounded price ID so catalog rotation cannot alter an outcome-unknown replay. Direct subscription creation uses only the registered customer/payment-method mandate, validates the registered plan/spend/currency ceiling, writes the exact four authority metadata fields, and returns only bounded local state.
+- Common lifecycle locks and workflow/profile CAS linearize create against close in both commit orders. Close revokes exact paid evidence and converts every attempted or materialized create into durable cancellation work; only a never-dispatched intent or an authoritative provider 4xx create rejection is locally proven absent. Local configuration failures and malformed successful responses are not absence proof. Duplicate observation of the same already-attached Stripe object is idempotent and does not spuriously fence a live workflow. Profile replacement or disable is fenced until the historical workflow is terminal and cancellation-confirmed.
+- Immediate cancellation uses `invoice_now=false` and `prorate=false`; timeout and HTTP 408/409/429/5xx remain provider-unknown and retry with the original idempotency key. DELETE 404 requires authoritative GET readback; canceled or double-404 confirms cleanup. Metadata mismatch and permanent failures become bounded durable non-retry workflow records, remain operator-visible, and cannot create a false terminal proof. The non-retry disposition applies to every dispatcher: scheduler, active subscription snapshots, known-subscription invoices, and metadata-resolved invoices; none may accelerate another provider call until explicit operator recovery, while an exact-ID canceled webhook may still confirm cleanup.
+- Autonomous subscription and invoice webhooks validate exact client/org/onboarding/generation metadata. Subscription plan validation accepts only the registered plan lookup key or the exact Stripe price ID embedded in the persisted create identity, so webhook correctness does not depend on Stripe returning an optional lookup key. Late active or trialing snapshots remain historical, cannot mint entitlement or paid evidence, and accelerate cancellation. Unknown autonomous invoices cannot fall through to a legacy customer mapping, and replacement subscriptions clear stale autonomous provenance so cleanup cannot target foreign state.
+- Before an unbound autonomous webhook can attach or confirm an object, Nerve requires an actually attempted `provider_unknown` create, replays the persisted create identity, and accepts the webhook only if its subscription ID matches that provider-authoritative result. A never-attempted or confirmed-absent workflow rejects the webhook before any Stripe POST, including after billing-profile replacement. A malformed successful create retains its materialized ID in monotonic quarantined mandatory-cancellation state across unknown/permanent cancellation results and late snapshots; an exact-ID canceled provider response or signed webhook can confirm cleanup without trusting the rejected metadata, while every active/entitlement path still requires the full metadata proof.
+- The scheduled reconciler now resolves bounded batches of provider-unknown creates and requested cancellations and exports resolved/pending/permanent counters. Its cleanup client is constructed without mutable price-catalog discovery: exact-price create readback comes from the persisted key and DELETE requires no catalog, so a catalog-only outage cannot block billing or unrelated maintenance. PostgreSQL integration tests cover exact replay/conflict, mandate immutability, cap rejection rollback, delayed create, pre-attachment sibling webhooks, post-absence webhook rejection with zero provider calls, malformed initial/readback materialization followed by both unknown/permanent cancellation and exact-ID webhook confirmation, permanent non-retry across all three webhook acceleration consumers, created/updated/deleted snapshots carrying the persisted price ID without a lookup key, authoritative rejection through both close and client revoke, duplicate provider observations, both lock orders, paid-evidence revocation, create and cancel timeout replay, late active/trialing/invoice events, catalog-independent cleanup, provider readback, and foreign-provenance isolation. Targeted PostgreSQL regressions and compile checks pass locally; full CI/review evidence remains the merge gate for this change.
+
 #### 4.4 Complete cleanup and reconnect
 
 **Cloud files**
@@ -1195,14 +1385,16 @@ Run every external operation through a lease/version fence and make cleanup—in
 - `internal/onboarding/service.go`
 - `internal/reconcile/service.go`
 - `cmd/nerve-reconcile/main.go`
+- `internal/store/agent_onboardings.go`
+- `internal/store/agent_onboarding_leases.go`
+- `internal/store/agent_onboarding_cleanup.go`
 - `internal/store/outbox.go`
 - `internal/emailtransport/outbox_worker.go`
-- `internal/store/email_tenancy.go`
 
 **Changes**
 
 - Close takes the per-org policy lock, increments the policy epoch, forbids new outbox claims/provider starts, and terminalizes generation-owned `queued` rows as `policy_revoked`. Every `sending` row must either be fenced before `provider_started_at` or drain to a terminal/readback-resolved outcome after its earlier linearization point.
-- Retire a managed alias before disabling—but never cascading-deleting—the generation-owned inbox, revoke its grant, or transition a custom-domain claim to releasing; then reconcile provider removal.
+- Retire a managed alias and disable—but never cascading-delete—the generation-owned inbox in one locked transaction, then revoke its grant; Cloud 0009's deployed inbox trigger requires the disabled inbox write to execute before the alias state becomes `retired`, while the atomic commit exposes neither intermediate state. Transition a custom-domain claim to releasing only after the inbox is disabled, then reconcile provider removal.
 - Use the specialized Cloud-only autonomous tombstone predicate only after proving every retained inbox belongs to this onboarding generation, is disabled, has no queued/sending outbox row, and has no unresolved provider-started operation. Existing legacy tombstone behavior remains unchanged.
 - `closed` requires terminal Stripe evidence for every generation billing workflow (`canceled` or proven absent), retired/released mailbox and domain state, the outbox barrier, provider readback proving disabled/deleted, no live `m2m_org` generation token, and a tombstoned org with retained disabled inbox/audit rows. Short-lived onboarding status/close tokens do not block this state.
 - A repeated close returns the same progress. An old start/close idempotency key returns its persisted generation.
@@ -1212,24 +1404,31 @@ Run every external operation through a lease/version fence and make cleanup—in
 
 #### Automated verification
 
-- [ ] Verify-versus-close and verify-versus-reconcile races cannot overwrite a newer workflow version or restore active state.
-- [ ] Expired-lease takeover resumes by stable provider identity without duplicating resources.
-- [ ] Stale provider success schedules compensating cleanup.
-- [ ] Permanent provisioning failure remains uniquely live in deprovisioning until cleanup completes.
-- [ ] Two-connection barriers prove close versus email issuance leaves no usable email token; close versus onboarding issuance leaves at most a poll/close-only token for N; and `revoke-client` versus either issuance leaves neither token usable, in both commit orders.
-- [ ] Close revokes email tokens and outbound permission before the first Stripe/provider call.
-- [ ] Subscribe-versus-close tests cover both transaction commit orders, a delayed create response, provider-unknown lookup, `requires_action`, and a webhook that materializes `trialing`/active after close; all converge to cancellation without paid evidence or a false `closed`.
-- [ ] Stripe timeout remains deprovisioning and retry uses the same idempotency key.
-- [ ] `closed` is impossible while a subscription-create outcome remains unresolved, an in-flight/provider-started email is unresolved, or a required subscription cancellation/provider cleanup is unconfirmed.
-- [ ] Two-connection barriers cover enqueue, claim, provider-start, complaint, and close in both commit orders: no provider start occurs after the new policy epoch, queued rows terminalize, and an earlier provider start keeps close pending until terminal/readback.
-- [ ] A worker holding a payload cannot race inbox cleanup into an untracked send; inbox rows remain disabled/retained, MarkSent detects zero affected rows, and the autonomous tombstone predicate refuses any nonterminal outbox state.
-- [ ] FK/retention tests prove close preserves outbox/message/audit evidence and never invokes cascading DeleteInboxForOrg.
-- [ ] Generation 2 receives distinct org/trial state and inherits no subscription/evidence.
+- [x] Verify-versus-close and verify-versus-reconcile races cannot overwrite a newer workflow version or restore active state.
+- [x] Expired-lease takeover resumes by stable provider identity without duplicating resources.
+- [x] Stale provider success schedules compensating cleanup.
+- [x] Permanent provisioning failure remains uniquely live in deprovisioning until cleanup completes.
+- [x] Two-connection barriers prove close versus email issuance leaves no usable email token; close versus onboarding issuance leaves at most a poll/close-only token for N; and `revoke-client` versus either issuance leaves neither token usable, in both commit orders.
+- [x] Close revokes email tokens and outbound permission before the first Stripe/provider call.
+- [x] Subscribe-versus-close tests cover both transaction commit orders, a delayed create response, provider-unknown lookup, `requires_action`, and a webhook that materializes `trialing`/active after close; all converge to cancellation without paid evidence or a false `closed`.
+- [x] Stripe timeout remains deprovisioning and retry uses the same idempotency key.
+- [x] `closed` is impossible while a subscription-create outcome remains unresolved, an in-flight/provider-started email is unresolved, or a required subscription cancellation/provider cleanup is unconfirmed.
+- [x] Two-connection barriers cover enqueue, claim, provider-start, complaint, and close in both commit orders: no provider start occurs after the new policy epoch, queued rows terminalize, and an earlier provider start keeps close pending until terminal/readback.
+- [x] A worker holding a payload cannot race inbox cleanup into an untracked send; inbox rows remain disabled/retained, MarkSent detects zero affected rows, and the autonomous tombstone predicate refuses any nonterminal outbox state.
+- [x] FK/retention tests prove close preserves outbox/message/audit evidence and never invokes cascading DeleteInboxForOrg.
+- [x] Generation 2 receives distinct org/trial state and inherits no subscription/evidence.
 
 #### Operator verification
 
 - [ ] Killing a reconciler after each external call converges to active or fully closed without duplicate provider resources.
 - [ ] Closing a paid canary confirms Stripe cancellation before tombstone and permits a clean reconnect.
+
+#### Repository implementation evidence (2026-08-21)
+
+- The first close now advances the org policy epoch exactly once even when complaint handling had already set `email_outbound_suspended=true`; repeated close remains idempotent. Existing Core 0029 claim/provider-start CAS and recovery paths provide the queued/provider-start drain barrier.
+- Scheduled reconciliation prepares managed cleanup in one locked transaction (disable exact inbox, irreversibly retire its alias, then revoke the grant), moves exact autonomous custom-domain claims to `releasing`, deletes the persisted Resend domain identity outside the transaction, and removes the claim/Core domain only after idempotent provider absence proof.
+- The Cloud-only tombstone predicate refuses close for nonterminal Stripe workflow state, unresolved onboarding provider intent/lease state, live generation tokens, ownership claims, queued/sending or unresolved provider-started outbox work, any foreign/active inbox, an unretired managed alias, an active grant, or an attached custom domain. It soft-tombstones the org while retaining the exact disabled inbox and its mailbox/outbox/audit evidence, then exposes N+1 onboarding with a distinct org and billing reference.
+- PostgreSQL regressions cover already-suspended close, provider-start drain, stale `MarkSent` claim loss, Stripe confirmation, managed alias/inbox/grant cleanup, custom-domain provider proof, retained inbox/message/outbox/audit evidence, idempotent close, and clean N+1 reconnect. Reconciler and CLI metrics report confirmed versus pending onboarding closures.
 
 ---
 
@@ -1245,13 +1444,49 @@ Provision a ready mailbox from a protected preverified platform domain and make 
 
 **Cloud files**
 
+- `deploy/cloud/oss-source.lock`
 - `internal/config/config.go`
 - `internal/config/config_test.go`
 - `internal/store/managed_mailbox_aliases.go`
+- `internal/store/agent_onboarding_cleanup.go`
 - `internal/store/inboxes_manage.go`
+- `internal/store/inboxes_manage_test.go`
+- `internal/store/email_tenancy.go`
+- `internal/store/store.go`
+- `internal/store/store_orgs.go`
+- `internal/store/cloud_m2m_migration_test.go`
+- `internal/store/cloud_email_tenancy_test.go`
+- new `internal/store/inbound_forward_replay.go`
+- new `internal/store/migrations/cloud/0010_managed_mailbox_canonical_addresses.sql`
+- `internal/startup/migrations.go`
+- `internal/startup/migrations_test.go`
+- `internal/cloudapi/attachment_read_test.go`
+- `internal/cloudapi/handler_inboxes.go`
+- `internal/cloudapi/handler_domains.go`
+- `internal/cloudapi/handler_test.go`
+- `internal/cloudapi/resend_webhook.go`
+- `internal/cloudapi/resend_webhook_test.go`
+- `internal/reconcile/service_test.go`
+- `cmd/nerve-migrate/main_test.go`
+- `scripts/release/generate_control_plane_manifest.sh`
+- `scripts/ci/test_control_plane_manifest.sh`
+- `deploy/cloud/runtime.lock`
 - `deploy/cloud/env.example`
 - `docs/REPO_SPLIT_RUNBOOK.md`
+- `cmd/nerve-drill/main.go`
 - new `cmd/nerve-drill/managed_mailbox.go`
+- `cmd/nerve-drill/managed_mailbox_test.go`
+
+**OSS prerequisite files**
+
+- `AGENTS.repo-invariants.md`
+- `internal/store/inboxes_manage.go`
+- `internal/store/inboxes_manage_test.go`
+- `internal/store/email_tenancy.go`
+- `internal/store/store.go`
+- `internal/store/store_orgs.go`
+- `internal/tools/outbound_policy.go`
+- `internal/tools/outbound_policy_test.go`
 
 **Changes**
 
@@ -1260,16 +1495,24 @@ Provision a ready mailbox from a protected preverified platform domain and make 
 - Under the platform-domain advisory lock and with allocation disabled, snapshot every existing active and disabled inbox on the chosen canonical domain. Permanently backfill each address/inbox pair into the alias registry as legacy-reserved with its observed state, then prove a second snapshot has no unregistered address before enabling the platform writer. Never attach these reservations to an onboarding generation.
 - Fail closed on missing/mismatched configuration or readiness.
 - Disabling new allocation leaves the registered namespace and all retired aliases protected.
+- Land address canonicalization at every shared inbox boundary OSS-first, merge it, and atomically advance `oss-source.lock` with the byte-identical Cloud mirror. All supported Store reads and writers use one canonical-equivalence predicate for case, complete outer whitespace, and one trailing domain dot. Every identity-creating, reactivating, disabling, deleting, or cleanup Store path pre-discovers both address-candidate and linked-domain namespaces, takes every distinct canonical-domain transaction lock in bytewise sorted order before org-policy/row locks, re-reads the same identities under lock, detects ambiguity, and preserves valid legacy noncanonical stored bytes. New Store-created bytes are canonical. Add the recurring invariant and deterministic six-boundary plus lifecycle PostgreSQL matrices in OSS. Arbitrary direct SQL against a standalone Core database is outside this tranche; extending that guarantee requires a separately approved Core migration and release graph.
+- Canonicalize loaded legacy address bytes before Cloud HTTP replay/self-forward checks, inbound forwarding comparisons, outbound-domain authorization, and provider `From` construction. Stored evidence remains byte-identical; comparisons and emitted provider identities use the canonical value. Invalid or ambiguous legacy bytes fail closed. Artifact B on Cloud 9 deliberately retains Artifact A's forwarding validation, key, and provider-address bytes during rolling overlap. Each B forwarding/config transaction takes the shared Cloud-schema-boundary lock and selects behavior from the migration version under that lock: schema 9 uses exact A behavior, while schema 10 uses canonical replay/provider identity. Cloud 0010 takes the exclusive side, so it drains all schema-9 B transactions before enabling canonical behavior; the transition additionally proves every A Machine is gone before 0010 begins.
+- Add forward-only Cloud 0010 after deployed 0009. Under its upfront inbox/table fences, preflight the entire hosted active-address set for canonical collisions, replace Core 0024's lower-only partial index with a byte-preserving functional unique index over the exact shared equivalence, and reject new noncanonical address storage while still allowing unrelated updates and status-only reactivation of a unique legacy row. Then preflight the managed namespace and install the replacement alias trigger so linked platform identity or the canonical final address domain catches trailing-dot, extra-`@`, whitespace, foreign-link, and other bypass spellings. No address bytes are rewritten.
+- Widen only the nondeployable validation control-plane compatibility manifest through Cloud 0010 and refresh only the Cloud schema member of the runtime lock during implementation. Historical A remains immutable at Core `[28,28]`/Cloud `[8,9]`, as do the signed 0009 transition bundle/receipt and its A-specific issuance-off evidence. B and C are future release-set artifacts, not historical fixtures: Phase 9 constructs B at Core `[28,29]`/Cloud `[9,10]` and C at Core `[29,29]`/Cloud `[10,10]`.
+- Cloud 0010 is implementation-ready but not production-authorized until the final release set contains B plus exact protected `release-set-issuance-off` and `cloud-0010-transition` producer specifications. The first producer derives B from the set and emits fresh release-set-bound issuance-off evidence. The transition derives B, migration bytes, and the immutable 0009 receipt only from the release set; accepts only that fresh issuance-off receipt run ID/SHA as additional caller evidence; verifies the Core28/Cloud9 prestate; keeps issuance off; and emits a separately attested post-deploy 0010 receipt binding both predecessor receipt digests and the same release-set SHA. The existing A/schema-9 issuance-off workflow and historical 0009 evidence are never widened or reinterpreted.
 
 #### 5.2 Allocate under database-enforced namespace ownership
 
 **Cloud files**
 
 - `internal/store/managed_mailbox_aliases.go`
+- new `internal/store/managed_mailbox_allocation_test.go`
 - `internal/store/agent_onboardings.go`
 - `internal/store/email_tenancy.go`
+- `internal/store/email_tenancy_test.go`
 - `internal/store/inboxes_manage.go`
 - `internal/cloudapi/resend_webhook.go`
+- `internal/cloudapi/handler_agent_onboarding_test.go`
 - `internal/onboarding/service.go`
 
 **Changes**
@@ -1279,25 +1522,43 @@ Provision a ready mailbox from a protected preverified platform domain and make 
 - Reuse existing locked grant/inbox helpers; do not add a second public provisioning implementation.
 - Retry only a cryptographic collision; do not expose an address-choice loop to the client.
 - Persist the winning address before returning.
-- Retiring cleanup changes alias to `retired` before inbox deactivation and never deletes or reactivates it.
-- Cloud 0009 triggers reject ordinary create/ensure/address update/reactivate/direct SQL unless a registered address maps to the same reserved/active inbox ID; retired rejects even its old ID.
+- Retiring cleanup disables the exact generation-owned inbox before changing its alias to `retired` in the same transaction, matching the deployed Cloud 0009 and replacement Cloud 0010 trigger order; it never deletes or reactivates either identity.
+- Cloud 0009 installs the first guard; Cloud 0010's replacement triggers and functional index provide the final boundary. They reject ordinary create/ensure/address update/reactivate/direct SQL unless a registered address maps to the same reserved/active inbox ID; retired rejects even its old ID.
 - Database enforcement prevents catch-all enablement for the platform domain. Inbound routing drops/rejects unknown or retired recipients before the generic catch-all path.
 
 ### Success Criteria
 
 #### Automated verification
 
-- [ ] Platform owner/grantee confusion and inactive-domain cases fail closed.
-- [ ] Registration refuses any unaccounted pre-existing platform inbox; active and disabled rows are permanently backfilled, cannot be allocated/reactivated under another ID, and survive later inbox status changes.
-- [ ] Parallel allocations never share an address.
-- [ ] Injected failures after grant, alias, or inbox insert roll back the entire graph.
-- [ ] Same-key replay returns the same address.
-- [ ] Cleanup plus generation 2 produces a different address.
-- [ ] Ordinary create, ensure, address update, reactivate, catch-all, direct SQL, and concurrent races cannot claim a reserved or retired alias.
-- [ ] No non-alias inbox can activate under the platform domain and catch-all cannot be enabled.
-- [ ] Inbound to an unknown or retired platform address creates no inbox or thread.
-- [ ] Tenant can read/use the granted domain but cannot mutate or delete the owner's domain.
-- [ ] Inbound Resend delivery resolves to the correct grantee inbox/org.
+- [x] Platform owner/grantee confusion and inactive-domain cases fail closed.
+- [x] Registration refuses any unaccounted pre-existing platform inbox; active and disabled rows are permanently backfilled, cannot be allocated/reactivated under another ID, and survive later inbox status changes.
+- [x] Parallel allocations never share an address.
+- [x] Injected failures after grant, alias, or inbox insert roll back the entire graph.
+- [x] Same-key replay returns the same address.
+- [x] Cleanup plus generation 2 produces a different address.
+- [x] Ordinary create, ensure, address update, reactivate, catch-all, direct SQL, and concurrent races cannot claim a reserved or retired alias.
+- [x] No non-alias inbox can activate under the platform domain and catch-all cannot be enabled.
+- [x] Inbound to an unknown or retired platform address creates no inbox or thread.
+- [x] Tenant can read/use the granted domain but cannot mutate or delete the owner's domain.
+- [x] Inbound Resend delivery resolves to the correct grantee inbox/org.
+
+#### Phase 5.1 platform-domain registration evidence (2026-08-22)
+
+- Deployment configuration now carries only the allocation gate, owner-org UUID, and platform org-domain UUID; production identifiers remain outside the repository. Enabled-without-identity, partial identity, and malformed UUIDs fail config load. Disabling allocation retains the configured identity so the database namespace remains addressable and protected.
+- The Cloud-only registration transaction takes the canonical-domain advisory lock, locks the live owner and exact domain, requires canonical/active/fully DNS-verified/receiving-enabled/catch-all-disabled readiness, inserts new platform rows disabled, backfills every active or disabled inbox as an immutable legacy reservation, and proves a second snapshot contains no missing or foreign mapping before enabling allocation. Revalidation is idempotent and does not rewrite a legacy reservation when its inbox later becomes disabled.
+- Existing exact registrations may always move to disabled even after domain or owner readiness degrades; enabling and first registration still require the full readiness proof. Namespace triggers continue rejecting unknown active and disabled inboxes while the allocation state is disabled.
+- `nerve-drill managed-mailbox configure|status` operates on deployment configuration. Configure requires an operator actor and atomically records hashed input/output evidence plus a replay ID with the registration transaction. The runbook documents the disabled-first activation sequence and permanent-reservation invariant.
+- PostgreSQL regressions cover foreign owner, inactive/unverified/receiving-disabled/deleted-owner refusal, active and disabled legacy snapshot backfill, permanent refusal to allocate or reactivate a legacy-disabled address under another inbox, conflicting foreign reservation rollback, concurrent ordinary inbox creation behind the advisory lock, idempotent revalidation after inbox status change, degraded emergency disable, and continued namespace protection.
+- UUID identities are normalized to their canonical semantic spelling at configuration and store boundaries. Reservation additionally requires the exact live, active-client, provisioning managed-mailbox onboarding and grantee identity with no prebound mailbox resources.
+- OSS and Cloud canonicalize every address-based create, ensure, lookup, default-inbox, inbound-resolution, and reactivation boundary. Equivalent case/outer-whitespace/trailing-dot inputs converge under one lock; all six read/create/ensure surfaces plus external-reference replay preserve valid legacy bytes, refuse semantic duplicates, and fail closed on ambiguous historical state.
+- Cloud 0010 globally rejects duplicate active canonical identities, atomically replaces the lower-only active index with the shared byte-preserving functional index, and rejects new noncanonical storage. It also closes the deployed 0009 managed-trigger gap for trailing-dot, extra-`@`, whitespace, linked-only, and other spellings. Candidate and linked canonical namespaces use the same deterministic bytewise order in Go and SQL (`COLLATE "C"`) before advisory acquisition. Its schema-9 preflight is serialized in both commit orders, rejects already-committed bypass/collision rows before the trigger swap, accepts exact unique active/disabled legacy reservations, preserves legacy bytes, and is forward-only.
+- B on Cloud 9 emits the same forwarding idempotency key and provider `To`/`From` bytes as A. A deterministic boundary test holds a schema-9 forwarding transaction, proves Cloud 0010 waits on the exclusive schema-boundary lock, then proves the first post-0010 transaction uses canonical replay/provider identity. Historical A forwarding rows remain replayable after a semantically equivalent config spelling is touched, while true different destinations remain independent.
+
+#### Phase 5.2 atomic managed-mailbox allocation evidence (2026-08-22, local WIP)
+
+- The server generates exactly `agent-` plus lowercase unpadded Base32 of 128 cryptographically random bits and a separate UUID inbox identity. One authority-locked transaction creates the graph, permanently reserves that exact alias/inbox tuple, ensures the owner-to-grantee grant, creates the exact-ID inbox, activates the alias, and persists the winning address while advancing the onboarding to active. Only alias/inbox cryptographic uniqueness collisions retry the complete transaction.
+- Twelve parallel real-PostgreSQL allocations produce twelve distinct canonical addresses. Same-key replay returns the exact onboarding/address/inbox/grant graph, while failure injection after alias, grant, and inbox creation rolls back the organization and every allocation child. Close/cleanup disables the inbox before irreversible alias retirement; N+1 receives a different address and inbox, and the retired recipient no longer resolves.
+- The public delegated boundary proves collision retry is invisible to the client, inbound delivery lands in the exact grantee org, and unknown or retired recipients create no inbox, message, or thread. An app-role fixture with actual `UPDATE` and `DELETE` privileges proves write RLS exposes zero owner-domain rows to the grantee while its active grant remains readable and usable. An independent final P0/P1 review of the repaired local bytes is clean; remote source-authority, review, and operator evidence remain pending.
 
 #### Manual verification
 
@@ -1315,18 +1576,66 @@ Serialize legacy and autonomous ownership through one canonical-domain claim and
 
 ### Changes Required
 
+#### 6.0 Freeze the Phase 6 source-authority inventory
+
+The Phase 6 dependency direction and repository ownership are part of the
+security boundary. The following inventory is normative; a source-lock advance
+is invalid unless both `sync-manifest.yaml` copies contain the same
+classification and every exact-mirror path is byte-identical:
+
+| Authority | Files | Manifest treatment |
+|---|---|---|
+| OSS-first exact mirror | `internal/emailaddr/**`; `internal/domains/canonical.go`; `internal/domains/canonical_test.go`; `internal/store/store_orgs.go`; `internal/store/org_domains.go`; `internal/store/org_domains_test.go`; `internal/store/domain_ownership_claims.go`; `internal/store/legacy_domain_lifecycle.go`; `internal/store/legacy_domain_lifecycle_test.go`; `internal/emailtransport/providers/resend/resend_domains.go`; `internal/emailtransport/providers/resend/resend_domains_test.go`; `docs/MCP_Contract.md`; `sync-manifest.yaml` | Explicit `exact-mirror` entries. The complete email-address package and tests share one authority. The lifecycle test uses an OSS test-local Cloud-9 schema fixture rather than making OSS depend on Cloud migrations. |
+| OSS/runtime only | `internal/mcp/**`, including onboarding and billing tool registration, catalog, invoker, protocol adapters, and runtime-only tests | Intentionally absent from every sync list. Runtime code must not import Cloud lifecycle or schema packages. |
+| Cloud only | `internal/cloudapi/handler_domains.go`; `internal/cloudapi/handler_domains_legacy_test.go`; `internal/cloudapi/handler_agent_onboarding_test.go`; `internal/store/provider_domain_quarantine.go`; `internal/store/agent_onboarding_domains.go`; `internal/store/agent_onboarding_domains_test.go`; `internal/store/agent_onboarding_domain_projection_test.go`; `internal/onboarding/service.go`; `internal/onboarding/service_test.go`; `internal/onboarding/state.go`; `internal/onboarding/provider_worker.go`; `internal/onboarding/resend_domain_provider.go`; `internal/onboarding/resend_domain_provider_test.go`; `internal/domains/instructions.go`; `internal/domains/verification.go`; `internal/domains/verification_test.go`; `internal/reconcile/service.go`; `internal/reconcile/service_test.go`; `internal/reconcile/onboarding_provider_worker_test.go`; Cloud command wiring under `cmd/**` | Explicit `cloud-only` entries where a same-name or patch-synced path could otherwise cross the boundary; all other listed Cloud-only paths remain non-mirrored. Provider/quarantine orchestration and its handler/scheduler tests never become runtime authority. |
+
+`internal/emailaddr` is the lower-level dependency. It must not import
+`internal/domains`. It may use the pinned IDNA profile only to validate an
+already-ASCII A-label; it never converts a U-label. The higher-level
+`internal/domains/canonical.go` exclusively performs U-label-to-A-label
+conversion with the pinned IDNA Lookup profile, then delegates the ASCII
+domain validation downward to `internal/emailaddr`. Copying only the
+canonical-domain wrapper would recreate the `emailaddr`↔`domains` cycle or
+give the two repositories different claim identities. `store_orgs.go` is
+shared compatibility behavior and is therefore reclassified from Cloud-only
+to exact mirror. The shared legacy lifecycle file owns only typed Store
+intent/CAS/absence-proof and cleanup due/claim/defer state; all provider I/O,
+quarantine mutation, HTTP handling, scheduling, and command construction stay
+Cloud-only. The shared MCP contract is the exact union of the OSS runtime
+onboarding/billing surface and the Cloud delegation semantics.
+
 #### 6.1 Put every domain path behind one claim
 
-**Cloud files**
+**OSS-first shared files**
 
+- `internal/emailaddr/emailaddr.go`
+- `internal/emailaddr/emailaddr_test.go`
 - `internal/domains/canonical.go`
+- `internal/domains/canonical_test.go`
+- `internal/store/store_orgs.go`
 - `internal/store/org_domains.go`
+- `internal/store/org_domains_test.go`
+- `internal/store/domain_ownership_claims.go`
+- new `internal/store/legacy_domain_lifecycle.go`
+- new `internal/store/legacy_domain_lifecycle_test.go`
+- OSS and Cloud `sync-manifest.yaml`
+
+**Cloud-only files**
+
+- new `internal/store/agent_onboarding_domains.go`
+- new `internal/store/agent_onboarding_domains_test.go`
+- new `internal/store/agent_onboarding_domain_projection_test.go`
+- `internal/store/provider_domain_quarantine.go`
 - `internal/cloudapi/handler_domains.go`
+- new `internal/cloudapi/handler_domains_legacy_test.go`
+- `internal/cloudapi/handler_test.go`
 - `internal/onboarding/service.go`
+- `internal/onboarding/state.go`
 - `internal/reconcile/service.go`
 
 **Changes**
 
+- Author canonical-domain and shared Store lock/finalization changes in OSS first, mirror them byte-for-byte into Cloud, and advance `oss-source.lock` only after the OSS authority merge. Use the same IDNA Lookup profile for U-label/A-label, case, and trailing-dot convergence in both repositories.
 - Acquire one global transaction advisory lock derived only from canonical domain; never include org ID.
 - Under that lock create/reconcile `domain_ownership_claims` for legacy REST and autonomous onboarding alike.
 - Treat every foreign pending, provider-owned, or releasing claim as a conflict regardless of claim expiry. Under the canonical lock, an expired pending claim is first fenced into `releasing` and its owner workflow into `deprovisioning`; it cannot be overwritten or rebound.
@@ -1337,35 +1646,80 @@ Serialize legacy and autonomous ownership through one canonical-domain claim and
 
 #### 6.2 Run the provider workflow under lifecycle fencing
 
-**Cloud files**
+**OSS-first shared files**
+
+- `internal/emailtransport/providers/resend/resend_domains.go`
+- `internal/emailtransport/providers/resend/resend_domains_test.go`
+- new `internal/store/legacy_domain_lifecycle.go`
+- new `internal/store/legacy_domain_lifecycle_test.go`
+- `internal/store/org_domains.go`
+- `internal/store/org_domains_test.go`
+- `internal/store/domain_ownership_claims.go`
+
+**Cloud-only files**
 
 - `internal/onboarding/service.go`
+- `internal/onboarding/provider_worker.go`
+- new `internal/onboarding/resend_domain_provider.go`
+- new `internal/onboarding/resend_domain_provider_test.go`
+- `internal/store/provider_domain_quarantine.go`
 - `internal/domains/instructions.go`
 - `internal/domains/verification.go`
-- `internal/emailtransport/providers/resend/resend_domains.go`
-- `internal/store/org_domains.go`
+- new `internal/domains/verification_test.go`
+- `internal/store/agent_onboarding_leases.go`
+- `internal/store/agent_onboarding_leases_test.go`
+- `internal/store/agent_onboarding_cleanup.go`
+- `internal/store/agent_onboarding_close_test.go`
+- `internal/store/agent_outbound_evidence.go`
 - `internal/reconcile/service.go`
+- `internal/reconcile/service_test.go`
+- `internal/reconcile/onboarding_provider_worker_test.go`
+- `internal/cloudapi/handler_domains.go`
+- new `internal/cloudapi/handler_domains_legacy_test.go`
+- `cmd/nerve-control-plane/main.go`
+- `cmd/nerve-control-plane/main_test.go`
+- `cmd/nerve-reconcile/main.go`
+- `cmd/nerve-reconcile/main_test.go`
 
 **Changes**
 
+- Author the shared Resend client in OSS first with repository-neutral Nerve transport identity, then mirror it byte-for-byte into Cloud; Cloud-only lifecycle orchestration may consume it but must not fork its retry, redaction, or exact-ID semantics.
 - Persist pending Core domain and ownership claim before external work.
 - Perform provider create/lookup/verify/receiving-enable/disable/delete outside DB transactions using stable operation IDs.
-- Unknown outcomes remain resumable only when canonical provider-domain lookup matches the workflow's persisted provider intent/fence or a Phase 1 explicitly adopted inventory record. A provider object found only by canonical name with no matching ownership provenance is quarantined, never claimed as this workflow's timeout result.
+- Unknown outcomes remain resumable only through the exact persisted provider-domain ID or a Phase 1 explicitly adopted inventory record. Resend domain creation has no provider-native idempotency key or operation/fence metadata, so a provider object found only by canonical name after an uncertain create cannot match the workflow's intent cryptographically: it is quarantined and never auto-adopted or recreated. An explicit protected adoption receipt is the only path that may bind that object to the workflow.
 - Persist complete DNS records/checks and transition to `dns_pending`.
 - Apply results only under the current workflow version and lease. Close/expiry fences in-flight verification and moves the claim to releasing.
 - A stale create/enable success initiates compensating disable/delete. Permanent provisioning errors enter deprovisioning; no state escapes cleanup.
+- The scheduled reconciler consumes the legacy cleanup due/claim/defer Store
+  substrate only through an injected provider interface. For an exact identity
+  it commits the cleanup claim, performs exact-ID GET, receiving-disable,
+  DELETE, and final exact-ID GET outside every Store transaction, and releases
+  local state only on authoritative same-ID 404. Provider uncertainty retains
+  the exact identity and clears the lease for bounded retry; a present final
+  readback remains failed/releasing. `awaiting_provider_proof` performs bounded
+  canonical inventory and quarantine only, never adoption or mutation, and
+  defers fairly. An open quarantine prevents provider mutation and cannot
+  relabel the already durable exact local identity as provider-only. Command
+  construction remains a separate approval-gated activation boundary: a nil
+  provider leaves the consumer inert and claims no rows.
+- Reconcile every active autonomous custom domain at least once per fifteen minutes. A confirmed ownership, provider-verification, MX, or receiving-capability loss demotes it to `dns_pending`, revokes effective compose evidence, advances the policy epoch, and retains the generation-owned inbox for recovery. Unknown transport outcomes do not revoke readiness until an authoritative readback succeeds.
 
 #### 6.3 Require complete live readiness and instructions
 
-**Contract/docs files**
+**OSS-first contract file**
 
 - `docs/MCP_Contract.md`
+
+**Cloud docs/files**
+
 - `docs/TENANT_GUIDE.md`
 - `internal/onboarding/service.go`
+- `internal/cloudapi/handler_agent_onboarding_test.go`
 - `sdk/python` examples
 
 **Changes**
 
+- Synthesize the authoritative MCP contract in OSS as a union: preserve the complete Phase 7 billing tool contract and the complete Phase 6 delegated-onboarding contract, then mirror those exact bytes into Cloud. Neither section may overwrite or omit the other.
 - Activate only after ownership challenge, SPF, DKIM, inbound MX, provider verified status, and receiving-enabled readback all succeed.
 - Never accept caller-supplied verified state.
 - Create the requested inbox transactionally after provider checks. Keep legacy public domain semantics but use the stricter autonomous predicate.
@@ -1377,18 +1731,18 @@ Serialize legacy and autonomous ownership through one canonical-domain claim and
 
 #### Automated verification
 
-- [ ] Canonical case/IDN/trailing-dot variants resolve to one claim.
-- [ ] Legacy-versus-autonomous and autonomous-versus-autonomous pending races produce one winner.
-- [ ] Migration preflight rejects ambiguous existing claims.
-- [ ] Legacy pending GC cannot delete autonomous work or bypass provider cleanup.
-- [ ] Expired-pending create-versus-GC and unknown-provider-outcome races never rebind the claim until the old provider identity is proven absent/removed and the old claim is released.
-- [ ] Provider timeout and lease takeover do not duplicate provider domains.
-- [ ] A provider-only orphan or mismatched provider ID can never be adopted by canonical-name lookup without the explicit preflight/adopt receipt; writer enable remains blocked while quarantine is unresolved.
-- [ ] Verify-versus-close cannot restore active state; stale success is compensated.
-- [ ] SPF/DKIM without MX/receiving remains dns_pending.
-- [ ] Only full readiness creates the inbox and domain-scoped compose permission.
-- [ ] Domain revocation or receiving failure removes effective domain compose permission.
-- [ ] A claim is reusable only after confirmed provider cleanup and release.
+- [x] Canonical case/IDN/trailing-dot variants resolve to one claim.
+- [x] Legacy-versus-autonomous and autonomous-versus-autonomous pending races produce one winner.
+- [x] Migration preflight rejects ambiguous existing claims.
+- [x] Legacy pending GC cannot delete autonomous work or bypass provider cleanup.
+- [x] Expired-pending create-versus-GC and unknown-provider-outcome races never rebind the claim until the old provider identity is proven absent/removed and the old claim is released.
+- [x] Provider timeout and lease takeover do not duplicate provider domains.
+- [x] A provider-only orphan or mismatched provider ID can never be adopted by canonical-name lookup without the explicit preflight/adopt receipt; writer enable remains blocked while quarantine is unresolved.
+- [x] Verify-versus-close cannot restore active state; stale success is compensated.
+- [x] SPF/DKIM without MX/receiving remains dns_pending.
+- [x] Only full readiness creates the inbox and domain-scoped compose permission.
+- [x] Domain revocation or receiving failure removes effective domain compose permission.
+- [x] A claim is reusable only after confirmed provider cleanup and release.
 
 #### Manual verification
 
@@ -1412,7 +1766,13 @@ Separate reply from compose, make autonomous policy fail closed, remove inbound-
 
 - `internal/mcp/catalog.go`
 - `internal/mcp/invoker.go`
-- `internal/mcp/billing.go`
+- `internal/mcp/invoker_test.go`
+- new `internal/mcp/billing.go`
+- new `internal/mcp/billing_tools_test.go`
+- `internal/mcp/errors.go`
+- `internal/mcp/sdk_server.go`
+- `internal/mcp/sdk_server_test.go`
+- `internal/mcp/server.go`
 - `internal/auth/context.go`
 - `docs/MCP_Contract.md`
 - `docs/SECURITY.md`
@@ -1483,12 +1843,21 @@ The caller is the tenant's own authenticated `m2m_org` agent sending from that t
 
 - `internal/cloudapi/handler_billing.go`
 - `internal/billing/stripe.go`
+- `internal/billing/stripe_test.go`
+- `internal/cloudapi/handler.go`
 - `internal/cloudapi/resend_webhook.go`
+- new `internal/cloudapi/resend_webhook_abuse_test.go`
 - `internal/store/store_billing.go`
+- `internal/store/agent_paid_projection_test.go`
 - `internal/store/agent_billing_workflows.go`
+- new `internal/store/agent_abuse_projection.go`
+- new `internal/store/agent_abuse_projection_test.go`
 - `internal/store/agent_outbound_evidence.go`
 - `internal/store/feature_flags.go`
 - `internal/reconcile/service.go`
+- `internal/reconcile/service_test.go`
+- `cmd/nerve-reconcile/main.go`
+- `cmd/nerve-reconcile/main_test.go`
 
 **Changes**
 
@@ -1501,7 +1870,27 @@ The caller is the tenant's own authenticated `m2m_org` agent sending from that t
 - Add an audited operator clear that records reason and actor; do not delete history.
 - Remove the proposed trust command, earned-trust source, inbound-count projector, and earned-trust tests.
 - Treat inbound From/headers as message data only; they never mutate authorization.
-- Reconciler recomputes paid/suspension projection and detects drift.
+- A bounded Store reconciler recomputes paid/suspension projection from durable
+  authority and detects drift under the shared lock order. Constructing the
+  suspension repair from the scheduled production command is part of the same
+  explicit tenant-wide abuse-policy activation as the signed-webhook projector.
+  Before that activation, the scheduled command may consume only the read-only
+  drift list and export its bounded count.
+- The scheduled paid-subscription readback consumer is constructed through a
+  separate injected read-only provider interface. A nil provider is inert and
+  does not list or mutate due workflows. When injected, it loads exact
+  generation/profile/workflow authority, performs Stripe GET outside every
+  Store transaction, captures the observation fence from PostgreSQL after the
+  provider call, validates exact subscription/customer/generation/price
+  provenance, and applies the existing Store CAS in a fresh transaction.
+  Exact 404 and non-qualifying authoritative status revoke; transport/auth/rate
+  uncertainty preserves only live unexpired proof; evidence expiry revokes;
+  and exact-GET provenance disagreement revokes compose authority without
+  rewriting the stored subscription to mismatched provider bytes. Close or
+  profile/version change wins the Store CAS. The command exports bounded
+  candidate/active/demoted/unknown/fenced metrics but deliberately does not
+  construct the provider until production billing activation is separately
+  authorized.
 
 #### 7.4 Reserve durable limits with matching events
 
@@ -1534,30 +1923,30 @@ The caller is the tenant's own authenticated `m2m_org` agent sending from that t
 
 #### Automated verification
 
-- [ ] Onboarding token cannot call any email tool.
-- [ ] Locked autonomous org can read/draft/reply but cannot list or call compose.
-- [ ] Autonomous policy missing/read-error/malformed denies M2M send while legacy behavior is unchanged.
-- [ ] Reply on an outbound-only thread fails and enqueues nothing.
-- [ ] Reply after multiple outbound messages still targets the latest real inbound sender.
-- [ ] Custom-domain evidence enables compose only for that owned domain.
-- [ ] Confirmed paid evidence enables org-wide compose, including managed mailbox.
-- [ ] Trial entitlement alone does not enable compose.
-- [ ] Spoofed From, self-mail, arbitrary Authentication-Results headers, and inbound volume never unlock compose.
-- [ ] Suspension overrides every scope/evidence path immediately, including a previously issued compose token.
-- [ ] Enqueue/claim/provider-start versus complaint/close barriers in both orders prove no provider start after the new epoch and correct drain/readback of the earlier linearization point.
+- [x] Onboarding token cannot call any email tool.
+- [x] Locked autonomous org can read/draft/reply but cannot list or call compose.
+- [x] Autonomous policy missing/read-error/malformed denies M2M send while legacy behavior is unchanged.
+- [x] Reply on an outbound-only thread fails and enqueues nothing.
+- [x] Reply after multiple outbound messages still targets the latest real inbound sender.
+- [x] Custom-domain evidence enables compose only for that owned domain.
+- [x] Confirmed paid evidence enables org-wide compose, including managed mailbox.
+- [x] Trial entitlement alone does not enable compose.
+- [x] Spoofed From, self-mail, arbitrary Authentication-Results headers, and inbound volume never unlock compose.
+- [x] Suspension overrides every scope/evidence path immediately, including a previously issued compose token.
+- [x] Enqueue/claim/provider-start versus complaint/close barriers in both orders prove no provider start after the new epoch and correct drain/readback of the earlier linearization point.
 - [ ] Core 0028→0029 migration preserves every legacy outbox row, leaves its fence columns null, and frozen legacy SQL-shape enqueue/claim/delivery fixtures remain green; artifact-level Core 29 compatibility is separately proven by R0 before production migration.
-- [ ] Core 0029 down succeeds only with no epoch rows or outbox fence evidence and refuses independently for a saved autonomous epoch, provider start, provider operation identity, or provider resolution timestamp.
-- [ ] Claim-versus-suspension and provider-start-versus-suspension/close two-connection fixtures cover both commit orders; a pre-fence row never calls the provider, while a post-fence row keeps cleanup nonterminal until resolved.
-- [ ] Crash after claim, after provider-start commit, after provider response, and before terminal persistence converges through the same provider operation identity without duplicate logical delivery or false `closed`.
-- [ ] One complaint suspends; bounce threshold obeys sample size and rate.
-- [ ] Multi-Machine concurrent sends cannot exceed durable limits.
-- [ ] Every counter increment has a matching event and a generic reconcile preserves the value.
+- [x] Core 0029 down succeeds only with no epoch rows or outbox fence evidence and refuses independently for a saved autonomous epoch, provider start, provider operation identity, or provider resolution timestamp.
+- [x] Claim-versus-suspension and provider-start-versus-suspension/close two-connection fixtures cover both commit orders; a pre-fence row never calls the provider, while a post-fence row keeps cleanup nonterminal until resolved.
+- [x] Crash after claim, after provider-start commit, after provider response, and before terminal persistence converges through the same provider operation identity without duplicate logical delivery or false `closed`.
+- [x] One complaint suspends; bounce threshold obeys sample size and rate.
+- [x] Multi-Machine concurrent sends cannot exceed durable limits.
+- [x] Every counter increment has a matching event and a generic reconcile preserves the value.
 - [x] Cross-org same-key, cross-tool same-key, and two-connection reserve-versus-reconcile fixtures prove no replay collision or lost update.
 - [x] Concurrent period-boundary update versus reconcile cannot exclude newly in-period events; a two-connection fixture proves both lock orderings.
-- [ ] Idempotent replay consumes one applicable unit/event and creates one outbox row.
-- [ ] Closing a paid generation removes compose immediately and never transfers it to reconnect.
-- [ ] Caller manipulation of needs_human_approval cannot bypass policy.
-- [ ] Autonomous billing rejects the legacy checkout route, caller org/generation/payment fields, missing/disabled mandate, cap violations, and `requires_action`; exact tool replay returns one subscription workflow.
+- [x] Idempotent replay consumes one applicable unit/event and creates one outbox row.
+- [x] Closing a paid generation removes compose immediately and never transfers it to reconnect.
+- [x] Caller manipulation of needs_human_approval cannot bypass policy.
+- [x] Autonomous billing rejects the legacy checkout route, caller org/generation/payment fields, missing/disabled mandate, cap violations, and `requires_action`; exact tool replay returns one subscription workflow.
 - [ ] Stripe tests cover `subscription.deleted -> late invoice.paid`, external cancellation while active, close versus invoice in both orders, provider readback disagreement, and crash between mutation and event processed marker; cancellation always wins.
 
 #### Manual verification
@@ -1637,6 +2026,8 @@ Build the immutable runtime and modern client candidates exactly once while pres
 - Cloud `scripts/ci/export_oss_tools_list.go.tmpl`
 - Cloud `deploy/cloud/oss-source.lock`
 - new Cloud `deploy/cloud/runtime-candidate.lock`
+- new Cloud `scripts/ci/fetch_runtime_candidate_manifest.sh`
+- new Cloud `scripts/ci/test_runtime_candidate_manifest_transport.sh`
 
 **Changes**
 
@@ -1673,20 +2064,20 @@ Build the immutable runtime and modern client candidates exactly once while pres
 
 #### Automated verification
 
-- [ ] SDK version constants, wheel metadata, filename patterns, and importlib version all equal 0.3.0.
+- [x] SDK version constants, wheel metadata, filename patterns, and importlib version all equal 0.3.0.
 - [ ] Official client conformance passes for 2026-07-28.
-- [ ] OAuth tests cover discovery, assertion, refresh, clock skew, replay response, and secret redaction.
-- [ ] Private-key tests cover PKCS#8/PKCS#1, PS256/explicit RS256, RSA-size and encryption rejection, derived/mismatched kid, deterministic clock/JTI, exact claims, single auth mode, and no secret leakage.
-- [ ] Candidate build installs exact hash-locked PyJWT 2.13.0 and cryptography 49.0.0 bytes and rejects dependency/hash drift.
-- [ ] 0.3.0 emits every required header/metadata/capability and parses JSON plus multiline/notification SSE.
-- [ ] Missing content type, wrong/duplicate ID, malformed/truncated SSE, cancellation, and EOF without final response fail safely.
-- [ ] Separate token-cache tests cover active, deprovisioning, expiry, close, and N-to-N+1 selection.
-- [ ] 0.3.0 modern tests cover all tool success/error schemas and result unwrapping.
+- [x] OAuth tests cover discovery, assertion, refresh, clock skew, replay response, and secret redaction.
+- [x] Private-key tests cover PKCS#8/PKCS#1, PS256/explicit RS256, RSA-size and encryption rejection, derived/mismatched kid, deterministic clock/JTI, exact claims, single auth mode, and no secret leakage.
+- [x] Candidate build installs exact hash-locked PyJWT 2.13.0 and cryptography 49.0.0 bytes and rejects dependency/hash drift.
+- [x] 0.3.0 emits every required header/metadata/capability and parses JSON plus multiline/notification SSE.
+- [x] Missing content type, wrong/duplicate ID, malformed/truncated SSE, cancellation, and EOF without final response fail safely.
+- [x] Separate token-cache tests cover active, deprovisioning, expiry, close, and N-to-N+1 selection.
+- [x] 0.3.0 modern tests cover all tool success/error schemas and result unwrapping.
 - [ ] 0.3.0 legacy mode passes against immutable v0.0.17 on Core 28 and R0 on Core 28/29 for existing email tools.
 - [ ] Exact published 0.2.0 wheel passes against vNext.
 - [ ] Candidate/source locks, frozen final semver, policy, manifest, and exact-mirror checks are green in the same Cloud PR while production runtime.lock still validates v0.0.17; rebuilding or changing manifest bytes is not a later release step.
-- [ ] The SDK publish workflow cannot be manually dispatched.
-- [ ] No hard-coded 0.2.0 build assertion remains except the explicit legacy-consumer fixture.
+- [x] The SDK publish workflow cannot be manually dispatched.
+- [x] No hard-coded 0.2.0 build assertion remains except the explicit legacy-consumer fixture.
 
 #### Manual verification
 
@@ -1699,19 +2090,20 @@ Build the immutable runtime and modern client candidates exactly once while pres
 
 ### Overview
 
-Replace temporary Artifact A with feature-complete Artifact B, record B as the permanent control-plane rollback floor, replace v0.0.17 with the behavior-equivalent R0 bridge while Core is still 28, apply additive Core 0029, and then deploy the `[29,29]` runtime plus contracted Artifact C. R0, runtime, and SDK remain unpublished candidates addressed only by immutable digest/SHA.
+Replace historical Artifact A with feature-complete Artifact B, designate B as the post-0010 control-plane rollback floor, replace v0.0.17 with the already attested non-semver R0 bridge while Core is still 28, apply forward-only Cloud 0010 under B, then apply additive Core 0029 and deploy the `[29,29]` runtime plus contracted Artifact C. The runtime and SDK remain unpublished candidates addressed only by immutable digest/SHA; R0 remains the separately attested bridge artifact embedded in the release set.
 
 ### Artifact identities
 
 | Artifact | Purpose | Core window | Cloud window |
 |---|---|---:|---:|
+| validation | Local CI-only current-tree artifact; non-publishable and non-runnable | checked-in head | checked-in head |
 | v0.0.17 | Immutable historical production baseline; pre-Core29 only | `[28,28]` | n/a |
 | R0 | Non-semver legacy bridge and authorized post-Core29 runtime rollback floor | `[28,29]` | n/a |
 | A | Historical Cloud migration-boundary predecessor from Phase 1 | `[28,28]` | `[8,9]` |
-| B | Final feature-complete Core/Cloud expand predecessor and rollback floor | `[28,29]` | `[8,9]` |
-| C | Normal contracted production control plane | `[29,29]` | `[9,9]` |
+| B | Final feature-complete Core/Cloud expand predecessor and permanent rollback floor | `[28,29]` | `[9,10]` |
+| C | Normal contracted production control plane | `[29,29]` | `[10,10]` |
 
-A and B are different immutable images. After B is proven, A is historical transition evidence and is no longer an operational rollback target. R0 is also a distinct immutable image: it retains v0.0.17 behavior while widening only the compiled Core window to `[28,29]`. The runtime candidate requires Core `[29,29]`; R0—not v0.0.17—is the independently attested below-vNext runtime fallback after Core 0029.
+A and B are different immutable images. B may return to A only while Core28/Cloud9 still holds; once Cloud 0010 commits, A is historical transition evidence and is no longer an operational rollback target. R0 is also a distinct immutable image: it retains v0.0.17 behavior while widening only the compiled Core window to `[28,29]`. R0 may return to v0.0.17 only before Core 0029; afterward R0—not v0.0.17—is the independently attested below-vNext runtime fallback. The runtime candidate requires Core `[29,29]`.
 
 ### Changes Required
 
@@ -1721,6 +2113,8 @@ A and B are different immutable images. After B is proven, A is historical trans
 
 - `internal/startup/migrations.go`
 - `internal/startup/migrations_test.go`
+- `internal/release/release_set.go`
+- `internal/release/release_set_test.go`
 - `deploy/cloud/Dockerfile.control-plane`
 - `.github/workflows/ci.yml`
 - `.github/workflows/deploy.yml`
@@ -1728,63 +2122,80 @@ A and B are different immutable images. After B is proven, A is historical trans
 - `.github/workflows/control-plane-deploy.yml`
 - new `.github/workflows/mcp2026-candidate.yml`
 - new `.github/workflows/mcp2026-runtime-mirror.yml`
+- new `.github/workflows/mcp2026-release-set-issuance-off.yml`
+- new `.github/workflows/mcp2026-cloud-0010-transition.yml`
+- `scripts/ci/verify_cloud_deploy_order.sh`
+- `schemas/mcp2026-release-set.schema.json`
+- new `schemas/mcp2026-release-set-issuance-off.schema.json`
+- new `scripts/release/generate_mcp2026_release_set_issuance_off_receipt.py`
+- new `scripts/ci/verify_mcp2026_release_set_issuance_off_receipt.py`
 - new `scripts/release/build_mcp2026_release_set.sh`
 - new `scripts/ci/verify_mcp2026_release_set.sh`
+- new `schemas/mcp2026-cloud-0010-transition-receipt.schema.json`
+- new `scripts/release/generate_mcp2026_cloud_0010_transition_receipt.py`
+- new `scripts/ci/verify_mcp2026_cloud_0010_transition_receipt.py`
+- new `scripts/ci/test_mcp2026_post_set_receipts.sh`
 - OSS candidate workflow from Phase 8
 - OSS R0 bridge workflow and receipt from Phase 0
 - `.github/workflows/publish-python-sdk.yml`
 
 **Changes**
 
-- Build B only after Phases 2-8 are complete. B contains final behavior and retains Cloud `[8,9]`; at schema 8 every 0009-dependent path remains issuance-off/inactive and cannot query a 0009 object.
-- Build C from an explicit contraction change. Restrict the B-to-C source diff to compiled Cloud minimum, compatibility tests, manifests, and release wiring; fail CI if business behavior changes.
+- Build B only after Phases 2-8 are complete. B contains final behavior and spans deployed Cloud 9 through forward-only Cloud 10. It does not support Cloud 8 because the signed A transition already crossed production and Cloud 0009 durable evidence forbids returning to 8.
+- Build C from an explicit contraction change. Restrict the B-to-C source diff to compiled Core and Cloud minima, compatibility tests, manifests, and release wiring; fail CI if business behavior changes.
 - Resolve the exact already-built Phase 8 runtime candidate and SDK 0.3 wheel by attested workflow-run identity and SHA; verify source, manifest, frozen semver, filename, and digests. Phase 9 never rebuilds either artifact.
 - Before release-set construction, run the protected mirror workflow with only the verified OSS candidate run ID and receipt SHA. Authenticate to Fly Registry, copy the exact candidate digest to a content-addressed non-semver `registry.fly.io/nerve-runtime:sha-...` tag without deployment or rebuild, and resolve both target index and linux/amd64 Machine digest. An already exact tag is an idempotent retry; any mismatch fails closed. Emit the signed runtime-mirror receipt defined in Phase 0.
 - Resolve and reverify both the Phase 0 historical v0.0.17 baseline receipt and the protected R0 bridge receipt. Release-set construction accepts only their protected run IDs/SHAs and the new candidate mirror receipt run ID/SHA; it accepts no raw Fly tag, baseline tag, bridge tag, patch, or digest.
 - Re-prove the frozen runtime semver and SDK filename remain unpublished before constructing the release set; a collision stops the release and requires a new plan revision/candidate build rather than manifest rewriting.
-- Generate/attest the canonical release set defined in Phase 0, binding A/B/C, runtime candidate and verified Fly mirror receipt, the historical v0.0.17 baseline member, the authorized R0 bridge member, SDK, schemas, contract, policy, exact mirrors, conformance pins, source SHAs, and workflow identities.
+- Generate/attest the canonical release set defined in Phase 0, binding historical A and its immutable 0009 transition evidence, including protected run/artifact/object locators sufficient to retrieve and reverify the canonical bundle and receipt without caller inputs; future B/C with distinct OCI index plus linux/amd64/Fly Machine digests; runtime candidate and verified Fly mirror receipt; the historical v0.0.17 baseline and authorized R0 bridge; SDK, schemas, contract, policy, exact mirrors, conformance pins, source SHAs, and workflow identities. It also binds Cloud head/tree 10, exact 0010 bytes and pre/post contract, B identity, and the protected release-set issuance-off and 0010 producer specifications/identities. The post-set issuance-off and post-deployment 0010 receipts are independently attested and name this release-set SHA; neither is hashed back into its parent set.
+- Define a distinct release-set issuance-off receipt schema/generator/verifier for exact B at Core28/Cloud9 with head10/pending0010, the release-set SHA, durable Machine inventory/digests, issuance control version/state, lock scope, producer identity, and timestamp. Do not widen or reinterpret `mcp2026-issuance-off.schema.json`, which remains the immutable Artifact A/Cloud8-or-9 historical evidence format.
+- The Cloud 0010 receipt consumes a fresh post-transition issuance-control observation and proves it remains disabled, durably bound to the same release-set SHA, and at the exact control version from the predecessor release-set issuance-off receipt. A hard-coded boolean or a changed/rebound control row cannot satisfy the transition.
 - Inject the verified release-set SHA and bounded signed canonical set/verification envelope at deployment time. B/C require it from their immutable artifact-role manifest even when every environment marker is absent. Each binary verifies the envelope offline and reports its build-manifest identity plus that runtime-bound release-set identity only after proving exact role/image/manifest/binary membership; no binary or manifest is rebuilt to embed the release-set hash.
-- Candidate deployment accepts only release-set run ID/SHA. Remove or disable raw image, tag, wheel, manifest, and digest inputs in `deploy.yml`, `runtime-deploy.yml`, and `control-plane-deploy.yml`; every candidate entry point must derive exact components from the verified set, and reusable child workflows reject calls without the parent verification receipt.
+- Candidate component selection accepts only release-set run ID/SHA. Remove or disable raw image, tag, wheel, manifest, and digest inputs in `deploy.yml`, `runtime-deploy.yml`, and `control-plane-deploy.yml`; every candidate entry point derives exact components from the verified set, and reusable child workflows reject calls without the parent verification receipt. Any B or C control-plane deploy on Cloud 10 additionally requires the independently attested 0010 receipt run ID/SHA bound to that set. The transition's exact Cloud10/B resume path may mint the first receipt; every later steady schema-10 deploy fails closed without it. Extend the central deploy-order verifier to enforce release-set issuance-off→B→0010→receipt ordering and the exact schema9/schema10 resume states.
 
 #### 9.2 Rehearse the final lifecycle and rollback graph
 
-- Restore a fresh production snapshot at Core 28/Cloud 9 including every onboarding lifecycle state, expired/active leases, domain claims, aliases, billing workflows, provider retries, tokens, usage meters, and legacy outbox states; rehearse v0.0.17→R0→B→Core 29→runtime candidate→C and the reverse C→B plus runtime-candidate→R0 paths on Core 29.
+- Restore a fresh production snapshot at Core 28/Cloud 9 including every onboarding lifecycle state, expired/active leases, domain claims, aliases, billing workflows, provider retries, tokens, usage meters, and legacy outbox states; rehearse v0.0.17→R0→B→Cloud 10→Core 29→runtime candidate→C and the reverse C→B plus runtime-candidate→R0 paths while retaining Core 29/Cloud 10.
 - Before building/deploying the candidate, run a claim-drift preflight proving every live Core domain has exactly one canonical ownership claim and no claim points at a missing/wrong live domain.
-- Run all six B manifest-listed database-mutating binaries across Core 28/29 and Cloud 8/9. Full autonomous behavior requires Core 29 plus Cloud 9; every predecessor combination proves legacy behavior, issuance-off refusal, and absence of unsupported-schema query/mutation before each binary's first side effect.
-- Run C on Core 29/Cloud 9 and prove all six manifest-listed database-mutating binaries reject Core 28 or Cloud 8 before listener, lease, provider call, or mutation.
-- Rehearse controlled C→B→C rollback on Core 29/Cloud 9 with no data rewrite or migration.
+- Run all six B manifest-listed database-mutating binaries across Core 28/29 and Cloud 9/10. Full autonomous behavior requires Core 29 plus Cloud 10; every predecessor combination proves legacy behavior, issuance-off refusal, and absence of unsupported-schema query/mutation before each binary's first side effect.
+- Run C on Core 29/Cloud 10 and prove all six manifest-listed database-mutating binaries reject Core 28 or Cloud 9 before listener, lease, provider call, or mutation.
+- Rehearse controlled C→B→C rollback on Core 29/Cloud 10 with no data rewrite or migration.
 - Rehearse controlled runtime-candidate→R0→runtime-candidate rollback on Core 29 with no schema change, using only release-set identities and proving every Machine digest.
 - Run immutable SDK 0.2 and exact candidate SDK 0.3 contracts against the release-set runtime.
 
 #### 9.3 Install B as rollback floor and contract to C
 
-1. Under the shared deploy lock, verify Core current 28/head 29/pending `[0029]` and Cloud current/head 9 with zero Cloud pending migrations plus the valid Phase 1 transition receipt.
+1. Under the shared deploy lock, verify Core current 28/head 29/pending `[0029]` and Cloud current 9/head 10/pending `[0010]`, plus the immutable signed Phase 1 transition receipt and its historical A-specific issuance-off evidence.
 2. Deploy the release-set R0 bridge on Core 28 from its content-addressed image. Prove every active/stopped runtime Machine is R0, its digest and `[28,29]` window match the signed receipt, production startup verification is enabled, and v0.0.17-equivalent legacy/SDK 0.2 contracts remain green.
 3. Deploy B web and reconciler while R0 serves Core 28; run all six manifest-listed compatibility commands and the legacy contract on Core 28/Cloud 9.
-4. Prove every active/stopped/scheduled control-plane Machine is B and record B in signed deployment evidence as the permanent control-plane rollback floor; record R0 as the runtime rollback floor.
-5. Apply Core 0029 with B's migrate binary. Before continuing, prove current/head 29, zero pending, preserved legacy rows/SQL behavior, exact Core schema hash, R0 startup/readiness, and legacy/SDK 0.2 contracts on the actual production R0 Machines.
-6. Deploy the release-set runtime candidate only from its verified content-addressed Fly mirror; prove every active/stopped runtime Machine, resolved linux/amd64 digest, `[29,29]` compatibility, and both legacy/modern contract smoke.
-7. Deploy C web; admit traffic only after the shared Core `[29,29]`/Cloud `[9,9]` readiness check.
-8. Converge reconciler to C only after web is green; run reconciler and migrate compatibility before mutation/schedule activation.
-9. Prove every web/reconciler Machine and binary digest/window is C and run both SDK contracts again.
+4. Prove every active/stopped/scheduled control-plane Machine is B at Core28/Cloud9 and record B in signed deployment evidence as the designated post-0010 control-plane rollback floor; record R0 as the runtime rollback floor. Until 0010 commits, exact B→A remains an authorized predecessor rollback.
+5. Invoke `mcp2026-release-set-issuance-off.yml` with only the release-set run ID/SHA. It derives B, verifies every durable control-plane Machine is exact B at Core28/Cloud9 with head10/pending0010, takes the common deploy/global-issuance lock, atomically records issuance off for this release-set SHA, and emits a fresh signed receipt. Raw image/schema inputs and the historical A receipt cannot satisfy this producer.
+6. Invoke only the release-set-bound Cloud 0010 transition with the final set and the fresh B issuance-off receipt run ID/SHA. It derives and verifies the immutable 0009 receipt from the set, re-verifies all three producer identities, permits only the known Core28/Cloud9+B prestate or an exact Core28/Cloud10+B resume, applies 0010 once, proves every Machine remains B and issuance remains off, and emits the separately attested 0010 receipt binding the release set plus both the 0009 and fresh issuance-off receipt digests. Cloud 0010 down is forbidden; after this commit A is no longer runnable and recovery is a forward fix under B.
+7. Apply Core 0029 with B's migrate binary only after verifying the 0010 receipt. Before continuing, prove Core current/head 29, Cloud current/head 10, zero pending, preserved legacy rows/SQL behavior, exact schema hashes, R0 startup/readiness, and legacy/SDK 0.2 contracts on the actual production R0 Machines.
+8. Deploy the release-set runtime candidate only from its verified content-addressed Fly mirror; prove every active/stopped runtime Machine, resolved linux/amd64 digest, `[29,29]` compatibility, and both legacy/modern contract smoke.
+9. Deploy C web; admit traffic only after the shared Core `[29,29]`/Cloud `[10,10]` readiness check.
+10. Converge reconciler to C only after web is green; run reconciler and migrate compatibility before mutation/schedule activation.
+11. Prove every web/reconciler Machine and binary digest/window is C and run both SDK contracts again.
 
-If C fails, roll web and reconciler back to B on Core 29/Cloud 9. Do not change schema and never roll back to A, Core 28, or Cloud `[8,8]` after fence evidence exists.
+If C fails, roll web and reconciler back to B on Core 29/Cloud 10. Do not change schema and never roll back to A, Core 28, or Cloud 9 after Cloud 0010 commits.
 
 ### Success Criteria
 
-- [ ] B is feature-complete, runs legacy/issuance-off behavior on predecessor Core/Cloud combinations and full behavior on Core 29/Cloud 9; C is behaviorally equivalent on 29/9 but refuses Core 28 or Cloud 8.
+- [ ] B is feature-complete, runs legacy/issuance-off behavior across Core 28/29 and Cloud 9/10, and full behavior on Core 29/Cloud 10; C is behaviorally equivalent on 29/10 but refuses Core 28 or Cloud 9.
 - [ ] Every manifest-listed database-mutating binary verifies and reports its immutable build-manifest identity, injected release-set hash, exact set membership, and correct window without an artifact rebuild.
 - [ ] Missing/wrong injected release-set identity and every raw candidate deployment bypass fail before listener or mutation.
+- [ ] Release-set issuance-off evidence rejects Artifact A or the historical schema, any non-B Machine, wrong Core28/Cloud9/head10/pending0010 state, wrong set/producer/lock identity, enabled issuance, or substituted receipt bytes.
 - [ ] B is recorded before any C Machine receives traffic.
-- [ ] C→B→C rehearsal on Core 29/Cloud 9 and production rollback require no schema change or data loss.
+- [ ] The dedicated 0010 transition derives B and migration bytes only from the release set, emits a separately attested receipt bound to it, and supports only exact schema9/B preflight or schema10/B resume; historical 0009 evidence remains byte-identical.
+- [ ] C→B→C rehearsal on Core 29/Cloud 10 and production rollback require no schema change or data loss.
 - [ ] v0.0.17→R0 on Core 28 and runtime-candidate→R0→runtime-candidate on Core 29 use distinct attested digests and require no schema change or data loss; v0.0.17 is rejected as a post-Core29 target.
 - [ ] One signed release set binds every exact candidate and policy/contract/schema provenance item.
 - [ ] Runtime and SDK bytes/digests equal the Phase 8 artifacts exactly, and the frozen runtime manifest/version is byte-identical before and after release-set construction.
 - [ ] Mirror production accepts only the candidate receipt, copies without rebuild/deploy, is idempotent only for an exact existing tag, and release-set verification rejects a missing/substituted mirror receipt.
-- [ ] The release set embeds both the independently verified historical v0.0.17 baseline and distinct R0 bridge members, and the dedicated rollback entry point accepts only release-set + issuance-off + complete-drain evidence and resolves R0.
+- [ ] The release set embeds both the independently verified historical v0.0.17 baseline and distinct R0 bridge members, and the dedicated rollback entry point accepts only release-set + a fresh Phase-10 post-disable issuance-control receipt + complete-drain evidence and resolves R0; historical A or pre-0010 issuance-off evidence is rejected.
 - [ ] No semver tag, GitHub Release, public OCI release tag, or PyPI 0.3 file exists yet.
 
-**Phase gate:** Do not begin production drills until every Machine is C, B is recorded, and the signed release set independently verifies from production.
+**Phase gate:** Do not begin production drills until every Machine is C, B and R0 are recorded, the signed release set independently verifies from production, and both the immutable 0009 receipt and release-set-bound 0010 receipt verify.
 
 ---
 
@@ -1802,8 +2213,8 @@ Validate both onboarding modes with isolated least-privilege clients. Keep every
 - `synthetic-custom-domain` permits custom-domain mode only for the disposable delegated zone.
 - Use distinct client IDs, keypairs, scopes, orgs, generations, rate buckets, and audit identities. Store private keys only in the protected canary secret store; upload only public JWKs.
 - The release-set-bound production-canary workflow alone registers/activates the two configured `synthetic` identities after C is proven; it checks their immutable class and cannot name or activate an `external` client. The managed synthetic additionally receives a spending-capped operator-owned live Stripe canary billing profile whose payment method and off-session mandate completed SCA before this workflow; only provider references enter the registry.
-- With global issuance still off, a protected `mcp2026-enable-issuance` step verifies the signed release set, exact deployed runtime/C digests, Core 29/Cloud 9, policy/contract hashes, transition receipt, and exactly these two active synthetic identities. Under the shared deploy lock it atomically enables `oauth_issuance_control` for that release-set SHA and emits a signed enable receipt. Only then may the first token exchange run.
-- Missing/wrong release set, an external active client, stale Machine digest, schema drift, or a concurrent disable makes enable/exchange fail closed. Every rollback first performs the symmetric locked disable, emits an issuance-off receipt, and only then drains/revokes lifecycle state.
+- With global issuance still off, a protected `mcp2026-enable-issuance` step verifies the signed release set, exact deployed runtime/C digests, Core 29/Cloud 10, policy/contract hashes, both the immutable 0009 receipt and release-set-bound 0010 receipt, and exactly these two active synthetic identities. Under the shared deploy/global-issuance lock it atomically enables `oauth_issuance_control` for that release-set SHA and emits a signed issuance-control enable receipt binding the prior/new control versions and states. Only then may the first token exchange run.
+- Missing/wrong release set, an external active client, stale Machine digest, schema drift, or a concurrent disable makes enable/exchange fail closed. Every rollback first invokes the distinct protected `mcp2026-disable-issuance` entry point under the same lock, atomically disables the exact current release-set control version, and emits a fresh Phase-10 post-disable issuance-control receipt binding exact C/runtime/Core29/Cloud10 identities and prior/new state. It explicitly rejects both historical Artifact A evidence and the Phase-9 pre-0010 issuance-off receipt. Only that fresh receipt may authorize lifecycle drain and below-vNext rollback.
 - Prove each client is denied the other mode and every cross-client onboarding/org/domain/inbox/thread/attachment resource.
 - Keep all partner clients pending/revoked. No deploy, tag, SDK-publish, or smoke workflow may activate one implicitly.
 
@@ -1825,7 +2236,6 @@ Validate both onboarding modes with isolated least-privilege clients. Keep every
 3. Poll ordinary complete results until strict readiness; prove no MRTR fields appear.
 4. Mint org token and prove domain-scoped compose, real inbound, and outbound delivery.
 5. Run cross-client/cross-org denials against managed generation 2.
-6. Close custom generation 1, then managed generation 2; assert no non-closed onboarding, active grant/inbox/domain claim, usable email token, unresolved billing workflow, or provider resource remains and both managed aliases remain retired. Retain confirmed billing/cleanup rows as audit evidence. Keep the two canary identities/keys active only to create the explicitly separate soak generations in 10.4.
 7. Emit two separately attested lifecycle receipts—managed and custom—from the recorded drill events and zero-live-resource queries. Promotion accepts only each receipt's protected workflow-run ID plus SHA and verifies that both name the exact deployed release-set SHA; component overrides are impossible.
 
 #### 10.4 Run continuous soak canaries
@@ -1834,11 +2244,16 @@ Validate both onboarding modes with isolated least-privilege clients. Keep every
 
 - new `.github/workflows/mcp2026-production-canary.yml`
 - new `.github/workflows/mcp2026-enable-issuance.yml`
+- new `.github/workflows/mcp2026-disable-issuance.yml`
 - new `.github/workflows/mcp2026-post-soak-promote.yml`
 - new `.github/workflows/mcp2026-activation-approval.yml`
 - new `.github/workflows/mcp2026-activate-clients.yml`
 - new `scripts/deploy/mcp2026_managed_canary.py`
 - new `scripts/deploy/mcp2026_custom_domain_canary.py`
+- new `schemas/mcp2026-issuance-control-receipt.schema.json`
+- new `scripts/release/generate_mcp2026_issuance_control_receipt.py`
+- new `scripts/ci/verify_mcp2026_issuance_control_receipt.py`
+- new `scripts/ci/test_mcp2026_issuance_control_receipt.sh`
 - new `schemas/mcp2026-lifecycle-receipt.schema.json`
 - new `scripts/release/generate_mcp2026_lifecycle_receipt.py`
 - new `scripts/ci/verify_mcp2026_lifecycle_receipt.py`
@@ -1862,10 +2277,11 @@ Validate both onboarding modes with isolated least-privilege clients. Keep every
 
 **Changes**
 
+- The Phase-10 issuance-control receipt has `action=enable|disable` and binds the release-set SHA; prior/new durable control version, enabled state, and recorded set identity; exact deployed control-plane/runtime roles and digests; Core29/Cloud10 plus both transition receipts; lock scope; producer/workflow/run identity; and timestamp. The verifier requires a strictly increasing committed control version and the exact expected state transition. A disable receipt is fresh only for the current deployed set/version and cannot be substituted by either earlier issuance-off schema.
 - Each lifecycle receipt binds schema version; signed release-set digest; deployed runtime/C digests and schema; hashed client identity, immutable client class, mode, key thumbprint, and every generation; idempotency replay outcomes; token-expiry/reacquisition proof; mode-specific readiness/mail assertions; cross-client denials; billing/provider cleanup states; retired alias/domain-claim evidence; zero-live-resource query results; workflow/run identity; timestamps; and a redaction attestation. Missing cleanup fields, cross-mode substitution, or a different release set makes verification fail.
 - After lifecycle cleanup, use fresh onboarding tokens and new idempotency keys to create an explicit managed generation 3 and custom generation 2 for soak. Bind the two immutable `synthetic` client IDs in protected release configuration and the drill/soak evidence; normal registration cannot claim those identities or class.
 - Probe both clients at least every 15 minutes for at least 24 uninterrupted hours. A missing interval longer than 30 minutes, any failed probe, digest/schema/policy mismatch, cross-tenant anomaly, or unresolved alert resets the continuous-window start.
-- Every observation verifies and records the same release-set digest, deployed runtime/C digests, Core 29/Cloud 9, and policy hash before calling MCP.
+- Every observation verifies and records the same release-set digest, deployed runtime/C digests, Core 29/Cloud 10, both transition receipts, and policy hash before calling MCP.
 - Exercise immutable SDK 0.2 and exact unpublished SDK 0.3 during the same window.
 - Produce signed soak evidence with `gate=pilot|broader`, release set, deployment time, hashed client identities, every expected/observed interval, successful run IDs, zero unresolved failures/alerts, and continuous start/end. Its schema/verifier recomputes cadence/coverage rather than trusting claimed timestamps. Promotion and activation accept only protected `soak_evidence_run_id` plus `soak_evidence_sha`, verify producer identity/attestation and the same release-set SHA, and reject direct timestamps or hand-authored summaries. Never record keys, assertions, tokens, DNS credentials, message bodies, or attachment bytes.
 - Pilot evidence covers at least 24 uninterrupted hours and has `continuous_end` no older than 30 minutes when used. After the one external pilot activation commits, keep both synthetic canaries running and emit a distinct `gate=broader` artifact bound to the pilot activation audit ID/timestamp. It must cover at least 168 uninterrupted hours beginning no earlier than that pilot commit (or the latest reset) and also end within 30 minutes of broader activation. The original 24-hour artifact can never satisfy the broader gate.
@@ -1888,7 +2304,7 @@ Publication is split across repository authority. The protected Cloud post-soak 
 
 - Because required-reviewer environment protection is unavailable for this private repository, `mcp2026-activation-approval.yml` is the sole approval producer. It accepts an exact canonical external-client list, release-set digest, `pilot|broader` cohort, not-before, and expiry; requires `github.actor` in the audited repository allowlist of activation approvers; emits a schema-validated GitHub-attested artifact binding those values plus approver/run identity; and cannot activate anything itself.
 - The separate protected `mcp2026-activate-clients.yml` workflow runs under the shared deploy lock and accepts the exact pending external `client_id` list, promoted release-set digest, only `promotion_evidence_run_id` plus SHA, only `soak_evidence_run_id` plus SHA, and only `approval_run_id` plus SHA. It first verifies promotion and the same release set/publication, then verifies a fresh soak artifact whose `gate` equals the requested `pilot|broader` cohort, and finally verifies approval producer/actor allowlist and exact set/release/cohort/time equality. It atomically consumes the approval digest with activation in `oauth_activation_approvals`; no wildcard, raw evidence fields, or class mutation is allowed. Exact retry after a committed activation is idempotent; replay for another set/release/cohort is rejected.
-- It queries durable client classification/activation state and verifies issuance still enabled for the exact current release set, current digests/Core 29/Cloud 9, both drill receipts, gate-appropriate fresh cadence-valid soak evidence, green synthetic canaries, and zero blockers before an audited targeted DB activation.
+- It queries durable client classification/activation state and verifies issuance still enabled for the exact current release set, current digests/Core 29/Cloud 10, both transition and drill receipts, gate-appropriate fresh cadence-valid soak evidence, green synthetic canaries, and zero blockers before an audited targeted DB activation.
 - Activation does not edit runtime.lock, set Fly secrets, redeploy, or activate any unlisted client.
 - When zero external clients are active, the input list must contain exactly one preapproved pilot ID and match its one-use approval; a multi-ID first cohort is rejected even after 24 hours.
 - Once any external client is active, every additional activation requires the distinct fresh `gate=broader` artifact covering 168 continuous post-pilot hours plus a separate approval that was not used for the pilot. Any release-set component change, canary gap/failure, issuance disable, or policy/schema drift resets the broader window.
@@ -1914,7 +2330,7 @@ Publication is split across repository authority. The protected Cloud post-soak 
 #### Operator verification
 
 - [ ] Dashboards stay green for auth, replay, lifecycle latency/leases, provider/billing cleanup, policy decisions, complaints/bounces, 5xx, compatibility, and memory shedding.
-- [ ] B/C, release-set, lifecycle-receipt, soak, and promotion digests are recorded in the runbook.
+- [ ] B/C, release-set, R0, historical 0009, pre-0010 release-set issuance-off, Cloud 0010, Phase-10 issuance-control enable/latest post-disable, lifecycle, soak, and promotion receipt digests are recorded in the runbook.
 - [ ] No non-synthetic client was active during candidate deployment or soak.
 
 ### Soak and exit gates
@@ -1940,7 +2356,7 @@ Publication is split across repository authority. The protected Cloud post-soak 
 
 ### PostgreSQL integration tests
 
-- Cloud 0008 to 0009 preflight/backfill/transition and refusal-style down for every protected table class.
+- Cloud 0008 to 0009 preflight/backfill/transition and refusal-style down for every protected table class; release-set-bound Cloud 9 to forward-only 10 preflight, serialization, exact B/receipt binding, resume, and refusal cases.
 - Provider inventory/quarantine under a writer fence plus explicit adopt/delete receipts.
 - Alias/catch-all triggers, pre-existing platform-inbox permanent backfill, managed namespace ownership, and retired-address non-reuse through every Core write path.
 - Global canonical-domain claims across legacy/autonomous create/verify/delete/GC, including expired-pending takeover and unknown-provider-outcome races.
@@ -1994,7 +2410,7 @@ Publication is split across repository authority. The protected Cloud post-soak 
 - Token endpoint and onboarding mutations use durable per-client buckets, not process memory.
 - Index onboarding work by state, lease expiry, and next retry; reconciler claims bounded batches with SKIP LOCKED and CAS.
 - Keep provider/Stripe calls outside transactions and reconcile unknown outcomes by stable provider identity plus workflow fence.
-- Acquire global issuance, client, org-policy, billing, canonical-domain, and row locks in the documented order and never hold transaction locks across network I/O.
+- Acquire global issuance and client locks first when that authority exists. Any operation that can mutate an inbox row observed by the Cloud canonical-identity/status triggers then takes the schema boundary when applicable, canonical-domain, sorted org-resource, org-policy, billing, and row locks in that order; this includes ordinary disable/delete/reactivate and autonomous cleanup. Operations that do not touch such an inbox retain their documented narrower prefix of this order. Never hold transaction locks across network I/O.
 - Global canonical-domain claims make ownership contention bounded to one canonical name rather than an org-wide lock.
 - Security-critical send policy uses the shared epoch at enqueue, claim, and provider-start; do not cache it across requests or provider operations.
 - Namespaced matching usage events plus the shared counter-row lock keep generic reconciliation linear in the indexed org/period/meter slice and prevent collisions or lost updates.
@@ -2061,23 +2477,24 @@ Alerts:
 
 ### Schema ownership
 
-- Cloud 0009 is authored only in nerve-cloud.
+- Cloud 0009 and forward-only Cloud 0010 are authored only in nerve-cloud. The signed 0009 transition evidence remains historical and immutable; 0010 receives a distinct release-set-bound transition and receipt.
 - Core 0029 is authored in nerve-oss first, mirrored byte-for-byte to Cloud, and advances `CORE_SCHEMA_HASH`. It owns only `org_outbound_policy_state` and the nullable outbox provider-fence columns; Cloud must not carry a divergent copy.
-- Cloud 0009 owns its lifecycle tables and the alias/catch-all protection triggers installed over existing Core inbox/domain tables in the same database.
+- Cloud 0009 owns lifecycle tables and the first alias/catch-all guards. Cloud 0010 owns the hosted canonical active-inbox index, new-write canonicality guard, permanent platform identity, and replacement managed-namespace trigger over the existing Core inbox/domain tables in the same database. Shared Store behavior remains OSS-first and does not depend on a Cloud-created SQL function.
 - Shared Go/auth/store files follow OSS-first exact-mirror discipline where they truly exist in both repositories.
-- `oss-source.lock` alone selects shared-source authority during development; `runtime.lock` alone selects the deployed production artifact. `runtime-candidate.lock` is non-deploying evidence consumed only by release-set construction.
+- `oss-source.lock` alone selects shared-source authority during development. `runtime.lock` selects the ordinary released production artifact; the pre-release R0 bridge and runtime candidate are selected only from their signed final-release-set members/receipts while `runtime.lock` remains on v0.0.17, then promotion converges it to the published runtime. `runtime-candidate.lock` is non-deploying evidence consumed only by release-set construction.
 - internal/mcp remains OSS/runtime-only.
 - The exact outbound policy bytes and declared shared auth/store/contract files move OSS-first and are present in both manifests.
 - Cloud-only billing, client registry, onboarding, subscription cancellation, alias/domain claim, and evidence files do not move into OSS.
 
 ### Expand and contract
 
-- Artifact A `[8,9]` crosses the boundary in the dedicated deploy-before-migrate transition and is only the temporary floor.
-- Artifact B is built from final feature code with Core `[28,29]` and Cloud `[8,9]`, proven on Core 29/Cloud 9 and compatibility-tested on every predecessor combination, then recorded as the permanent rollback floor.
+- Artifact A `[8,9]` crossed the boundary in the dedicated deploy-before-migrate transition and was the temporary floor; its bytes and evidence are now historical and immutable.
+- Artifact B is built from final feature code with Core `[28,29]` and Cloud `[9,10]` and proven across both Cloud states. It is recorded before 0010, becomes the permanent rollback floor when 0010 commits, and until that commit may return to exact A on Core28/Cloud9.
 - Before Core 0029, the protected bridge workflow builds R0 as a distinct digest from pinned v0.0.17 source plus the exact allowlisted `[28,28]`→`[28,29]` compatibility-window patch. Production moves v0.0.17→R0 while Core is 28 and proves legacy equivalence.
-- After every durable control-plane role is B and every runtime Machine is R0, B's migrate binary applies additive Core 0029. The migration gate proves preserved legacy SQL/data behavior and runs the actual R0 binary on Core 29 before the runtime candidate is deployed.
-- Artifact C contracts the same behavior to Core `[29,29]` and Cloud `[9,9]`; web, reconciler, and migrate all reject Core 28 or Cloud 8 before side effects.
+- After every durable control-plane role is B and every runtime Machine is R0, the dedicated workflow applies Cloud 0010 and emits its receipt; only then does B's migrate binary apply additive Core 0029. The migration gate proves preserved legacy SQL/data behavior and runs the actual R0 binary on Core 29 before the runtime candidate is deployed.
+- Artifact C contracts the same behavior to Core `[29,29]` and Cloud `[10,10]`; web, reconciler, and migrate all reject Core 28 or Cloud 9 before side effects.
 - Cloud 0009 down refuses after durable data. Production recovery uses forward fixes/restores, not casual down migration.
+- Cloud 0010 down is unconditionally forbidden; once its receipt exists, B at Cloud 10 is the permanent control-plane recovery floor.
 - Core 0029 down refuses after any autonomous epoch or provider-fence evidence. Production recovery likewise uses a forward fix/restore; B remains compatible with Core 29.
 
 ### Runtime promotion
@@ -2093,39 +2510,41 @@ Preserve the existing decision to use production-snapshot rehearsal plus two iso
 
 ## Rollback Matrix
 
-| Component | Cloud 8/Core 28 before transition | Cloud 9/Core 28 after A | Candidate production after B/Core 29/C | After external activation |
-|---|---|---|---|---|
-| Control plane | Cloud `[8,8]`, Core `[28,28]` remains valid until every role is A | A Core `[28,28]`/Cloud `[8,9]` temporary floor | C Core `[29,29]`/Cloud `[9,9]` normal; B Core `[28,29]`/Cloud `[8,9]` is the only rollback floor | Same C→B rollback; never A/Core 28/Cloud 8 after fence evidence |
-| Runtime | v0.0.17 while issuance is off | v0.0.17 until protected R0 deployment on Core 28 | Release-set dual runtime requires Core `[29,29]` and is product floor; R0 `[28,29]` is the only runtime rollback floor | Rollback below vNext requires client disable/lifecycle drain and deploys R0; v0.0.17 is forbidden on Core 29 |
-| Schema | Cloud 8/Core 28 | Cloud 9/Core 28; no casual Cloud down after durable rows | Cloud 9/Core 29 | Cloud 9/Core 29; forward fix or restore only |
-| SDK 0.2.0 | Supported | Supported | Supported and canaried | Supported until separate retirement plan |
-| SDK 0.3.0 | Unpublished candidate | Modern unavailable if runtime remains old | Exact release-set wheel | Published exact bytes; legacy email fallback only below vNext |
-| Alias/domain claims | None before 0009 | Permanent registry/claims survive every rollback | Never delete/reuse/bypass | Same invariant |
-| Billing cleanup | None | Durable subscribe/payment/cancellation workflows survive rollback | B and C reconcile the same state | Never tombstone or close while subscription-create outcome or cancellation is unconfirmed |
-| Outbox shutdown | Legacy behavior | Autonomous policy epoch/barrier state is durable | B and C cancel queued and drain/readback provider-started work | Same barrier; no cascading inbox deletion |
-| Client activation | None | Issuance off/no client active | Synthetic clients only | Explicit post-soak client list only |
+| Component | Cloud 8/Core 28 before transition | Cloud 9/Core 28 before 0010 | Cloud 10/Core 28 after 0010 | Candidate Core 29/Cloud 10 | After external activation |
+|---|---|---|---|---|---|
+| Control plane | Cloud `[8,8]`, Core `[28,28]` until every role is A | A remains current until B installs; then exact B→A remains possible before 0010 | B Core `[28,29]`/Cloud `[9,10]` is the forward-only floor; A is forbidden | C Core `[29,29]`/Cloud `[10,10]` normal; B is the only rollback floor | Same C→B rollback; never A/Core28/Cloud9 |
+| Runtime | v0.0.17 while issuance is off | v0.0.17 remains current until R0 installs; then exact R0→v0.0.17 remains possible before Core29 | R0 `[28,29]`; v0.0.17 remains possible only until Core29 | Runtime candidate `[29,29]`; R0 is the only runtime rollback floor | Rollback below vNext requires disable/drain then R0; v0.0.17 is forbidden |
+| Schema | Cloud8/Core28 | Cloud9/Core28 | Cloud10/Core28; 0010 down forbidden | Cloud10/Core29 | Cloud10/Core29; forward fix or restore only |
+| SDK 0.2.0 | Supported | Supported | Supported | Supported and canaried | Supported until separate retirement plan |
+| SDK 0.3.0 | Unpublished candidate | Unpublished | Unpublished | Exact release-set wheel | Published exact bytes; legacy email fallback only below vNext |
+| Alias/domain claims | None before 0009 | Permanent registry/claims | Canonical identity/namespace evidence retained | Never delete/reuse/bypass | Same invariant |
+| Billing cleanup | None | Durable workflows retained | B reconciles the same state | B and C reconcile the same state | Never close while create/cancellation outcome is unconfirmed |
+| Outbox shutdown | Legacy behavior | Durable policy evidence | B preserves it | B and C cancel queued and drain/readback starts | Same barrier; no cascading inbox deletion |
+| Client activation | None | Issuance off/no client active | Issuance off/no client active | Synthetic clients only | Explicit post-soak client list only |
 
-Preferred rollback is C→B with schema unchanged. Before any runtime rollback below vNext:
+Before Cloud 0010 commits, the only predecessor rollback is exact B→A on Core28/Cloud9; before Core 0029, exact R0→v0.0.17 is also permitted while issuance remains off. Once 0010 commits, recovery retains Cloud10 and B; once Core0029 commits, v0.0.17 is forbidden. Preferred steady rollback is C→B with schema unchanged. Before any runtime rollback below vNext:
 
-1. Atomically disable global M2M issuance under the common deploy/global issuance lock, verify the exact release-set-bound issuance-off receipt, and disable all further client activation.
+1. Atomically disable global M2M issuance through the protected Phase-10 disable entry point under the common deploy/global issuance lock, then verify its fresh post-disable issuance-control receipt against the exact current release set, prior/new control version, C/runtime digests, Core29/Cloud10, and producer. Reject the historical A and pre-0010 issuance-off receipt formats, and disable all further client activation.
 2. Enumerate every non-closed M2M generation, including `active`, under the common lifecycle lock. For each one, run audited close or `revoke-client`, revoke email authority, and retain its onboarding-only polling path when the client itself is not revoked.
 3. Keep B running until every enumerated generation is `closed`, every subscription-create/payment/cancellation workflow, outbox provider-start, and domain-claim release is terminal, and signed drain evidence proves the enumeration did not change. Refuse rollback while any generation or cleanup barrier remains nonterminal.
-4. Do not delete Cloud 0009 state, alias tombstones, domain claims, billing workflows, or evidence history.
-5. Invoke the dedicated bridge rollback workflow with only the final release set, issuance-off receipt, and lifecycle-drain receipt. It derives and deploys embedded R0, verifies every Machine digest and its `[28,29]` startup window, and keeps B. State clearly that existing legacy org email may work while autonomous onboarding is unavailable. The workflow must reject v0.0.17 or any raw image/tag input.
+4. Do not delete Cloud 0009/0010 state, either transition receipt, alias tombstones, domain claims, billing workflows, or evidence history.
+5. Invoke the dedicated bridge rollback workflow with only the final release set, fresh Phase-10 post-disable issuance-control receipt, and lifecycle-drain receipt. It derives and deploys embedded R0, verifies every Machine digest and its `[28,29]` startup window, and keeps B. State clearly that existing legacy org email may work while autonomous onboarding is unavailable. The workflow must reject the historical/pre-0010 issuance-off formats, v0.0.17, or any raw image/tag input.
 
-Core stays at 29 throughout C→B or below-vNext runtime rollback. R0 is the only legacy-behavior runtime authorized on Core 29, and provider-fence evidence is never removed as part of rollback.
+Core stays at 29 and Cloud stays at 10 throughout C→B or below-vNext runtime rollback. R0 is the only legacy-behavior runtime authorized on Core 29, and canonical-identity/provider-fence evidence is never removed as part of rollback.
 
 ## Definition of Done
 
 - [ ] Every Phase 0 proof gate is real and green.
 - [ ] Artifact A crossed Cloud 8→9 through the dedicated deploy-before-migrate workflow and produced a signed receipt.
-- [ ] Artifact B is recorded as the permanent feature-complete `[8,9]` rollback floor.
-- [ ] Artifact C runs Core `[29,29]`/Cloud `[9,9]`; web, reconciler, and migrate independently refuse Core 28 or Cloud 8 before side effects.
+- [ ] Artifact B is recorded as the designated feature-complete Core `[28,29]`/Cloud `[9,10]` post-0010 rollback floor and becomes permanent only when forward-only 0010 commits.
+- [ ] Cloud 0010 is applied only by the release-set-bound B transition after the immutable 0009 and fresh release-set issuance-off evidence verify, and its independent signed receipt binds both predecessor receipt digests and proves the exact pre/post state without a release-set self-cycle.
+- [ ] Artifact C runs Core `[29,29]`/Cloud `[10,10]`; web, reconciler, and migrate independently refuse Core 28 or Cloud 9 before side effects.
 - [ ] Core 0029 is applied only after B is the durable control-plane floor and R0 is the deployed runtime floor; the runtime candidate and C require `[29,29]`, B and R0 remain `[28,29]`, and actual R0 legacy behavior is proven on Core 28 and additive Core 29.
 - [ ] auth.nerve.email serves correct public metadata/JWKS/token behavior.
 - [ ] Client-credentials-only metadata passes the pinned consumers with the Errata 7793 omission; numerical request limits, versioned error extension, permanent key thumbprints, and JTI skew retention are exact and tested.
 - [ ] A pre-registered private-key JWT client obtains separate generation-bound onboarding and org tokens without a human tenant flow, including maintenance after initial token expiry.
 - [ ] Token issuance is linearized with close/revoke: close leaves no email authority but permits own-generation onboarding polling, while `revoke-client` makes both token kinds unusable and no path orphans a generation.
+- [ ] Phase-10 enable and disable evidence binds the exact release set, deployed C/runtime/Core29/Cloud10 identity, both transition receipts, and a strictly increasing durable control version; rollback accepts only a fresh post-disable receipt and rejects both earlier issuance-off formats.
 - [ ] MCP 2026-07-28 passes pinned conformance, JSON/SSE tests, capability negotiation, error partition, and Origin/auth matrix.
 - [ ] Published SDK 0.2.0 remains compatible with the hybrid route.
 - [ ] SDK 0.3.0 is built once, tested in both response modes, soaked in production, and published by exact SHA without rebuild.
@@ -2209,6 +2628,222 @@ Core stays at 29 throughout C→B or below-vNext runtime rollback. R0 is the onl
 - https://resend.com/docs/api-reference/emails/retrieve-received-email
 
 ## Enhancement History
+
+### Revision 21 — 2026-08-23
+
+**Trigger:** Revision 20 still had no organization-level projection for the
+trusted complaint and hard-bounce observations already persisted by the signed
+Resend webhook. Recipient suppression alone could not revoke autonomous
+outbound authority, and the transition-bundle verifier also used predictable
+global `/tmp` files that made concurrent evidence verification racy.
+
+**Disposition:** Add a Cloud-only abuse projection Store boundary plus a
+nil-by-default webhook dependency seam. The Store re-resolves the exact
+persisted outbox event under tenant RLS and the shared reconciliation-resource
+then org-policy lock order; a
+complaint immediately activates `abuse_suspension`, while hard bounces use
+durable UTC-day attempts and the policy's exact 20-attempt/5-percent threshold.
+Observation replay, evidence, suspension flag, policy epoch, and queued-row
+terminalization are transactional. The exact signed external event identity
+also deterministically selects one timeline row, so a failed projection retry
+cannot duplicate audit rows or customer webhook fan-out. Operator clearance
+revokes only the active complaint and hard-bounce evidence minted from signed
+webhook observations, preserves all history, and clears the flag under the same
+epoch only when no stronger suspension authority remains. Client-revocation
+evidence and a deprovisioning or closed onboarding state therefore dominate an
+abuse-clear request. PostgreSQL tests cover threshold boundaries, tenant/event
+identity, rollback, replay, Core-28 inertness, clearance dominance, complaint
+versus enqueue in both commit orders, and deterministic serialization with the
+OAuth-authority reconciliation-resource lock. Signed-webhook tests cover complaint, threshold,
+replay, retryable projection failure, and the nil dependency. The MCP runtime
+contract separately reuses one already-issued generation principal
+across the live policy transition and proves compose disappears from
+`tools/list` while a cached direct `tools/call` fails through the policy gate.
+The release evidence verifier now compares process-local normalized inventories and a
+concurrent distinct-bundle regression rejects the former shared-file design.
+
+The same Store boundary now includes a bounded drift repair that re-derives
+the flag only from active deny evidence or deprovisioning/closed lifecycle
+state, rechecks under reconciliation-resource then org-policy locks, advances
+the epoch on repair, terminalizes older queued work, and is inert before Core
+0029. The scheduled production command consumes only its read-only drift
+detector and exports a bounded metric; the repair remains unconstructed until
+the same explicit abuse-policy activation is approved.
+
+**Release consequence:** No production suspension or clearance entry point is
+activated by this revision. `NewHandler` leaves the projector nil, preserving
+the deployed recipient-suppression behavior byte-for-byte until explicit
+production authority assigns the Store implementation. The audited clearance
+exists only as a Store transaction and has no operator CLI or HTTP caller.
+Activating either tenant-wide suspension or its clearance remains a separate
+approval-gated trust-boundary change. Revision 20's billing-provider boundary,
+revision 19's custom-domain provider boundary, and revision 15's release graph
+remain unchanged.
+
+### Revision 20 — 2026-08-23
+
+**Trigger:** Revision 19 left the Phase 7 paid-subscription Store apply seam
+and due-list without any non-test consumer. That meant bounded evidence expiry
+was modeled and Store-tested, but no scheduled path could refresh or revoke it
+after a missed webhook. The first scheduler test also exposed that a
+process-clock observation cannot safely satisfy a PostgreSQL-time monotonic
+authority fence across independently clocked hosts.
+
+**Disposition:** Add a Cloud-only scheduled paid-readback consumer behind a
+separate injected read-only provider interface. It performs exact Stripe GET
+after every preflight transaction has closed, then captures `clock_timestamp()`
+from PostgreSQL and applies the generation/profile/workflow/subscription CAS in
+a fresh transaction. Exact generation metadata and the one price ID encoded in
+the persisted create identity are mandatory and byte-exact. Qualifying active
+plus `succeeded` payment state grants bounded evidence; exact absence or a
+non-qualifying authoritative state revokes; transport uncertainty preserves
+only still-live evidence; expiry revokes; and exact-GET provenance drift
+revokes without rewriting durable subscription identity. PostgreSQL tests
+cover provider I/O outside transactions, active grant, exact absence,
+generation/price drift, live-proof uncertainty, proof expiry, close-wins CAS,
+and nil-provider inertness; focused race, billing, reconcile, command, compile,
+vet, manifest, and exact-mirror gates pass.
+
+**Release consequence:** Revision 19's Phase 6 activation boundary, revision
+18's provider receipts, revision 16's OSS authority, and revision 15's release
+graph remain unchanged. `nerve-reconcile` emits the new counters but does not
+inject a Stripe readback provider, so the new consumer is production-inert.
+Constructing that dependency, wiring signed billing delegation, making webhook
+mutation plus processed-marker atomic, adding complaint/bounce suspension, or
+performing a production billing/provider call remains separately
+approval-gated.
+
+### Revision 19 — 2026-08-23
+
+**Trigger:** Revision 18 closed the offline adoption/deletion evidence
+contracts, while the shared Store already had exact legacy cleanup discovery,
+claim, defer, lease-takeover, quarantine-CAS, and fairness primitives. No
+Cloud reconciler consumed them, so expired/releasing provider-backed legacy
+domains could retain a claim indefinitely even though the recovery state
+machine was otherwise executable.
+
+**Disposition:** Add a Cloud-only scheduled cleanup consumer behind an injected
+provider interface. It claims an exact Store snapshot before any provider I/O;
+for a known provider ID it validates exact ID plus canonical identity, disables
+receiving, issues DELETE, and requires a final same-ID GET 404 before local
+release. Initial 404 is idempotent completion, DELETE uncertainty is resolved
+only by the final readback, and present/unknown outcomes retain the identity
+and release the lease for retry. No-ID or quarantine-blocked work performs
+bounded inventory/quarantine and defer only. PostgreSQL tests cover external
+I/O after transaction release, mismatch and provider-only quarantine, exact
+identity exclusion from name-only quarantine, initial/final absence, uncertain
+DELETE, still-present/unknown readback, and pristine local-only cleanup.
+
+**Release consequence:** Revision 18's receipt contracts, revision 16's source
+authority, and revision 15's release graph remain unchanged. The consumer is
+locally implemented and testable but production-inert because
+`nerve-reconcile` does not construct its provider dependency. Supplying real
+provider credentials to that interface remains an explicit approval-gated
+activation; this revision performs no production provider call, deployment,
+or receipt mutation.
+
+### Revision 18 — 2026-08-23
+
+**Trigger:** Revision 17 closed the offline explicit-adoption contract, but the
+original Phase 1/6 invariant also permits an audited delete resolution. A
+generic receipt SHA or DELETE 2xx cannot prove safe deletion: a quarantined
+provider ID may still be referenced locally, and provider absence is
+authoritative only after a final exact-ID readback returns 404.
+
+**Disposition:** Add a distinct provider-domain deletion receipt schema,
+generator, verifier, and adversarial test. Bind the exact open quarantine and
+canonicalizer binary, a fenced local-reference snapshot with zero provider-ID,
+active-inbox, and provider-owned-claim references, and an ordered delete/final
+GET-404 observation no more than five minutes old. The future protected delete
+workflow derives/rechecks snapshots under the global writer plus canonical
+lock, performs network calls outside transactions, and resolves the ledger
+only after exact receipt verification.
+
+**Release consequence:** Revision 17's adoption contract, revision 16's source
+authority, and revision 15's release graph remain unchanged. The offline
+deletion contract may land without provider access. Real DELETE, ledger
+resolution, writer enable, and historical transition changes remain explicitly
+approval-gated; uncertainty leaves quarantine open and writers fenced.
+
+### Revision 17 — 2026-08-23
+
+**Trigger:** Final Phase 6 validation found two remaining provider-inventory
+authority gaps. The historical Cloud-0009 Python preflight uses Python's
+IDNA2003 codec while Store/runtime identity uses the pinned Go Lookup/UTS-46
+profile, so a valid name such as `straße.de` can compare as `strasse.de` in
+the preflight but `xn--strae-oqa.de` at runtime. The quarantine table also had
+only an unauthenticated receipt-SHA slot: no closed schema bound the exact
+open row, unbound target/claim, fresh exact-ID provider observation, protected
+approver/producer, and canonical lock scope required for explicit adoption.
+
+**Disposition:** Make `internal/domains` the sole operational inventory
+identity by compiling a bounded batch helper and routing every Python
+preflight domain through it. Add a separate provider-domain adoption receipt
+schema, generator, verifier, and adversarial offline test. The future protected
+adoption workflow derives snapshots under the global writer fence plus
+canonical lock, applies only an exact snapshot/version CAS, and requires a
+fresh zero-finding inventory after mutation. Receipt bytes or canonical-name
+lookup alone never authorize attachment.
+
+**Release consequence:** Revision 16's source-authority inventory and revision
+15's A/R0/B/Cloud-0010/Core-0029/C release graph are unchanged. The offline
+receipt contract may land and be tested without provider access. Changing the
+historical production transition or constructing the adoption workflow remains
+explicitly approval-gated; until then provider adoption is unavailable and any
+unresolved quarantine keeps domain writers fenced.
+
+### Revision 16 — 2026-08-23
+
+**Trigger:** The Phase 6 source-authority audit found that the revision-15
+release graph was coherent but its file inventory was not. Both manifests
+omitted the lower-level `internal/emailaddr/**` package/tests and the
+canonical-domain wrapper/tests, the typed legacy provider lifecycle plus
+cleanup-scheduler Store API/tests had no declared OSS authority, and the
+byte-identical `internal/store/store_orgs.go` was still labeled Cloud-only.
+That incomplete declaration allowed the existing exact-mirror check to report
+only `org_domains.go` drift while silently excluding files that determine the
+same canonical claim and provider-absence security boundary.
+
+**Disposition:** Freeze one identical inventory in both plan copies and both
+sync manifests. The complete `internal/emailaddr/**` package/tests,
+`domains/canonical.go` and its test,
+`store_orgs.go`, `legacy_domain_lifecycle.go` and its test, and the already
+shared claim/Resend/contract files are OSS-first exact mirrors. The lower-level
+`emailaddr` package does not import `domains` and may use the pinned IDNA
+profile only to validate already-ASCII A-labels; the higher-level canonical
+wrapper exclusively owns U-label-to-A-label conversion and then delegates
+ASCII validation downward. The lifecycle Store test receives an OSS-local
+Cloud-9 schema fixture so the shared API can be proven without importing Cloud
+migrations. `internal/mcp/**` remains intentionally OSS/runtime-only and absent
+from the manifest. Provider quarantine, Cloud lifecycle orchestration,
+domain/HTTP handlers, reconciliation/scheduler consumers, command wiring, and
+their handler/scheduler tests remain Cloud-only; the domain handlers are
+explicitly excluded ahead of the broader `internal/cloudapi/**` patch-sync
+rule.
+
+**Release consequence:** Revision 15's Cloud-10/R0/A/B/C transition and
+rollback graph is unchanged. No source lock may advance merely because the old
+partial manifest passes: OSS must first contain and test every newly declared
+shared lifecycle byte, both manifests must match, and the complete declared
+mirror must be byte-identical in Cloud. This inventory correction does not
+authorize provider construction, deployment, migration, issuance, billing, or
+rollout.
+
+### Revision 15 — 2026-08-22
+
+**Trigger:** Phase 5.1 review proved that request-only canonicalization missed valid pre-Core-0024 address spellings with outer whitespace or a trailing domain dot. Supported Store reads could miss them, writers could create a semantic duplicate, and the hosted lower-only active index did not enforce the same identity. The new forward-only Cloud 0010 also made the previous Phase 9/10 Cloud-9 contraction internally impossible, while the release-set scaffold still omitted the already-approved R0 bridge.
+
+**Disposition:** Keep Core 0029 outbox-only and do not introduce Core 0030. OSS-first shared Store paths now use one serialized, byte-preserving canonical equivalence for every address read/create/ensure/reactivate boundary and canonicalize loaded bytes at downstream comparison/provider boundaries. Cloud 0010 owns the hosted direct-SQL backstop: a serialized global collision preflight, functional active-identity index, new-write canonicality guard, and replacement managed-namespace trigger. Arbitrary direct SQL against standalone OSS remains outside this plan; adding that guarantee requires a separately approved Core migration and a new bridge/release graph.
+
+**Release consequence:** Preserve v0.0.17, R0, Artifact A, and the signed Cloud 0009 evidence exactly. Future B is Core `[28,29]`/Cloud `[9,10]`; future C is Core `[29,29]`/Cloud `[10,10]`; the runtime candidate remains Core `[29,29]`. Production proceeds R0, B on Core28/Cloud9, a dedicated release-set-bound Cloud0010 transition and independent receipt, Core0029, runtime candidate, then C. After 0010 commits, A/Cloud9 rollback is forbidden; C→B and runtime-candidate→R0 retain Core29/Cloud10. Release-set schema/build/verification must include R0 and the exact 0010 transition specification without hashing the post-deploy receipt back into its parent set.
+
+### Revision 14 — 2026-08-19
+
+**Trigger:** The first Cloud sync containing Core 0029 passed exact-mirror but failed `control-plane-artifact`: CI rebuilt the current tree as role A, so the generated manifest had Core head 29 while A's frozen compatibility window remained `[28,28]`. Widening or republishing A would destroy the already-attested transition identity.
+
+**Disposition:** Freeze A permanently at its captured source/digest. Replace post-transition per-commit A builds with a separate `validation` artifact role whose window follows the checked-in migration head. It is local CI evidence only: no GHCR push, Sigstore release signature, deploy-pattern name, transition/release-set membership, or service startup is permitted. Offline `compatibility --json` still verifies the complete six-binary manifest and image labels.
+
+**Release consequence:** Core 0029 exact mirrors may land in Cloud without fabricating a new A or prematurely constructing B. Production remains on the previously attested A until the explicit R0/B Phase 9 sequence; B/C remain the only release-set-required future control-plane roles.
 
 ### Revision 13 — 2026-08-19
 

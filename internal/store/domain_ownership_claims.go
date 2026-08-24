@@ -158,14 +158,14 @@ func (s *Store) withLockedLegacyDomain(ctx context.Context, domainID, requiredOr
 		if err := scoped.requireDomainWritesEnabled(ctx); err != nil {
 			return err
 		}
-		var storedDomain string
-		query := `SELECT domain FROM org_domains WHERE id = $1`
+		var storedDomain, discoveredOrgID string
+		query := `SELECT domain, org_id::text FROM org_domains WHERE id = $1`
 		args := []any{domainID}
 		if strings.TrimSpace(requiredOrgID) != "" {
 			query += ` AND org_id = $2`
 			args = append(args, requiredOrgID)
 		}
-		if err := scoped.q.QueryRowContext(ctx, query, args...).Scan(&storedDomain); err != nil {
+		if err := scoped.q.QueryRowContext(ctx, query, args...).Scan(&storedDomain, &discoveredOrgID); err != nil {
 			return err
 		}
 		canonical, err := domains.CanonicalizeDomain(storedDomain)
@@ -173,6 +173,13 @@ func (s *Store) withLockedLegacyDomain(ctx context.Context, domainID, requiredOr
 			return fmt.Errorf("canonicalize stored domain: %w", err)
 		}
 		if err := scoped.lockCanonicalDomain(ctx, canonical); err != nil {
+			return err
+		}
+		// Every compatibility writer shares the provider lifecycle order:
+		// domain-writes fence -> canonical domain -> org policy -> domain/claim
+		// rows. The unlocked discovery above supplies only lock keys; both org and
+		// domain identity are rechecked after the row lock below.
+		if err := scoped.LockOrgPolicy(ctx, discoveredOrgID); err != nil {
 			return err
 		}
 		var identity legacyDomainIdentity
@@ -190,18 +197,11 @@ func (s *Store) withLockedLegacyDomain(ctx context.Context, domainID, requiredOr
 		); err != nil {
 			return err
 		}
-		// Domain readiness is evidence the autonomous outbound policy reads, so
-		// every writer that reaches this helper also takes the enqueue fence.
-		// Without it a domain could lose readiness between an enqueue's policy
-		// check and its outbox insert.
-		if err := scoped.LockOrgPolicy(ctx, identity.OrgID); err != nil {
-			return err
-		}
 		lockedCanonical, err := domains.CanonicalizeDomain(identity.Canonical)
 		if err != nil {
 			return fmt.Errorf("canonicalize locked domain: %w", err)
 		}
-		if lockedCanonical != canonical {
+		if identity.OrgID != discoveredOrgID || lockedCanonical != canonical {
 			return errors.New("domain identity changed while acquiring canonical lock")
 		}
 		identity.Canonical = lockedCanonical

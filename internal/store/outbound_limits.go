@@ -18,11 +18,14 @@ const (
 	meterOutboundFirstRecipientDay = "autonomous_outbound_first_recipient_day"
 	meterOutboundReplyRecipient    = "autonomous_outbound_reply_recipient"
 	meterOutboundRecipientSeen     = "autonomous_outbound_recipient_seen"
+	meterOutboundHardBounceDay     = "autonomous_outbound_hard_bounce_day"
 
 	limitReplyPerDay           = int64(20)
 	limitReplyPerRecipientDay  = int64(5)
 	limitSendPerDay            = int64(100)
 	limitFirstRecipientsPerDay = int64(25)
+	limitHardBounceAttempts    = int64(20)
+	limitHardBounceBasisPoints = int64(500)
 )
 
 type OutboundLimitInput struct {

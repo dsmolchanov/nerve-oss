@@ -74,8 +74,13 @@ func NewSDKHandler(runtime *Server, jsonResponse bool) http.Handler {
 		if !authorizeModernRequest(w, request, body, runtime) {
 			return
 		}
-		if principal, ok := auth.PrincipalFromContext(request.Context()); ok && principal.Kind == auth.PrincipalM2MOnboarding {
-			request = request.WithContext(withOnboardingAuthorization(request.Context(), request.Header.Get("Authorization")))
+		if principal, ok := auth.PrincipalFromContext(request.Context()); ok {
+			switch principal.Kind {
+			case auth.PrincipalM2MOnboarding:
+				request = request.WithContext(withOnboardingAuthorization(request.Context(), request.Header.Get("Authorization")))
+			case auth.PrincipalM2MOrg:
+				request = request.WithContext(withBillingAuthorization(request.Context(), request.Header.Get("Authorization")))
+			}
 		}
 		sdkHandler.ServeHTTP(w, request)
 	})
@@ -302,6 +307,10 @@ func newSDKServer(requestContext context.Context, runtime *Server) *sdkmcp.Serve
 			if principal.Kind == auth.PrincipalM2MOnboarding {
 				result, err = invokeOnboardingTool(ctx, runtime.Onboarding, OnboardingCaller{
 					Principal: principal, Authorization: onboardingAuthorizationFromContext(requestContext),
+				}, request.Params.Name, request.Params.Arguments)
+			} else if request.Params.Name == billingSubscribeToolName {
+				result, err = invokeBillingTool(ctx, runtime.Billing, BillingCaller{
+					Principal: principal, Authorization: billingAuthorizationFromContext(requestContext),
 				}, request.Params.Name, request.Params.Arguments)
 			} else {
 				result, err = runtime.Invoker.Invoke(ctx, ToolInvocation{

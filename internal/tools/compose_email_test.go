@@ -70,3 +70,24 @@ func TestFormatSenderMailboxRejectsInvalidAddress(t *testing.T) {
 		t.Fatalf("expected invalid sender address, got %v", err)
 	}
 }
+
+func TestCanonicalOutboundInboxAddressPreservesStorageOnlyInternally(t *testing.T) {
+	for _, value := range []string{
+		"Agent@Example.TEST",
+		"\u00a0\u2003agent@example.test\u3000",
+		"agent@example.test.",
+	} {
+		t.Run(value, func(t *testing.T) {
+			got, err := canonicalOutboundInboxAddress(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != "agent@example.test" {
+				t.Fatalf("canonical sender=%q", got)
+			}
+		})
+	}
+	if _, err := canonicalOutboundInboxAddress("agent@@example.test"); err == nil || err.Error() != "invalid sender address" {
+		t.Fatalf("invalid legacy sender error=%v", err)
+	}
+}

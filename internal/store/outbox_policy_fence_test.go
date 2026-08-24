@@ -338,6 +338,39 @@ func TestProviderFenceRejectsStaleWorkerAfterReclaim(t *testing.T) {
 	}
 }
 
+func TestProviderFenceRecoversCrashAfterClaimBeforeProviderStart(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		workerAStore := &Store{db: db, q: db}
+		workerBStore := &Store{db: db, q: db}
+		orgID, inboxID := insertPolicyFenceTenant(t, ctx, db, "reclaim-before-start")
+		seedPolicyFenceState(t, ctx, st, orgID)
+		outboxID := insertPolicyFenceOutbox(t, ctx, db, orgID, inboxID, 1)
+		t0 := time.Now().UTC()
+
+		workerA := claimOnePolicyFenceOutbox(t, ctx, workerAStore, outboxID, "nerve-runtime-worker")
+		claimedB, err := workerBStore.ClaimOutboxMessages(ctx, 10, "nerve-runtime-worker", t0.Add(2*time.Minute), time.Minute)
+		if err != nil || len(claimedB) != 1 {
+			t.Fatalf("worker-b claim=%+v err=%v", claimedB, err)
+		}
+		if claimedB[0].LockedBy.String == workerA.LockedBy.String {
+			t.Fatalf("reclaim reused stale lease %q", workerA.LockedBy.String)
+		}
+		operationID, err := workerBStore.BeginOutboxProviderOperation(ctx, claimedB[0])
+		if err != nil || operationID == "" {
+			t.Fatalf("recovered provider operation=%q err=%v", operationID, err)
+		}
+		if err := workerBStore.MarkClaimedOutboxMessageSent(ctx, outboxID, claimedB[0].LockedBy.String, operationID, "provider-id"); err != nil {
+			t.Fatal(err)
+		}
+		if err := workerAStore.MarkClaimedOutboxMessageFailed(ctx, outboxID, workerA.LockedBy.String, "late pre-provider failure"); !errors.Is(err, ErrOutboxClaimLost) {
+			t.Fatalf("stale pre-provider terminalization err=%v", err)
+		}
+		assertPolicyFenceRow(t, ctx, db, outboxID, "sent", true, true)
+	})
+}
+
 func beginProviderOnConnection(ctx context.Context, db *sql.DB, conn *sql.Conn, msg OutboxMessage) (string, error) {
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {

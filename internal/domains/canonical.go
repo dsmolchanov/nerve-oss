@@ -1,38 +1,35 @@
 package domains
 
 import (
-	"fmt"
-	"regexp"
 	"strings"
+
+	"golang.org/x/net/idna"
+
+	"neuralmail/internal/emailaddr"
 )
 
-var validHostnameRE = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$`)
+var domainLookupProfile = idna.New(
+	idna.MapForLookup(),
+	idna.BidiRule(),
+	idna.VerifyDNSLength(true),
+)
 
-// CanonicalizeDomain normalizes a domain for storage:
-// - lowercase
-// - trim spaces
-// - strip trailing dot
-// - validate as a valid hostname (no protocol, no path)
-// Returns error if domain is invalid.
+// IsExactProviderResourceID reports whether value is a non-empty, bounded,
+// path-safe opaque provider identity whose bytes require no normalization.
+// Callers must never trim or otherwise rewrite a provider-returned identity
+// before using it for an exact-ID mutation.
+func IsExactProviderResourceID(value string, maxBytes int) bool {
+	return maxBytes > 0 && value != "" && value == strings.TrimSpace(value) &&
+		len(value) <= maxBytes && !strings.ContainsAny(value, "/\\?#")
+}
+
+// CanonicalizeDomain normalizes a domain for storage.
+// Delegates to emailaddr.CanonicalizeDomain to avoid a circular dependency
+// (emailaddr is a lower-level utility; domains is a higher-level service).
 func CanonicalizeDomain(domain string) (string, error) {
-	d := strings.TrimSpace(domain)
-	d = strings.ToLower(d)
-	d = strings.TrimSuffix(d, ".")
-
-	if d == "" {
-		return "", fmt.Errorf("domain is empty")
+	ascii, err := domainLookupProfile.ToASCII(strings.TrimSpace(domain))
+	if err != nil {
+		return "", err
 	}
-	if strings.Contains(d, "://") {
-		return "", fmt.Errorf("domain must not contain protocol: %q", domain)
-	}
-	if strings.Contains(d, "/") {
-		return "", fmt.Errorf("domain must not contain path: %q", domain)
-	}
-	if strings.Contains(d, " ") {
-		return "", fmt.Errorf("domain must not contain spaces: %q", domain)
-	}
-	if !validHostnameRE.MatchString(d) {
-		return "", fmt.Errorf("invalid domain: %q", domain)
-	}
-	return d, nil
+	return emailaddr.CanonicalizeDomain(ascii)
 }

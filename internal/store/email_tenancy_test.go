@@ -729,6 +729,139 @@ func TestGranteeAppRoleCanCreateInboxWithDomainGrant(t *testing.T) {
 	})
 }
 
+func TestAppRoleCanonicalInboxConflictProbeIsGlobalAcrossSharedDomain(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		adminStore := &Store{db: db, q: db}
+		ownerID, firstGranteeID, domainID, _ := createDomainGrantFixture(
+			t, ctx, adminStore, "global-canonical-probe",
+		)
+		secondGranteeID, err := adminStore.CreateOrg(ctx, "domain-second-grantee-global-canonical-probe")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := adminStore.EnsureOrgDomainGrant(
+			ctx, ownerID, domainID, secondGranteeID, "grant:global-canonical-probe:second",
+		); err != nil {
+			t.Fatal(err)
+		}
+		appStore := openDomainGrantAppStore(t, ctx, db)
+		domain := "global-canonical-probe.abrolia.com"
+
+		seedForeignActive := func(localPart string) string {
+			t.Helper()
+			canonical := localPart + "@" + domain
+			legacyAddress := "\u00a0" + strings.ToUpper(canonical) + ".\u3000"
+			tx, err := db.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			if _, err := tx.ExecContext(ctx, `SET LOCAL session_replication_role = replica`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO inboxes
+				  (id, org_id, org_domain_id, address, status, outbound_provider, external_ref)
+				VALUES ($1, $2, $3, $4, 'active', 'smtp', $5)
+			`, uuid.NewString(), firstGranteeID, domainID, legacyAddress, "foreign:"+localPart); err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+			return canonical
+		}
+		assertOneActiveCanonical := func(canonical string) {
+			t.Helper()
+			var count int
+			if err := db.QueryRowContext(ctx, `
+				SELECT count(*)
+				FROM inboxes
+				WHERE `+canonicalInboxAddressSQL("address")+` = $1
+				  AND status = 'active'
+			`, canonical).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != 1 {
+				t.Fatalf("active canonical inboxes for %q=%d, want 1", canonical, count)
+			}
+		}
+		runScopedConflict := func(call func(*Store) error) error {
+			t.Helper()
+			var callErr error
+			var cloudMode string
+			if err := appStore.RunAsOrg(ctx, secondGranteeID, func(scoped *Store) error {
+				callErr = call(scoped)
+				return scoped.q.QueryRowContext(
+					ctx, `SELECT current_setting('app.cloud_mode', true)`,
+				).Scan(&cloudMode)
+			}); err != nil {
+				t.Fatalf("RunAsOrg wrapper: %v", err)
+			}
+			if cloudMode != "true" {
+				t.Fatalf("canonical probe restored app.cloud_mode=%q, want true", cloudMode)
+			}
+			return callErr
+		}
+
+		t.Run("CreateInboxForOrg", func(t *testing.T) {
+			canonical := seedForeignActive("create")
+			err := runScopedConflict(func(scoped *Store) error {
+				_, err := scoped.CreateInboxForOrg(ctx, secondGranteeID, canonical, domainID, "smtp")
+				return err
+			})
+			if !errors.Is(err, ErrResourceConflict) {
+				t.Fatalf("create error=%v, want resource conflict", err)
+			}
+			assertOneActiveCanonical(canonical)
+		})
+
+		t.Run("EnsureInboxForOrg", func(t *testing.T) {
+			canonical := seedForeignActive("ensure")
+			var created bool
+			err := runScopedConflict(func(scoped *Store) error {
+				_, created, err = scoped.EnsureInboxForOrg(
+					ctx, secondGranteeID, canonical, domainID, "smtp", "second:ensure",
+				)
+				return err
+			})
+			if created || !errors.Is(err, ErrResourceConflict) {
+				t.Fatalf("ensure created=%t error=%v, want false/resource conflict", created, err)
+			}
+			assertOneActiveCanonical(canonical)
+		})
+
+		t.Run("ReactivateInboxForOrg", func(t *testing.T) {
+			canonical := seedForeignActive("reactivate")
+			disabledID := uuid.NewString()
+			if _, err := db.ExecContext(ctx, `
+				INSERT INTO inboxes (id, org_id, org_domain_id, address, status)
+				VALUES ($1, $2, $3, $4, 'disabled')
+			`, disabledID, secondGranteeID, domainID, canonical); err != nil {
+				t.Fatal(err)
+			}
+			var changed bool
+			err := runScopedConflict(func(scoped *Store) error {
+				var err error
+				changed, err = scoped.ReactivateInboxForOrg(ctx, secondGranteeID, disabledID)
+				return err
+			})
+			if changed || !errors.Is(err, ErrResourceConflict) {
+				t.Fatalf("reactivate changed=%t error=%v, want false/resource conflict", changed, err)
+			}
+			var status string
+			if err := db.QueryRowContext(ctx, `SELECT status FROM inboxes WHERE id = $1`, disabledID).Scan(&status); err != nil {
+				t.Fatal(err)
+			}
+			if status != "disabled" {
+				t.Fatalf("failed reactivation status=%q, want disabled", status)
+			}
+			assertOneActiveCanonical(canonical)
+		})
+	})
+}
+
 func TestInboxCreationAndGrantRevocationSerialize(t *testing.T) {
 	t.Run("legacy revocation row lock rejects waiting inbox", func(t *testing.T) {
 		withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
@@ -882,7 +1015,10 @@ func openDomainGrantAppStore(t *testing.T, ctx context.Context, db *sql.DB) *Sto
 	if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO %s`, roleName)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT SELECT ON org_domains, org_domain_grants TO %s`, roleName)); err != nil {
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT SELECT ON orgs, org_domain_grants TO %s`, roleName)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT SELECT, UPDATE, DELETE ON org_domains TO %s`, roleName)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE ON inboxes TO %s`, roleName)); err != nil {

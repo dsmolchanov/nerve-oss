@@ -553,7 +553,7 @@ func TestSDKServerM2MOrgUsesSplitReplyAndComposeScopes(t *testing.T) {
 	}
 }
 
-func TestSDKServerPhase2DoesNotRegisterFutureBillingTool(t *testing.T) {
+func TestSDKServerDoesNotRegisterBillingToolWithoutProvisioner(t *testing.T) {
 	cfg := hostedRouterConfig()
 	runtime := NewServer(cfg, nil, auth.NewService(cfg, nil), nil)
 	principal := auth.Principal{
@@ -565,9 +565,8 @@ func TestSDKServerPhase2DoesNotRegisterFutureBillingTool(t *testing.T) {
 			t.Fatal("Phase 7 billing tool registered during the Phase 2 adapter rollout")
 		}
 	}
-	// The Phase 2 success criterion intentionally keeps future lifecycle and
-	// billing dispatch absent. Phase 7 adds BillingProvisioner and registers
-	// nerve_billing_subscribe atomically with its live mandate enforcement.
+	// A scope alone cannot expose billing. Production must explicitly install a
+	// BillingProvisioner backed by the principal-bound control-plane service.
 }
 
 type originRoundTripper struct {

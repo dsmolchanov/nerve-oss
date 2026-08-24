@@ -68,22 +68,7 @@ func (s *Store) EnsureDefaultOrg(ctx context.Context) (string, error) {
 }
 
 func (s *Store) EnsureDefaultInbox(ctx context.Context, address string) (string, error) {
-	orgID, err := s.EnsureDefaultOrg(ctx)
-	if err != nil {
-		return "", err
-	}
-	row := s.q.QueryRowContext(ctx, `SELECT id FROM inboxes WHERE address = $1`, address)
-	var id string
-	if err := row.Scan(&id); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			id = uuid.NewString()
-			_, err = s.q.ExecContext(ctx, `INSERT INTO inboxes (id, org_id, address, status) VALUES ($1,$2,$3,'active')`, id, orgID, address)
-			return id, err
-		}
-		return "", err
-	}
-	_, _ = s.q.ExecContext(ctx, `UPDATE inboxes SET org_id = COALESCE(org_id, $2) WHERE id = $1`, id, orgID)
-	return id, nil
+	return s.ensureInbox(ctx, address)
 }
 
 func (s *Store) EnsureDefaults(ctx context.Context, inboxAddress string) (string, error) {
