@@ -92,6 +92,9 @@ func (s *Store) LockOrgPolicy(ctx context.Context, orgID string) error {
 // intentionally transaction-only so onboarding can seed it atomically with
 // the org graph and explicit policy flags.
 func (s *Store) EnsureOutboundPolicyState(ctx context.Context, orgID string) (int64, error) {
+	if err := s.requireOutboundFence("EnsureOutboundPolicyState"); err != nil {
+		return 0, err
+	}
 	orgID = strings.TrimSpace(orgID)
 	if orgID == "" {
 		return 0, errors.New("missing org id")
@@ -117,6 +120,9 @@ func (s *Store) EnsureOutboundPolicyState(ctx context.Context, orgID string) (in
 // transaction-scoped org policy lock. Absence fails closed for autonomous
 // senders rather than silently treating the org as legacy.
 func (s *Store) CurrentOutboundPolicyEpoch(ctx context.Context, orgID string) (int64, error) {
+	if err := s.requireOutboundFence("CurrentOutboundPolicyEpoch"); err != nil {
+		return 0, err
+	}
 	orgID = strings.TrimSpace(orgID)
 	if orgID == "" {
 		return 0, errors.New("missing org id")
@@ -141,6 +147,9 @@ func (s *Store) CurrentOutboundPolicyEpoch(ctx context.Context, orgID string) (i
 // epoch in the same transaction as the caller's policy transition. The
 // existing failed status is retained; policy_revoked is the bounded reason.
 func (s *Store) AdvanceOutboundPolicyEpoch(ctx context.Context, orgID string) (epoch int64, terminalized int64, err error) {
+	if ferr := s.requireOutboundFence("AdvanceOutboundPolicyEpoch"); ferr != nil {
+		return 0, 0, ferr
+	}
 	orgID = strings.TrimSpace(orgID)
 	if orgID == "" {
 		return 0, 0, errors.New("missing org id")
@@ -285,6 +294,11 @@ func (s *Store) SetFeatureFlag(ctx context.Context, orgID *string, flag string, 
 	// Legacy organizations have no epoch row and retain their existing flag
 	// behavior. Every real autonomous policy change advances the fence in the
 	// same transaction, so suspended work can never revive after a later clear.
+	// Before Core 0029 the policy-state table does not exist and no org can
+	// carry an epoch, so the probe itself would be an unsupported-schema query.
+	if !s.OutboundFenceEnabled() {
+		return true, nil
+	}
 	var hasPolicyState bool
 	if err := s.q.QueryRowContext(ctx, `
 		SELECT EXISTS (
