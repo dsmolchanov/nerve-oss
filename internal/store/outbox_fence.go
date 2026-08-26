@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"strings"
 	"sync/atomic"
 )
@@ -32,15 +33,36 @@ var coreOutboundFenceColumns = []string{
 // the autonomous policy epoch and provider-start checks, so an undetermined
 // schema must fail loudly on Core 28 rather than quietly under-enforce on
 // Core 29.
-// It reads the *applied* version through the same latest-record semantics as
-// CurrentVersionCore. A plain max(version_id) would be wrong: Goose retains a
-// version 29 row after a clean down-migration, so a rolled-back schema would
-// still look fenced and every statement would then fail against objects that
-// migration 0029 had just dropped.
+// It distinguishes three states, because only one of them may disable the
+// fence:
+//
+//   - Absent or empty migration history is *undetermined*. It must not be read
+//     as "pre-29": with NM_MIGRATE_ON_START=off, or after history loss on an
+//     otherwise Core 29 database, selecting pre-fence SQL would drop
+//     autonomous_policy_epoch on enqueue, make the claim predicate vacuously
+//     true, and send mail with no epoch or revocation check. That is a silent
+//     policy bypass, so this returns an error and leaves the fence enabled.
+//   - A proven applied version below 29 is the legacy predecessor: unfenced.
+//   - A proven applied version at or above 29 is fenced.
+//
+// The applied version comes from CurrentVersionCore's latest-record semantics.
+// A plain max(version_id) would be wrong in the other direction: Goose can
+// retain a version 29 row after a rollback, so a rolled-back schema would still
+// look fenced and every statement would fail against objects 0029 had dropped.
 func outboundFenceAvailable(ctx context.Context, db *sql.DB) (bool, error) {
+	exists, err := migrationTableExists(ctx, db, migrationTableCore)
+	if err != nil {
+		return true, err
+	}
+	if !exists {
+		return true, errors.New("core migration history is absent: outbound fence capability is undetermined")
+	}
 	version, err := CurrentVersionCore(ctx, db)
 	if err != nil {
 		return true, err
+	}
+	if version == 0 {
+		return true, errors.New("core migration history has no applied version: outbound fence capability is undetermined")
 	}
 	return version >= CoreOutboundFenceVersion, nil
 }
