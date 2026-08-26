@@ -32,16 +32,17 @@ var coreOutboundFenceColumns = []string{
 // the autonomous policy epoch and provider-start checks, so an undetermined
 // schema must fail loudly on Core 28 rather than quietly under-enforce on
 // Core 29.
-func outboundFenceAvailable(ctx context.Context, q queryer) (bool, error) {
-	var version sql.NullInt64
-	err := q.QueryRowContext(ctx, `SELECT max(version_id) FROM schema_migrations_core`).Scan(&version)
+// It reads the *applied* version through the same latest-record semantics as
+// CurrentVersionCore. A plain max(version_id) would be wrong: Goose retains a
+// version 29 row after a clean down-migration, so a rolled-back schema would
+// still look fenced and every statement would then fail against objects that
+// migration 0029 had just dropped.
+func outboundFenceAvailable(ctx context.Context, db *sql.DB) (bool, error) {
+	version, err := CurrentVersionCore(ctx, db)
 	if err != nil {
 		return true, err
 	}
-	if !version.Valid {
-		return true, nil
-	}
-	return version.Int64 >= CoreOutboundFenceVersion, nil
+	return version >= CoreOutboundFenceVersion, nil
 }
 
 // RefreshOutboundFenceCapability records whether the live Core schema carries
@@ -51,7 +52,7 @@ func (s *Store) RefreshOutboundFenceCapability(ctx context.Context) error {
 	if s.fence == nil {
 		s.fence = newEnabledFence()
 	}
-	available, err := outboundFenceAvailable(ctx, s.q)
+	available, err := outboundFenceAvailable(ctx, s.db)
 	if err != nil {
 		s.fence.Store(true)
 		return err

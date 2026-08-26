@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -47,6 +48,38 @@ func TestFencedOutboxStatementsRetainTheFence(t *testing.T) {
 	claim := store.outboxSQL("SELECT coalesce(o.autonomous_policy_epoch, 0)")
 	if !strings.Contains(claim, "autonomous_policy_epoch") {
 		t.Fatal("fenced statement lost its fence column")
+	}
+}
+
+// A dropped clause can remove the last reference to a placeholder while the
+// caller still passes its argument, which pgx rejects at execution rather than
+// at build. Compare the highest placeholder in each adapted statement against
+// the fenced original so that mismatch surfaces here too.
+func TestPreFenceStatementsDoNotStrandPlaceholders(t *testing.T) {
+	source, err := os.ReadFile("outbox.go")
+	if err != nil {
+		t.Fatalf("read outbox.go: %v", err)
+	}
+	pattern := regexp.MustCompile("(?s)outboxSQL\\(`(.*?)`\\)")
+	placeholder := regexp.MustCompile(`\$([0-9]+)`)
+	highest := func(sql string) int {
+		max := 0
+		for _, m := range placeholder.FindAllStringSubmatch(sql, -1) {
+			n := 0
+			fmt.Sscanf(m[1], "%d", &n)
+			if n > max {
+				max = n
+			}
+		}
+		return max
+	}
+	for _, match := range pattern.FindAllStringSubmatch(string(source), -1) {
+		fenced := match[1]
+		adapted := preFenceOutboxSQL.Replace(fenced)
+		if got, want := highest(adapted), highest(fenced); got != want {
+			t.Logf("adapted statement drops placeholders %d..%d; its caller must trim the same trailing arguments via outboxArgs:\n%s",
+				got+1, want, adapted)
+		}
 	}
 }
 

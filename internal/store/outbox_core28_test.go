@@ -109,8 +109,20 @@ func TestAutonomousFenceOperationsRefuseOnCore28(t *testing.T) {
 		}
 		orgID, _ := seedCore28Outbox(t, ctx, db)
 
-		if _, err := st.BeginOutboxProviderOperationState(ctx, OutboxMessage{ID: uuid.NewString()}); err == nil {
-			t.Fatal("provider-start admitted on core 28")
+		// A legacy row (epoch 0) must pass straight through: the worker calls
+		// this for every claimed message and Core 28 has nothing but legacy rows.
+		legacy := OutboxMessage{
+			ID: uuid.NewString(), OrgID: orgID,
+			LockedBy: sql.NullString{String: "worker", Valid: true},
+		}
+		if _, err := st.BeginOutboxProviderOperationState(ctx, legacy); err != nil {
+			t.Fatalf("legacy provider-start refused on core 28: %v", err)
+		}
+		// A row claiming an epoch cannot exist before the fence, so it must refuse.
+		fenced := legacy
+		fenced.AutonomousPolicyEpoch = 1
+		if _, err := st.BeginOutboxProviderOperationState(ctx, fenced); err == nil {
+			t.Fatal("fenced provider-start admitted on core 28")
 		}
 		if err := st.ResolveOutboxProviderAttempt(ctx, uuid.NewString(), "w", "op"); err == nil {
 			t.Fatal("provider resolution admitted on core 28")
@@ -162,6 +174,73 @@ func TestFenceBecomesActiveAfterCore29(t *testing.T) {
 		}
 		if len(claimed) != 1 || claimed[0].ID != id {
 			t.Fatalf("claim returned %+v, want the enqueued row", claimed)
+		}
+	})
+}
+
+// Goose keeps the version 29 record after a clean down-migration, so a naive
+// max(version_id) probe would still report the fence as present and then emit
+// statements against the objects 0029 had just dropped.
+func TestFenceDetectionRespectsRolledBackCore29(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 29); err != nil {
+			t.Fatalf("migrate to core 29: %v", err)
+		}
+		st := &Store{db: db, q: db, fence: newEnabledFence()}
+		if err := st.RefreshOutboundFenceCapability(ctx); err != nil {
+			t.Fatalf("detect fence at 29: %v", err)
+		}
+		if !st.OutboundFenceEnabled() {
+			t.Fatal("fence reported unavailable on core 29")
+		}
+
+		// MigrateDownCore steps back exactly one migration: 29 -> 28.
+		if err := MigrateDownCore(ctx, db); err != nil {
+			t.Fatalf("migrate down to core 28: %v", err)
+		}
+		var retained int
+		if err := db.QueryRowContext(ctx,
+			`SELECT count(*) FROM schema_migrations_core WHERE version_id = 29`).Scan(&retained); err != nil {
+			t.Fatalf("read migration history: %v", err)
+		}
+		if retained == 0 {
+			// This goose configuration deletes the record on the way down. Recreate
+			// the hazard explicitly so the applied-version semantics are still
+			// proven: a not-applied version 29 row must never count as fenced.
+			if _, err := db.ExecContext(ctx, `
+				INSERT INTO schema_migrations_core (version_id, is_applied, tstamp)
+				VALUES (29, false, now())
+			`); err != nil {
+				t.Fatalf("seed rolled-back migration record: %v", err)
+			}
+		}
+
+		if err := st.RefreshOutboundFenceCapability(ctx); err != nil {
+			t.Fatalf("detect fence after rollback: %v", err)
+		}
+		if st.OutboundFenceEnabled() {
+			t.Fatal("rolled-back core 29 still reported the fence as available")
+		}
+
+		// Legacy delivery must work again against the rolled-back schema.
+		orgID, inboxID := seedCore28Outbox(t, ctx, db)
+		id, err := st.EnqueueOutboxMessage(ctx, OutboxMessage{
+			OrgID: orgID, InboxID: inboxID, Provider: "smtp", IdempotencyKey: "rolled-back",
+			To: "recipient@local.neuralmail", From: "core28@local.neuralmail",
+			Subject: "rolled back", TextBody: "body",
+		})
+		if err != nil {
+			t.Fatalf("enqueue after rollback: %v", err)
+		}
+		claimed, err := st.ClaimOutboxMessages(ctx, 10, "rollback-worker", time.Now().UTC(), 5*time.Minute)
+		if err != nil {
+			t.Fatalf("claim after rollback: %v", err)
+		}
+		if len(claimed) != 1 || claimed[0].ID != id {
+			t.Fatalf("claim returned %+v, want the enqueued row", claimed)
+		}
+		if err := st.MarkOutboxMessageSent(ctx, id, "provider-rolled-back"); err != nil {
+			t.Fatalf("mark sent after rollback: %v", err)
 		}
 	})
 }

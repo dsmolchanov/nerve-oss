@@ -643,14 +643,19 @@ func (s *Store) BeginOutboxProviderOperation(ctx context.Context, msg OutboxMess
 // BeginOutboxProviderOperationState is BeginOutboxProviderOperation plus the
 // persisted database start time needed to enforce bounded provider replay.
 func (s *Store) BeginOutboxProviderOperationState(ctx context.Context, msg OutboxMessage) (OutboxProviderOperation, error) {
-	if err := s.requireOutboundFence("BeginOutboxProviderOperationState"); err != nil {
-		return OutboxProviderOperation{}, err
-	}
 	if msg.ID == "" || msg.OrgID == "" || !msg.LockedBy.Valid || msg.LockedBy.String == "" {
 		return OutboxProviderOperation{}, errors.New("missing claimed outbox identity")
 	}
+	// The legacy fast path must come first. The worker calls this for every
+	// claimed message, and on Core 28 every row is legacy, so guarding ahead of
+	// this return would refuse each one and requeue it without ever reaching the
+	// provider -- Artifact B could not deliver mail on the Core 28 half of its
+	// window. Only a genuinely fenced row needs the fence.
 	if msg.AutonomousPolicyEpoch <= 0 {
 		return OutboxProviderOperation{}, nil
+	}
+	if err := s.requireOutboundFence("BeginOutboxProviderOperationState"); err != nil {
+		return OutboxProviderOperation{}, err
 	}
 	operationID := "outbox:" + msg.ID
 	var operationStartedAt time.Time
@@ -962,7 +967,7 @@ func (s *Store) finishClaimedOutbox(ctx context.Context, id, workerID, operation
 		  AND status = 'sending'
 		  AND locked_by = $2
 		  AND (($3 = '' AND provider_operation_id IS NULL) OR provider_operation_id = $3)
-	`), id, workerID, operationID, status, lastError, providerMessageID, resolve)
+	`), s.outboxArgs(id, workerID, operationID, status, lastError, providerMessageID, resolve)...)
 	if err != nil {
 		return err
 	}
