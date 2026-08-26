@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -48,6 +49,77 @@ func TestFencedOutboxStatementsRetainTheFence(t *testing.T) {
 	if !strings.Contains(claim, "autonomous_policy_epoch") {
 		t.Fatal("fenced statement lost its fence column")
 	}
+}
+
+// A dropped clause can remove the last reference to a placeholder while the
+// caller still passes its argument, which pgx rejects at execution rather than
+// at build. Every adapted statement that loses trailing placeholders must
+// therefore route its arguments through outboxArgs, and this fails when one
+// does not -- a test that merely logged would leave the next occurrence green
+// until it failed in production.
+func TestPreFenceStatementsTrimStrandedPlaceholderArguments(t *testing.T) {
+	fileSet := token.NewFileSet()
+	parsed, err := parser.ParseFile(fileSet, "outbox.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse outbox.go: %v", err)
+	}
+	placeholder := regexp.MustCompile(`\$([0-9]+)`)
+	highest := func(sql string) int {
+		max := 0
+		for _, m := range placeholder.FindAllStringSubmatch(sql, -1) {
+			n := 0
+			fmt.Sscanf(m[1], "%d", &n)
+			if n > max {
+				max = n
+			}
+		}
+		return max
+	}
+	checked := 0
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		outer, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		// Find the query literal this call passes through outboxSQL.
+		var fenced string
+		usesOutboxArgs := false
+		for _, arg := range outer.Args {
+			inner, ok := arg.(*ast.CallExpr)
+			if !ok {
+				continue
+			}
+			sel, ok := inner.Fun.(*ast.SelectorExpr)
+			if !ok {
+				continue
+			}
+			switch sel.Sel.Name {
+			case "outboxSQL":
+				if len(inner.Args) == 1 {
+					if lit, ok := inner.Args[0].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+						fenced = strings.Trim(lit.Value, "`")
+					}
+				}
+			case "outboxArgs":
+				usesOutboxArgs = true
+			}
+		}
+		if fenced == "" {
+			return true
+		}
+		checked++
+		adapted := preFenceOutboxSQL.Replace(fenced)
+		dropped := highest(fenced) - highest(adapted)
+		if dropped > 0 && !usesOutboxArgs {
+			t.Errorf("adapted statement drops %d trailing placeholder(s) but its caller does not use outboxArgs; "+
+				"pgx will reject it with a parameter-count error on the pre-fence path:\n%s", dropped, adapted)
+		}
+		return true
+	})
+	if checked == 0 {
+		t.Fatal("no outboxSQL call sites found; the wrapper or this test drifted")
+	}
+	t.Logf("verified %d outboxSQL call sites", checked)
 }
 
 func TestUndeterminedSchemaDefaultsToFenced(t *testing.T) {

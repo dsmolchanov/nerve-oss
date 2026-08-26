@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"strings"
 	"sync/atomic"
 )
@@ -32,16 +33,38 @@ var coreOutboundFenceColumns = []string{
 // the autonomous policy epoch and provider-start checks, so an undetermined
 // schema must fail loudly on Core 28 rather than quietly under-enforce on
 // Core 29.
-func outboundFenceAvailable(ctx context.Context, q queryer) (bool, error) {
-	var version sql.NullInt64
-	err := q.QueryRowContext(ctx, `SELECT max(version_id) FROM schema_migrations_core`).Scan(&version)
+// It distinguishes three states, because only one of them may disable the
+// fence:
+//
+//   - Absent or empty migration history is *undetermined*. It must not be read
+//     as "pre-29": with NM_MIGRATE_ON_START=off, or after history loss on an
+//     otherwise Core 29 database, selecting pre-fence SQL would drop
+//     autonomous_policy_epoch on enqueue, make the claim predicate vacuously
+//     true, and send mail with no epoch or revocation check. That is a silent
+//     policy bypass, so this returns an error and leaves the fence enabled.
+//   - A proven applied version below 29 is the legacy predecessor: unfenced.
+//   - A proven applied version at or above 29 is fenced.
+//
+// The applied version comes from CurrentVersionCore's latest-record semantics.
+// A plain max(version_id) would be wrong in the other direction: Goose can
+// retain a version 29 row after a rollback, so a rolled-back schema would still
+// look fenced and every statement would fail against objects 0029 had dropped.
+func outboundFenceAvailable(ctx context.Context, db *sql.DB) (bool, error) {
+	exists, err := migrationTableExists(ctx, db, migrationTableCore)
 	if err != nil {
 		return true, err
 	}
-	if !version.Valid {
-		return true, nil
+	if !exists {
+		return true, errors.New("core migration history is absent: outbound fence capability is undetermined")
 	}
-	return version.Int64 >= CoreOutboundFenceVersion, nil
+	version, err := CurrentVersionCore(ctx, db)
+	if err != nil {
+		return true, err
+	}
+	if version == 0 {
+		return true, errors.New("core migration history has no applied version: outbound fence capability is undetermined")
+	}
+	return version >= CoreOutboundFenceVersion, nil
 }
 
 // RefreshOutboundFenceCapability records whether the live Core schema carries
@@ -51,7 +74,7 @@ func (s *Store) RefreshOutboundFenceCapability(ctx context.Context) error {
 	if s.fence == nil {
 		s.fence = newEnabledFence()
 	}
-	available, err := outboundFenceAvailable(ctx, s.q)
+	available, err := outboundFenceAvailable(ctx, s.db)
 	if err != nil {
 		s.fence.Store(true)
 		return err
