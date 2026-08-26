@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -425,17 +426,25 @@ func TestStaleStoreDoesNotClaimFencedRowAsLegacy(t *testing.T) {
 		}
 
 		claimed, err := stale.ClaimOutboxMessages(ctx, 10, "stale-worker", time.Now().UTC(), 5*time.Minute)
-		if err != nil {
-			// Refusing is acceptable; silently claiming it as legacy is not.
-			t.Logf("stale consumer refused: %v", err)
-		}
 		for _, msg := range claimed {
 			if msg.ID == outboxID {
 				t.Fatal("stale consumer claimed a fenced row as legacy: the policy predicate was bypassed")
 			}
 		}
-		if !stale.OutboundFenceEnabled() {
-			t.Fatal("stale consumer did not revalidate against the live core 29 schema")
+		if !errors.Is(err, ErrOutboundFenceDrift) {
+			t.Fatalf("stale consumer error = %v, want drift refusal", err)
+		}
+		// Drift is terminal for the process: it must not quietly switch modes.
+		if _, err := stale.ClaimOutboxMessages(ctx, 10, "stale-worker", time.Now().UTC(), 5*time.Minute); !errors.Is(err, ErrOutboundFenceDrift) {
+			t.Fatalf("second claim error = %v, want drift refusal", err)
+		}
+		// A restarted process picks up the new schema cleanly.
+		restarted := &Store{db: db, q: db, fence: newEnabledFence(), drift: new(atomic.Bool)}
+		if err := restarted.RefreshOutboundFenceCapability(ctx); err != nil {
+			t.Fatalf("restarted refresh: %v", err)
+		}
+		if !restarted.OutboundFenceEnabled() {
+			t.Fatal("restarted process did not observe core 29")
 		}
 	})
 }
@@ -443,7 +452,7 @@ func TestStaleStoreDoesNotClaimFencedRowAsLegacy(t *testing.T) {
 // The inverse: a stale fenced instance after a clean rollback issues fenced SQL
 // against removed objects. That is an outage rather than a bypass, so it may
 // fail -- but it must re-detect and recover instead of failing forever.
-func TestStaleFencedStoreRecoversAfterRollback(t *testing.T) {
+func TestStaleFencedStoreRefusesAfterRollbackUntilRestart(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		if err := MigrateUpToCore(ctx, db, 29); err != nil {
 			t.Fatalf("migrate to core 29: %v", err)
@@ -470,21 +479,33 @@ func TestStaleFencedStoreRecoversAfterRollback(t *testing.T) {
 		if firstErr != nil {
 			t.Logf("first post-rollback attempt failed as expected: %v", firstErr)
 		}
-		if st.OutboundFenceEnabled() {
-			t.Fatal("store still believes the fence exists after a clean rollback")
-		}
-
-		// Having re-detected, it must work.
-		id, err := st.EnqueueOutboxMessage(ctx, OutboxMessage{
+		// Drift is terminal: the process refuses rather than downgrading itself.
+		if _, err := st.EnqueueOutboxMessage(ctx, OutboxMessage{
 			OrgID: orgID, InboxID: inboxID, Provider: "smtp", IdempotencyKey: "post-rollback-2",
 			To: "recipient@local.neuralmail", From: "core28@local.neuralmail",
 			Subject: "post rollback", TextBody: "body",
+		}); !errors.Is(err, ErrOutboundFenceDrift) {
+			t.Fatalf("second enqueue error = %v, want drift refusal", err)
+		}
+
+		// A restart is what recovers, and it works on the rolled-back schema.
+		restarted := &Store{db: db, q: db, fence: newEnabledFence(), drift: new(atomic.Bool)}
+		if err := restarted.RefreshOutboundFenceCapability(ctx); err != nil {
+			t.Fatalf("restarted refresh: %v", err)
+		}
+		if restarted.OutboundFenceEnabled() {
+			t.Fatal("restarted process still believes the fence exists")
+		}
+		id, err := restarted.EnqueueOutboxMessage(ctx, OutboxMessage{
+			OrgID: orgID, InboxID: inboxID, Provider: "smtp", IdempotencyKey: "post-restart",
+			To: "recipient@local.neuralmail", From: "core28@local.neuralmail",
+			Subject: "post restart", TextBody: "body",
 		})
 		if err != nil {
-			t.Fatalf("enqueue after re-detection: %v", err)
+			t.Fatalf("enqueue after restart: %v", err)
 		}
-		if _, err := st.ClaimOutboxMessages(ctx, 10, "recovered-worker", time.Now().UTC(), 5*time.Minute); err != nil {
-			t.Fatalf("claim after re-detection: %v", err)
+		if _, err := restarted.ClaimOutboxMessages(ctx, 10, "restarted-worker", time.Now().UTC(), 5*time.Minute); err != nil {
+			t.Fatalf("claim after restart: %v", err)
 		}
 		if id == "" {
 			t.Fatal("enqueue returned no id")
@@ -546,7 +567,7 @@ func TestPreFenceOperationsNeedNoSecondConnection(t *testing.T) {
 // refuse the autonomous-only operations forever after Core 0029 lands beneath
 // a process that started on Core 28, until some unrelated adaptable operation
 // happened to refresh the shared flag.
-func TestCapabilityGatesFollowLiveSchema(t *testing.T) {
+func TestCapabilityGatesUseTheStartupDecision(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		if err := MigrateUpToCore(ctx, db, 28); err != nil {
 			t.Fatalf("migrate to core 28: %v", err)
@@ -570,21 +591,32 @@ func TestCapabilityGatesFollowLiveSchema(t *testing.T) {
 		if err := MigrateUpToCore(ctx, db, 29); err != nil {
 			t.Fatalf("migrate to core 29: %v", err)
 		}
+		// The startup decision stands: this process keeps refusing rather than
+		// switching mid-flight. That is the point -- re-deciding at run time is
+		// what produced a probe-then-execute race.
 		if err := st.RunInTx(ctx, func(scoped *Store) error {
 			_, err := scoped.EnsureOutboundPolicyState(ctx, orgID)
 			return err
-		}); err != nil {
-			t.Fatalf("gate still refused after core 29 landed: %v", err)
+		}); err == nil {
+			t.Fatal("gate switched modes mid-flight instead of holding its startup decision")
 		}
-		if !st.OutboundFenceEnabled() {
-			t.Fatal("gate did not update the shared capability")
+
+		restarted := &Store{db: db, q: db, fence: newEnabledFence(), drift: new(atomic.Bool)}
+		if err := restarted.RefreshOutboundFenceCapability(ctx); err != nil {
+			t.Fatalf("restarted refresh: %v", err)
+		}
+		if err := restarted.RunInTx(ctx, func(scoped *Store) error {
+			_, err := scoped.EnsureOutboundPolicyState(ctx, orgID)
+			return err
+		}); err != nil {
+			t.Fatalf("restarted process refused a valid core 29 operation: %v", err)
 		}
 	})
 }
 
 // Each requeue entry point must be able to be the first consumer after a clean
 // rollback and still recover.
-func TestRequeueEntryPointsRecoverAfterRollback(t *testing.T) {
+func TestRequeueEntryPointsRefuseAfterRollback(t *testing.T) {
 	for _, entry := range []struct {
 		name   string
 		invoke func(ctx context.Context, st *Store, id, lockedBy string) error
@@ -635,13 +667,16 @@ func TestRequeueEntryPointsRecoverAfterRollback(t *testing.T) {
 				if firstErr := entry.invoke(ctx, st, id, lockedBy); firstErr != nil {
 					t.Logf("first attempt failed as expected: %v", firstErr)
 				}
-				if st.OutboundFenceEnabled() {
-					t.Fatal("capability was not refreshed after the rollback")
+				if err := entry.invoke(ctx, st, id, lockedBy); !errors.Is(err, ErrOutboundFenceDrift) {
+					t.Fatalf("retry error = %v, want drift refusal", err)
 				}
-				if err := entry.invoke(ctx, st, id, lockedBy); err != nil {
-					if !errors.Is(err, ErrOutboxClaimLost) {
-						t.Fatalf("retry after re-detection: %v", err)
-					}
+				restarted := &Store{db: db, q: db, fence: newEnabledFence(), drift: new(atomic.Bool)}
+				if err := restarted.RefreshOutboundFenceCapability(ctx); err != nil {
+					t.Fatalf("restarted refresh: %v", err)
+				}
+				if err := entry.invoke(ctx, restarted, id, lockedBy); err != nil &&
+					!errors.Is(err, ErrOutboxClaimLost) {
+					t.Fatalf("restarted process still failed: %v", err)
 				}
 			})
 		})

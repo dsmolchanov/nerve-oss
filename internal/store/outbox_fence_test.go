@@ -34,8 +34,12 @@ func TestPreFenceOutboxStatementsDropEveryFenceColumn(t *testing.T) {
 				t.Errorf("pre-fence statement still references %s:\n%s", column, adapted)
 			}
 		}
-		if strings.Contains(adapted, "org_outbound_policy_state") {
-			t.Errorf("pre-fence statement still references org_outbound_policy_state:\n%s", adapted)
+		// preFenceClaimGuard names the table inside to_regclass on purpose: it is
+		// an existence test that is valid on both schemas, and it is what makes
+		// a fenced schema unclaimable in the same statement as the claim.
+		withoutGuard := strings.ReplaceAll(adapted, preFenceClaimGuard, "")
+		if strings.Contains(withoutGuard, "org_outbound_policy_state") {
+			t.Errorf("pre-fence statement still queries org_outbound_policy_state:\n%s", adapted)
 		}
 	}
 	t.Logf("verified %d adapted statements", len(matches))

@@ -98,6 +98,12 @@ func (s *Store) RefreshOutboundFenceCapability(ctx context.Context) error {
 	if s.fence == nil {
 		s.fence = newEnabledFence()
 	}
+	// Allocate the drift holder here, before any scoped store copies the
+	// pointer: a nil parent would leave each transaction marking a private copy
+	// that the process never observes.
+	if s.drift == nil {
+		s.drift = new(atomic.Bool)
+	}
 	available, err := outboundFenceAvailable(ctx, s.q)
 	if err != nil {
 		s.setOutboundFence(true)
@@ -154,7 +160,7 @@ var preFenceOutboxSQL = strings.NewReplacer(
 						  AND NOT suspended.enabled
 					)
 				)
-			)`, "true",
+			)`, preFenceClaimGuard,
 
 	// Projections keep their column count and types so every Scan target and
 	// every caller sees the same shape on both schemas.
@@ -175,54 +181,53 @@ var preFenceOutboxSQL = strings.NewReplacer(
 	"SELECT NULL::bigint, NULL::timestamptz, NULL::timestamptz",
 )
 
-// resolveOutboundFence reports the capability to use for one operation.
+// ErrOutboundFenceDrift reports that the live Core schema no longer matches the
+// capability this process fixed at startup. It is deliberately terminal for the
+// process: re-deciding at run time is what created a probe-then-execute race,
+// so a drifted process refuses outbox work until it is restarted.
+var ErrOutboundFenceDrift = errors.New("core schema changed beneath this process: restart required before outbox work resumes")
+
+// resolveOutboundFence reports the capability fixed at startup.
 //
-// The two directions are deliberately asymmetric, because their failure modes
-// are not comparable:
-//
-//   - Believing we are pre-fence when the schema has moved to Core 29 is a
-//     policy bypass. The legacy claim predicate is vacuously true, the epoch
-//     projects as zero, and provider-start takes the legacy fast path, so an
-//     autonomous row can be sent with no epoch or revocation check. Phase 9
-//     creates exactly this window: Artifact B is deployed on Core 28 and Core
-//     0029 is applied while it is still running. So the pre-fence path
-//     revalidates against the live schema before every operation, and the cost
-//     falls entirely inside that short-lived predecessor window.
-//   - Believing we are fenced when the schema has rolled back to Core 28 is an
-//     outage, not a bypass: the statement fails loudly with undefined_column.
-//     That direction stays optimistic and self-heals through
-//     noteOutboxSchemaError, so the steady Core 29 state pays nothing.
-func (s *Store) resolveOutboundFence(ctx context.Context) bool {
-	if s.OutboundFenceEnabled() {
-		return true
-	}
-	if s.q == nil {
-		// Nothing to probe and nothing executable either; keep what is known.
-		return false
-	}
-	available, err := outboundFenceAvailable(ctx, s.q)
-	if err != nil {
-		// Undetermined: fail closed rather than keep using legacy SQL.
-		s.setOutboundFence(true)
-		return true
-	}
-	s.setOutboundFence(available)
-	return available
+// It never re-decides. An earlier design probed the live schema per operation,
+// but the probe and the caller's statement are separate statements: Core 0029
+// could commit between them, and the claim would then run legacy SQL against a
+// fenced schema. Deciding once and refusing on drift removes that race by
+// construction rather than narrowing it.
+func (s *Store) resolveOutboundFence(context.Context) bool {
+	return s.OutboundFenceEnabled()
 }
 
-// noteOutboxSchemaError re-detects the capability when a statement failed
-// because the schema does not carry the objects it referenced. The caller still
-// sees the error; the next attempt selects correctly.
-func (s *Store) noteOutboxSchemaError(ctx context.Context, err error) error {
-	if err == nil || !isUndefinedColumnOrTable(err) {
+// requireNoOutboundFenceDrift refuses every outbox operation once drift has
+// been observed.
+func (s *Store) requireNoOutboundFenceDrift() error {
+	if s.drift != nil && s.drift.Load() {
+		return ErrOutboundFenceDrift
+	}
+	return nil
+}
+
+func (s *Store) markOutboundFenceDrift() {
+	if s.drift == nil {
+		s.drift = new(atomic.Bool)
+	}
+	s.drift.Store(true)
+}
+
+// noteOutboxSchemaError converts an undefined-column or undefined-table failure
+// into terminal drift. This is the fenced-process-on-a-rolled-back-schema
+// direction: the statement fails loudly, so no bypass is possible, but the
+// process must not silently downgrade itself either.
+//
+// It takes no connection. The previous version probed the pool from inside a
+// caller's transaction, which could wait for a connection that the same caller
+// already held.
+func (s *Store) noteOutboxSchemaError(err error) error {
+	if err == nil {
 		return err
 	}
-	// The caller's transaction, if any, has already failed; probe the pool so a
-	// poisoned connection cannot swallow the re-detection.
-	if available, probeErr := outboundFenceAvailable(ctx, s.db); probeErr == nil {
-		s.setOutboundFence(available)
-	} else {
-		s.setOutboundFence(true)
+	if isUndefinedColumnOrTable(err) {
+		s.markOutboundFenceDrift()
 	}
 	return err
 }
@@ -241,6 +246,14 @@ func (s *Store) setOutboundFence(enabled bool) {
 	}
 	s.fence.Store(enabled)
 }
+
+// preFenceClaimGuard is spliced into the pre-fence claim. It is evaluated in the
+// same statement and the same snapshot as the claim itself, so a Core 0029 that
+// commits after the startup decision cannot be claimed against with legacy SQL.
+// This is the one direction that produces no SQL error -- legacy SQL runs
+// perfectly well on a fenced schema -- so it needs an in-statement guard rather
+// than any form of probe.
+const preFenceClaimGuard = "(SELECT to_regclass('public.org_outbound_policy_state') IS NULL)"
 
 // adaptOutboxSQL and trimOutboxArgs take an already-resolved capability so a
 // single operation cannot pick the statement under one answer and its arguments
@@ -269,6 +282,9 @@ func trimOutboxArgs(fenced bool, args ...any) []any {
 // refresh the shared capability, blocking onboarding and autonomous delivery
 // against a perfectly valid schema.
 func (s *Store) requireOutboundFence(ctx context.Context, operation string) error {
+	if err := s.requireNoOutboundFenceDrift(); err != nil {
+		return err
+	}
 	if s.resolveOutboundFence(ctx) {
 		return nil
 	}
