@@ -20,10 +20,10 @@ func TestPreFenceOutboxStatementsDropEveryFenceColumn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read outbox.go: %v", err)
 	}
-	pattern := regexp.MustCompile("(?s)outboxSQL\\(`(.*?)`\\)")
+	pattern := regexp.MustCompile("(?s)adaptOutboxSQL\\([A-Za-z]+, `(.*?)`\\)")
 	matches := pattern.FindAllStringSubmatch(string(source), -1)
 	if len(matches) == 0 {
-		t.Fatal("no outboxSQL statements found; the wrapper or this test drifted")
+		t.Fatal("no adaptOutboxSQL statements found; the wrapper or this test drifted")
 	}
 	for _, match := range matches {
 		fenced := match[1]
@@ -43,9 +43,7 @@ func TestPreFenceOutboxStatementsDropEveryFenceColumn(t *testing.T) {
 // The fenced form must keep the columns. A replacer that fired unconditionally
 // would silently disable the policy fence on Core 29.
 func TestFencedOutboxStatementsRetainTheFence(t *testing.T) {
-	store := &Store{}
-	store.fence = newEnabledFence()
-	claim := store.outboxSQL("SELECT coalesce(o.autonomous_policy_epoch, 0)")
+	claim := adaptOutboxSQL(true, "SELECT coalesce(o.autonomous_policy_epoch, 0)")
 	if !strings.Contains(claim, "autonomous_policy_epoch") {
 		t.Fatal("fenced statement lost its fence column")
 	}
@@ -89,18 +87,23 @@ func TestPreFenceStatementsTrimStrandedPlaceholderArguments(t *testing.T) {
 			if !ok {
 				continue
 			}
-			sel, ok := inner.Fun.(*ast.SelectorExpr)
-			if !ok {
+			name := ""
+			switch fn := inner.Fun.(type) {
+			case *ast.SelectorExpr:
+				name = fn.Sel.Name
+			case *ast.Ident:
+				name = fn.Name
+			default:
 				continue
 			}
-			switch sel.Sel.Name {
-			case "outboxSQL":
-				if len(inner.Args) == 1 {
-					if lit, ok := inner.Args[0].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+			switch name {
+			case "adaptOutboxSQL":
+				if len(inner.Args) == 2 {
+					if lit, ok := inner.Args[1].(*ast.BasicLit); ok && lit.Kind == token.STRING {
 						fenced = strings.Trim(lit.Value, "`")
 					}
 				}
-			case "outboxArgs":
+			case "trimOutboxArgs":
 				usesOutboxArgs = true
 			}
 		}
@@ -111,15 +114,15 @@ func TestPreFenceStatementsTrimStrandedPlaceholderArguments(t *testing.T) {
 		adapted := preFenceOutboxSQL.Replace(fenced)
 		dropped := highest(fenced) - highest(adapted)
 		if dropped > 0 && !usesOutboxArgs {
-			t.Errorf("adapted statement drops %d trailing placeholder(s) but its caller does not use outboxArgs; "+
+			t.Errorf("adapted statement drops %d trailing placeholder(s) but its caller does not use trimOutboxArgs; "+
 				"pgx will reject it with a parameter-count error on the pre-fence path:\n%s", dropped, adapted)
 		}
 		return true
 	})
 	if checked == 0 {
-		t.Fatal("no outboxSQL call sites found; the wrapper or this test drifted")
+		t.Fatal("no adaptOutboxSQL call sites found; the wrapper or this test drifted")
 	}
-	t.Logf("verified %d outboxSQL call sites", checked)
+	t.Logf("verified %d adaptOutboxSQL call sites", checked)
 }
 
 func TestUndeterminedSchemaDefaultsToFenced(t *testing.T) {
@@ -163,7 +166,7 @@ func TestEveryFenceReferencingStatementIsAdaptedOrGuarded(t *testing.T) {
 		}
 		ast.Inspect(fn.Body, func(node ast.Node) bool {
 			if call, ok := node.(*ast.CallExpr); ok {
-				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "outboxSQL" {
+				if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "adaptOutboxSQL" {
 					return false
 				}
 			}
@@ -173,7 +176,7 @@ func TestEveryFenceReferencingStatementIsAdaptedOrGuarded(t *testing.T) {
 			}
 			for _, column := range coreOutboundFenceColumns {
 				if strings.Contains(lit.Value, column) {
-					t.Errorf("%s: statement references %s without outboxSQL or a requireOutboundFence guard",
+					t.Errorf("%s: statement references %s without adaptOutboxSQL or a requireOutboundFence guard",
 						fn.Name.Name, column)
 					return false
 				}

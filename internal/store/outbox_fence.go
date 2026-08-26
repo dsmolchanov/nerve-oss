@@ -6,6 +6,8 @@ import (
 	"errors"
 	"strings"
 	"sync/atomic"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // CoreOutboundFenceVersion is the Core migration that adds the outbound policy
@@ -151,12 +153,82 @@ var preFenceOutboxSQL = strings.NewReplacer(
 	"SELECT NULL::bigint, NULL::timestamptz, NULL::timestamptz",
 )
 
-// outboxSQL returns the statement appropriate to the live Core schema.
-func (s *Store) outboxSQL(fenced string) string {
+// resolveOutboundFence reports the capability to use for one operation.
+//
+// The two directions are deliberately asymmetric, because their failure modes
+// are not comparable:
+//
+//   - Believing we are pre-fence when the schema has moved to Core 29 is a
+//     policy bypass. The legacy claim predicate is vacuously true, the epoch
+//     projects as zero, and provider-start takes the legacy fast path, so an
+//     autonomous row can be sent with no epoch or revocation check. Phase 9
+//     creates exactly this window: Artifact B is deployed on Core 28 and Core
+//     0029 is applied while it is still running. So the pre-fence path
+//     revalidates against the live schema before every operation, and the cost
+//     falls entirely inside that short-lived predecessor window.
+//   - Believing we are fenced when the schema has rolled back to Core 28 is an
+//     outage, not a bypass: the statement fails loudly with undefined_column.
+//     That direction stays optimistic and self-heals through
+//     noteOutboxSchemaError, so the steady Core 29 state pays nothing.
+func (s *Store) resolveOutboundFence(ctx context.Context) bool {
 	if s.OutboundFenceEnabled() {
-		return fenced
+		return true
 	}
-	return preFenceOutboxSQL.Replace(fenced)
+	available, err := outboundFenceAvailable(ctx, s.db)
+	if err != nil {
+		// Undetermined: fail closed rather than keep using legacy SQL.
+		s.setOutboundFence(true)
+		return true
+	}
+	s.setOutboundFence(available)
+	return available
+}
+
+// noteOutboxSchemaError re-detects the capability when a statement failed
+// because the schema does not carry the objects it referenced. The caller still
+// sees the error; the next attempt selects correctly.
+func (s *Store) noteOutboxSchemaError(ctx context.Context, err error) error {
+	if err == nil || !isUndefinedColumnOrTable(err) {
+		return err
+	}
+	if available, probeErr := outboundFenceAvailable(ctx, s.db); probeErr == nil {
+		s.setOutboundFence(available)
+	} else {
+		s.setOutboundFence(true)
+	}
+	return err
+}
+
+func isUndefinedColumnOrTable(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == "42703" || pgErr.Code == "42P01"
+}
+
+func (s *Store) setOutboundFence(enabled bool) {
+	if s.fence == nil {
+		s.fence = newEnabledFence()
+	}
+	s.fence.Store(enabled)
+}
+
+// adaptOutboxSQL and trimOutboxArgs take an already-resolved capability so a
+// single operation cannot pick the statement under one answer and its arguments
+// under another, which would strand a parameter.
+func adaptOutboxSQL(fenced bool, statement string) string {
+	if fenced {
+		return statement
+	}
+	return preFenceOutboxSQL.Replace(statement)
+}
+
+func trimOutboxArgs(fenced bool, args ...any) []any {
+	if fenced {
+		return args
+	}
+	return args[:len(args)-1]
 }
 
 // requireOutboundFence guards the autonomous-only provider fence operations.
@@ -167,15 +239,6 @@ func (s *Store) requireOutboundFence(operation string) error {
 		return nil
 	}
 	return &UnsupportedSchemaError{Operation: operation, RequiresCore: CoreOutboundFenceVersion}
-}
-
-// outboxArgs drops the trailing fence parameter when the pre-fence statement
-// omits it. The fence value is always last so no other position shifts.
-func (s *Store) outboxArgs(args ...any) []any {
-	if s.OutboundFenceEnabled() {
-		return args
-	}
-	return args[:len(args)-1]
 }
 
 // newEnabledFence returns the fail-closed default capability holder.

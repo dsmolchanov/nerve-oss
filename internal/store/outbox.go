@@ -434,7 +434,8 @@ func (s *Store) resolveOrInsertOutboxParent(
 	for attempt := 0; ; attempt++ {
 		// The fence column and its parameter are last so the pre-fence variant
 		// drops both without renumbering anything ahead of them.
-		row := s.q.QueryRowContext(ctx, s.outboxSQL(`
+		fence := s.resolveOutboundFence(ctx)
+		row := s.q.QueryRowContext(ctx, adaptOutboxSQL(fence, `
 			INSERT INTO outbox_messages (
 				id, org_id, inbox_id, provider, idempotency_key,
 				"to", "from", subject, text_body, html_body,
@@ -454,14 +455,14 @@ func (s *Store) resolveOrInsertOutboxParent(
 			)
 			ON CONFLICT DO NOTHING
 			RETURNING id::text
-		`), s.outboxArgs(id, msg.OrgID, msg.InboxID, msg.Provider, msg.IdempotencyKey,
+		`), trimOutboxArgs(fence, id, msg.OrgID, msg.InboxID, msg.Provider, msg.IdempotencyKey,
 			msg.To, msg.From, msg.Subject, msg.TextBody, msg.HTMLBody, hash,
 			msg.InReplyToMessageID, msg.References, status, deliveryStatus,
 			suppressed, lastError, msg.AutonomousPolicyEpoch)...)
 		if scanErr := row.Scan(&outID); scanErr == nil {
 			return outID, true, nil
 		} else if !errors.Is(scanErr, sql.ErrNoRows) {
-			return "", false, scanErr
+			return "", false, s.noteOutboxSchemaError(ctx, scanErr)
 		}
 
 		if afterConflict != nil {
@@ -525,7 +526,8 @@ func (s *Store) ClaimOutboxMessages(ctx context.Context, limit int, workerID str
 	// one process after a stale reclaim—from passing each other's outcome CAS.
 	claimLeaseID := workerID + ":" + uuid.NewString()
 
-	rows, err := s.q.QueryContext(ctx, s.outboxSQL(`
+	fence := s.resolveOutboundFence(ctx)
+	rows, err := s.q.QueryContext(ctx, adaptOutboxSQL(fence, `
 		WITH picked AS (
 			SELECT outbox.id
 			FROM outbox_messages outbox
@@ -585,7 +587,7 @@ func (s *Store) ClaimOutboxMessages(ctx context.Context, limit int, workerID str
 		          coalesce(o.autonomous_policy_epoch, 0), o.provider_started_at, o.provider_operation_id, o.provider_resolved_at
 	`), now, limit, claimLeaseID, staleCutoff)
 	if err != nil {
-		return nil, err
+		return nil, s.noteOutboxSchemaError(ctx, err)
 	}
 	defer rows.Close()
 
@@ -828,7 +830,8 @@ func (s *Store) MarkOutboxMessageSent(ctx context.Context, id string, providerMe
 	if id == "" {
 		return errors.New("missing id")
 	}
-	_, err := s.q.ExecContext(ctx, s.outboxSQL(`
+	fence := s.resolveOutboundFence(ctx)
+	_, err := s.q.ExecContext(ctx, adaptOutboxSQL(fence, `
 		UPDATE outbox_messages
 		SET status = 'sent',
 		    provider_message_id = nullif($2, ''),
@@ -839,7 +842,7 @@ func (s *Store) MarkOutboxMessageSent(ctx context.Context, id string, providerMe
 		    provider_resolved_at = CASE WHEN provider_started_at IS NOT NULL THEN now() ELSE provider_resolved_at END
 		WHERE id = $1
 	`), id, providerMessageID)
-	return err
+	return s.noteOutboxSchemaError(ctx, err)
 }
 
 func (s *Store) MarkClaimedOutboxMessageSent(ctx context.Context, id, workerID, operationID, providerMessageID string) error {
@@ -870,7 +873,8 @@ func (s *Store) MarkOutboxMessageFailed(ctx context.Context, id string, lastErro
 	if id == "" {
 		return errors.New("missing id")
 	}
-	_, err := s.q.ExecContext(ctx, s.outboxSQL(`
+	fence := s.resolveOutboundFence(ctx)
+	_, err := s.q.ExecContext(ctx, adaptOutboxSQL(fence, `
 		UPDATE outbox_messages
 		SET status = 'failed',
 		    last_error = nullif($2, ''),
@@ -879,7 +883,7 @@ func (s *Store) MarkOutboxMessageFailed(ctx context.Context, id string, lastErro
 		    terminal_at = now()
 		WHERE id = $1
 	`), id, lastError)
-	return err
+	return s.noteOutboxSchemaError(ctx, err)
 }
 
 // MarkClaimedOutboxMessageFailed terminalizes a pre-provider failure only
@@ -894,7 +898,8 @@ func (s *Store) MarkOutboxProviderFailure(ctx context.Context, id string, lastEr
 	if id == "" {
 		return errors.New("missing id")
 	}
-	_, err := s.q.ExecContext(ctx, s.outboxSQL(`
+	fence := s.resolveOutboundFence(ctx)
+	_, err := s.q.ExecContext(ctx, adaptOutboxSQL(fence, `
 		UPDATE outbox_messages
 		SET status = 'failed',
 		    last_error = nullif($2, ''),
@@ -904,7 +909,7 @@ func (s *Store) MarkOutboxProviderFailure(ctx context.Context, id string, lastEr
 		    provider_resolved_at = CASE WHEN provider_started_at IS NOT NULL THEN now() ELSE provider_resolved_at END
 		WHERE id = $1
 	`), id, lastError)
-	return err
+	return s.noteOutboxSchemaError(ctx, err)
 }
 
 func (s *Store) MarkClaimedOutboxProviderFailure(ctx context.Context, id, workerID, operationID, lastError string) error {
@@ -954,7 +959,8 @@ func (s *Store) finishClaimedOutbox(ctx context.Context, id, workerID, operation
 	if id == "" || workerID == "" {
 		return errors.New("missing claimed outbox identity")
 	}
-	result, err := s.q.ExecContext(ctx, s.outboxSQL(`
+	fence := s.resolveOutboundFence(ctx)
+	result, err := s.q.ExecContext(ctx, adaptOutboxSQL(fence, `
 		UPDATE outbox_messages
 		SET status = $4,
 		    provider_message_id = nullif($6, ''),
@@ -967,9 +973,9 @@ func (s *Store) finishClaimedOutbox(ctx context.Context, id, workerID, operation
 		  AND status = 'sending'
 		  AND locked_by = $2
 		  AND (($3 = '' AND provider_operation_id IS NULL) OR provider_operation_id = $3)
-	`), s.outboxArgs(id, workerID, operationID, status, lastError, providerMessageID, resolve)...)
+	`), trimOutboxArgs(fence, id, workerID, operationID, status, lastError, providerMessageID, resolve)...)
 	if err != nil {
-		return err
+		return s.noteOutboxSchemaError(ctx, err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
@@ -1100,11 +1106,12 @@ func (s *Store) requeueOutboxMessage(ctx context.Context, id, workerID string, n
 		nextAttemptAt = time.Now().UTC().Add(10 * time.Second)
 	}
 	return s.withTx(ctx, func(scoped *Store) error {
+		scopedFence := scoped.resolveOutboundFence(ctx)
 		var (
 			orgID      string
 			savedEpoch sql.NullInt64
 		)
-		if err := scoped.q.QueryRowContext(ctx, scoped.outboxSQL(`
+		if err := scoped.q.QueryRowContext(ctx, adaptOutboxSQL(scopedFence, `
 			SELECT org_id::text, autonomous_policy_epoch
 			FROM outbox_messages
 			WHERE id = $1
@@ -1124,7 +1131,7 @@ func (s *Store) requeueOutboxMessage(ctx context.Context, id, workerID string, n
 			startedAt  sql.NullTime
 			resolvedAt sql.NullTime
 		)
-		if err := scoped.q.QueryRowContext(ctx, scoped.outboxSQL(`
+		if err := scoped.q.QueryRowContext(ctx, adaptOutboxSQL(scopedFence, `
 			SELECT autonomous_policy_epoch, provider_started_at, provider_resolved_at
 			FROM outbox_messages
 			WHERE id = $1

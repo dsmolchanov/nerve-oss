@@ -345,7 +345,7 @@ func TestUndeterminedHistoryCannotEnqueueAutonomousRowAsLegacy(t *testing.T) {
 		}
 
 		// The concrete consequence: enqueue must still carry the epoch column.
-		if !strings.Contains(st.outboxSQL("autonomous_policy_epoch"), "autonomous_policy_epoch") {
+		if !strings.Contains(adaptOutboxSQL(st.OutboundFenceEnabled(), "autonomous_policy_epoch"), "autonomous_policy_epoch") {
 			t.Fatal("undetermined history selected pre-fence SQL")
 		}
 		// A plain legacy enqueue still works, and the fenced statement keeps the
@@ -365,6 +365,125 @@ func TestUndeterminedHistoryCannotEnqueueAutonomousRowAsLegacy(t *testing.T) {
 			WHERE table_name = 'outbox_messages' AND column_name = 'autonomous_policy_epoch'
 		`).Scan(&column); err != nil {
 			t.Fatalf("fence column missing on a core 29 schema: %v", err)
+		}
+		if id == "" {
+			t.Fatal("enqueue returned no id")
+		}
+	})
+}
+
+// Phase 9 applies Core 0029 while Artifact B is already running, so a live
+// process must not keep its startup answer. A stale instance that still
+// believes it is pre-fence would claim an autonomous row with the policy
+// predicate replaced by true, project its epoch as zero, and let provider-start
+// take the legacy fast path -- a send with no epoch or revocation check.
+func TestStaleStoreDoesNotClaimFencedRowAsLegacy(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 28); err != nil {
+			t.Fatalf("migrate to core 28: %v", err)
+		}
+		producer := &Store{db: db, q: db, fence: newEnabledFence()}
+		stale := &Store{db: db, q: db, fence: newEnabledFence()}
+		for _, st := range []*Store{producer, stale} {
+			if err := st.RefreshOutboundFenceCapability(ctx); err != nil {
+				t.Fatalf("initial refresh: %v", err)
+			}
+			if st.OutboundFenceEnabled() {
+				t.Fatal("core 28 reported the fence as available")
+			}
+		}
+
+		// Core 0029 lands underneath both. Only the producer is refreshed; the
+		// stale consumer keeps its Core 28 answer, exactly like a live instance
+		// during the Phase 9 transition.
+		if err := MigrateUpToCore(ctx, db, 29); err != nil {
+			t.Fatalf("migrate to core 29: %v", err)
+		}
+		if err := producer.RefreshOutboundFenceCapability(ctx); err != nil {
+			t.Fatalf("producer refresh: %v", err)
+		}
+		if !producer.OutboundFenceEnabled() {
+			t.Fatal("producer did not observe core 29")
+		}
+
+		orgID, inboxID := seedCore28Outbox(t, ctx, db)
+		// An autonomous row whose org has no policy-state row and no enabling
+		// flags: the fenced predicate must exclude it, the legacy predicate
+		// would not.
+		outboxID := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO outbox_messages (
+				id, org_id, inbox_id, provider, idempotency_key,
+				"to", "from", subject, text_body,
+				status, delivery_status, autonomous_policy_epoch, next_attempt_at
+			) VALUES ($1, $2, $3, 'smtp', 'fenced-row',
+				'recipient@local.neuralmail', 'core28@local.neuralmail', 'fenced', 'body',
+				'queued', 'queued', 5, now())
+		`, outboxID, orgID, inboxID); err != nil {
+			t.Fatalf("insert fenced row: %v", err)
+		}
+
+		claimed, err := stale.ClaimOutboxMessages(ctx, 10, "stale-worker", time.Now().UTC(), 5*time.Minute)
+		if err != nil {
+			// Refusing is acceptable; silently claiming it as legacy is not.
+			t.Logf("stale consumer refused: %v", err)
+		}
+		for _, msg := range claimed {
+			if msg.ID == outboxID {
+				t.Fatal("stale consumer claimed a fenced row as legacy: the policy predicate was bypassed")
+			}
+		}
+		if !stale.OutboundFenceEnabled() {
+			t.Fatal("stale consumer did not revalidate against the live core 29 schema")
+		}
+	})
+}
+
+// The inverse: a stale fenced instance after a clean rollback issues fenced SQL
+// against removed objects. That is an outage rather than a bypass, so it may
+// fail -- but it must re-detect and recover instead of failing forever.
+func TestStaleFencedStoreRecoversAfterRollback(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 29); err != nil {
+			t.Fatalf("migrate to core 29: %v", err)
+		}
+		st := &Store{db: db, q: db, fence: newEnabledFence()}
+		if err := st.RefreshOutboundFenceCapability(ctx); err != nil {
+			t.Fatalf("refresh at 29: %v", err)
+		}
+		if !st.OutboundFenceEnabled() {
+			t.Fatal("core 29 did not report the fence")
+		}
+		orgID, inboxID := seedCore28Outbox(t, ctx, db)
+
+		if err := MigrateDownCore(ctx, db); err != nil {
+			t.Fatalf("roll back to core 28: %v", err)
+		}
+
+		// First attempt may fail against the removed columns; it must re-detect.
+		_, firstErr := st.EnqueueOutboxMessage(ctx, OutboxMessage{
+			OrgID: orgID, InboxID: inboxID, Provider: "smtp", IdempotencyKey: "post-rollback-1",
+			To: "recipient@local.neuralmail", From: "core28@local.neuralmail",
+			Subject: "post rollback", TextBody: "body",
+		})
+		if firstErr != nil {
+			t.Logf("first post-rollback attempt failed as expected: %v", firstErr)
+		}
+		if st.OutboundFenceEnabled() {
+			t.Fatal("store still believes the fence exists after a clean rollback")
+		}
+
+		// Having re-detected, it must work.
+		id, err := st.EnqueueOutboxMessage(ctx, OutboxMessage{
+			OrgID: orgID, InboxID: inboxID, Provider: "smtp", IdempotencyKey: "post-rollback-2",
+			To: "recipient@local.neuralmail", From: "core28@local.neuralmail",
+			Subject: "post rollback", TextBody: "body",
+		})
+		if err != nil {
+			t.Fatalf("enqueue after re-detection: %v", err)
+		}
+		if _, err := st.ClaimOutboxMessages(ctx, 10, "recovered-worker", time.Now().UTC(), 5*time.Minute); err != nil {
+			t.Fatalf("claim after re-detection: %v", err)
 		}
 		if id == "" {
 			t.Fatal("enqueue returned no id")
