@@ -109,6 +109,12 @@ func runWorker(ctx context.Context, cfg config.Config) {
 	if err := startup.Migrate(ctx, storeInstance.DB(), cfg.Cloud.Mode); err != nil {
 		log.Fatalf("migration error: %v", err)
 	}
+	// Record whether the live Core schema carries the 0029 outbound fence
+	// before any worker claims outbox work. Artifact B spans Core [28,29];
+	// on Core 28 the legacy outbox path must not emit fence columns.
+	if err := storeInstance.RefreshOutboundFenceCapability(ctx); err != nil {
+		log.Fatalf("detect outbound fence capability: %v", err)
+	}
 	queueInstance, err := queue.New(cfg.Redis.URL)
 	if err != nil {
 		log.Fatalf("queue error: %v", err)

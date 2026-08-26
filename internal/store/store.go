@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -14,6 +15,11 @@ type Store struct {
 	db   *sql.DB
 	q    queryer
 	inTx bool
+	// fence records whether the live Core schema carries the 0029 outbound
+	// fence. It is shared by pointer so a scoped transaction store observes
+	// the same capability, and defaults to true so an undetermined schema
+	// fails loudly on Core 28 instead of under-enforcing policy on Core 29.
+	fence *atomic.Bool
 }
 
 type queryer interface {
@@ -176,7 +182,7 @@ func Open(dsn string) (*Store, error) {
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(30 * time.Minute)
-	return &Store{db: db, q: db}, nil
+	return &Store{db: db, q: db, fence: newEnabledFence()}, nil
 }
 
 func (s *Store) DB() *sql.DB {
@@ -217,7 +223,7 @@ func (s *Store) RunAsOrg(ctx context.Context, orgID string, fn func(scoped *Stor
 		return err
 	}
 
-	scoped := &Store{db: s.db, q: tx, inTx: true}
+	scoped := &Store{db: s.db, q: tx, inTx: true, fence: s.fence}
 	if err := fn(scoped); err != nil {
 		return err
 	}
@@ -241,7 +247,7 @@ func (s *Store) withTx(ctx context.Context, fn func(*Store) error) error {
 	}
 	defer tx.Rollback()
 
-	scoped := &Store{db: s.db, q: tx, inTx: true}
+	scoped := &Store{db: s.db, q: tx, inTx: true, fence: s.fence}
 	if err := fn(scoped); err != nil {
 		return err
 	}

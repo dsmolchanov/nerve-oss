@@ -63,6 +63,12 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	if err := startup.Migrate(ctx, st.DB(), cfg.Cloud.Mode); err != nil {
 		return nil, err
 	}
+	// Record whether the live Core schema carries the 0029 outbound fence
+	// before any worker claims outbox work. Artifact B spans Core [28,29];
+	// on Core 28 the legacy outbox path must not emit fence columns.
+	if err := st.RefreshOutboundFenceCapability(ctx); err != nil {
+		return nil, fmt.Errorf("detect outbound fence capability: %w", err)
+	}
 	inboxAddr := cfg.SMTP.From
 	if inboxAddr == "" {
 		inboxAddr = "dev@local.nerve.email"
