@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -130,11 +131,11 @@ func TestUndeterminedSchemaDefaultsToFenced(t *testing.T) {
 	if !store.OutboundFenceEnabled() {
 		t.Fatal("fence capability must default to enabled so an unknown schema fails closed")
 	}
-	if err := store.requireOutboundFence("op"); err != nil {
+	if err := store.requireOutboundFence(context.Background(), "op"); err != nil {
 		t.Fatalf("fenced store rejected an autonomous operation: %v", err)
 	}
 	store.fence.Store(false)
-	if err := store.requireOutboundFence("op"); err == nil {
+	if err := store.requireOutboundFence(context.Background(), "op"); err == nil {
 		t.Fatal("pre-fence store admitted an autonomous operation")
 	}
 }

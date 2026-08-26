@@ -656,7 +656,7 @@ func (s *Store) BeginOutboxProviderOperationState(ctx context.Context, msg Outbo
 	if msg.AutonomousPolicyEpoch <= 0 {
 		return OutboxProviderOperation{}, nil
 	}
-	if err := s.requireOutboundFence("BeginOutboxProviderOperationState"); err != nil {
+	if err := s.requireOutboundFence(ctx, "BeginOutboxProviderOperationState"); err != nil {
 		return OutboxProviderOperation{}, err
 	}
 	operationID := "outbox:" + msg.ID
@@ -784,7 +784,7 @@ func (s *Store) outboundPolicyFlagsAllowSend(ctx context.Context, orgID string) 
 // known non-success outcome. A later retry keeps the same operation identity
 // and clears the resolution only at its next provider-start CAS.
 func (s *Store) ResolveOutboxProviderAttempt(ctx context.Context, id, workerID, operationID string) error {
-	if err := s.requireOutboundFence("ResolveOutboxProviderAttempt"); err != nil {
+	if err := s.requireOutboundFence(ctx, "ResolveOutboxProviderAttempt"); err != nil {
 		return err
 	}
 	if id == "" || workerID == "" || operationID == "" {
@@ -921,7 +921,7 @@ func (s *Store) MarkClaimedOutboxProviderFailure(ctx context.Context, id, worker
 // worker can periodically re-evaluate provider capability, while the durable
 // unresolved fence keeps lifecycle cleanup nonterminal.
 func (s *Store) QuarantineClaimedOutboxUnknown(ctx context.Context, id, workerID, operationID, lastError string) error {
-	if err := s.requireOutboundFence("QuarantineClaimedOutboxUnknown"); err != nil {
+	if err := s.requireOutboundFence(ctx, "QuarantineClaimedOutboxUnknown"); err != nil {
 		return err
 	}
 	if id == "" || workerID == "" || operationID == "" {
@@ -1003,7 +1003,7 @@ func (s *Store) RequeueClaimedOutboxMessage(ctx context.Context, id, workerID st
 // policy epoch or terminalizes it when a suspension/close already advanced
 // the epoch. There is no resolved+sending crash gap.
 func (s *Store) RequeueClaimedOutboxKnownProviderFailure(ctx context.Context, id, claimLeaseID, operationID string, nextAttemptAt time.Time, lastError string) error {
-	if err := s.requireOutboundFence("RequeueClaimedOutboxKnownProviderFailure"); err != nil {
+	if err := s.requireOutboundFence(ctx, "RequeueClaimedOutboxKnownProviderFailure"); err != nil {
 		return err
 	}
 	if id == "" || claimLeaseID == "" || operationID == "" {
@@ -1105,7 +1105,10 @@ func (s *Store) requeueOutboxMessage(ctx context.Context, id, workerID string, n
 	if nextAttemptAt.IsZero() {
 		nextAttemptAt = time.Now().UTC().Add(10 * time.Second)
 	}
-	return s.withTx(ctx, func(scoped *Store) error {
+	// A schema error here must update the shared capability once the transaction
+	// has rolled back, or a fenced Store after a clean rollback re-emits the same
+	// invalid SQL on every retry instead of recovering.
+	return s.noteOutboxSchemaError(ctx, s.withTx(ctx, func(scoped *Store) error {
 		scopedFence := scoped.resolveOutboundFence(ctx)
 		var (
 			orgID      string
@@ -1187,7 +1190,7 @@ func (s *Store) requeueOutboxMessage(ctx context.Context, id, workerID string, n
 			return ErrOutboxClaimLost
 		}
 		return nil
-	})
+	}))
 }
 
 // UpdateOutboxDeliveryStatus updates the current delivery status with monotonic enforcement.

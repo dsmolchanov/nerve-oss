@@ -92,7 +92,7 @@ func (s *Store) LockOrgPolicy(ctx context.Context, orgID string) error {
 // intentionally transaction-only so onboarding can seed it atomically with
 // the org graph and explicit policy flags.
 func (s *Store) EnsureOutboundPolicyState(ctx context.Context, orgID string) (int64, error) {
-	if err := s.requireOutboundFence("EnsureOutboundPolicyState"); err != nil {
+	if err := s.requireOutboundFence(ctx, "EnsureOutboundPolicyState"); err != nil {
 		return 0, err
 	}
 	orgID = strings.TrimSpace(orgID)
@@ -120,7 +120,7 @@ func (s *Store) EnsureOutboundPolicyState(ctx context.Context, orgID string) (in
 // transaction-scoped org policy lock. Absence fails closed for autonomous
 // senders rather than silently treating the org as legacy.
 func (s *Store) CurrentOutboundPolicyEpoch(ctx context.Context, orgID string) (int64, error) {
-	if err := s.requireOutboundFence("CurrentOutboundPolicyEpoch"); err != nil {
+	if err := s.requireOutboundFence(ctx, "CurrentOutboundPolicyEpoch"); err != nil {
 		return 0, err
 	}
 	orgID = strings.TrimSpace(orgID)
@@ -147,7 +147,7 @@ func (s *Store) CurrentOutboundPolicyEpoch(ctx context.Context, orgID string) (i
 // epoch in the same transaction as the caller's policy transition. The
 // existing failed status is retained; policy_revoked is the bounded reason.
 func (s *Store) AdvanceOutboundPolicyEpoch(ctx context.Context, orgID string) (epoch int64, terminalized int64, err error) {
-	if ferr := s.requireOutboundFence("AdvanceOutboundPolicyEpoch"); ferr != nil {
+	if ferr := s.requireOutboundFence(ctx, "AdvanceOutboundPolicyEpoch"); ferr != nil {
 		return 0, 0, ferr
 	}
 	orgID = strings.TrimSpace(orgID)

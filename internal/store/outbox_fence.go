@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"strings"
 	"sync/atomic"
@@ -47,26 +46,49 @@ var coreOutboundFenceColumns = []string{
 //   - A proven applied version below 29 is the legacy predecessor: unfenced.
 //   - A proven applied version at or above 29 is fenced.
 //
-// The applied version comes from CurrentVersionCore's latest-record semantics.
-// A plain max(version_id) would be wrong in the other direction: Goose can
-// retain a version 29 row after a rollback, so a rolled-back schema would still
-// look fenced and every statement would fail against objects 0029 had dropped.
-func outboundFenceAvailable(ctx context.Context, db *sql.DB) (bool, error) {
-	exists, err := migrationTableExists(ctx, db, migrationTableCore)
-	if err != nil {
+// It reads through the caller's queryer rather than the pool. A caller inside a
+// transaction already holds a connection, so probing on a second one lets the
+// pool deadlock: with MaxOpenConns(10), ten concurrent pre-fence enqueues each
+// hold one and then all wait for an eleventh.
+//
+// The applied-version scan mirrors currentVersion: latest record per version
+// wins, and only an applied one counts. A plain max(version_id) would be wrong
+// in the other direction, since Goose can retain a version 29 row after a
+// rollback and the schema would still look fenced.
+func outboundFenceAvailable(ctx context.Context, q queryer) (bool, error) {
+	var present bool
+	if err := q.QueryRowContext(ctx,
+		`SELECT to_regclass('public.schema_migrations_core') IS NOT NULL`).Scan(&present); err != nil {
 		return true, err
 	}
-	if !exists {
+	if !present {
 		return true, errors.New("core migration history is absent: outbound fence capability is undetermined")
 	}
-	version, err := CurrentVersionCore(ctx, db)
+	rows, err := q.QueryContext(ctx,
+		`SELECT version_id, is_applied FROM schema_migrations_core ORDER BY id DESC`)
 	if err != nil {
 		return true, err
 	}
-	if version == 0 {
-		return true, errors.New("core migration history has no applied version: outbound fence capability is undetermined")
+	defer rows.Close()
+	seen := make(map[int64]struct{})
+	for rows.Next() {
+		var version int64
+		var applied bool
+		if err := rows.Scan(&version, &applied); err != nil {
+			return true, err
+		}
+		if _, ok := seen[version]; ok {
+			continue
+		}
+		seen[version] = struct{}{}
+		if applied {
+			return version >= CoreOutboundFenceVersion, nil
+		}
 	}
-	return version >= CoreOutboundFenceVersion, nil
+	if err := rows.Err(); err != nil {
+		return true, err
+	}
+	return true, errors.New("core migration history has no applied version: outbound fence capability is undetermined")
 }
 
 // RefreshOutboundFenceCapability records whether the live Core schema carries
@@ -76,12 +98,12 @@ func (s *Store) RefreshOutboundFenceCapability(ctx context.Context) error {
 	if s.fence == nil {
 		s.fence = newEnabledFence()
 	}
-	available, err := outboundFenceAvailable(ctx, s.db)
+	available, err := outboundFenceAvailable(ctx, s.q)
 	if err != nil {
-		s.fence.Store(true)
+		s.setOutboundFence(true)
 		return err
 	}
-	s.fence.Store(available)
+	s.setOutboundFence(available)
 	return nil
 }
 
@@ -174,7 +196,11 @@ func (s *Store) resolveOutboundFence(ctx context.Context) bool {
 	if s.OutboundFenceEnabled() {
 		return true
 	}
-	available, err := outboundFenceAvailable(ctx, s.db)
+	if s.q == nil {
+		// Nothing to probe and nothing executable either; keep what is known.
+		return false
+	}
+	available, err := outboundFenceAvailable(ctx, s.q)
 	if err != nil {
 		// Undetermined: fail closed rather than keep using legacy SQL.
 		s.setOutboundFence(true)
@@ -191,6 +217,8 @@ func (s *Store) noteOutboxSchemaError(ctx context.Context, err error) error {
 	if err == nil || !isUndefinedColumnOrTable(err) {
 		return err
 	}
+	// The caller's transaction, if any, has already failed; probe the pool so a
+	// poisoned connection cannot swallow the re-detection.
 	if available, probeErr := outboundFenceAvailable(ctx, s.db); probeErr == nil {
 		s.setOutboundFence(available)
 	} else {
@@ -234,8 +262,14 @@ func trimOutboxArgs(fenced bool, args ...any) []any {
 // requireOutboundFence guards the autonomous-only provider fence operations.
 // They are unreachable before Core 0029 because no autonomous generation can
 // exist, so a call on Core 28 is a programming error, not a legacy path.
-func (s *Store) requireOutboundFence(operation string) error {
-	if s.OutboundFenceEnabled() {
+// requireOutboundFence guards the autonomous-only operations. It resolves
+// against the live schema rather than the cached flag: after Core 0029 is
+// applied beneath a process that started on Core 28, a cached answer would
+// refuse these forever until some unrelated adaptable operation happened to
+// refresh the shared capability, blocking onboarding and autonomous delivery
+// against a perfectly valid schema.
+func (s *Store) requireOutboundFence(ctx context.Context, operation string) error {
+	if s.resolveOutboundFence(ctx) {
 		return nil
 	}
 	return &UnsupportedSchemaError{Operation: operation, RequiresCore: CoreOutboundFenceVersion}

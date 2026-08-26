@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -489,4 +490,160 @@ func TestStaleFencedStoreRecoversAfterRollback(t *testing.T) {
 			t.Fatal("enqueue returned no id")
 		}
 	})
+}
+
+// A caller inside a transaction already holds a connection. Probing the live
+// schema on a second one lets the pool deadlock: with MaxOpenConns(10), ten
+// concurrent pre-fence enqueues each hold one and then all wait for an
+// eleventh. MaxOpenConns(1) makes that failure deterministic rather than
+// load-dependent, so every transactional entry point is exercised under it.
+func TestPreFenceOperationsNeedNoSecondConnection(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 28); err != nil {
+			t.Fatalf("migrate to core 28: %v", err)
+		}
+		db.SetMaxOpenConns(1)
+		st := &Store{db: db, q: db, fence: newEnabledFence()}
+		if err := st.RefreshOutboundFenceCapability(ctx); err != nil {
+			t.Fatalf("refresh: %v", err)
+		}
+		if st.OutboundFenceEnabled() {
+			t.Fatal("core 28 reported the fence as available")
+		}
+		orgID, inboxID := seedCore28Outbox(t, ctx, db)
+
+		deadline, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+
+		id, err := st.EnqueueOutboxMessage(deadline, OutboxMessage{
+			OrgID: orgID, InboxID: inboxID, Provider: "smtp", IdempotencyKey: "single-conn",
+			To: "recipient@local.neuralmail", From: "core28@local.neuralmail",
+			Subject: "single conn", TextBody: "body",
+		})
+		if err != nil {
+			t.Fatalf("enqueue on a single connection: %v", err)
+		}
+		if _, err := st.ClaimOutboxMessages(deadline, 10, "single-conn-worker", time.Now().UTC(), 5*time.Minute); err != nil {
+			t.Fatalf("claim on a single connection: %v", err)
+		}
+		if err := st.RequeueOutboxMessage(deadline, id, time.Now().UTC().Add(time.Minute), "retry"); err != nil {
+			t.Fatalf("RequeueOutboxMessage on a single connection: %v", err)
+		}
+		claimed, err := st.ClaimOutboxMessages(deadline, 10, "single-conn-worker-2", time.Now().UTC().Add(2*time.Minute), 5*time.Minute)
+		if err != nil {
+			t.Fatalf("reclaim on a single connection: %v", err)
+		}
+		if len(claimed) == 1 {
+			if err := st.RequeueClaimedOutboxMessage(deadline, claimed[0].ID, claimed[0].LockedBy.String,
+				time.Now().UTC().Add(time.Minute), "retry"); err != nil {
+				t.Fatalf("RequeueClaimedOutboxMessage on a single connection: %v", err)
+			}
+		}
+	})
+}
+
+// Every capability gate must follow the live schema. A cached answer would
+// refuse the autonomous-only operations forever after Core 0029 lands beneath
+// a process that started on Core 28, until some unrelated adaptable operation
+// happened to refresh the shared flag.
+func TestCapabilityGatesFollowLiveSchema(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 28); err != nil {
+			t.Fatalf("migrate to core 28: %v", err)
+		}
+		st := &Store{db: db, q: db, fence: newEnabledFence()}
+		if err := st.RefreshOutboundFenceCapability(ctx); err != nil {
+			t.Fatalf("refresh: %v", err)
+		}
+		orgID, _ := seedCore28Outbox(t, ctx, db)
+
+		// Refused on Core 28, as the schema genuinely cannot support them.
+		if err := st.RunInTx(ctx, func(scoped *Store) error {
+			_, err := scoped.EnsureOutboundPolicyState(ctx, orgID)
+			return err
+		}); err == nil {
+			t.Fatal("policy state admitted on core 28")
+		}
+
+		// Core 0029 lands underneath. The gate must now admit them without any
+		// unrelated operation having refreshed the flag first.
+		if err := MigrateUpToCore(ctx, db, 29); err != nil {
+			t.Fatalf("migrate to core 29: %v", err)
+		}
+		if err := st.RunInTx(ctx, func(scoped *Store) error {
+			_, err := scoped.EnsureOutboundPolicyState(ctx, orgID)
+			return err
+		}); err != nil {
+			t.Fatalf("gate still refused after core 29 landed: %v", err)
+		}
+		if !st.OutboundFenceEnabled() {
+			t.Fatal("gate did not update the shared capability")
+		}
+	})
+}
+
+// Each requeue entry point must be able to be the first consumer after a clean
+// rollback and still recover.
+func TestRequeueEntryPointsRecoverAfterRollback(t *testing.T) {
+	for _, entry := range []struct {
+		name   string
+		invoke func(ctx context.Context, st *Store, id, lockedBy string) error
+	}{
+		{
+			name: "RequeueOutboxMessage",
+			invoke: func(ctx context.Context, st *Store, id, _ string) error {
+				return st.RequeueOutboxMessage(ctx, id, time.Now().UTC().Add(time.Minute), "retry")
+			},
+		},
+		{
+			name: "RequeueClaimedOutboxMessage",
+			invoke: func(ctx context.Context, st *Store, id, lockedBy string) error {
+				return st.RequeueClaimedOutboxMessage(ctx, id, lockedBy, time.Now().UTC().Add(time.Minute), "retry")
+			},
+		},
+	} {
+		t.Run(entry.name, func(t *testing.T) {
+			withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+				if err := MigrateUpToCore(ctx, db, 29); err != nil {
+					t.Fatalf("migrate to core 29: %v", err)
+				}
+				st := &Store{db: db, q: db, fence: newEnabledFence()}
+				if err := st.RefreshOutboundFenceCapability(ctx); err != nil {
+					t.Fatalf("refresh at 29: %v", err)
+				}
+				orgID, inboxID := seedCore28Outbox(t, ctx, db)
+				id, err := st.EnqueueOutboxMessage(ctx, OutboxMessage{
+					OrgID: orgID, InboxID: inboxID, Provider: "smtp", IdempotencyKey: "pre-rollback",
+					To: "recipient@local.neuralmail", From: "core28@local.neuralmail",
+					Subject: "pre rollback", TextBody: "body",
+				})
+				if err != nil {
+					t.Fatalf("enqueue at 29: %v", err)
+				}
+				claimed, err := st.ClaimOutboxMessages(ctx, 10, "rollback-worker", time.Now().UTC(), 5*time.Minute)
+				if err != nil || len(claimed) != 1 {
+					t.Fatalf("claim at 29: %v (%d rows)", err, len(claimed))
+				}
+				lockedBy := claimed[0].LockedBy.String
+
+				if err := MigrateDownCore(ctx, db); err != nil {
+					t.Fatalf("roll back to core 28: %v", err)
+				}
+
+				// This entry point is the first post-rollback consumer. It may
+				// fail once, but must re-detect so the retry succeeds.
+				if firstErr := entry.invoke(ctx, st, id, lockedBy); firstErr != nil {
+					t.Logf("first attempt failed as expected: %v", firstErr)
+				}
+				if st.OutboundFenceEnabled() {
+					t.Fatal("capability was not refreshed after the rollback")
+				}
+				if err := entry.invoke(ctx, st, id, lockedBy); err != nil {
+					if !errors.Is(err, ErrOutboxClaimLost) {
+						t.Fatalf("retry after re-detection: %v", err)
+					}
+				}
+			})
+		})
+	}
 }
