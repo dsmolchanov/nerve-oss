@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -20,10 +21,10 @@ func TestPreFenceOutboxStatementsDropEveryFenceColumn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read outbox.go: %v", err)
 	}
-	pattern := regexp.MustCompile("(?s)outboxSQL\\(`(.*?)`\\)")
+	pattern := regexp.MustCompile("(?s)adaptOutboxSQL\\([A-Za-z]+, `(.*?)`\\)")
 	matches := pattern.FindAllStringSubmatch(string(source), -1)
 	if len(matches) == 0 {
-		t.Fatal("no outboxSQL statements found; the wrapper or this test drifted")
+		t.Fatal("no adaptOutboxSQL statements found; the wrapper or this test drifted")
 	}
 	for _, match := range matches {
 		fenced := match[1]
@@ -33,8 +34,12 @@ func TestPreFenceOutboxStatementsDropEveryFenceColumn(t *testing.T) {
 				t.Errorf("pre-fence statement still references %s:\n%s", column, adapted)
 			}
 		}
-		if strings.Contains(adapted, "org_outbound_policy_state") {
-			t.Errorf("pre-fence statement still references org_outbound_policy_state:\n%s", adapted)
+		// preFenceClaimGuard names the table inside to_regclass on purpose: it is
+		// an existence test that is valid on both schemas, and it is what makes
+		// a fenced schema unclaimable in the same statement as the claim.
+		withoutGuard := strings.ReplaceAll(adapted, preFenceClaimGuard, "")
+		if strings.Contains(withoutGuard, "org_outbound_policy_state") {
+			t.Errorf("pre-fence statement still queries org_outbound_policy_state:\n%s", adapted)
 		}
 	}
 	t.Logf("verified %d adapted statements", len(matches))
@@ -43,9 +48,7 @@ func TestPreFenceOutboxStatementsDropEveryFenceColumn(t *testing.T) {
 // The fenced form must keep the columns. A replacer that fired unconditionally
 // would silently disable the policy fence on Core 29.
 func TestFencedOutboxStatementsRetainTheFence(t *testing.T) {
-	store := &Store{}
-	store.fence = newEnabledFence()
-	claim := store.outboxSQL("SELECT coalesce(o.autonomous_policy_epoch, 0)")
+	claim := adaptOutboxSQL(true, "SELECT coalesce(o.autonomous_policy_epoch, 0)")
 	if !strings.Contains(claim, "autonomous_policy_epoch") {
 		t.Fatal("fenced statement lost its fence column")
 	}
@@ -89,18 +92,23 @@ func TestPreFenceStatementsTrimStrandedPlaceholderArguments(t *testing.T) {
 			if !ok {
 				continue
 			}
-			sel, ok := inner.Fun.(*ast.SelectorExpr)
-			if !ok {
+			name := ""
+			switch fn := inner.Fun.(type) {
+			case *ast.SelectorExpr:
+				name = fn.Sel.Name
+			case *ast.Ident:
+				name = fn.Name
+			default:
 				continue
 			}
-			switch sel.Sel.Name {
-			case "outboxSQL":
-				if len(inner.Args) == 1 {
-					if lit, ok := inner.Args[0].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+			switch name {
+			case "adaptOutboxSQL":
+				if len(inner.Args) == 2 {
+					if lit, ok := inner.Args[1].(*ast.BasicLit); ok && lit.Kind == token.STRING {
 						fenced = strings.Trim(lit.Value, "`")
 					}
 				}
-			case "outboxArgs":
+			case "trimOutboxArgs":
 				usesOutboxArgs = true
 			}
 		}
@@ -111,15 +119,15 @@ func TestPreFenceStatementsTrimStrandedPlaceholderArguments(t *testing.T) {
 		adapted := preFenceOutboxSQL.Replace(fenced)
 		dropped := highest(fenced) - highest(adapted)
 		if dropped > 0 && !usesOutboxArgs {
-			t.Errorf("adapted statement drops %d trailing placeholder(s) but its caller does not use outboxArgs; "+
+			t.Errorf("adapted statement drops %d trailing placeholder(s) but its caller does not use trimOutboxArgs; "+
 				"pgx will reject it with a parameter-count error on the pre-fence path:\n%s", dropped, adapted)
 		}
 		return true
 	})
 	if checked == 0 {
-		t.Fatal("no outboxSQL call sites found; the wrapper or this test drifted")
+		t.Fatal("no adaptOutboxSQL call sites found; the wrapper or this test drifted")
 	}
-	t.Logf("verified %d outboxSQL call sites", checked)
+	t.Logf("verified %d adaptOutboxSQL call sites", checked)
 }
 
 func TestUndeterminedSchemaDefaultsToFenced(t *testing.T) {
@@ -127,11 +135,11 @@ func TestUndeterminedSchemaDefaultsToFenced(t *testing.T) {
 	if !store.OutboundFenceEnabled() {
 		t.Fatal("fence capability must default to enabled so an unknown schema fails closed")
 	}
-	if err := store.requireOutboundFence("op"); err != nil {
+	if err := store.requireOutboundFence(context.Background(), "op"); err != nil {
 		t.Fatalf("fenced store rejected an autonomous operation: %v", err)
 	}
 	store.fence.Store(false)
-	if err := store.requireOutboundFence("op"); err == nil {
+	if err := store.requireOutboundFence(context.Background(), "op"); err == nil {
 		t.Fatal("pre-fence store admitted an autonomous operation")
 	}
 }
@@ -163,7 +171,7 @@ func TestEveryFenceReferencingStatementIsAdaptedOrGuarded(t *testing.T) {
 		}
 		ast.Inspect(fn.Body, func(node ast.Node) bool {
 			if call, ok := node.(*ast.CallExpr); ok {
-				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "outboxSQL" {
+				if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "adaptOutboxSQL" {
 					return false
 				}
 			}
@@ -173,7 +181,7 @@ func TestEveryFenceReferencingStatementIsAdaptedOrGuarded(t *testing.T) {
 			}
 			for _, column := range coreOutboundFenceColumns {
 				if strings.Contains(lit.Value, column) {
-					t.Errorf("%s: statement references %s without outboxSQL or a requireOutboundFence guard",
+					t.Errorf("%s: statement references %s without adaptOutboxSQL or a requireOutboundFence guard",
 						fn.Name.Name, column)
 					return false
 				}

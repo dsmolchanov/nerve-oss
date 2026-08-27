@@ -92,7 +92,10 @@ func (s *Store) LockOrgPolicy(ctx context.Context, orgID string) error {
 // intentionally transaction-only so onboarding can seed it atomically with
 // the org graph and explicit policy flags.
 func (s *Store) EnsureOutboundPolicyState(ctx context.Context, orgID string) (int64, error) {
-	if err := s.requireOutboundFence("EnsureOutboundPolicyState"); err != nil {
+	if err := s.requireNoOutboundFenceDrift(); err != nil {
+		return 0, err
+	}
+	if err := s.requireOutboundFence(ctx, "EnsureOutboundPolicyState"); err != nil {
 		return 0, err
 	}
 	orgID = strings.TrimSpace(orgID)
@@ -120,7 +123,7 @@ func (s *Store) EnsureOutboundPolicyState(ctx context.Context, orgID string) (in
 // transaction-scoped org policy lock. Absence fails closed for autonomous
 // senders rather than silently treating the org as legacy.
 func (s *Store) CurrentOutboundPolicyEpoch(ctx context.Context, orgID string) (int64, error) {
-	if err := s.requireOutboundFence("CurrentOutboundPolicyEpoch"); err != nil {
+	if err := s.requireOutboundFence(ctx, "CurrentOutboundPolicyEpoch"); err != nil {
 		return 0, err
 	}
 	orgID = strings.TrimSpace(orgID)
@@ -147,7 +150,10 @@ func (s *Store) CurrentOutboundPolicyEpoch(ctx context.Context, orgID string) (i
 // epoch in the same transaction as the caller's policy transition. The
 // existing failed status is retained; policy_revoked is the bounded reason.
 func (s *Store) AdvanceOutboundPolicyEpoch(ctx context.Context, orgID string) (epoch int64, terminalized int64, err error) {
-	if ferr := s.requireOutboundFence("AdvanceOutboundPolicyEpoch"); ferr != nil {
+	if ferr := s.requireNoOutboundFenceDrift(); ferr != nil {
+		return 0, 0, ferr
+	}
+	if ferr := s.requireOutboundFence(ctx, "AdvanceOutboundPolicyEpoch"); ferr != nil {
 		return 0, 0, ferr
 	}
 	orgID = strings.TrimSpace(orgID)
@@ -294,10 +300,32 @@ func (s *Store) SetFeatureFlag(ctx context.Context, orgID *string, flag string, 
 	// Legacy organizations have no epoch row and retain their existing flag
 	// behavior. Every real autonomous policy change advances the fence in the
 	// same transaction, so suspended work can never revive after a later clear.
-	// Before Core 0029 the policy-state table does not exist and no org can
-	// carry an epoch, so the probe itself would be an unsupported-schema query.
+	//
+	// A pre-fence process may skip that advance only if the fence genuinely does
+	// not exist. Assert it here rather than trusting the startup decision: a
+	// process left stale by a live Core 0029 would otherwise commit a
+	// suspension, and later its clear, with no epoch advance at all, reviving
+	// queued autonomous mail that the suspension was meant to revoke. The
+	// assertion runs in the caller's transaction, so a refusal rolls the flag
+	// write back with it.
 	if !s.OutboundFenceEnabled() {
-		return true, nil
+		var preFence bool
+		if err := s.q.QueryRowContext(ctx,
+			`SELECT to_regclass('public.org_outbound_policy_state') IS NULL`).Scan(&preFence); err != nil {
+			return false, err
+		}
+		if preFence {
+			return true, nil
+		}
+		// The fence exists after all: this process started on Core 28 and the
+		// schema moved forward. Upgrade and continue.
+		//
+		// The capability is monotonic -- it may move unfenced to fenced but never
+		// back. A forward upgrade is proven atomically here, in the caller's own
+		// transaction, and only ever adds enforcement, so it cannot produce the
+		// stale-legacy-read that per-operation revalidation did. The backward
+		// direction stays terminal drift and still requires a restart.
+		s.setOutboundFence(true)
 	}
 	var hasPolicyState bool
 	if err := s.q.QueryRowContext(ctx, `

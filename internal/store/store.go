@@ -20,6 +20,10 @@ type Store struct {
 	// the same capability, and defaults to true so an undetermined schema
 	// fails loudly on Core 28 instead of under-enforcing policy on Core 29.
 	fence *atomic.Bool
+	// drift is sticky and shared with scoped stores. Once the live schema is
+	// observed to disagree with the startup decision, this process refuses
+	// outbox work rather than re-deciding mid-flight.
+	drift *atomic.Bool
 }
 
 type queryer interface {
@@ -182,7 +186,7 @@ func Open(dsn string) (*Store, error) {
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(30 * time.Minute)
-	return &Store{db: db, q: db, fence: newEnabledFence()}, nil
+	return &Store{db: db, q: db, fence: newEnabledFence(), drift: new(atomic.Bool)}, nil
 }
 
 func (s *Store) DB() *sql.DB {
@@ -223,7 +227,7 @@ func (s *Store) RunAsOrg(ctx context.Context, orgID string, fn func(scoped *Stor
 		return err
 	}
 
-	scoped := &Store{db: s.db, q: tx, inTx: true, fence: s.fence}
+	scoped := &Store{db: s.db, q: tx, inTx: true, fence: s.fence, drift: s.drift}
 	if err := fn(scoped); err != nil {
 		return err
 	}
@@ -247,7 +251,7 @@ func (s *Store) withTx(ctx context.Context, fn func(*Store) error) error {
 	}
 	defer tx.Rollback()
 
-	scoped := &Store{db: s.db, q: tx, inTx: true, fence: s.fence}
+	scoped := &Store{db: s.db, q: tx, inTx: true, fence: s.fence, drift: s.drift}
 	if err := fn(scoped); err != nil {
 		return err
 	}

@@ -2,10 +2,11 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"strings"
 	"sync/atomic"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // CoreOutboundFenceVersion is the Core migration that adds the outbound policy
@@ -45,26 +46,49 @@ var coreOutboundFenceColumns = []string{
 //   - A proven applied version below 29 is the legacy predecessor: unfenced.
 //   - A proven applied version at or above 29 is fenced.
 //
-// The applied version comes from CurrentVersionCore's latest-record semantics.
-// A plain max(version_id) would be wrong in the other direction: Goose can
-// retain a version 29 row after a rollback, so a rolled-back schema would still
-// look fenced and every statement would fail against objects 0029 had dropped.
-func outboundFenceAvailable(ctx context.Context, db *sql.DB) (bool, error) {
-	exists, err := migrationTableExists(ctx, db, migrationTableCore)
-	if err != nil {
+// It reads through the caller's queryer rather than the pool. A caller inside a
+// transaction already holds a connection, so probing on a second one lets the
+// pool deadlock: with MaxOpenConns(10), ten concurrent pre-fence enqueues each
+// hold one and then all wait for an eleventh.
+//
+// The applied-version scan mirrors currentVersion: latest record per version
+// wins, and only an applied one counts. A plain max(version_id) would be wrong
+// in the other direction, since Goose can retain a version 29 row after a
+// rollback and the schema would still look fenced.
+func outboundFenceAvailable(ctx context.Context, q queryer) (bool, error) {
+	var present bool
+	if err := q.QueryRowContext(ctx,
+		`SELECT to_regclass('public.schema_migrations_core') IS NOT NULL`).Scan(&present); err != nil {
 		return true, err
 	}
-	if !exists {
+	if !present {
 		return true, errors.New("core migration history is absent: outbound fence capability is undetermined")
 	}
-	version, err := CurrentVersionCore(ctx, db)
+	rows, err := q.QueryContext(ctx,
+		`SELECT version_id, is_applied FROM schema_migrations_core ORDER BY id DESC`)
 	if err != nil {
 		return true, err
 	}
-	if version == 0 {
-		return true, errors.New("core migration history has no applied version: outbound fence capability is undetermined")
+	defer rows.Close()
+	seen := make(map[int64]struct{})
+	for rows.Next() {
+		var version int64
+		var applied bool
+		if err := rows.Scan(&version, &applied); err != nil {
+			return true, err
+		}
+		if _, ok := seen[version]; ok {
+			continue
+		}
+		seen[version] = struct{}{}
+		if applied {
+			return version >= CoreOutboundFenceVersion, nil
+		}
 	}
-	return version >= CoreOutboundFenceVersion, nil
+	if err := rows.Err(); err != nil {
+		return true, err
+	}
+	return true, errors.New("core migration history has no applied version: outbound fence capability is undetermined")
 }
 
 // RefreshOutboundFenceCapability records whether the live Core schema carries
@@ -74,12 +98,18 @@ func (s *Store) RefreshOutboundFenceCapability(ctx context.Context) error {
 	if s.fence == nil {
 		s.fence = newEnabledFence()
 	}
-	available, err := outboundFenceAvailable(ctx, s.db)
+	// Allocate the drift holder here, before any scoped store copies the
+	// pointer: a nil parent would leave each transaction marking a private copy
+	// that the process never observes.
+	if s.drift == nil {
+		s.drift = new(atomic.Bool)
+	}
+	available, err := outboundFenceAvailable(ctx, s.q)
 	if err != nil {
-		s.fence.Store(true)
+		s.setOutboundFence(true)
 		return err
 	}
-	s.fence.Store(available)
+	s.setOutboundFence(available)
 	return nil
 }
 
@@ -130,7 +160,7 @@ var preFenceOutboxSQL = strings.NewReplacer(
 						  AND NOT suspended.enabled
 					)
 				)
-			)`, "true",
+			)`, preFenceClaimGuard,
 
 	// Projections keep their column count and types so every Scan target and
 	// every caller sees the same shape on both schemas.
@@ -151,31 +181,118 @@ var preFenceOutboxSQL = strings.NewReplacer(
 	"SELECT NULL::bigint, NULL::timestamptz, NULL::timestamptz",
 )
 
-// outboxSQL returns the statement appropriate to the live Core schema.
-func (s *Store) outboxSQL(fenced string) string {
-	if s.OutboundFenceEnabled() {
-		return fenced
+// ErrOutboundFenceDrift reports that the live Core schema no longer matches the
+// capability this process fixed at startup. It is deliberately terminal for the
+// process: re-deciding at run time is what created a probe-then-execute race,
+// so a drifted process refuses outbox work until it is restarted.
+var ErrOutboundFenceDrift = errors.New("core schema changed beneath this process: restart required before outbox work resumes")
+
+// resolveOutboundFence reports the capability fixed at startup.
+//
+// It never re-decides. An earlier design probed the live schema per operation,
+// but the probe and the caller's statement are separate statements: Core 0029
+// could commit between them, and the claim would then run legacy SQL against a
+// fenced schema. Deciding once and refusing on drift removes that race by
+// construction rather than narrowing it.
+func (s *Store) resolveOutboundFence(context.Context) bool {
+	return s.OutboundFenceEnabled()
+}
+
+// requireNoOutboundFenceDrift refuses every outbox operation once drift has
+// been observed.
+func (s *Store) requireNoOutboundFenceDrift() error {
+	if s.drift != nil && s.drift.Load() {
+		return ErrOutboundFenceDrift
 	}
-	return preFenceOutboxSQL.Replace(fenced)
+	return nil
+}
+
+func (s *Store) markOutboundFenceDrift() {
+	if s.drift == nil {
+		s.drift = new(atomic.Bool)
+	}
+	s.drift.Store(true)
+}
+
+// noteOutboxSchemaError converts an undefined-column or undefined-table failure
+// into terminal drift. This is the fenced-process-on-a-rolled-back-schema
+// direction: the statement fails loudly, so no bypass is possible, but the
+// process must not silently downgrade itself either.
+//
+// It takes no connection. The previous version probed the pool from inside a
+// caller's transaction, which could wait for a connection that the same caller
+// already held.
+func (s *Store) noteOutboxSchemaError(err error) error {
+	if err == nil {
+		return err
+	}
+	if isUndefinedColumnOrTable(err) {
+		s.markOutboundFenceDrift()
+	}
+	return err
+}
+
+func isUndefinedColumnOrTable(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == "42703" || pgErr.Code == "42P01"
+}
+
+// setOutboundFence records the capability. Callers may only ever move it from
+// unfenced to fenced: see the monotonicity note in SetFeatureFlag. The reverse
+// transition is drift and is handled by markOutboundFenceDrift instead.
+func (s *Store) setOutboundFence(enabled bool) {
+	if s.fence == nil {
+		s.fence = newEnabledFence()
+	}
+	s.fence.Store(enabled)
+}
+
+// preFenceClaimGuard is spliced into the pre-fence claim. It is evaluated in the
+// same statement and the same snapshot as the claim itself, so a Core 0029 that
+// commits after the startup decision cannot be claimed against with legacy SQL.
+// This is the one direction that produces no SQL error -- legacy SQL runs
+// perfectly well on a fenced schema -- so it needs an in-statement guard rather
+// than any form of probe.
+const preFenceClaimGuard = "(SELECT to_regclass('public.org_outbound_policy_state') IS NULL)"
+
+// adaptOutboxSQL and trimOutboxArgs take an already-resolved capability so a
+// single operation cannot pick the statement under one answer and its arguments
+// under another, which would strand a parameter.
+func adaptOutboxSQL(fenced bool, statement string) string {
+	if fenced {
+		return statement
+	}
+	return preFenceOutboxSQL.Replace(statement)
+}
+
+func trimOutboxArgs(fenced bool, args ...any) []any {
+	if fenced {
+		return args
+	}
+	return args[:len(args)-1]
 }
 
 // requireOutboundFence guards the autonomous-only provider fence operations.
 // They are unreachable before Core 0029 because no autonomous generation can
 // exist, so a call on Core 28 is a programming error, not a legacy path.
-func (s *Store) requireOutboundFence(operation string) error {
-	if s.OutboundFenceEnabled() {
+// requireOutboundFence guards the autonomous-only operations. It resolves
+// against the live schema rather than the cached flag: after Core 0029 is
+// applied beneath a process that started on Core 28, a cached answer would
+// refuse these forever until some unrelated adaptable operation happened to
+// refresh the shared capability, blocking onboarding and autonomous delivery
+// against a perfectly valid schema.
+func (s *Store) requireOutboundFence(ctx context.Context, operation string) error {
+	// Deliberately no drift check: this guards convergence paths such as
+	// ResolveOutboxProviderAttempt and QuarantineClaimedOutboxUnknown as well as
+	// paths that start work. Once a provider call may have happened its outcome
+	// must stay recordable, so drift is enforced by the callers that begin work.
+	if s.resolveOutboundFence(ctx) {
 		return nil
 	}
 	return &UnsupportedSchemaError{Operation: operation, RequiresCore: CoreOutboundFenceVersion}
-}
-
-// outboxArgs drops the trailing fence parameter when the pre-fence statement
-// omits it. The fence value is always last so no other position shifts.
-func (s *Store) outboxArgs(args ...any) []any {
-	if s.OutboundFenceEnabled() {
-		return args
-	}
-	return args[:len(args)-1]
 }
 
 // newEnabledFence returns the fail-closed default capability holder.
