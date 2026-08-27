@@ -616,7 +616,7 @@ func TestCapabilityGatesUseTheStartupDecision(t *testing.T) {
 
 // Each requeue entry point must be able to be the first consumer after a clean
 // rollback and still recover.
-func TestRequeueEntryPointsRefuseAfterRollback(t *testing.T) {
+func TestRequeueEntryPointsFailLoudlyAfterRollback(t *testing.T) {
 	for _, entry := range []struct {
 		name   string
 		invoke func(ctx context.Context, st *Store, id, lockedBy string) error
@@ -667,8 +667,19 @@ func TestRequeueEntryPointsRefuseAfterRollback(t *testing.T) {
 				if firstErr := entry.invoke(ctx, st, id, lockedBy); firstErr != nil {
 					t.Logf("first attempt failed as expected: %v", firstErr)
 				}
-				if err := entry.invoke(ctx, st, id, lockedBy); !errors.Is(err, ErrOutboundFenceDrift) {
-					t.Fatalf("retry error = %v, want drift refusal", err)
+				// Requeue is a convergence path, so it is deliberately not gated on
+				// drift -- an in-flight outcome must stay recordable. On a
+				// rolled-back schema it therefore keeps failing loudly rather than
+				// silently downgrading, which is the outage direction, not a bypass.
+				retryErr := entry.invoke(ctx, st, id, lockedBy)
+				if retryErr == nil {
+					t.Fatal("retry silently succeeded against a rolled-back schema")
+				}
+				if !isUndefinedColumnOrTable(retryErr) && !errors.Is(retryErr, ErrOutboundFenceDrift) {
+					t.Fatalf("retry error = %v, want a loud schema failure", retryErr)
+				}
+				if !st.drift.Load() {
+					t.Fatal("the schema failure did not record drift")
 				}
 				restarted := &Store{db: db, q: db, fence: newEnabledFence(), drift: new(atomic.Bool)}
 				if err := restarted.RefreshOutboundFenceCapability(ctx); err != nil {
