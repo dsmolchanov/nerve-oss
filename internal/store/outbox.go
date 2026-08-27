@@ -665,6 +665,9 @@ func (s *Store) BeginOutboxProviderOperation(ctx context.Context, msg OutboxMess
 // BeginOutboxProviderOperationState is BeginOutboxProviderOperation plus the
 // persisted database start time needed to enforce bounded provider replay.
 func (s *Store) BeginOutboxProviderOperationState(ctx context.Context, msg OutboxMessage) (OutboxProviderOperation, error) {
+	if err := s.requireNoOutboundFenceDrift(); err != nil {
+		return OutboxProviderOperation{}, err
+	}
 	if msg.ID == "" || msg.OrgID == "" || !msg.LockedBy.Valid || msg.LockedBy.String == "" {
 		return OutboxProviderOperation{}, errors.New("missing claimed outbox identity")
 	}
@@ -847,9 +850,6 @@ func (s *Store) CountOutboxByState(ctx context.Context, state string) (int64, er
 }
 
 func (s *Store) MarkOutboxMessageSent(ctx context.Context, id string, providerMessageID string) error {
-	if err := s.requireNoOutboundFenceDrift(); err != nil {
-		return err
-	}
 	if id == "" {
 		return errors.New("missing id")
 	}
@@ -918,9 +918,6 @@ func (s *Store) MarkClaimedOutboxMessageFailed(ctx context.Context, id, claimLea
 // MarkOutboxProviderFailure records a provider-confirmed permanent failure.
 // Unlike pre-provider failures, a started operation becomes durably resolved.
 func (s *Store) MarkOutboxProviderFailure(ctx context.Context, id string, lastError string) error {
-	if err := s.requireNoOutboundFenceDrift(); err != nil {
-		return err
-	}
 	if id == "" {
 		return errors.New("missing id")
 	}
@@ -982,9 +979,6 @@ func (s *Store) QuarantineClaimedOutboxUnknown(ctx context.Context, id, workerID
 }
 
 func (s *Store) finishClaimedOutbox(ctx context.Context, id, workerID, operationID, status, lastError, providerMessageID string, resolve bool) error {
-	if err := s.requireNoOutboundFenceDrift(); err != nil {
-		return err
-	}
 	if id == "" || workerID == "" {
 		return errors.New("missing claimed outbox identity")
 	}
@@ -1128,9 +1122,6 @@ func (s *Store) RequeueClaimedOutboxKnownProviderFailure(ctx context.Context, id
 }
 
 func (s *Store) requeueOutboxMessage(ctx context.Context, id, workerID string, nextAttemptAt time.Time, lastError string) error {
-	if err := s.requireNoOutboundFenceDrift(); err != nil {
-		return err
-	}
 	if id == "" {
 		return errors.New("missing id")
 	}

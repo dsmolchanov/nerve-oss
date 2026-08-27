@@ -854,3 +854,60 @@ func TestDriftDoesNotBlockUnrelatedFeatureAdministration(t *testing.T) {
 		}
 	})
 }
+
+// Drift stops new work; it must never strand the outcome of work already
+// begun. A provider call in flight when the schema changes has to remain
+// recordable, or the row stays `sending`, is reclaimed later, and the message
+// can go out twice.
+func TestDriftDoesNotStrandInFlightOutcomes(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 28); err != nil {
+			t.Fatalf("migrate to core 28: %v", err)
+		}
+		st := &Store{db: db, q: db, fence: newEnabledFence(), drift: new(atomic.Bool)}
+		if err := st.RefreshOutboundFenceCapability(ctx); err != nil {
+			t.Fatalf("refresh: %v", err)
+		}
+		orgID, inboxID := seedCore28Outbox(t, ctx, db)
+		id, err := st.EnqueueOutboxMessage(ctx, OutboxMessage{
+			OrgID: orgID, InboxID: inboxID, Provider: "smtp", IdempotencyKey: "in-flight",
+			To: "recipient@local.neuralmail", From: "core28@local.neuralmail",
+			Subject: "in flight", TextBody: "body",
+		})
+		if err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+		claimed, err := st.ClaimOutboxMessages(ctx, 10, "in-flight-worker", time.Now().UTC(), 5*time.Minute)
+		if err != nil || len(claimed) != 1 {
+			t.Fatalf("claim: %v (%d rows)", err, len(claimed))
+		}
+		lockedBy := claimed[0].LockedBy.String
+
+		// The provider call is now in flight. Something else observes drift.
+		st.markOutboundFenceDrift()
+
+		// New work must stop.
+		if _, err := st.EnqueueOutboxMessage(ctx, OutboxMessage{
+			OrgID: orgID, InboxID: inboxID, Provider: "smtp", IdempotencyKey: "post-drift",
+			To: "recipient@local.neuralmail", From: "core28@local.neuralmail",
+			Subject: "post drift", TextBody: "body",
+		}); !errors.Is(err, ErrOutboundFenceDrift) {
+			t.Fatalf("enqueue after drift = %v, want refusal", err)
+		}
+		if _, err := st.ClaimOutboxMessages(ctx, 10, "another-worker", time.Now().UTC(), 5*time.Minute); !errors.Is(err, ErrOutboundFenceDrift) {
+			t.Fatalf("claim after drift = %v, want refusal", err)
+		}
+
+		// The in-flight outcome must still be recordable.
+		if err := st.MarkClaimedOutboxMessageSent(ctx, id, lockedBy, "", "provider-in-flight"); err != nil {
+			t.Fatalf("could not record an in-flight outcome after drift: %v", err)
+		}
+		var status string
+		if err := db.QueryRowContext(ctx, `SELECT status FROM outbox_messages WHERE id = $1`, id).Scan(&status); err != nil {
+			t.Fatalf("read status: %v", err)
+		}
+		if status != "sent" {
+			t.Fatalf("status = %q, want sent -- the outcome was stranded", status)
+		}
+	})
+}

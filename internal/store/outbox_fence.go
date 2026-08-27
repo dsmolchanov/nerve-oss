@@ -285,9 +285,10 @@ func trimOutboxArgs(fenced bool, args ...any) []any {
 // refresh the shared capability, blocking onboarding and autonomous delivery
 // against a perfectly valid schema.
 func (s *Store) requireOutboundFence(ctx context.Context, operation string) error {
-	if err := s.requireNoOutboundFenceDrift(); err != nil {
-		return err
-	}
+	// Deliberately no drift check: this guards convergence paths such as
+	// ResolveOutboxProviderAttempt and QuarantineClaimedOutboxUnknown as well as
+	// paths that start work. Once a provider call may have happened its outcome
+	// must stay recordable, so drift is enforced by the callers that begin work.
 	if s.resolveOutboundFence(ctx) {
 		return nil
 	}
