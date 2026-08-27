@@ -234,6 +234,9 @@ func (s *Store) LookupFeatureFlag(ctx context.Context, orgID string, flag string
 // SetFeatureFlag is idempotent: setting an existing scope to its current
 // value performs no update and reports changed=false.
 func (s *Store) SetFeatureFlag(ctx context.Context, orgID *string, flag string, enabled bool, updatedBy string) (bool, error) {
+	if err := s.requireNoOutboundFenceDrift(); err != nil {
+		return false, err
+	}
 	flag = strings.TrimSpace(flag)
 	updatedBy = strings.TrimSpace(updatedBy)
 	if flag == "" || updatedBy == "" {
@@ -294,9 +297,24 @@ func (s *Store) SetFeatureFlag(ctx context.Context, orgID *string, flag string, 
 	// Legacy organizations have no epoch row and retain their existing flag
 	// behavior. Every real autonomous policy change advances the fence in the
 	// same transaction, so suspended work can never revive after a later clear.
-	// Before Core 0029 the policy-state table does not exist and no org can
-	// carry an epoch, so the probe itself would be an unsupported-schema query.
+	//
+	// A pre-fence process may skip that advance only if the fence genuinely does
+	// not exist. Assert it here rather than trusting the startup decision: a
+	// process left stale by a live Core 0029 would otherwise commit a
+	// suspension, and later its clear, with no epoch advance at all, reviving
+	// queued autonomous mail that the suspension was meant to revoke. The
+	// assertion runs in the caller's transaction, so a refusal rolls the flag
+	// write back with it.
 	if !s.OutboundFenceEnabled() {
+		var preFence bool
+		if err := s.q.QueryRowContext(ctx,
+			`SELECT to_regclass('public.org_outbound_policy_state') IS NULL`).Scan(&preFence); err != nil {
+			return false, err
+		}
+		if !preFence {
+			s.markOutboundFenceDrift()
+			return false, ErrOutboundFenceDrift
+		}
 		return true, nil
 	}
 	var hasPolicyState bool
@@ -319,6 +337,9 @@ func (s *Store) SetFeatureFlag(ctx context.Context, orgID *string, flag string, 
 // records the operator action. A repeated value leaves the flag row unchanged
 // but still records that the command was issued.
 func (s *Store) SetFeatureFlagAudited(ctx context.Context, orgID *string, flag string, enabled bool, actor string) (bool, string, error) {
+	if err := s.requireNoOutboundFenceDrift(); err != nil {
+		return false, "", err
+	}
 	replayID := uuid.NewString()
 	var changed bool
 	err := s.withTx(ctx, func(scoped *Store) error {

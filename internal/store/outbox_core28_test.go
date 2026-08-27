@@ -682,3 +682,119 @@ func TestRequeueEntryPointsRefuseAfterRollback(t *testing.T) {
 		})
 	}
 }
+
+// A stale pre-fence process must not be able to suspend and then clear an
+// epoch-bearing org without advancing the epoch: the clear would otherwise
+// revive queued autonomous mail that the suspension was meant to revoke.
+func TestStaleFlagWritersCannotReviveSuspendedAutonomousMail(t *testing.T) {
+	for _, entry := range []struct {
+		name      string
+		preMarked bool
+		write     func(ctx context.Context, st *Store, orgID string, enabled bool) error
+	}{
+		{
+			name: "SetFeatureFlag",
+			write: func(ctx context.Context, st *Store, orgID string, enabled bool) error {
+				return st.RunInTx(ctx, func(scoped *Store) error {
+					_, err := scoped.SetFeatureFlag(ctx, &orgID, "email_outbound_suspended", enabled, "test")
+					return err
+				})
+			},
+		},
+		{
+			name: "SetFeatureFlagAudited",
+			write: func(ctx context.Context, st *Store, orgID string, enabled bool) error {
+				return st.RunInTx(ctx, func(scoped *Store) error {
+					_, _, err := scoped.SetFeatureFlagAudited(ctx, &orgID, "email_outbound_suspended", enabled, "operator@example.test")
+					return err
+				})
+			},
+		},
+		{
+			name:      "SetFeatureFlag with drift already marked",
+			preMarked: true,
+			write: func(ctx context.Context, st *Store, orgID string, enabled bool) error {
+				return st.RunInTx(ctx, func(scoped *Store) error {
+					_, err := scoped.SetFeatureFlag(ctx, &orgID, "email_outbound_suspended", enabled, "test")
+					return err
+				})
+			},
+		},
+	} {
+		t.Run(entry.name, func(t *testing.T) {
+			withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+				if err := MigrateUpToCore(ctx, db, 28); err != nil {
+					t.Fatalf("migrate to core 28: %v", err)
+				}
+				stale := &Store{db: db, q: db, fence: newEnabledFence(), drift: new(atomic.Bool)}
+				if err := stale.RefreshOutboundFenceCapability(ctx); err != nil {
+					t.Fatalf("refresh at 28: %v", err)
+				}
+				if stale.OutboundFenceEnabled() {
+					t.Fatal("core 28 reported the fence")
+				}
+
+				// Core 0029 lands and another instance creates an epoch-bearing org.
+				if err := MigrateUpToCore(ctx, db, 29); err != nil {
+					t.Fatalf("migrate to core 29: %v", err)
+				}
+				orgID, inboxID := seedCore28Outbox(t, ctx, db)
+				fresh := &Store{db: db, q: db, fence: newEnabledFence(), drift: new(atomic.Bool)}
+				if err := fresh.RefreshOutboundFenceCapability(ctx); err != nil {
+					t.Fatalf("fresh refresh: %v", err)
+				}
+				if err := fresh.RunInTx(ctx, func(scoped *Store) error {
+					_, err := scoped.EnsureOutboundPolicyState(ctx, orgID)
+					return err
+				}); err != nil {
+					t.Fatalf("seed policy state: %v", err)
+				}
+				outboxID := uuid.NewString()
+				if _, err := db.ExecContext(ctx, `
+					INSERT INTO outbox_messages (
+						id, org_id, inbox_id, provider, idempotency_key,
+						"to", "from", subject, text_body,
+						status, delivery_status, autonomous_policy_epoch, next_attempt_at
+					) VALUES ($1, $2, $3, 'smtp', 'revive-probe',
+						'recipient@local.neuralmail', 'core28@local.neuralmail', 'revive', 'body',
+						'queued', 'queued', 1, now())
+				`, outboxID, orgID, inboxID); err != nil {
+					t.Fatalf("insert epoch-bearing row: %v", err)
+				}
+
+				if entry.preMarked {
+					stale.markOutboundFenceDrift()
+				}
+
+				// Suspend then clear through the stale process. Both writes must
+				// refuse rather than commit without advancing the epoch.
+				if err := entry.write(ctx, stale, orgID, true); err == nil {
+					t.Fatal("stale suspend committed without advancing the epoch")
+				}
+				if err := entry.write(ctx, stale, orgID, false); err == nil {
+					t.Fatal("stale clear committed without advancing the epoch")
+				}
+
+				// The flag must not have been left set by a partially applied write.
+				var flagRows int
+				if err := db.QueryRowContext(ctx, `
+					SELECT count(*) FROM org_feature_flags
+					WHERE org_id = $1::uuid AND flag = 'email_outbound_suspended'
+				`, orgID).Scan(&flagRows); err != nil {
+					t.Fatalf("read flag: %v", err)
+				}
+				if flagRows != 0 {
+					t.Fatalf("stale writer left %d flag row(s) behind; the write did not roll back", flagRows)
+				}
+
+				// And the epoch-bearing row must remain unclaimable by the stale process.
+				claimed, _ := stale.ClaimOutboxMessages(ctx, 10, "stale-worker", time.Now().UTC(), 5*time.Minute)
+				for _, msg := range claimed {
+					if msg.ID == outboxID {
+						t.Fatal("stale process claimed the epoch-bearing row")
+					}
+				}
+			})
+		})
+	}
+}
