@@ -766,25 +766,49 @@ func TestStaleFlagWritersCannotReviveSuspendedAutonomousMail(t *testing.T) {
 					stale.markOutboundFenceDrift()
 				}
 
-				// Suspend then clear through the stale process. Both writes must
-				// refuse rather than commit without advancing the epoch.
-				if err := entry.write(ctx, stale, orgID, true); err == nil {
-					t.Fatal("stale suspend committed without advancing the epoch")
-				}
-				if err := entry.write(ctx, stale, orgID, false); err == nil {
-					t.Fatal("stale clear committed without advancing the epoch")
+				var beforeEpoch int64
+				if err := db.QueryRowContext(ctx,
+					`SELECT policy_epoch FROM org_outbound_policy_state WHERE org_id = $1::uuid`,
+					orgID).Scan(&beforeEpoch); err != nil {
+					t.Fatalf("read epoch: %v", err)
 				}
 
-				// The flag must not have been left set by a partially applied write.
-				var flagRows int
-				if err := db.QueryRowContext(ctx, `
-					SELECT count(*) FROM org_feature_flags
-					WHERE org_id = $1::uuid AND flag = 'email_outbound_suspended'
-				`, orgID).Scan(&flagRows); err != nil {
-					t.Fatalf("read flag: %v", err)
-				}
-				if flagRows != 0 {
-					t.Fatalf("stale writer left %d flag row(s) behind; the write did not roll back", flagRows)
+				// Either outcome is safe; skipping the epoch advance is not.
+				suspendErr := entry.write(ctx, stale, orgID, true)
+				clearErr := entry.write(ctx, stale, orgID, false)
+
+				if entry.preMarked {
+					// Drift means a backward transition was already observed, so the
+					// writes must roll back rather than proceed on an unknown schema.
+					if !errors.Is(suspendErr, ErrOutboundFenceDrift) || !errors.Is(clearErr, ErrOutboundFenceDrift) {
+						t.Fatalf("drifted writes were not refused: suspend=%v clear=%v", suspendErr, clearErr)
+					}
+					var flagRows int
+					if err := db.QueryRowContext(ctx, `
+						SELECT count(*) FROM org_feature_flags
+						WHERE org_id = $1::uuid AND flag = 'email_outbound_suspended'
+					`, orgID).Scan(&flagRows); err != nil {
+						t.Fatalf("read flag: %v", err)
+					}
+					if flagRows != 0 {
+						t.Fatalf("refused write left %d flag row(s) behind", flagRows)
+					}
+				} else {
+					if suspendErr != nil || clearErr != nil {
+						t.Fatalf("stale writes failed: suspend=%v clear=%v", suspendErr, clearErr)
+					}
+					var afterEpoch int64
+					if err := db.QueryRowContext(ctx,
+						`SELECT policy_epoch FROM org_outbound_policy_state WHERE org_id = $1::uuid`,
+						orgID).Scan(&afterEpoch); err != nil {
+						t.Fatalf("read epoch: %v", err)
+					}
+					if afterEpoch <= beforeEpoch {
+						t.Fatalf("epoch %d -> %d: the stale writer skipped the fence advance", beforeEpoch, afterEpoch)
+					}
+					if !stale.OutboundFenceEnabled() {
+						t.Fatal("stale writer did not upgrade after proving the fence exists")
+					}
 				}
 
 				// And the epoch-bearing row must remain unclaimable by the stale process.
@@ -797,4 +821,36 @@ func TestStaleFlagWritersCannotReviveSuspendedAutonomousMail(t *testing.T) {
 			})
 		})
 	}
+}
+
+// Outbound drift must not disable feature administration that has nothing to do
+// with the outbound fence.
+func TestDriftDoesNotBlockUnrelatedFeatureAdministration(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 29); err != nil {
+			t.Fatalf("migrate to core 29: %v", err)
+		}
+		st := &Store{db: db, q: db, fence: newEnabledFence(), drift: new(atomic.Bool)}
+		if err := st.RefreshOutboundFenceCapability(ctx); err != nil {
+			t.Fatalf("refresh: %v", err)
+		}
+		st.markOutboundFenceDrift()
+
+		// A global flag never touches the outbound fence at all.
+		if err := st.RunInTx(ctx, func(scoped *Store) error {
+			_, err := scoped.SetFeatureFlag(ctx, nil, "domain_writes", true, "operator@example.test")
+			return err
+		}); err != nil {
+			t.Fatalf("drift blocked an unrelated global flag write: %v", err)
+		}
+
+		// So does an org flag on an org with no outbound policy state.
+		orgID, _ := seedCore28Outbox(t, ctx, db)
+		if err := st.RunInTx(ctx, func(scoped *Store) error {
+			_, _, err := scoped.SetFeatureFlagAudited(ctx, &orgID, "domain_writes", true, "operator@example.test")
+			return err
+		}); err != nil {
+			t.Fatalf("drift blocked an unrelated org flag write: %v", err)
+		}
+	})
 }

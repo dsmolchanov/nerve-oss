@@ -240,6 +240,9 @@ func isUndefinedColumnOrTable(err error) bool {
 	return pgErr.Code == "42703" || pgErr.Code == "42P01"
 }
 
+// setOutboundFence records the capability. Callers may only ever move it from
+// unfenced to fenced: see the monotonicity note in SetFeatureFlag. The reverse
+// transition is drift and is handled by markOutboundFenceDrift instead.
 func (s *Store) setOutboundFence(enabled bool) {
 	if s.fence == nil {
 		s.fence = newEnabledFence()

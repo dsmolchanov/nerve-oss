@@ -234,9 +234,6 @@ func (s *Store) LookupFeatureFlag(ctx context.Context, orgID string, flag string
 // SetFeatureFlag is idempotent: setting an existing scope to its current
 // value performs no update and reports changed=false.
 func (s *Store) SetFeatureFlag(ctx context.Context, orgID *string, flag string, enabled bool, updatedBy string) (bool, error) {
-	if err := s.requireNoOutboundFenceDrift(); err != nil {
-		return false, err
-	}
 	flag = strings.TrimSpace(flag)
 	updatedBy = strings.TrimSpace(updatedBy)
 	if flag == "" || updatedBy == "" {
@@ -311,11 +308,18 @@ func (s *Store) SetFeatureFlag(ctx context.Context, orgID *string, flag string, 
 			`SELECT to_regclass('public.org_outbound_policy_state') IS NULL`).Scan(&preFence); err != nil {
 			return false, err
 		}
-		if !preFence {
-			s.markOutboundFenceDrift()
-			return false, ErrOutboundFenceDrift
+		if preFence {
+			return true, nil
 		}
-		return true, nil
+		// The fence exists after all: this process started on Core 28 and the
+		// schema moved forward. Upgrade and continue.
+		//
+		// The capability is monotonic -- it may move unfenced to fenced but never
+		// back. A forward upgrade is proven atomically here, in the caller's own
+		// transaction, and only ever adds enforcement, so it cannot produce the
+		// stale-legacy-read that per-operation revalidation did. The backward
+		// direction stays terminal drift and still requires a restart.
+		s.setOutboundFence(true)
 	}
 	var hasPolicyState bool
 	if err := s.q.QueryRowContext(ctx, `
@@ -337,9 +341,6 @@ func (s *Store) SetFeatureFlag(ctx context.Context, orgID *string, flag string, 
 // records the operator action. A repeated value leaves the flag row unchanged
 // but still records that the command was issued.
 func (s *Store) SetFeatureFlagAudited(ctx context.Context, orgID *string, flag string, enabled bool, actor string) (bool, string, error) {
-	if err := s.requireNoOutboundFenceDrift(); err != nil {
-		return false, "", err
-	}
 	replayID := uuid.NewString()
 	var changed bool
 	err := s.withTx(ctx, func(scoped *Store) error {
