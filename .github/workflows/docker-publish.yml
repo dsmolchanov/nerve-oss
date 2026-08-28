@@ -136,6 +136,13 @@ jobs:
   candidate:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # Narrower than the workflow default on purpose. Keyless signing needs
+    # id-token, and a job whose whole point is to create nothing publishable
+    # has no business inheriting contents: write.
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
       - name: Require exact protected inputs
         env:
@@ -306,6 +313,29 @@ jobs:
             echo "could not resolve a linux/amd64 digest" >&2; exit 1; }
           echo "index_digest=${INDEX_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "amd64_digest=${amd64}" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign the candidate image and prove the signature is consumable
+        env:
+          OWNER: ${{ github.repository_owner }}
+          INDEX_DIGEST: ${{ steps.digests.outputs.index_digest }}
+        run: |
+          set -euo pipefail
+          reference="ghcr.io/${OWNER}/nerve-runtime@${INDEX_DIGEST}"
+          cosign sign --yes "${reference}"
+          # Verify against the identity the control plane will demand, not
+          # against "a signature exists". The first candidate was built without
+          # this step and nothing noticed until a consumer finally had the
+          # credentials to check -- an unsigned image cannot be signed after the
+          # fact, because keyless signing binds to the producing workflow.
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/docker-publish.yml@refs/heads/main"
+          cosign verify \
+            --certificate-identity "${identity}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${reference}" >/dev/null
+          echo "candidate signed and verified as ${identity}"
 
       - name: Write the candidate lock for the consuming Cloud PR
         env:
