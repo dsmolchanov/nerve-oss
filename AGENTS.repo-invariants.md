@@ -66,3 +66,12 @@ makes a review loop unable to terminate.
   `TestCanonicalVariantWritersSerializeBeforePreinsertCheck`,
   `TestOutboundPolicyCanonicalizesLegacyInboxAddressForOwnedDomainProof`, and
   `TestCanonicalOutboundInboxAddressPreservesStorageOnlyInternally`.
+
+- A candidate release identity is only free when a probe *positively proves* it
+  absent. `scripts/release/prove_candidate_version_unused.sh` is the single
+  implementation, run both before and after the image build, and each probe
+  distinguishes absence from "could not tell": git `ls-remote --exit-code` must
+  exit 2, the Releases API must return 404, and an OCI probe must report the
+  registry's own manifest-unknown signal. A nonzero exit, a non-404 status, or a
+  generic "not found" is not proof and must refuse. Enforced by
+  `scripts/ci/test_candidate_version_probe.sh`.
