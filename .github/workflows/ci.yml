@@ -49,6 +49,8 @@ jobs:
         run: ./scripts/ci/verify_runtime_boundaries.sh
       - name: Verify migration ownership
         run: ./scripts/ci/verify_migration_ownership.sh
+      - name: Candidate uniqueness probe contract
+        run: ./scripts/ci/test_candidate_version_probe.sh
       - name: Validate sync manifest
         run: |
           ./scripts/sync/verify_exact_mirror.sh sync-manifest.yaml . .

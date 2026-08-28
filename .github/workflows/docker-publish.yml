@@ -4,6 +4,16 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      final_version:
+        description: "Frozen final runtime semver (vX.Y.Z). Must be unused everywhere; no tag or Release is created."
+        required: true
+        type: string
+      confirm:
+        description: Type BUILD-RUNTIME-CANDIDATE.
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -15,6 +25,7 @@ concurrency:
 
 jobs:
   publish:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -112,3 +123,244 @@ jobs:
             --verify-tag \
             --title "${VERSION}" \
             --generate-notes
+
+  # Phase 8.3 candidate build. This is the sole producer of the runtime bytes
+  # that Phase 9 consumes, and nerve-cloud's fetch_runtime_candidate_manifest.sh
+  # pins this exact identity: this workflow path, event workflow_dispatch, branch
+  # main, and one artifact named mcp2026-runtime-candidate-<head sha> holding
+  # exactly one runtime-manifest.json.
+  #
+  # It builds immutable bytes and nothing else: no semver tag, no GitHub Release,
+  # no release asset. The frozen version is proven unused and recorded in the
+  # manifest and OCI labels so Phase 9 can bind it without the tag existing.
+  candidate:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require exact protected inputs
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          FINAL_VERSION: ${{ inputs.final_version }}
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          [[ "${CONFIRM}" == "BUILD-RUNTIME-CANDIDATE" ]] || {
+            echo "type BUILD-RUNTIME-CANDIDATE to confirm" >&2; exit 1; }
+          # The full ref, as mcp2026-legacy-bridge.yml checks it. github.ref_name
+          # is not sufficient: the workflow-dispatch API accepts a tag, and a tag
+          # named "main" yields ref_name "main" while the checked-out bytes come
+          # from refs/tags/main. The job-level guard above enforces the same
+          # thing; this repeats it so the reason is visible at the point of use.
+          [[ "${DISPATCH_REF}" == "refs/heads/main" ]] || {
+            echo "the runtime candidate must be built from refs/heads/main, got ${DISPATCH_REF}" >&2; exit 1; }
+          # Semver forbids leading zeros in numeric identifiers, so a plain
+          # [0-9]+ would freeze an invalid identity like v01.2.3 into the
+          # manifest, OCI labels and lock -- which downstream promotion tooling
+          # cannot treat as the promised final semver.
+          [[ "${FINAL_VERSION}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo "final_version must be a canonical semver vX.Y.Z without leading zeros, got ${FINAL_VERSION}" >&2; exit 1; }
+
+      - uses: actions/checkout@v4
+
+      - name: Require a successful main CI run for this exact SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Phase 8.3 requires the candidate to be built from "an exact
+          # successful main SHA". Dispatch and branch alone do not establish
+          # that: an operator can dispatch while CI is still pending, or after
+          # tests, race, conformance or runtime-boundary checks failed on a tree
+          # that still builds a Docker image. The bytes would then be attested
+          # and frozen without the suite that justifies them.
+          runs="$(gh api \
+            "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&per_page=100")" || {
+            echo "could not query OSS CI runs for ${GITHUB_SHA}; refusing to build" >&2; exit 1; }
+          # Fail closed: an unreadable or empty answer is not a passing run.
+          # Full provenance, matching how nerve-cloud's
+          # fetch_runtime_candidate_manifest.sh establishes the same thing. A
+          # branch name is not provenance: a pull_request run from a branch
+          # named "main" carries head_branch "main" and this head_sha while
+          # testing the PR merge ref rather than the main tree, and a fork run
+          # is not this repository's CI at all.
+          successful="$(jq -r --arg sha "${GITHUB_SHA}" --arg repo "${REPOSITORY}" '
+            [ .workflow_runs[]?
+              | select(.head_sha == $sha
+                       and .event == "push"
+                       and .head_branch == "main"
+                       and .repository.full_name == $repo
+                       and .head_repository.full_name == $repo
+                       and .status == "completed"
+                       and .conclusion == "success") ] | length' <<<"${runs}")" || {
+            echo "could not parse OSS CI runs for ${GITHUB_SHA}; refusing to build" >&2; exit 1; }
+          [[ "${successful}" =~ ^[0-9]+$ ]] || {
+            echo "OSS CI run count was not numeric; refusing to build" >&2; exit 1; }
+          if [[ "${successful}" -lt 1 ]]; then
+            echo "no successful OSS CI run on main for ${GITHUB_SHA}; refusing to build a candidate from it" >&2
+            jq -r '.workflow_runs[]? | "  seen: \(.status)/\(.conclusion // "-") event=\(.event) branch=\(.head_branch) repo=\(.head_repository.full_name // "-")"' <<<"${runs}" >&2 || true
+            exit 1
+          fi
+          echo "OSS CI passed on main for ${GITHUB_SHA} (${successful} successful run(s))"
+
+      - name: Prove the frozen version is unused
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          FINAL_VERSION: ${{ inputs.final_version }}
+        run: |
+          ./scripts/release/prove_candidate_version_unused.sh \
+            "${REPOSITORY}" "${OWNER}" "${FINAL_VERSION}" preflight
+
+      - name: Generate the candidate runtime manifest
+        id: manifest
+        env:
+          FINAL_VERSION: ${{ inputs.final_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/candidate
+          # GIT_COMMIT must be the full 40-character SHA: the Cloud verifier
+          # compares build_commit against oss-source.lock's revision.
+          GIT_COMMIT="${GITHUB_SHA}" \
+            ./scripts/release/generate_runtime_manifest.sh \
+              "${FINAL_VERSION}" "dist/candidate/runtime-manifest.json"
+          ./scripts/release/export_runtime_manifest_outputs.sh \
+            "dist/candidate/runtime-manifest.json" "${FINAL_VERSION}" "$GITHUB_OUTPUT"
+
+      - name: Verify the manifest projects the candidate contract
+        env:
+          FINAL_VERSION: ${{ inputs.final_version }}
+        run: |
+          set -euo pipefail
+          # Fail here rather than let nerve-cloud reject the artifact later.
+          jq -e --arg version "${FINAL_VERSION}" --arg commit "${GITHUB_SHA}" '
+            .runtime_version == $version and
+            .build_commit == $commit and
+            .core_schema_min_required == "29" and
+            .core_schema_max_supported == "29" and
+            .outbound_policy_version == "autonomous-outbound-v1" and
+            (.mcp_contract_hash | test("^[0-9a-f]{64}$")) and
+            (.core_schema_hash | test("^[0-9a-f]{64}$")) and
+            (.outbound_policy_sha256 | test("^[0-9a-f]{64}$"))
+          ' dist/candidate/runtime-manifest.json >/dev/null || {
+            echo "candidate manifest does not project the required contract" >&2
+            cat dist/candidate/runtime-manifest.json >&2
+            exit 1
+          }
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push the candidate by digest
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: deploy/docker/cortex/Dockerfile
+          push: true
+          # A content-addressed tag, never the frozen semver: these bytes must
+          # not be reachable by the name Phase 10 will publish.
+          tags: ghcr.io/${{ github.repository_owner }}/nerve-runtime:candidate-${{ github.sha }}
+          build-args: |
+            RUNTIME_VERSION=${{ steps.manifest.outputs.runtime_version }}
+            MCP_CONTRACT_HASH=${{ steps.manifest.outputs.mcp_contract_hash }}
+            CORE_SCHEMA_HASH=${{ steps.manifest.outputs.core_schema_hash }}
+            CORE_SCHEMA_MIN_REQUIRED=${{ steps.manifest.outputs.core_schema_min_required }}
+            CORE_SCHEMA_MAX_SUPPORTED=${{ steps.manifest.outputs.core_schema_max_supported }}
+            OUTBOUND_POLICY_VERSION=${{ steps.manifest.outputs.outbound_policy_version }}
+            OUTBOUND_POLICY_SHA256=${{ steps.manifest.outputs.outbound_policy_sha256 }}
+            BUILD_COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ steps.manifest.outputs.build_time }}
+
+      - name: Resolve index and linux/amd64 digests
+        id: digests
+        env:
+          OWNER: ${{ github.repository_owner }}
+          INDEX_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "${INDEX_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "build did not report a digest" >&2; exit 1; }
+          reference="ghcr.io/${OWNER}/nerve-runtime@${INDEX_DIGEST}"
+          raw="$(docker buildx imagetools inspect --raw "${reference}")"
+          media_type="$(jq -r '.mediaType // ""' <<<"${raw}")"
+          case "${media_type}" in
+            *"image.index"*|*"manifest.list"*)
+              amd64="$(jq -r '
+                .manifests[]
+                | select(.platform.os == "linux" and .platform.architecture == "amd64")
+                | .digest' <<<"${raw}" | head -1)"
+              ;;
+            *)
+              # Single-platform build: the index digest is the platform digest.
+              amd64="${INDEX_DIGEST}"
+              ;;
+          esac
+          [[ "${amd64}" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "could not resolve a linux/amd64 digest" >&2; exit 1; }
+          echo "index_digest=${INDEX_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "amd64_digest=${amd64}" >> "$GITHUB_OUTPUT"
+
+      - name: Write the candidate lock for the consuming Cloud PR
+        env:
+          OWNER: ${{ github.repository_owner }}
+          FINAL_VERSION: ${{ inputs.final_version }}
+          INDEX_DIGEST: ${{ steps.digests.outputs.index_digest }}
+          AMD64_DIGEST: ${{ steps.digests.outputs.amd64_digest }}
+        run: |
+          set -euo pipefail
+          manifest_sha="$(sha256sum dist/candidate/runtime-manifest.json | awk '{print $1}')"
+          # Copied verbatim into nerve-cloud as deploy/cloud/runtime-candidate.lock.
+          # verify_runtime_candidate_lock.sh reads exactly these keys.
+          cat > dist/candidate/runtime-candidate.lock <<LOCK
+          # Pre-tag runtime candidate. Digest-addressed and deliberately not a
+          # released artifact: deploy/cloud/runtime.lock still pins v0.0.17.
+          # Produced by .github/workflows/docker-publish.yml (candidate job).
+          RUNTIME_CANDIDATE_IMAGE=ghcr.io/${OWNER}/nerve-runtime@${INDEX_DIGEST}
+          RUNTIME_CANDIDATE_VERSION=${FINAL_VERSION}
+          RUNTIME_CANDIDATE_SOURCE_REVISION=${GITHUB_SHA}
+          RUNTIME_CANDIDATE_INDEX_DIGEST=${INDEX_DIGEST}
+          RUNTIME_CANDIDATE_LINUX_AMD64_DIGEST=${AMD64_DIGEST}
+          RUNTIME_CANDIDATE_MANIFEST_SHA256=${manifest_sha}
+          RUNTIME_CANDIDATE_MCP_CONTRACT_SHA256=$(jq -r .mcp_contract_hash dist/candidate/runtime-manifest.json)
+          RUNTIME_CANDIDATE_CORE_SCHEMA_SHA256=$(jq -r .core_schema_hash dist/candidate/runtime-manifest.json)
+          RUNTIME_CANDIDATE_CORE_MIN_REQUIRED=29
+          RUNTIME_CANDIDATE_CORE_MAX_SUPPORTED=29
+          RUNTIME_CANDIDATE_POLICY_VERSION=$(jq -r .outbound_policy_version dist/candidate/runtime-manifest.json)
+          RUNTIME_CANDIDATE_POLICY_SHA256=$(jq -r .outbound_policy_sha256 dist/candidate/runtime-manifest.json)
+          RUNTIME_CANDIDATE_ARTIFACT_RUN_ID=${GITHUB_RUN_ID}
+          LOCK
+          sed -i 's/^          //' dist/candidate/runtime-candidate.lock
+          cat dist/candidate/runtime-candidate.lock
+
+      - name: Refuse to publish anything
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          FINAL_VERSION: ${{ inputs.final_version }}
+        run: |
+          # Re-prove all four, not just the two this run could have created.
+          # The image build is long enough for another writer to claim either
+          # OCI tag in between, and freezing an identity now owned by different
+          # bytes is exactly what this job must not do. Identical probe, so it
+          # is the same script rather than a second copy that can drift.
+          ./scripts/release/prove_candidate_version_unused.sh \
+            "${REPOSITORY}" "${OWNER}" "${FINAL_VERSION}" postbuild
+
+      - name: Upload the protected candidate artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # nerve-cloud's fetcher resolves this exact name.
+          name: mcp2026-runtime-candidate-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 90
+          path: |
+            dist/candidate/runtime-manifest.json
+            dist/candidate/runtime-candidate.lock
