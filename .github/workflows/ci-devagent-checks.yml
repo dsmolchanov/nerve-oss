@@ -1,15 +1,36 @@
 name: ci
-on:
-  pull_request:
-    types: [opened, reopened, synchronize, ready_for_review]
-  push:
-    branches: [main, master]
 
-# IMPORTANT: this file is a starting-point template. The job keys below must
-# match the required-status-check names in branch protection:
-#   lint, unit, integration, e2e, coverage
-# Tune the per-repo commands (npm, pnpm, pytest, go test, cargo test, etc.)
-# without renaming the jobs.
+# DISABLED 2026-08-28. Every job below tested nothing in this repository.
+#
+# The template dispatches on exactly two ecosystem markers:
+#
+#   if   [ -f package.json ];   then npm ci && npm test --if-present
+#   elif [ -f pyproject.toml ]; then pip install -e . && pytest ...
+#   fi
+#
+# This repository is Go. The root holds go.mod and a Makefile and neither of
+# those files, so every job checked out the tree, matched neither branch of the
+# `if`, and exited 0 in four to six seconds having run nothing.
+#
+# That mattered because lint, unit, integration, e2e and coverage were REQUIRED
+# status checks: five marks on every pull request that could not turn red. The
+# repository itself stayed gated — build-test, govulncheck and dependency-review
+# are real and remain required — so what is removed here is false assurance,
+# not protection.
+#
+# This repository is public, so its Actions minutes are free; the ~1755 minutes
+# a month these jobs consumed cost nothing. The reason to disable them is that
+# a green check should mean something. nerve-cloud carries the identical file
+# and there the same jobs did cost ~2255 billable minutes a month.
+#
+# The five contexts are dropped from branch protection in the same change; a
+# required context that never reports blocks every merge, so the protection
+# edit must land FIRST.
+#
+# The jobs are kept below rather than deleted so a future maintainer can see
+# what was claimed and what ran.
+on:
+  workflow_dispatch:
 
 jobs:
   lint:
