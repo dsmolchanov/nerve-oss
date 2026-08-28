@@ -162,6 +162,38 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - name: Require a successful main CI run for this exact SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Phase 8.3 requires the candidate to be built from "an exact
+          # successful main SHA". Dispatch and branch alone do not establish
+          # that: an operator can dispatch while CI is still pending, or after
+          # tests, race, conformance or runtime-boundary checks failed on a tree
+          # that still builds a Docker image. The bytes would then be attested
+          # and frozen without the suite that justifies them.
+          runs="$(gh api \
+            "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&per_page=100")" || {
+            echo "could not query OSS CI runs for ${GITHUB_SHA}; refusing to build" >&2; exit 1; }
+          # Fail closed: an unreadable or empty answer is not a passing run.
+          successful="$(jq -r --arg sha "${GITHUB_SHA}" '
+            [ .workflow_runs[]?
+              | select(.head_sha == $sha
+                       and .head_branch == "main"
+                       and .status == "completed"
+                       and .conclusion == "success") ] | length' <<<"${runs}")" || {
+            echo "could not parse OSS CI runs for ${GITHUB_SHA}; refusing to build" >&2; exit 1; }
+          [[ "${successful}" =~ ^[0-9]+$ ]] || {
+            echo "OSS CI run count was not numeric; refusing to build" >&2; exit 1; }
+          if [[ "${successful}" -lt 1 ]]; then
+            echo "no successful OSS CI run on main for ${GITHUB_SHA}; refusing to build a candidate from it" >&2
+            jq -r '.workflow_runs[]? | "  seen: \(.status)/\(.conclusion // "-") \(.head_branch)"' <<<"${runs}" >&2 || true
+            exit 1
+          fi
+          echo "OSS CI passed on main for ${GITHUB_SHA} (${successful} successful run(s))"
+
       - name: Prove the frozen version is unused
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
