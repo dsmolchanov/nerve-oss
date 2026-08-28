@@ -153,8 +153,12 @@ jobs:
           # thing; this repeats it so the reason is visible at the point of use.
           [[ "${DISPATCH_REF}" == "refs/heads/main" ]] || {
             echo "the runtime candidate must be built from refs/heads/main, got ${DISPATCH_REF}" >&2; exit 1; }
-          [[ "${FINAL_VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-            echo "final_version must be vX.Y.Z, got ${FINAL_VERSION}" >&2; exit 1; }
+          # Semver forbids leading zeros in numeric identifiers, so a plain
+          # [0-9]+ would freeze an invalid identity like v01.2.3 into the
+          # manifest, OCI labels and lock -- which downstream promotion tooling
+          # cannot treat as the promised final semver.
+          [[ "${FINAL_VERSION}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo "final_version must be a canonical semver vX.Y.Z without leading zeros, got ${FINAL_VERSION}" >&2; exit 1; }
 
       - uses: actions/checkout@v4
 
