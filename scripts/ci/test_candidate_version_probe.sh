@@ -21,7 +21,7 @@ failures=0
 # the two repositories collide. Probing only one repository is a regression the
 # registered invariant claims this test catches.
 run_case() {
-  local name="$1" want="$2" git_exit="$3" http="$4" oci_exit="$5" oci_msg="$6" oci_taken="${7:-}"
+  local name="$1" want="$2" git_exit="$3" http="$4" oci_exit="$5" oci_msg="$6" oci_taken="${7:-}" curl_exit="${8:-0}"
   local stub; stub="$(mktemp -d)"
   local probed="$stub/probed"
   : > "$probed"
@@ -32,7 +32,9 @@ exit ${git_exit}
 EOF
   cat > "$stub/curl" <<EOF
 #!/usr/bin/env bash
+# A transport failure can still write output; the helper must not read it.
 printf '%s' "${http}"
+exit ${curl_exit}
 EOF
   cat > "$stub/docker" <<EOF
 #!/usr/bin/env bash
@@ -89,6 +91,12 @@ run_case "oci unauthorized"                refused    2    404   1    "unauthori
 run_case "oci no such manifest"            accepted   2    404   1    "no such manifest: ghcr.io/o/i:v1"
 run_case "only nerve-runtime taken"        refused    2    404   1    "manifest unknown"  nerve-runtime
 run_case "only neuralmaild taken"          refused    2    404   1    "manifest unknown"  neuralmaild
+# Transport failures on the Release probe. The last is the dangerous one: curl
+# fails but still emits a 404-looking body, which must not be read as absence.
+run_case "release curl dns failure"        refused    2    ""    1    "manifest unknown"  ""  6
+run_case "release curl timeout"            refused    2    ""    1    "manifest unknown"  ""  28
+run_case "release curl fails but says 404" refused    2    404   1    "manifest unknown"  ""  35
+run_case "release http error status 22"    accepted   2    404   1    "manifest unknown"  ""  22
 
 # The invariant covers the call sites too, not just the classifier: a helper
 # that is correct but invoked in only one phase reopens the post-build window.

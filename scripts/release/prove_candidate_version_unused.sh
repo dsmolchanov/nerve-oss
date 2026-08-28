@@ -31,12 +31,26 @@ case "${tag_status}" in
 esac
 
 # Releases: read the HTTP status directly, so 404 is the only proof of absence.
-release_status="$(curl --silent --show-error \
+# curl's own exit status is checked explicitly rather than left to set -e: a
+# DNS, TLS, timeout or truncated-response failure can still emit output, and
+# reading that output as an HTTP status would treat an unreachable API as proof
+# the version is free.
+set +e
+release_status="$(curl --silent --show-error --fail-with-body \
   --output /dev/null --write-out '%{http_code}' \
   --header 'Accept: application/vnd.github+json' \
   --header "Authorization: Bearer ${GH_TOKEN}" \
   --header 'X-GitHub-Api-Version: 2022-11-28' \
   "https://api.github.com/repos/${REPOSITORY}/releases/tags/${VERSION}")"
+curl_status=$?
+set -e
+# 22 is --fail-with-body's status for an HTTP error response, which is expected
+# for the 404 that proves absence. Any other nonzero status is a transport
+# failure and proves nothing.
+if [[ "${curl_status}" -ne 0 && "${curl_status}" -ne 22 ]]; then
+  echo "${PHASE}: release probe transport failed with curl status ${curl_status}; cannot prove ${VERSION} unused" >&2
+  exit 1
+fi
 case "${release_status}" in
   404) ;;
   200) echo "${PHASE}: ${VERSION} exists as a GitHub Release" >&2; exit 1 ;;
