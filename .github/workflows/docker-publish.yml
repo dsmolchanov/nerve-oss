@@ -212,7 +212,11 @@ jobs:
             if [[ "${oci_status}" -eq 0 ]]; then
               echo "${FINAL_VERSION} already exists as a public OCI tag on ${image}" >&2; exit 1
             fi
-            if ! grep -qiE 'manifest unknown|not found|no such manifest|manifest_unknown' <<<"${oci_error}"; then
+            # Only the registry's own manifest-unknown signal proves absence.
+            # A generic "not found" does not: a proxy answering "404 Not Found"
+            # and a missing credential helper reporting "executable file not
+            # found" both exit nonzero without saying anything about the tag.
+            if ! grep -qiE 'manifest unknown|manifest_unknown|no such manifest' <<<"${oci_error}"; then
               echo "OCI probe for ${image} failed without proving absence: ${oci_error}" >&2; exit 1
             fi
           done
