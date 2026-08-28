@@ -75,6 +75,7 @@
     "scripts/ci/mcp_conformance_paths.sh",
     "scripts/ci/test_mcp_conformance_paths.sh",
     "scripts/ci/test_mcp_conformance.sh",
+    "scripts/release/prove_candidate_version_unused.sh",
     "docs/MCP_Contract.md"
   ],
   "patch-synced": [
