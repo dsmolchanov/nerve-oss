@@ -20,7 +20,7 @@ anywhere once the PR merged.
 
 ## Desired state
 
-Adopt gate v3 (codex-review-gate pin `6569100561df84a415a4640a380148f78b1c1b90`,
+Adopt gate v3 (codex-review-gate pin `656910056514570ab1fe0c94c122d2cbfcb1bbb4`,
 reviewed and merged there as PRs #3/#4/#6/#7):
 
 - The gate takes a 120-second verdict window only where an ACTIVE
@@ -55,7 +55,7 @@ live).
 
 ## Success criteria
 
-- [ ] Both stubs pin `6569100561df84a415a4640a380148f78b1c1b90`.
+- [ ] Both stubs pin `656910056514570ab1fe0c94c122d2cbfcb1bbb4`.
 - [ ] After merge, `gh api repos/dsmolchanov/nerve-oss/actions/workflows/codex-verdict-waker.yml`
       reports `state: active`.
 - [ ] A PR whose Codex verdict arrives as a comment after the gate's short
