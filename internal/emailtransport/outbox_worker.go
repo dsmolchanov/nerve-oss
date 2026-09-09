@@ -128,7 +128,9 @@ func (w *OutboxWorker) runWithPoll(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			w.claimAndDeliver(ctx)
+			if err := w.claimAndDeliver(ctx); err != nil {
+				return err
+			}
 		}
 	}
 }
@@ -137,7 +139,9 @@ func (w *OutboxWorker) runWithPoll(ctx context.Context) error {
 // as a fallback safety-net in case a notification is missed.
 func (w *OutboxWorker) runWithNotify(ctx context.Context) error {
 	for {
-		w.claimAndDeliver(ctx)
+		if err := w.claimAndDeliver(ctx); err != nil {
+			return err
+		}
 
 		listenCtx, cancel := context.WithTimeout(ctx, w.PollInterval)
 		_, err := w.Listener.Listen(listenCtx)
@@ -163,7 +167,7 @@ func (w *OutboxWorker) runWithNotify(ctx context.Context) error {
 	}
 }
 
-func (w *OutboxWorker) claimAndDeliver(ctx context.Context) {
+func (w *OutboxWorker) claimAndDeliver(ctx context.Context) error {
 	w.refreshQueueDepth(ctx)
 	now := time.Now().UTC()
 	msgs, err := w.Store.ClaimOutboxMessages(ctx, w.ClaimLimit, w.WorkerID, now, w.StaleLockAfter)
@@ -172,19 +176,32 @@ func (w *OutboxWorker) claimAndDeliver(ctx context.Context) {
 			slog.String("worker_id", w.WorkerID),
 			slog.String("error", err.Error()),
 		)
-		return
+		return nil
 	}
+	return w.deliverClaimedBatch(ctx, msgs, 70*time.Second)
+}
+
+type batchDrainContextKey struct{}
+
+// One deadline bounds all delivery, acknowledgement and requeue operations in
+// a claim. A signal stops new deliveries without multiplying the drain budget
+// by the number of unstarted rows. Failed requeues retain their leases for stale
+// claim recovery and are returned to the process owner.
+func (w *OutboxWorker) deliverClaimedBatch(ctx context.Context, msgs []store.OutboxMessage, timeout time.Duration) error {
+	drainCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer stop()
+	var requeueErrors []error
 	for _, msg := range msgs {
-		// A signal stops new deliveries, but must not cancel the acknowledgement
-		// of a provider that may already have accepted an in-flight message.
-		deliveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || drainCtx.Err() != nil {
 			if msg.LockedBy.Valid {
-				_ = w.Store.RequeueClaimedOutboxMessage(deliveryCtx, msg.ID, msg.LockedBy.String, time.Now().UTC(), "worker stopping before delivery")
+				if err := w.Store.RequeueClaimedOutboxMessage(drainCtx, msg.ID, msg.LockedBy.String, time.Now().UTC(), "worker stopping before delivery"); err != nil {
+					requeueErrors = append(requeueErrors, fmt.Errorf("requeue unstarted outbox %s: %w", msg.ID, err))
+				}
 			}
-			cancel()
 			continue
 		}
+		deliveryCtx, cancel := context.WithTimeout(drainCtx, time.Minute)
+		deliveryCtx = context.WithValue(deliveryCtx, batchDrainContextKey{}, drainCtx)
 		err := w.deliverOne(deliveryCtx, msg)
 		cancel()
 		if err != nil {
@@ -198,6 +215,7 @@ func (w *OutboxWorker) claimAndDeliver(ctx context.Context) {
 			)
 		}
 	}
+	return errors.Join(requeueErrors...)
 }
 
 func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) error {
@@ -372,7 +390,11 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		w.incDeliver(msg.Provider, "ok")
 		// SMTP may acknowledge DATA and then exhaust the deadline during QUIT.
 		// Persist known acceptance even when the provider consumed its budget.
-		acknowledgementCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		acknowledgementParent := context.WithoutCancel(ctx)
+		if batchCtx, ok := ctx.Value(batchDrainContextKey{}).(context.Context); ok {
+			acknowledgementParent = batchCtx
+		}
+		acknowledgementCtx, cancel := context.WithTimeout(acknowledgementParent, 10*time.Second)
 		defer cancel()
 		return w.Store.MarkClaimedOutboxMessageSent(acknowledgementCtx, msg.ID, claimLeaseID, operationID, providerMessageID)
 	}

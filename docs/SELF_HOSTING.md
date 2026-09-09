@@ -28,8 +28,10 @@ Cloud mode keeps the previous default (a separate worker); an explicit
 
 On SIGTERM/SIGINT, the runtime stops loops, waits for the in-flight delivery
 and its database acknowledgement, then closes the shared store. An in-flight
-worker delivery has a one-minute deadline; messages claimed but not started
-are returned to the queue. Allow sufficient container shutdown time (at least
+worker delivery has a one-minute deadline; the whole claimed batch, including
+acknowledgements and returning unstarted messages, has a shared 70-second limit.
+Failed requeues are reported to the process; their leases remain until stale-claim
+recovery. Allow sufficient container shutdown time (at least
 90 seconds) for the HTTP drain and worker acknowledgement. A hard kill, an
 ambiguous SMTP acknowledgement, or a database failure after provider acceptance
 can still result in redelivery. SMTP does not provide exactly-once delivery.
