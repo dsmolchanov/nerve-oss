@@ -20,6 +20,7 @@ import (
 	"neuralmail/internal/featureflags"
 	"neuralmail/internal/jmap"
 	"neuralmail/internal/llm"
+	"neuralmail/internal/localauth"
 	"neuralmail/internal/mcp"
 	"neuralmail/internal/observability"
 	onboardingclient "neuralmail/internal/onboarding"
@@ -200,6 +201,9 @@ func (a *App) Close() error {
 }
 
 func (a *App) Serve(ctx context.Context) error {
+	if err := a.Config.ValidateSelfhost(); err != nil {
+		return err
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -217,9 +221,11 @@ func (a *App) Serve(ctx context.Context) error {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ready"))
 	})
-	protectedResourceMetadata := mcp.ProtectedResourceMetadataHandler()
-	mux.Handle(mcp.ProtectedResourceMetadataPath, protectedResourceMetadata)
-	mux.Handle(mcp.ProtectedResourceMetadataMCPPath, protectedResourceMetadata)
+	if a.Config.Cloud.Mode {
+		protectedResourceMetadata := mcp.ProtectedResourceMetadataHandler(a.Config)
+		mux.Handle(mcp.ProtectedResourceMetadataPath, protectedResourceMetadata)
+		mux.Handle(mcp.ProtectedResourceMetadataMCPPath, protectedResourceMetadata)
+	}
 	mux.HandleFunc("/debug", a.handleDebug)
 	mux.Handle(featureflags.EffectiveStatePathPrefix, featureflags.EffectiveStateHandler(a.MCP.Auth, a.MCP.FeatureFlags))
 	mux.Handle("/mcp", a.MCPRouter)
@@ -264,6 +270,18 @@ func (a *App) handleJMAPPush(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleDebug(w http.ResponseWriter, r *http.Request) {
+	if !a.Config.Cloud.Mode {
+		ctx, err := localauth.Authenticate(a.Config, r)
+		if err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if _, restricted := localauth.FromContext(ctx); restricted {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+	}
+
 	ctx := r.Context()
 	queueDepth, _ := a.Queue.Depth(ctx)
 	inboxes, _ := a.Store.ListInboxes(ctx)

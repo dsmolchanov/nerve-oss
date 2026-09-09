@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"neuralmail/internal/config"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -65,5 +67,15 @@ func TestServeLoopsJoinOnSignalAndFailure(t *testing.T) {
 				t.Fatal("returned before sibling loops joined")
 			}
 		})
+	}
+}
+
+func TestServeRejectsUnsafeBindBeforeOpeningDatabase(t *testing.T) {
+	cfg := config.Default()
+	cfg.HTTP.Addr = "0.0.0.0:8088"
+	cfg.Database.DSN = "invalid-database-that-must-not-be-opened"
+	err := runServe(context.Background(), cfg, true)
+	if err == nil || !strings.Contains(err.Error(), "non-loopback OSS bind") {
+		t.Fatalf("unsafe startup: %v", err)
 	}
 }

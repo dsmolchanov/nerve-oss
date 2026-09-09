@@ -1395,7 +1395,12 @@ func assertMigrationStatus(t *testing.T, status MigrationStatus, current int64, 
 
 func migrationVersions(t *testing.T, scope string) []int64 {
 	t.Helper()
-	migrations, err := goose.CollectMigrations(migrationDir(scope), 0, goose.MaxVersion)
+	var migrations goose.Migrations
+	err := withGoose(migrationTableCore, func() error {
+		var err error
+		migrations, err = goose.CollectMigrations(migrationDir(scope), 0, goose.MaxVersion)
+		return err
+	})
 	if err != nil {
 		t.Fatalf("collect %s migrations: %v", scope, err)
 	}

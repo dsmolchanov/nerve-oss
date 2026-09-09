@@ -19,6 +19,7 @@ import (
 	"neuralmail/internal/config"
 	"neuralmail/internal/entitlements"
 	"neuralmail/internal/llm"
+	"neuralmail/internal/localauth"
 	"neuralmail/internal/memguard"
 	"neuralmail/internal/observability"
 	"neuralmail/internal/store"
@@ -135,6 +136,15 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, routed bool)
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if !routed && !s.Config.Cloud.Mode {
+		ctx, err := localauth.Authenticate(s.Config, r)
+		if err != nil {
+			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		r = r.WithContext(ctx)
+	}
 	if !routed {
 		if err := s.validateOrigin(r); err != nil {
 			http.Error(w, err.Error(), http.StatusForbidden)
@@ -179,7 +189,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, routed bool)
 		}
 		authenticated, err := s.Auth.AuthenticateRequest(r)
 		if err != nil {
-			writeInvalidToken(w)
+			writeInvalidToken(w, s.Config)
 			return
 		}
 		principal = authenticated
@@ -634,7 +644,7 @@ func (s *Server) readResource(ctx context.Context, req Request) (any, error) {
 		if hasPrincipal {
 			ids, err = s.Tools.Store.ListInboxesByOrg(ctx, principal.OrgID)
 		} else {
-			ids, err = s.Tools.Store.ListInboxes(ctx)
+			ids, err = s.Tools.LocalInboxes(ctx)
 		}
 		if err != nil {
 			return nil, err
@@ -645,6 +655,9 @@ func (s *Server) readResource(ctx context.Context, req Request) (any, error) {
 		return s.Tools.GetThread(ctx, threadID)
 	case strings.HasPrefix(params.URI, "email://messages/"):
 		messageID := strings.TrimPrefix(params.URI, "email://messages/")
+		if err := s.Tools.CheckLocalAccess(ctx, "message", messageID); err != nil {
+			return nil, err
+		}
 		if hasPrincipal {
 			if err := s.Tools.Store.EnsureMessageBelongsToOrg(ctx, messageID, principal.OrgID); err != nil {
 				return nil, err

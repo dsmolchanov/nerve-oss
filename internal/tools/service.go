@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/mail"
-	"os"
+	"neuralmail/configs"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -122,6 +122,9 @@ func (s *Service) ensureMessageBelongsToOrg(ctx context.Context, st *store.Store
 }
 
 func (s *Service) ListThreads(ctx context.Context, inboxID string, status string, limit int) (any, error) {
+	if err := s.CheckLocalAccess(ctx, "inbox", inboxID); err != nil {
+		return nil, err
+	}
 	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
 		if principal.OrgID != "" {
 			if err := s.ensureInboxBelongsToOrg(scopedCtx, st, principal.OrgID, inboxID); err != nil {
@@ -137,6 +140,9 @@ func (s *Service) ListThreads(ctx context.Context, inboxID string, status string
 }
 
 func (s *Service) GetThread(ctx context.Context, threadID string) (any, error) {
+	if err := s.CheckLocalAccess(ctx, "thread", threadID); err != nil {
+		return nil, err
+	}
 	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
 		if principal.OrgID != "" {
 			if err := s.ensureThreadBelongsToOrg(scopedCtx, st, principal.OrgID, threadID); err != nil {
@@ -152,6 +158,9 @@ func (s *Service) GetThread(ctx context.Context, threadID string) (any, error) {
 }
 
 func (s *Service) SearchInbox(ctx context.Context, inboxID string, query string, topK int) (any, error) {
+	if err := s.CheckLocalAccess(ctx, "inbox", inboxID); err != nil {
+		return nil, err
+	}
 	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
 		if principal.OrgID != "" {
 			if err := s.ensureInboxBelongsToOrg(scopedCtx, st, principal.OrgID, inboxID); err != nil {
@@ -200,6 +209,9 @@ func (s *Service) searchVector(ctx context.Context, inboxID, query string, topK 
 }
 
 func (s *Service) TriageMessage(ctx context.Context, messageID string) (any, error) {
+	if err := s.CheckLocalAccess(ctx, "message", messageID); err != nil {
+		return nil, err
+	}
 	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
 		if principal.OrgID != "" {
 			if err := s.ensureMessageBelongsToOrg(scopedCtx, st, principal.OrgID, messageID); err != nil {
@@ -229,6 +241,9 @@ func (s *Service) TriageMessage(ctx context.Context, messageID string) (any, err
 }
 
 func (s *Service) ExtractToSchema(ctx context.Context, messageID string, schemaID string) (any, error) {
+	if err := s.CheckLocalAccess(ctx, "message", messageID); err != nil {
+		return nil, err
+	}
 	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
 		if principal.OrgID != "" {
 			if err := s.ensureMessageBelongsToOrg(scopedCtx, st, principal.OrgID, messageID); err != nil {
@@ -274,6 +289,9 @@ func (s *Service) ExtractToSchema(ctx context.Context, messageID string, schemaI
 }
 
 func (s *Service) DraftReply(ctx context.Context, threadID string, goal string) (any, error) {
+	if err := s.CheckLocalAccess(ctx, "thread", threadID); err != nil {
+		return nil, err
+	}
 	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
 		if principal.OrgID != "" {
 			if err := s.ensureThreadBelongsToOrg(scopedCtx, st, principal.OrgID, threadID); err != nil {
@@ -387,6 +405,9 @@ func (s *Service) requireApprovalOverride(ctx context.Context, needsApproval boo
 }
 
 func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string, body string, bodyHTML string, needsApproval bool, idempotencyKey string, attachments []store.OutboundAttachment) (any, error) {
+	if err := s.CheckLocalAccess(ctx, "thread", threadID); err != nil {
+		return nil, err
+	}
 	if err := s.approvalGate(ctx, body, bodyHTML, needsApproval); err != nil {
 		return nil, err
 	}
@@ -554,6 +575,9 @@ func (s *Service) ComposeEmail(ctx context.Context, inboxID, toAddress, subject,
 }
 
 func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddress, subject, body string, bodyHTML string, idempotencyKey string, options ComposeEmailOptions) (any, error) {
+	if err := s.CheckLocalAccess(ctx, "inbox", inboxID); err != nil {
+		return nil, err
+	}
 	if subject == "" {
 		return nil, errors.New("missing subject")
 	}
@@ -803,7 +827,7 @@ func LoadSchema(schemaID string) (map[string]any, error) {
 	if filepath.Dir(resolved) != root {
 		return nil, errors.New("invalid schema id")
 	}
-	data, err := os.ReadFile(path)
+	data, err := configs.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
