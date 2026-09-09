@@ -91,5 +91,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Self-host process diagnostics regression
+        run: python3 scripts/ci/test_selfhost_smoke.py
       - name: Compose SMTP/JMAP, persistence and restore
         run: python3 scripts/ci/selfhost_smoke.py

@@ -19,6 +19,26 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def run_command(command, env, input=None):
+    # Process exceptions include argv/output; never chain them into CI tracebacks.
+    try:
+        result = subprocess.run(command, env=env, input=input, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, timeout=900)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError('Command timed out after 900 seconds') from None
+    except (OSError, subprocess.SubprocessError):
+        raise RuntimeError('Command could not complete') from None
+    if result.returncode:
+        detail = result.stderr.decode(errors='replace')
+        for name in ['NERVE_API_KEY', 'POSTGRES_PASSWORD', 'STALWART_PASSWORD']:
+            value = env.get(name)
+            if value:
+                detail = detail.replace(value, '[redacted]')
+        # Redact before truncating, so the boundary cannot expose part of a key.
+        raise RuntimeError(f'Command failed ({result.returncode}): {detail[-4000:]}')
+    return result.stdout.decode()
+
+
 def wait_for(check, description, timeout=90):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -105,15 +125,7 @@ def main():
             env['COMPOSE_FILE'] += os.pathsep + str(path)
 
         def run(*command, input=None):
-            result = subprocess.run(command, env=env, input=input, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, timeout=900)
-            if result.returncode:
-                # Never print argv/config; it can contain database credentials.
-                detail = result.stderr.decode(errors='replace')[-4000:]
-                for name in ['NERVE_API_KEY', 'POSTGRES_PASSWORD', 'STALWART_PASSWORD']:
-                    detail = detail.replace(env[name], '[redacted]')
-                raise RuntimeError(f'{command[0]} failed ({result.returncode}): {detail}')
-            return result.stdout.decode()
+            return run_command(command, env, input=input)
 
         def compose(*command):
             return run('docker', 'compose', *command)
