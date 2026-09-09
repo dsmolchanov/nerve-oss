@@ -64,7 +64,8 @@ embedding provider and vector store. The tool-cost YAML is unchanged by this fix
 The host binary defaults to `127.0.0.1:8088`. Set `NERVE_API_KEY` to an owner
 bearer token to require authentication on `/mcp` (both protocol versions).
 Missing, invalid or duplicate Authorization headers return HTTP 401. The owner
-key can access all local inboxes and `/debug`.
+key can access all local inboxes and `/debug`. Cloud mode does not mount
+`/debug` and rejects direct access to its handler, including authenticated users.
 
 A non-loopback bind requires at least one configured key. The explicit unsafe
 opt-in `NERVE_ALLOW_UNAUTHENTICATED=true` permits anonymous exposure; it never
@@ -108,3 +109,9 @@ loader behavior on invalid custom files retains its existing fallback costs.
 `NERVE_MIGRATIONS_DIR` overrides the migration root, which must contain `core/`
 and `cloud/`. An invalid override fails rather than selecting bundled migrations.
 Startup still respects the compiled schema window and cloud migration policy.
+
+Mailbox-scoped reads require message and thread inboxes to agree. Inconsistent
+historical rows are excluded from thread/search results and denied by direct
+message resources; this does not delete or repair them. Local vector results
+use the database for ownership and displayed content, so a stale index cannot
+supply another inbox's snippet or thread identifier.

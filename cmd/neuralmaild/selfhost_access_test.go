@@ -12,9 +12,11 @@ import (
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"neuralmail/internal/config"
+	"neuralmail/internal/embed"
 	"neuralmail/internal/localauth"
 	"neuralmail/internal/mcp"
 	"neuralmail/internal/store"
+	"neuralmail/internal/vector"
 )
 
 type localBearerTransport struct{ token string }
@@ -47,6 +49,16 @@ func TestSelfhostMailboxKeysIsolateToolsAndResources(t *testing.T) {
 		threads = append(threads, thread)
 		messages = append(messages, message)
 	}
+	// The schema permits independent inbox/thread foreign keys. Include rows
+	// whose message belongs to the other mailbox but points at the allowed thread.
+	malformed := []string{}
+	for owner := 0; owner < 2; owner++ {
+		id, err := a.Store.InsertMessage(ctx, store.Message{InboxID: inboxes[1-owner], ThreadID: threads[owner], Direction: "inbound", Subject: "foreignmisbound", Text: "foreignmisbound", CreatedAt: time.Now().UTC().Add(time.Minute), From: store.Participant{Email: "foreign@example.test"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		malformed = append(malformed, id)
+	}
 	for owner := 0; owner < 2; owner++ {
 		restricted := localauth.WithIdentity(ctx, localauth.Identity{InboxIDs: []string{inboxes[owner]}})
 		foreign := 1 - owner
@@ -69,9 +81,53 @@ func TestSelfhostMailboxKeysIsolateToolsAndResources(t *testing.T) {
 				t.Fatalf("owner=%d tool=%d: %v %v", owner, i, r, e)
 			}
 		}
-		if _, err := svc.GetThread(restricted, threads[owner]); err != nil {
+		own, err := svc.GetThread(restricted, threads[owner])
+		if err != nil {
 			t.Fatal(err)
 		}
+		raw, _ := json.Marshal(own)
+		if strings.Contains(string(raw), "foreignmisbound") {
+			t.Fatalf("thread leaked mismatched message: %s", raw)
+		}
+		for _, id := range malformed {
+			if err := svc.CheckLocalAccess(restricted, "message", id); !errors.Is(err, localauth.ErrForbidden) {
+				t.Fatalf("mismatched message allowed: %v", err)
+			}
+		}
+		found, err := svc.SearchInbox(restricted, inboxes[owner], "foreignmisbound", 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(found.(map[string]any)["results"].([]store.SearchResult)) != 0 {
+			t.Fatalf("FTS leaked: %#v", found)
+		}
+		reply, err := svc.SendReply(restricted, threads[owner], "reply", "", false, "mismatch-reply-"+inboxes[owner])
+		if err != nil {
+			t.Fatal(err)
+		}
+		var recipient string
+		if err := a.Store.DB().QueryRowContext(ctx, `SELECT "to" FROM outbox_messages WHERE id=$1`, reply.(map[string]any)["message_id"]).Scan(&recipient); err != nil {
+			t.Fatal(err)
+		}
+		if recipient != "sender@example.test" {
+			t.Fatalf("reply used foreign message recipient: %s", recipient)
+		}
+		svc.Vector = localSearchProbe{hits: []vector.SearchHit{
+			{Score: 1, Payload: map[string]any{"message_id": malformed[owner], "snippet": "foreignmisbound"}},
+			{Score: .9, Payload: map[string]any{"message_id": messages[1-owner], "snippet": "foreignmisbound"}},
+			{Score: .8, Payload: map[string]any{"message_id": messages[owner], "thread_id": threads[1-owner], "snippet": "foreignmisbound"}},
+		}}
+		svc.Embedder = embed.NewNoop(2)
+		found, err = svc.SearchInbox(restricted, inboxes[owner], "quasar", 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hits := found.(map[string]any)["results"].([]map[string]any)
+		if len(hits) != 1 || hits[0]["message_id"] != messages[owner] || hits[0]["thread_id"] != threads[owner] || hits[0]["snippet"] != "quasar" {
+			t.Fatalf("vector index leaked content: %#v", hits)
+		}
+		svc.Vector = nil
+
 	}
 	cfg := a.Config
 	cfg.Security.LocalAPIKeys = []config.LocalAPIKey{{Token: "first-test", InboxIDs: []string{inboxes[0]}}, {Token: "second-test", InboxIDs: []string{inboxes[1]}}}
@@ -95,7 +151,7 @@ func TestSelfhostMailboxKeysIsolateToolsAndResources(t *testing.T) {
 		if err != nil || result.IsError {
 			t.Fatalf("own thread refused: %v %v", result, err)
 		}
-		for _, uri := range []string{"email://threads/" + threads[1-owner], "email://messages/" + messages[1-owner]} {
+		for _, uri := range []string{"email://threads/" + threads[1-owner], "email://messages/" + messages[1-owner], "email://messages/" + malformed[0], "email://messages/" + malformed[1]} {
 			if got, err := session.ReadResource(ctx, &sdk.ReadResourceParams{URI: uri}); err == nil {
 				t.Fatalf("resource leaked: %s %#v", uri, got)
 			}
@@ -110,4 +166,13 @@ func TestSelfhostMailboxKeysIsolateToolsAndResources(t *testing.T) {
 		}
 		session.Close()
 	}
+}
+
+type localSearchProbe struct{ hits []vector.SearchHit }
+
+func (p localSearchProbe) Name() string                                 { return "test" }
+func (p localSearchProbe) EnsureCollection(context.Context, int) error  { return nil }
+func (p localSearchProbe) Upsert(context.Context, []vector.Point) error { return nil }
+func (p localSearchProbe) Search(context.Context, []float32, int, map[string]any) ([]vector.SearchHit, error) {
+	return p.hits, nil
 }

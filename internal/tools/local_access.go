@@ -24,7 +24,7 @@ func (s *Service) CheckLocalAccess(ctx context.Context, kind, id string) error {
 	case "thread":
 		query = `SELECT EXISTS(SELECT 1 FROM threads WHERE id::text=$1 AND inbox_id::text=ANY($2))`
 	case "message":
-		query = `SELECT EXISTS(SELECT 1 FROM messages m JOIN threads t ON t.id=m.thread_id WHERE m.id::text=$1 AND t.inbox_id::text=ANY($2))`
+		query = `SELECT EXISTS(SELECT 1 FROM messages m JOIN threads t ON t.id=m.thread_id WHERE m.id::text=$1 AND m.inbox_id::text=ANY($2) AND t.inbox_id=m.inbox_id)`
 	default:
 		return localauth.ErrForbidden
 	}

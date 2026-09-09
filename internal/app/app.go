@@ -226,7 +226,9 @@ func (a *App) Serve(ctx context.Context) error {
 		mux.Handle(mcp.ProtectedResourceMetadataPath, protectedResourceMetadata)
 		mux.Handle(mcp.ProtectedResourceMetadataMCPPath, protectedResourceMetadata)
 	}
-	mux.HandleFunc("/debug", a.handleDebug)
+	if !a.Config.Cloud.Mode {
+		mux.HandleFunc("/debug", a.handleDebug)
+	}
 	mux.Handle(featureflags.EffectiveStatePathPrefix, featureflags.EffectiveStateHandler(a.MCP.Auth, a.MCP.FeatureFlags))
 	mux.Handle("/mcp", a.MCPRouter)
 	mux.HandleFunc("/mcp/sse", a.MCP.HandleSSEStub)
@@ -269,8 +271,14 @@ func (a *App) handleJMAPPush(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (a *App) handleDebug(w http.ResponseWriter, r *http.Request) {
-	if !a.Config.Cloud.Mode {
+// debugAccess denies cloud access even if the local-only handler is mounted
+// accidentally in a future route change. Local mailbox keys are not owners.
+func (a *App) debugAccess(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if a.Config.Cloud.Mode {
+			http.NotFound(w, r)
+			return
+		}
 		ctx, err := localauth.Authenticate(a.Config, r)
 		if err != nil {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -280,8 +288,15 @@ func (a *App) handleDebug(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-	}
+		next.ServeHTTP(w, r)
+	})
+}
 
+func (a *App) handleDebug(w http.ResponseWriter, r *http.Request) {
+	a.debugAccess(http.HandlerFunc(a.renderDebug)).ServeHTTP(w, r)
+}
+
+func (a *App) renderDebug(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	queueDepth, _ := a.Queue.Depth(ctx)
 	inboxes, _ := a.Store.ListInboxes(ctx)

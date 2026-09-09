@@ -24,6 +24,7 @@ import (
 	"neuralmail/internal/embed"
 	"neuralmail/internal/entitlements"
 	"neuralmail/internal/llm"
+	"neuralmail/internal/localauth"
 	"neuralmail/internal/observability"
 	"neuralmail/internal/policy"
 	"neuralmail/internal/store"
@@ -198,6 +199,32 @@ func (s *Service) searchVector(ctx context.Context, inboxID, query string, topK 
 	}
 	results := make([]map[string]any, 0, len(hits))
 	for _, hit := range hits {
+		if _, restricted := localauth.FromContext(ctx); restricted {
+			messageID, _ := hit.Payload["message_id"].(string)
+			if err := s.CheckLocalAccess(ctx, "message", messageID); err != nil {
+				if errors.Is(err, localauth.ErrForbidden) {
+					continue
+				}
+				return nil, err
+			}
+			msg, err := s.Store.GetMessage(ctx, messageID)
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			if msg.InboxID != inboxID {
+				continue
+			}
+			// The index supplies ranking, not mailbox ownership or displayed content.
+			snippet := []rune(msg.Text)
+			if len(snippet) > 200 {
+				snippet = snippet[:200]
+			}
+			results = append(results, map[string]any{"message_id": msg.ID, "thread_id": msg.ThreadID, "score": hit.Score, "snippet": string(snippet)})
+			continue
+		}
 		results = append(results, map[string]any{
 			"message_id": hit.Payload["message_id"],
 			"thread_id":  hit.Payload["thread_id"],
