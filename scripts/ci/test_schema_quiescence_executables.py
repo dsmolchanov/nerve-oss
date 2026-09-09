@@ -30,24 +30,31 @@ with tempfile.TemporaryDirectory() as temp:
             with tempfile.TemporaryFile() as log:
                 process = subprocess.Popen([str(binary), command], env={**env, 'NM_HTTP_ADDR': address}, stdout=log, stderr=log)
                 try:
+                    deadline = time.monotonic() + 10
+                    while True:
+                        log.seek(0)
+                        output = log.read()
+                        if b'schema quiescence active: no listeners' in output:
+                            break
+                        assert process.poll() is None and time.monotonic() < deadline, output.decode()
+                        time.sleep(.05)
+                    assert process.poll() is None, 'quiescence initialized invalid dependencies'
+                    # All methods/routes/credentials are excluded at the socket boundary.
+                    # Any HTTP response (even 401/503) would mean ingress was opened.
                     if command == 'serve':
-                        deadline = time.monotonic()+5
-                        while True:
-                            try:
-                                urllib.request.urlopen(urllib.request.Request('http://'+address+'/mcp', data=b'{}', headers={'Authorization':'Bearer previously-issued-token'}), timeout=.5)
-                                raise AssertionError('quiescent server accepted a write')
-                            except urllib.error.HTTPError as error:
-                                assert error.code == 503 and error.headers['Retry-After'] == '60'
-                                error.close()
-                                break
-                            except urllib.error.URLError:
-                                if process.poll() is not None or time.monotonic() >= deadline:
-                                    log.seek(0)
-                                    raise AssertionError(log.read().decode())
-                                time.sleep(.05)
-                    else:
-                        time.sleep(.3)
-                        assert process.poll() is None, 'worker initialized invalid dependencies instead of quiescing'
+                        for method in ('GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS'):
+                            for path in ('/health', '/mcp', '/v1/billing', '/webhooks/resend', '/webhooks/stripe'):
+                                for headers in ({}, {'Authorization': 'Bearer previously-issued-token'},
+                                                {'Stripe-Signature': 'invalid'}, {'svix-signature': 'invalid'}):
+                                    try:
+                                        with urllib.request.urlopen(urllib.request.Request('http://'+address+path, method=method, headers=headers), timeout=.5):
+                                            raise AssertionError('quiescence opened ingress')
+                                    except urllib.error.HTTPError as error:
+                                        error.close()
+                                        raise AssertionError('quiescence exposed an HTTP handler')
+                                    except urllib.error.URLError as error:
+                                        assert isinstance(error.reason, ConnectionRefusedError), error
+                    assert process.poll() is None, 'quiescent process exited before SIGTERM'
                     process.send_signal(signal.SIGTERM)
                     assert process.wait(timeout=3) == 0
                 finally:

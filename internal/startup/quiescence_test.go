@@ -2,10 +2,10 @@ package startup
 
 import (
 	"context"
-	"net"
-	"net/http"
+	"go/parser"
+	"go/token"
+	"strconv"
 	"testing"
-	"time"
 )
 
 func TestSchemaQuiescenceRejectsBeforeApplicationStartup(t *testing.T) {
@@ -31,37 +31,33 @@ func TestSchemaQuiescenceRejectsBeforeApplicationStartup(t *testing.T) {
 	}
 }
 
-func TestSchemaQuiescenceDeniesEveryIngressAndStops(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+// An invalid address makes an accidental listener construction fail deterministically.
+func TestSchemaQuiescenceOpensNoListener(t *testing.T) {
+	for _, command := range []string{"serve", "worker"} {
+		t.Run(command, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			handled, err := SchemaQuiescence(ctx, "quiescent", true, command, "not a TCP address")
+			if !handled || err != nil {
+				t.Fatalf("quiescence attempted initialization: %v %v", handled, err)
+			}
+		})
+	}
+}
+
+// The maintenance path cannot quietly regain a public handler or socket.
+func TestSchemaQuiescenceHasNoNetworkDependency(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "quiescence.go", nil, parser.ImportsOnly)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	result := make(chan error, 1)
-	go func() { result <- serveQuiescence(ctx, listener) }()
-	client := &http.Client{Timeout: time.Second}
-	for _, method := range []string{"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"} {
-		for _, path := range []string{"/health", "/mcp", "/v1/billing", "/webhooks/resend", "/webhooks/stripe"} {
-			req, _ := http.NewRequest(method, "http://"+listener.Addr().String()+path, nil)
-			req.Header.Set("Authorization", "Bearer previously-issued-token")
-			resp, err := client.Do(req)
-			if err != nil {
-				t.Fatal(err)
-			}
-			resp.Body.Close()
-			if resp.StatusCode != 503 || resp.Header.Get("Retry-After") != "60" || resp.Header.Get("Cache-Control") != "no-store" {
-				t.Fatalf("%s %s: %v", method, path, resp)
-			}
-		}
-	}
-	cancel()
-	select {
-	case err := <-result:
+	for _, dependency := range file.Imports {
+		name, err := strconv.Unquote(dependency.Path.Value)
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("quiescence did not stop")
+		if name != "context" && name != "errors" && name != "log" {
+			t.Fatalf("quiescence dependency requires review: %s", name)
+		}
 	}
 }

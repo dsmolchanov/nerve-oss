@@ -17,7 +17,7 @@ Explicitly introduce the operational setting `NERVE_SCHEMA_TRANSITION_MODE`: uns
 
 Files: new `internal/startup/quiescence.go` and tests; runtime and administrative entrypoints `cmd/neuralmail/main.go` and `cmd/neuralmaild/main.go` and executable tests in `scripts/ci/test_schema_quiescence_executables.py`; the invocation in `.github/workflows/ci.yml` is explicitly in scope. No new dependency, HTTP API, database table or trust principal. This is a startup mode, not a dynamically cached feature flag. The deployment must stop every old Machine, disable autostart/schedules, then start all bridge/target Machines in this mode. It must verify the full inventory and old-token/webhook rejection before starting the dump. Already running old processes are not retroactively fenced by setting an environment variable on a different process.
 
-Tests must exercise the real compiled entrypoints with invalid database/provider endpoints: all HTTP methods/routes return retryable failure; workers stay alive without opening dependencies; invalid mode fails; signal shutdown completes; ordinary startup remains unchanged. No cloud-only changes to exact-mirror files.
+Tests must exercise the real compiled entrypoints with invalid database/provider endpoints: all HTTP methods/routes/credentials fail at the closed socket boundary; workers stay alive without opening dependencies; invalid mode fails; signal shutdown completes; ordinary startup remains unchanged. No cloud-only changes to exact-mirror files.
 
 ## Remaining counterpart deliverables
 
@@ -28,3 +28,9 @@ Tests must exercise the real compiled entrypoints with invalid database/provider
 - [ ] Disposable combined Cloud/OSS rehearsal, shutdown of all old writers, dump/restore and reopening only after archived disabled CAS.
 
 Quiescence alone does not prove shutdown of the old fleet or settle in-flight provider operations. Preserve their unknown intents. No native runtime claim, pricing quota implementation or production gate is marked complete by this plan.
+
+## Review correction — 2026-09-09
+
+Remove the maintenance HTTP handler entirely. Both serve and worker wait only for cancellation, without auth/store/provider initialization or network listeners. External ingress must provide retryable maintenance failure; verify that separately before a dump. No local 503 claim is made. `AGENTS.repo-invariants.md` is explicitly included for the recurring cross-repository auth finding, with deterministic dependency/no-listener tests and a real executable method/path/credential matrix. Ordinary startup, invalid-mode/admin refusal and SIGTERM tests remain required.
+
+Fix validation: targeted `go test -race` and `go vet` for startup/neuralmail/neuralmaild PASS; real executable no-listener matrix, invalid dependency/ordinary-start control, admin refusal and SIGTERM PASS. Remote review/CI remains separate.
