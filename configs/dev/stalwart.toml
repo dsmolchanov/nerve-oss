@@ -1,4 +1,4 @@
-# Stalwart dev config (local only).
+# Stalwart v0.11.8 test configuration, local only. Never expose to the Internet.
 # Based on Stalwart minimal config + JMAP HTTP listener.
 # See: https://stalw.art/docs/configuration/overview and https://stalw.art/docs/http/jmap/overview/
 
@@ -8,15 +8,24 @@ hostname = "local.nerve.email"
 [server.listener."smtp"]
 bind = ["[::]:25"]
 protocol = "smtp"
+tls.enable = false
 
-[server.listener."imap"]
-bind = ["[::]:143"]
+[server.listener."submission"]
+bind = ["[::]:587"]
+protocol = "smtp"
+
+[server.listener."imaps"]
+bind = ["[::]:993"]
 protocol = "imap"
+tls.implicit = true
 
 [server.listener."jmap"]
 bind = ["[::]:8080"]
 protocol = "http"
 tls.implicit = false
+
+[server.http]
+url = "'http://stalwart:8080'"
 
 [storage]
 data = "rocksdb"
@@ -37,14 +46,14 @@ type = "memory"
 name = "admin"
 class = "admin"
 description = "Admin"
-secret = "adminpass"
+secret = "%{env:STALWART_PASSWORD}%"
 email = ["admin@local.nerve.email"]
 
 [[directory."memory".principals]]
 name = "dev"
 class = "individual"
 description = "Dev User"
-secret = "devpass"
+secret = "%{env:STALWART_PASSWORD}%"
 email = ["dev@local.nerve.email"]
 
 [tracer."stdout"]
@@ -55,4 +64,8 @@ enable = true
 
 [authentication.fallback-admin]
 user = "admin"
-secret = "adminpass"
+secret = "%{env:STALWART_PASSWORD}%"
+
+# Synthetic local messages must reach Inbox; this is not a public mail server.
+[spam-filter]
+enable = false

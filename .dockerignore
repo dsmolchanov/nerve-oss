@@ -1,0 +1,9 @@
+.git
+.env
+.env.*
+backups
+output
+dist
+thoughts
+_mcp_conformance
+_mcp_ext_auth

@@ -27,6 +27,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 RUN CGO_ENABLED=0 GOOS=linux go build \
   -ldflags "-s -w" \
   -o /out/nerve-migrate ./cmd/nerve-migrate
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-s -w" -o /out/neuralmail ./cmd/neuralmail
 
 FROM alpine:3.20
 
@@ -57,6 +58,7 @@ WORKDIR /app
 
 COPY --from=build /out/nerve-runtime /app/nerve-runtime
 COPY --from=build /out/nerve-migrate /app/nerve-migrate
+COPY --from=build /out/neuralmail /app/neuralmail
 RUN ln -s /app/nerve-runtime /app/neuralmaild
 COPY configs /app/configs
 COPY internal/store/migrations /app/internal/store/migrations

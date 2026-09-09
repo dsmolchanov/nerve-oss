@@ -1,0 +1,95 @@
+# Local sandbox. No credentials or listeners are exposed beyond loopback.
+services:
+  cortex:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: deploy/docker/cortex/Dockerfile
+    environment:
+      NERVE_CONFIG: /app/configs/dev/cortex.yaml
+      NERVE_API_KEY: ${NERVE_API_KEY:?Set NERVE_API_KEY in .env (see .env.example)}
+      NERVE_JMAP_PUSH_SECRET: ${NERVE_API_KEY:?Set NERVE_API_KEY in .env}
+      NERVE_DB_DSN: postgres://neuralmail:${POSTGRES_PASSWORD:?Set a hexadecimal POSTGRES_PASSWORD in .env}@postgres:5432/neuralmail?sslmode=disable
+      NERVE_JMAP_USERNAME: dev
+      NERVE_JMAP_PASSWORD: ${STALWART_PASSWORD:?Set STALWART_PASSWORD in .env}
+      NERVE_REDIS_URL: redis://redis:6379/0
+      NERVE_HTTP_ADDR: 0.0.0.0:8088
+      NERVE_EMBED_PROVIDER: ${NERVE_EMBED_PROVIDER:-noop}
+    ports:
+      - "127.0.0.1:${NERVE_HTTP_PORT:-8088}:8088"
+    stop_grace_period: 90s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8088/readyz"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+  postgres:
+    restart: unless-stopped
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: neuralmail
+      POSTGRES_DB: neuralmail
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "neuralmail", "-d", "neuralmail"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  redis:
+    restart: unless-stopped
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  mailpit:
+    restart: unless-stopped
+    image: axllent/mailpit:v1.22.3
+    environment:
+      MP_DATABASE: /data/mailpit.db
+    volumes:
+      - mailpit-data:/data
+    ports:
+      - "127.0.0.1:${NERVE_VIEWER_PORT:-8025}:8025"
+      - "127.0.0.1:${NERVE_SMTP_PORT:-2525}:1025"
+  stalwart:
+    restart: unless-stopped
+    image: stalwartlabs/mail-server:v0.11.8
+    profiles: [full]
+    environment:
+      STALWART_PASSWORD: ${STALWART_PASSWORD:?Set STALWART_PASSWORD in .env}
+    volumes:
+      - ./configs/dev/stalwart.toml:/opt/stalwart-mail/etc/config.toml:ro
+      - stalwart-data:/opt/stalwart/data
+    ports:
+      - "127.0.0.1:${NERVE_INBOUND_PORT:-2526}:25"
+      - "127.0.0.1:${NERVE_JMAP_PORT:-8080}:8080"
+      - "127.0.0.1:${NERVE_SUBMISSION_PORT:-1587}:587"
+      - "127.0.0.1:${NERVE_IMAPS_PORT:-1993}:993"
+    stop_grace_period: 90s
+  qdrant:
+    restart: unless-stopped
+    image: qdrant/qdrant:v1.13.6
+    profiles: [vector]
+    volumes:
+      - qdrant-data:/qdrant/storage
+volumes:
+  postgres-data:
+  redis-data:
+  mailpit-data:
+  qdrant-data:
+  stalwart-data:
