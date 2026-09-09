@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -45,7 +46,13 @@ func main() {
 
 	switch cmd {
 	case "serve":
-		runServe(ctx, cfg)
+		withWorker, err := serveWorkerOption(cfg.Cloud.Mode, os.Args[2:])
+		if err != nil {
+			log.Fatalf("serve options: %v", err)
+		}
+		if err := runServe(ctx, cfg, withWorker); err != nil {
+			log.Fatalf("serve: %v", err)
+		}
 	case "worker":
 		runWorker(ctx, cfg)
 	case "mcp-stdio":
@@ -76,28 +83,43 @@ func migrateAllToRuntimeWindow(ctx context.Context, db *sql.DB) error {
 	return migrateCloudToRuntimeWindow(ctx, db)
 }
 
-func runServe(ctx context.Context, cfg config.Config) {
+func serveWorkerOption(cloudMode bool, args []string) (bool, error) {
+	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
+	withWorker := flags.Bool("with-worker", !cloudMode, "run the outbox worker alongside HTTP")
+	if err := flags.Parse(args); err != nil {
+		return false, err
+	}
+	if flags.NArg() != 0 {
+		return false, errors.New("unexpected serve arguments")
+	}
+	return *withWorker, nil
+}
+
+func runServe(ctx context.Context, cfg config.Config, withWorker bool) error {
 	appInstance, err := app.New(ctx, cfg)
 	if err != nil {
-		log.Fatalf("app init error: %v", err)
+		return fmt.Errorf("app init: %w", err)
 	}
 	defer appInstance.Close()
-
 	inboxAddr := cfg.SMTP.From
 	if inboxAddr == "" {
 		inboxAddr = "dev@local.nerve.email"
 	}
-	inboxID, _ := appInstance.Store.EnsureDefaults(ctx, inboxAddr)
-	go func() {
-		if err := appInstance.PollLoop(ctx, inboxID); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("poll loop stopped: %v", err)
-		}
-	}()
-
-	log.Printf("nerve-runtime serving on %s", cfg.HTTP.Addr)
-	if err := appInstance.Serve(ctx); err != nil {
-		log.Fatalf("server error: %v", err)
+	inboxID, err := appInstance.Store.EnsureDefaults(ctx, inboxAddr)
+	if err != nil {
+		return fmt.Errorf("default inbox: %w", err)
 	}
+	loops := []serveLoop{
+		{name: "HTTP", run: appInstance.Serve},
+		{name: "poll", run: func(ctx context.Context) error { return appInstance.PollLoop(ctx, inboxID) }},
+	}
+	if withWorker {
+		worker := emailtransport.NewOutboxWorker(appInstance.Store, appInstance.EmailTransport, "nerve-runtime-serve", appInstance.MCP.MemoryBudget)
+		loops = append(loops, serveLoop{name: "outbox", run: worker.Run})
+	}
+	log.Printf("nerve-runtime serving on %s (outbox worker: %t)", cfg.HTTP.Addr, withWorker)
+	// All loops join before the deferred Close releases the shared store/queue.
+	return runServeLoops(ctx, loops)
 }
 
 func runWorker(ctx context.Context, cfg config.Config) {
@@ -155,8 +177,12 @@ func runWorker(ctx context.Context, cfg config.Config) {
 		log.Fatalf("memory budget error: %v", err)
 	}
 	outboxWorker := emailtransport.NewOutboxWorker(storeInstance, transportRegistry, "nerve-runtime-worker", memoryBudget)
+	workerCtx, stopWorker := context.WithCancel(ctx)
+	workerDone := make(chan struct{})
+	defer func() { stopWorker(); <-workerDone }()
 	go func() {
-		if err := outboxWorker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		defer close(workerDone)
+		if err := outboxWorker.Run(workerCtx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("outbox worker stopped: %v", err)
 		}
 	}()

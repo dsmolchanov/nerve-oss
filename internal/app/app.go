@@ -232,11 +232,26 @@ func (a *App) Serve(ctx context.Context) error {
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       a.Config.HTTP.ReadTimeout,
 	}
+	shutdownTrigger, stop := context.WithCancel(ctx)
+	defer stop()
+	shutdownDone := make(chan error, 1)
 	go func() {
-		<-ctx.Done()
-		_ = srv.Shutdown(context.Background())
+		<-shutdownTrigger.Done()
+		drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		err := srv.Shutdown(drainCtx)
+		if err != nil {
+			_ = srv.Close()
+		}
+		shutdownDone <- err
 	}()
-	return srv.ListenAndServe()
+	err := srv.ListenAndServe()
+	stop()
+	shutdownErr := <-shutdownDone
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return shutdownErr
 }
 
 func (a *App) handleJMAPPush(w http.ResponseWriter, r *http.Request) {

@@ -5,17 +5,20 @@ import (
 	"time"
 
 	"neuralmail/internal/entitlements"
+	"neuralmail/internal/llm"
 	"neuralmail/internal/tools"
 )
 
 type modernBusinessError struct {
-	Code      string `json:"code"`
-	Retryable bool   `json:"retryable"`
-	RetryAt   string `json:"retry_at,omitempty"`
+	Remediation string `json:"remediation,omitempty"`
+	Code        string `json:"code"`
+	Retryable   bool   `json:"retryable"`
+	RetryAt     string `json:"retry_at,omitempty"`
 }
 
 func translateModernBusinessError(err error) modernBusinessError {
 	translated := modernBusinessError{Code: "tool_failed"}
+	var configurationErr *tools.OutboundConfigurationError
 	var attachmentErr *tools.AttachmentInputError
 	var policyErr *outboundPolicyError
 	// The enqueue-time recheck raises the tools-layer type; without this the
@@ -26,6 +29,12 @@ func translateModernBusinessError(err error) modernBusinessError {
 	var onboardingErr *OnboardingBusinessError
 	var billingErr *BillingBusinessError
 	switch {
+	case errors.Is(err, llm.ErrUnavailable):
+		translated.Code = "ai_unavailable"
+		translated.Remediation = "docs/SELF_HOSTING.md#ai-configuration"
+	case errors.As(err, &configurationErr):
+		translated.Code = configurationErr.Code
+		translated.Remediation = configurationErr.Remediation
 	case errors.As(err, &billingErr):
 		if !validBillingBusinessError(billingErr) {
 			return translated

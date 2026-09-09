@@ -154,7 +154,11 @@ func (w *OutboxWorker) runWithNotify(ctx context.Context) error {
 				slog.String("error", err.Error()),
 				slog.Duration("retry_in", backoff),
 			)
-			time.Sleep(backoff)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
 		}
 	}
 }
@@ -171,7 +175,19 @@ func (w *OutboxWorker) claimAndDeliver(ctx context.Context) {
 		return
 	}
 	for _, msg := range msgs {
-		if err := w.deliverOne(ctx, msg); err != nil {
+		// A signal stops new deliveries, but must not cancel the acknowledgement
+		// of a provider that may already have accepted an in-flight message.
+		deliveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		if ctx.Err() != nil {
+			if msg.LockedBy.Valid {
+				_ = w.Store.RequeueClaimedOutboxMessage(deliveryCtx, msg.ID, msg.LockedBy.String, time.Now().UTC(), "worker stopping before delivery")
+			}
+			cancel()
+			continue
+		}
+		err := w.deliverOne(deliveryCtx, msg)
+		cancel()
+		if err != nil {
 			slog.ErrorContext(ctx, "outbox deliver error",
 				slog.String("worker_id", w.WorkerID),
 				slog.String("outbox_id", msg.ID),
@@ -354,7 +370,11 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 	w.observeDelivery(msg.Provider, time.Since(sendStart).Seconds())
 	if err == nil {
 		w.incDeliver(msg.Provider, "ok")
-		return w.Store.MarkClaimedOutboxMessageSent(ctx, msg.ID, claimLeaseID, operationID, providerMessageID)
+		// SMTP may acknowledge DATA and then exhaust the deadline during QUIT.
+		// Persist known acceptance even when the provider consumed its budget.
+		acknowledgementCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		return w.Store.MarkClaimedOutboxMessageSent(acknowledgementCtx, msg.ID, claimLeaseID, operationID, providerMessageID)
 	}
 
 	// Classify the provider error. Permanent errors terminate the message

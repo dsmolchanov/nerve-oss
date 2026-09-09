@@ -18,6 +18,7 @@ import (
 	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
 	"neuralmail/internal/entitlements"
+	"neuralmail/internal/llm"
 	"neuralmail/internal/memguard"
 	"neuralmail/internal/observability"
 	"neuralmail/internal/store"
@@ -711,10 +712,15 @@ func (s *Server) requiredScope(req Request) string {
 }
 
 func (s *Server) writeDispatchError(w http.ResponseWriter, id any, err error) {
+	var configurationErr *tools.OutboundConfigurationError
 	var rateErr *entitlements.RateLimitError
 	var inProgressErr *entitlements.IdempotencyInProgressError
 	var attachmentErr *tools.AttachmentInputError
 	switch {
+	case errors.Is(err, llm.ErrUnavailable):
+		writeErrorWithData(w, id, -32000, llm.ErrUnavailable.Error(), translateModernBusinessError(err))
+	case errors.As(err, &configurationErr):
+		writeErrorWithData(w, id, -32000, configurationErr.Code, map[string]any{"code": configurationErr.Code, "retryable": false, "remediation": configurationErr.Remediation})
 	case errors.As(err, &attachmentErr):
 		writeErrorWithData(w, id, -32602, attachmentErr.Code, map[string]any{"retryable": false, "ordinal": attachmentErr.Ordinal})
 	case errors.Is(err, entitlements.ErrQuotaExceeded):
