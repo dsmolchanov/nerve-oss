@@ -1,7 +1,122 @@
-# Self-hosting: outbound configuration
+# Self-hosting
 
-This guide currently covers outbound configuration and worker lifecycle. The
-complete Compose quickstart and backup/restore guide are still being implemented.
+The Compose stack below is a local development environment. It binds published
+ports to loopback and captures outbound mail instead of delivering to the Internet.
+
+## Compose quickstart
+
+Requires Docker with Compose v2, `make`, and `openssl`. Go is unnecessary for the
+container CLI. From the repository root:
+
+```sh
+umask 077
+printf 'NERVE_API_KEY=%s\nPOSTGRES_PASSWORD=%s\nSTALWART_PASSWORD=%s\n' \
+  "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > .env
+docker compose up -d --build --wait
+make mcp-test
+```
+
+Create `.env` once; do not overwrite an existing installation's credentials.
+`.env.example` lists the Compose variables and host ports. PostgreSQL passwords
+in this example are hexadecimal so they can safely appear in the connection URI.
+Keep `.env` private and back it up separately. It is excluded from Git and Docker
+build context. The owner MCP token is available in `.env` as `NERVE_API_KEY`.
+
+The default sandbox starts PostgreSQL 16, Redis 7 with AOF persistence, the runtime
+with its outbox worker, and Mailpit. Open <http://localhost:8025> for the mail viewer;
+MCP is <http://localhost:8088/mcp>. PostgreSQL and Redis have no published host port.
+`make seed` sends five sample messages to Mailpit; they are visible in the viewer
+but **are not runtime inbox messages**: Mailpit has no JMAP interface.
+
+For actual inbound ingestion, enable the local `full` profile:
+
+```sh
+docker compose --profile full up -d --wait
+make seed-full
+# Polling runs every 30 seconds; wait for the inbox to populate.
+make mcp-test
+```
+
+`full` adds Stalwart pinned to v0.11.8, matching the checked-in TOML. Local inbound
+SMTP is `127.0.0.1:2526` (container port 25), JMAP is `127.0.0.1:8080`, submission
+is `127.0.0.1:1587` (587), and IMAPS is `127.0.0.1:1993` (993). The `dev` and
+`admin` accounts use `STALWART_PASSWORD`; `dev@local.nerve.email` is the test inbox.
+The local SMTP ingestion listener has TLS disabled; submission/IMAPS use the
+server's development certificate. Do not expose this test configuration publicly.
+Replies go to Mailpit, so testing cannot send them to external recipients.
+
+`seed` and `seed-full` share `/tmp/nerve-seed.done` inside the runtime container.
+If you seeded Mailpit before enabling full, remove that marker before `seed-full`:
+`docker compose exec cortex rm -f /tmp/nerve-seed.done`. Removing it permits another
+five messages. Recreating the container also removes the marker.
+
+A public mail server needs a separately maintained Stalwart deployment with a
+supported release and production configuration: domain/MX pointing to its public
+address, matching PTR set by the IP provider, reachable port 25, valid TLS,
+submission authentication, and SPF/DKIM/DMARC. The local profile does not provision
+DNS, certificates or sender reputation. Follow the [Stalwart deployment guide](https://stalw.art/docs/install/).
+Configure the runtime's JMAP and SMTP settings for that server rather than
+publishing this development profile.
+
+`--profile vector` additionally starts Qdrant with a persistent volume. Leave it
+off with the default `NERVE_EMBED_PROVIDER=noop`; PostgreSQL full-text search works
+without it. Starting Qdrant alone does not enable a working embedding provider.
+
+`configs/dev/cortex.yaml` uses Compose service names; `configs/dev/host.yaml` is
+for a host binary with separately supplied endpoints. Use `make mcp-test-host`
+with `NERVE_API_KEY` and `CONFIG` for that mode. The default stack does not publish
+PostgreSQL or Redis; provide those services separately or use a local override.
+
+## Persistence and backup/restore
+
+PostgreSQL (including outbox and idempotency records), Redis AOF, Mailpit and
+Stalwart data live in named volumes. `docker compose restart` and `down` preserve
+them. `docker compose down -v` deletes those volumes and their data. Keep the same
+Compose project name when restarting an installation; a new project gets new volumes.
+
+For a consistent application snapshot, stop the runtime and any separately running
+workers before dumping PostgreSQL. Preserve the source mailbox and prevent inbound
+changes during a coordinated full-system backup. These scripts back up PostgreSQL
+only; they do not back up Stalwart raw mail, Redis jobs, Qdrant, external object
+storage, `.env` or custom configuration.
+
+```sh
+mkdir -p backups
+docker compose stop cortex
+scripts/selfhost/backup.sh backups/runtime.dump
+docker compose start cortex
+```
+
+The script creates a private custom-format `pg_dump` file and refuses to overwrite
+an existing file. A failed dump is incomplete: remove it before retrying. Do not
+resume writers until the snapshot is finished. Keep backups off-host and periodically
+verify recovery; a volume is not a backup.
+
+Restore into a **new** database on the same PostgreSQL service:
+
+```sh
+scripts/selfhost/restore.sh backups/runtime.dump restore_verify
+```
+
+The target must begin with `restore_` and must not already exist. `pg_restore` uses
+a single transaction and stops on errors. On failure the newly created database
+remains for inspection; the active database is unchanged. Test it with an isolated
+runtime pointing `NERVE_DB_DSN` at `restore_verify`, with `serve --with-worker=false`,
+and compare `list_threads` with the source. Keep transport ingestion disabled in the
+verification runtime. Never run two workers against independent restored snapshots
+of the same mail queue: that can redeliver queued messages.
+
+After verification, a deliberate cutover requires stopping all writers, configuring
+the chosen restored database, and reconciling external delivery since the snapshot.
+Restoring an older outbox cannot undo mail already accepted by an SMTP server.
+
+`make selfhost-smoke` creates an isolated disposable Compose project with generated
+credentials. It tests sandbox MCP/auth, SMTP→JMAP ingestion, a queued reply across
+restart, idempotent delivery into Mailpit, Redis persistence, backup/restore with
+identical `list_threads`, and migrations from an empty working directory. It removes
+only its own containers and volumes. CI runs this with named volumes. On Docker
+Desktop with a full VM disk, `python3 scripts/ci/selfhost_smoke.py --bind-data` uses
+persistent host directories instead; this is a separate storage-backend check.
 
 ## Outbound configuration
 

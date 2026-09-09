@@ -87,3 +87,13 @@ jobs:
         run: ./scripts/ci/verify_runtime_policy_artifact.sh nerve-oss-ci:test dist/runtime/runtime-manifest.json
       - name: Migration CLI image smoke
         run: docker run --rm --entrypoint /app/nerve-migrate nerve-oss-ci:test --help
+
+  selfhost-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Self-host process diagnostics regression
+        run: python3 scripts/ci/test_selfhost_smoke.py
+      - name: Compose SMTP/JMAP, persistence and restore
+        run: python3 scripts/ci/selfhost_smoke.py
