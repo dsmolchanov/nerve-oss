@@ -1,5 +1,5 @@
 http:
-  addr: ":8088"
+  addr: "0.0.0.0:8088"
   read_timeout: 30s
 
 memory:
@@ -12,20 +12,20 @@ jmap:
   url: "http://stalwart:8080/jmap"
   session_url: "http://stalwart:8080/.well-known/jmap"
   account_id: ""
-  username: "dev"
-  password: "devpass"
-  push_secret: "devsecret"
+  username: ""
+  password: ""
+  push_secret: ""
   poll_interval: 30s
 
 smtp:
-  host: "stalwart"
-  port: 25
-  username: "dev@local.nerve.email"
-  password: "devpass"
+  host: "mailpit"
+  port: 1025
+  username: ""
+  password: ""
   from: "dev@local.nerve.email"
 
 database:
-  dsn: "postgres://neuralmail:neuralmail@postgres:5432/neuralmail?sslmode=disable"
+  dsn: "postgres://neuralmail@postgres:5432/neuralmail?sslmode=disable"
 
 qdrant:
   url: "http://qdrant:6333"
@@ -34,12 +34,6 @@ qdrant:
 
 redis:
   url: "redis://redis:6379/0"
-
-object_store:
-  url: "http://minio:9000"
-  bucket: "neuralmail"
-  access_key: "minio"
-  secret_key: "minio123"
 
 embedding:
   provider: "noop"

@@ -86,3 +86,7 @@ makes a review loop unable to terminate.
 - Cloud mode must never reach the local debug renderer, even if the handler is
   accidentally mounted. OSS debug accepts the owner key and rejects mailbox
   keys. Enforced by `TestDebugAccessMatrix` in internal/app/debug_access_test.go.
+
+- Self-host smoke process failures must not log credentials through argv, stderr,
+  timeout/spawn exceptions or chained tracebacks. Enforced by the restored/empty
+  database failure matrix in `scripts/ci/test_selfhost_smoke.py`.
