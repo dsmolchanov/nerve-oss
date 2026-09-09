@@ -75,3 +75,7 @@ makes a review loop unable to terminate.
   registry's own manifest-unknown signal. A nonzero exit, a non-404 status, or a
   generic "not found" is not proof and must refuse. Enforced by
   `scripts/ci/test_candidate_version_probe.sh`.
+
+- Cloud mode must never reach the local debug renderer, even if the handler is
+  accidentally mounted. OSS debug accepts the owner key and rejects mailbox
+  keys. Enforced by `TestDebugAccessMatrix` in internal/app/debug_access_test.go.

@@ -40,4 +40,10 @@ check_absent "$CLOUD_DIR" "cloud migrations" \
   "outbox_attempts" \
   "org_domains"
 
+# Embed both scopes explicitly: a broad migrations/** glob can silently ship
+# unrelated files, and dropping a scope breaks the migration CLI.
+grep -Fq '//go:embed migrations/core/*.sql migrations/cloud/*.sql' "$ROOT_DIR/internal/store/migrate.go"
+cd "$ROOT_DIR"
+go test ./internal/store -run '^TestEmbeddedMigrationInventory$' -count=1
+
 echo "migration ownership checks passed"

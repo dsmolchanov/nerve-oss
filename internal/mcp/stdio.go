@@ -4,9 +4,13 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+
+	"neuralmail/internal/llm"
+	"neuralmail/internal/tools"
 )
 
 func RunStdio(ctx context.Context, srv *Server) error {
@@ -27,6 +31,12 @@ func RunStdio(ctx context.Context, srv *Server) error {
 		resp := Response{JSONRPC: "2.0", ID: req.ID}
 		if err != nil {
 			resp.Error = &ResponseError{Code: -32000, Message: err.Error()}
+			var configurationErr *tools.OutboundConfigurationError
+			if errors.Is(err, llm.ErrUnavailable) {
+				resp.Error.Data = translateModernBusinessError(err)
+			} else if errors.As(err, &configurationErr) {
+				resp.Error.Data = map[string]any{"code": configurationErr.Code, "retryable": false, "remediation": configurationErr.Remediation}
+			}
 		} else {
 			resp.Result = result
 		}

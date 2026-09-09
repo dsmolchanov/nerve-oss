@@ -18,6 +18,7 @@ import (
 	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
 	"neuralmail/internal/entitlements"
+	"neuralmail/internal/tools"
 )
 
 func TestSDKServerIsStatelessAndListsDeterministicEmailTools(t *testing.T) {
@@ -86,6 +87,7 @@ func TestSDKServerTranslatesBusinessFailureAsCallToolResult(t *testing.T) {
 		wantCode      string
 		wantRetryable bool
 	}{
+		{name: "local setup", err: &tools.OutboundConfigurationError{Code: "smtp_unconfigured", Remediation: "docs/SELF_HOSTING.md#outbound-configuration"}, wantCode: "smtp_unconfigured"},
 		{name: "quota", err: entitlements.ErrQuotaExceeded, wantCode: "quota_exceeded"},
 		{name: "subscription", err: entitlements.ErrSubscriptionInactive, wantCode: "subscription_inactive"},
 		{name: "rate", err: &entitlements.RateLimitError{RetryAfterSeconds: 12}, wantCode: "rate_limited", wantRetryable: true},
@@ -132,6 +134,9 @@ func TestSDKServerTranslatesBusinessFailureAsCallToolResult(t *testing.T) {
 					t.Fatalf("raw modern response violated final-response contract: %v body=%s", err, raw)
 				}
 				wire := string(raw)
+				if test.name == "local setup" && !strings.Contains(wire, `"remediation":"docs/SELF_HOSTING.md#outbound-configuration"`) {
+					t.Fatal("missing remediation: " + wire)
+				}
 				if !strings.Contains(wire, `"code":"`+test.wantCode+`"`) ||
 					!strings.Contains(wire, fmt.Sprintf(`"retryable":%t`, test.wantRetryable)) ||
 					strings.Contains(wire, "-32040") || strings.Contains(wire, "-32041") ||

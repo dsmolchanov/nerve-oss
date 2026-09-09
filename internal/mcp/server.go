@@ -18,6 +18,8 @@ import (
 	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
 	"neuralmail/internal/entitlements"
+	"neuralmail/internal/llm"
+	"neuralmail/internal/localauth"
 	"neuralmail/internal/memguard"
 	"neuralmail/internal/observability"
 	"neuralmail/internal/store"
@@ -134,6 +136,15 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, routed bool)
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if !routed && !s.Config.Cloud.Mode {
+		ctx, err := localauth.Authenticate(s.Config, r)
+		if err != nil {
+			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		r = r.WithContext(ctx)
+	}
 	if !routed {
 		if err := s.validateOrigin(r); err != nil {
 			http.Error(w, err.Error(), http.StatusForbidden)
@@ -178,7 +189,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, routed bool)
 		}
 		authenticated, err := s.Auth.AuthenticateRequest(r)
 		if err != nil {
-			writeInvalidToken(w)
+			writeInvalidToken(w, s.Config)
 			return
 		}
 		principal = authenticated
@@ -633,7 +644,7 @@ func (s *Server) readResource(ctx context.Context, req Request) (any, error) {
 		if hasPrincipal {
 			ids, err = s.Tools.Store.ListInboxesByOrg(ctx, principal.OrgID)
 		} else {
-			ids, err = s.Tools.Store.ListInboxes(ctx)
+			ids, err = s.Tools.LocalInboxes(ctx)
 		}
 		if err != nil {
 			return nil, err
@@ -644,6 +655,9 @@ func (s *Server) readResource(ctx context.Context, req Request) (any, error) {
 		return s.Tools.GetThread(ctx, threadID)
 	case strings.HasPrefix(params.URI, "email://messages/"):
 		messageID := strings.TrimPrefix(params.URI, "email://messages/")
+		if err := s.Tools.CheckLocalAccess(ctx, "message", messageID); err != nil {
+			return nil, err
+		}
 		if hasPrincipal {
 			if err := s.Tools.Store.EnsureMessageBelongsToOrg(ctx, messageID, principal.OrgID); err != nil {
 				return nil, err
@@ -711,10 +725,15 @@ func (s *Server) requiredScope(req Request) string {
 }
 
 func (s *Server) writeDispatchError(w http.ResponseWriter, id any, err error) {
+	var configurationErr *tools.OutboundConfigurationError
 	var rateErr *entitlements.RateLimitError
 	var inProgressErr *entitlements.IdempotencyInProgressError
 	var attachmentErr *tools.AttachmentInputError
 	switch {
+	case errors.Is(err, llm.ErrUnavailable):
+		writeErrorWithData(w, id, -32000, llm.ErrUnavailable.Error(), translateModernBusinessError(err))
+	case errors.As(err, &configurationErr):
+		writeErrorWithData(w, id, -32000, configurationErr.Code, map[string]any{"code": configurationErr.Code, "retryable": false, "remediation": configurationErr.Remediation})
 	case errors.As(err, &attachmentErr):
 		writeErrorWithData(w, id, -32602, attachmentErr.Code, map[string]any{"retryable": false, "ordinal": attachmentErr.Ordinal})
 	case errors.Is(err, entitlements.ErrQuotaExceeded):

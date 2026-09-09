@@ -6,6 +6,8 @@ import (
 	"errors"
 
 	"neuralmail/internal/auth"
+	"neuralmail/internal/llm"
+	"neuralmail/internal/localauth"
 	"neuralmail/internal/store"
 	"neuralmail/internal/tools"
 )
@@ -36,6 +38,13 @@ func (invoker *Invoker) Invoke(ctx context.Context, invocation ToolInvocation) (
 	if invocation.Name == "" {
 		return nil, errors.New("tool name is required")
 	}
+	if _, restricted := localauth.FromContext(ctx); restricted {
+		switch invocation.Name {
+		case "list_threads", "get_thread", "search_inbox", "triage_message", "extract_to_schema", "draft_reply_with_policy", "send_reply", "compose_email":
+		default:
+			return nil, localauth.ErrForbidden
+		}
+	}
 	if invoker.server.Config.Cloud.Mode {
 		principal, ok := auth.PrincipalFromContext(ctx)
 		if !ok || invoker.server.Auth == nil {
@@ -57,6 +66,17 @@ func (invoker *Invoker) Invoke(ctx context.Context, invocation ToolInvocation) (
 		// Billing is intentionally modern-only and is dispatched by the SDK
 		// adapter through BillingProvisioner after the same scope precheck.
 		return nil, errors.New("billing tool requires the modern MCP protocol")
+	}
+	// Check the selected provider after cloud authentication/scopes and before
+	// reserving usage. Configuration can fall back to noop even for a real name.
+	switch invocation.Name {
+	case "triage_message", "extract_to_schema", "draft_reply_with_policy":
+		if invoker.server.Tools == nil {
+			return nil, llm.ErrUnavailable
+		}
+		if err := llm.RequireAvailable(invoker.server.Tools.LLM); err != nil {
+			return nil, err
+		}
 	}
 	return invoker.invokeTool(ctx, ToolCallParams{
 		Name: invocation.Name, Arguments: invocation.Arguments,

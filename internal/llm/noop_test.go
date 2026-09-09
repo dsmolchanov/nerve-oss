@@ -2,19 +2,22 @@ package llm
 
 import (
 	"context"
+	"errors"
+	"reflect"
 	"testing"
 )
 
-func TestNoopTriageUrgentNegative(t *testing.T) {
-	provider := NewNoop()
-	res, err := provider.Classify(context.Background(), "Critical server outage and angry refund", nil)
-	if err != nil {
-		t.Fatalf("classify error: %v", err)
+func TestNoopNeverProducesAIResults(t *testing.T) {
+	p := NewNoop()
+	c, ce := p.Classify(context.Background(), "Critical outage refund", nil)
+	e, ee := p.Extract(context.Background(), "invoice", map[string]any{"required": []any{"amount"}}, nil)
+	d, de := p.Draft(context.Background(), "message", nil, "reply")
+	for _, err := range []error{ce, ee, de, RequireAvailable(p), RequireAvailable(nil)} {
+		if !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("want unavailable, got %v", err)
+		}
 	}
-	if res.Urgency != "high" {
-		t.Fatalf("expected high urgency, got %s", res.Urgency)
-	}
-	if res.Sentiment != "negative" {
-		t.Fatalf("expected negative sentiment, got %s", res.Sentiment)
+	if c != (Classification{}) || !reflect.DeepEqual(e, Extraction{}) || !reflect.DeepEqual(d, Draft{}) {
+		t.Fatalf("fabricated results: %#v %#v %#v", c, e, d)
 	}
 }

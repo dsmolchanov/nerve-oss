@@ -202,9 +202,10 @@ func modernErrorOutput(errorCodes []string) map[string]any {
 				"type":                 "object",
 				"additionalProperties": false,
 				"properties": map[string]any{
-					"code":      code,
-					"retryable": map[string]any{"type": "boolean"},
-					"retry_at":  map[string]any{"type": "string", "format": "date-time"},
+					"code":        code,
+					"retryable":   map[string]any{"type": "boolean"},
+					"retry_at":    map[string]any{"type": "string", "format": "date-time"},
+					"remediation": map[string]any{"type": "string"},
 				},
 				"required": []string{"code", "retryable"},
 			},

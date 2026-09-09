@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -21,6 +23,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"neuralmail/internal/config"
+	"neuralmail/internal/mcp"
 	"neuralmail/internal/startup"
 	"neuralmail/internal/store"
 )
@@ -48,13 +51,19 @@ func main() {
 	case "migrate-all":
 		runMigrations(cfg, migrateAllToRuntimeWindow)
 	case "seed":
-		seed(cfg)
+		if err := seed(cfg, "/tmp/nerve-seed.done"); err != nil {
+			log.Fatalf("seed failed: %v", err)
+		}
 	case "doctor":
 		doctor(cfg)
 	case "send-test":
-		sendTest(cfg)
+		if err := sendTest(cfg); err != nil {
+			log.Fatalf("send-test failed: %v", err)
+		}
 	case "mcp-test":
-		mcpTest(cfg)
+		if err := mcpTest(cfg, os.Stdout); err != nil {
+			log.Fatalf("mcp-test failed: %v", err)
+		}
 	default:
 		usage()
 	}
@@ -96,11 +105,12 @@ func runMigrations(cfg config.Config, migrate func(context.Context, *sql.DB) err
 	fmt.Println("migrations complete")
 }
 
-func seed(cfg config.Config) {
-	seedFlag := "/tmp/nerve-seed.done"
+func seed(cfg config.Config, seedFlag string) error {
 	if _, err := os.Stat(seedFlag); err == nil {
-		fmt.Println("seed already applied; delete /tmp/nerve-seed.done to re-run")
-		return
+		fmt.Printf("seed already applied; delete %s to re-run\n", seedFlag)
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect seed marker: %w", err)
 	}
 	messages := []struct {
 		Subject string
@@ -113,10 +123,15 @@ func seed(cfg config.Config) {
 		{"General question", "Can you help me change my plan?"},
 	}
 	for _, msg := range messages {
-		sendSMTP(cfg, msg.Subject, msg.Body)
+		if err := sendSMTP(cfg, msg.Subject, msg.Body); err != nil {
+			return fmt.Errorf("send demo email: %w", err)
+		}
 	}
-	_ = os.WriteFile(seedFlag, []byte(time.Now().Format(time.RFC3339)), 0o644)
+	if err := os.WriteFile(seedFlag, []byte(time.Now().Format(time.RFC3339)), 0o644); err != nil {
+		return fmt.Errorf("write seed marker: %w", err)
+	}
 	fmt.Println("seeded demo emails")
+	return nil
 }
 
 func doctor(cfg config.Config) {
@@ -144,83 +159,130 @@ func doctor(cfg config.Config) {
 	_ = ctx
 }
 
-func sendTest(cfg config.Config) {
-	sendSMTP(cfg, "Nerve test", "This is a test email from nerve CLI.")
+func sendTest(cfg config.Config) error {
+	if err := sendSMTP(cfg, "Nerve test", "This is a test email from nerve CLI."); err != nil {
+		return err
+	}
 	fmt.Println("sent test email")
+	return nil
 }
 
-func mcpTest(cfg config.Config) {
-	url := fmt.Sprintf("%s/mcp", localHTTPBase(cfg))
-	initReq := map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{}}
-	resp, session := callMCP(url, initReq, "")
-	_, err := parseMCPResponse(resp)
+// mcpTest exercises the frozen legacy adapter, including its session contract.
+// The modern stateless adapter has a separate conformance suite.
+func mcpTest(cfg config.Config, output io.Writer) error {
+	endpoint := fmt.Sprintf("%s/mcp", localHTTPBase(cfg))
+	session := ""
+	call := func(payload map[string]any) (mcpResponse, error) {
+		raw, nextSession, err := callMCP(endpoint, payload, session, cfg.Security.APIKey)
+		if err != nil {
+			return mcpResponse{}, err
+		}
+		session = nextSession
+		parsed, err := parseMCPResponse(raw)
+		if err != nil {
+			return parsed, err
+		}
+		expectedID, err := json.Marshal(payload["id"])
+		if err != nil {
+			return parsed, err
+		}
+		actualID, err := json.Marshal(parsed.ID)
+		if err != nil || !bytes.Equal(expectedID, actualID) {
+			return parsed, errors.New("MCP response ID does not match request")
+		}
+		return parsed, nil
+	}
+	initReq := map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{
+		"protocolVersion": mcp.LegacyProtocolVersion,
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": "neuralmail-cli", "version": "0.1.0"},
+	}}
+	initialized, err := call(initReq)
 	if err != nil {
-		log.Fatalf("initialize failed: %v", err)
+		return fmt.Errorf("initialize: %w", err)
 	}
-	fmt.Printf("initialize: %s\n", resp)
+	var negotiated struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
+	if err := json.Unmarshal(initialized.Result, &negotiated); err != nil {
+		return fmt.Errorf("initialize result: %w", err)
+	}
+	if negotiated.ProtocolVersion != mcp.LegacyProtocolVersion || session == "" {
+		return errors.New("initialize: missing session or unexpected protocol version")
+	}
+	fmt.Fprintf(output, "initialize: %s\n", initialized.Result)
 
-	listReq := map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": map[string]any{}}
-	resp, _ = callMCP(url, listReq, session)
-	if _, err := parseMCPResponse(resp); err != nil {
-		log.Fatalf("tools/list failed: %v", err)
-	}
-	fmt.Printf("tools/list: %s\n", resp)
-
-	inboxesReq := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      3,
-		"method":  "resources/read",
-		"params": map[string]any{
-			"uri": "email://inboxes",
-		},
-	}
-	resp, _ = callMCP(url, inboxesReq, session)
-	inboxesParsed, err := parseMCPResponse(resp)
+	listed, err := call(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": map[string]any{}})
 	if err != nil {
-		log.Fatalf("resources/read inboxes failed: %v", err)
+		return fmt.Errorf("tools/list: %w", err)
 	}
-	inboxID, err := firstInboxID(inboxesParsed.Result)
+	fmt.Fprintf(output, "tools/list: %s\n", listed.Result)
+
+	inboxes, err := call(map[string]any{"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": map[string]any{"uri": "email://inboxes"}})
 	if err != nil {
-		log.Fatalf("no inbox available for list_threads: %v", err)
+		return fmt.Errorf("resources/read inboxes: %w", err)
+	}
+	inboxID, err := firstInboxID(inboxes.Result)
+	if err != nil {
+		return fmt.Errorf("no inbox available for list_threads: %w", err)
 	}
 
-	callReq := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      4,
-		"method":  "tools/call",
-		"params": map[string]any{
-			"name": "list_threads",
-			"arguments": map[string]any{
-				"inbox_id": inboxID,
-				"limit":    10,
-			},
-		},
+	threads, err := call(map[string]any{"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": map[string]any{
+		"name": "list_threads", "arguments": map[string]any{"inbox_id": inboxID, "limit": 10},
+	}})
+	if err != nil {
+		return fmt.Errorf("tools/call list_threads: %w", err)
 	}
-	resp, _ = callMCP(url, callReq, session)
-	if _, err := parseMCPResponse(resp); err != nil {
-		log.Fatalf("tools/call list_threads failed: %v", err)
-	}
-	fmt.Printf("tools/call list_threads: %s\n", resp)
+	fmt.Fprintf(output, "tools/call list_threads: %s\n", threads.Result)
+	return nil
 }
 
-func callMCP(url string, payload map[string]any, session string) (string, string) {
-	body, _ := json.Marshal(payload)
-	req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+func callMCP(endpoint string, payload map[string]any, session, apiKey string) (string, string, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", session, fmt.Errorf("encode MCP request: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return "", session, fmt.Errorf("create MCP request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("MCP-Protocol-Version", mcp.LegacyProtocolVersion)
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
 	if session != "" {
 		req.Header.Set("MCP-Session-Id", session)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		// A smoke test must fail on a redirect, not follow it with credentials.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := client.Do(req)
 	if err != nil {
-		return err.Error(), session
+		return "", session, fmt.Errorf("MCP request: %w", err)
 	}
 	defer resp.Body.Close()
-	buf := new(bytes.Buffer)
-	_, _ = buf.ReadFrom(resp.Body)
-	return buf.String(), resp.Header.Get("MCP-Session-Id")
+	if resp.StatusCode != http.StatusOK {
+		return "", session, fmt.Errorf("MCP HTTP status %d", resp.StatusCode)
+	}
+	const maxResponseBytes = 16 << 20
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return "", session, fmt.Errorf("read MCP response: %w", err)
+	}
+	if len(data) > maxResponseBytes {
+		return "", session, errors.New("MCP response too large")
+	}
+	if next := resp.Header.Get("MCP-Session-Id"); next != "" {
+		session = next
+	}
+	return string(data), session, nil
 }
 
-func sendSMTP(cfg config.Config, subject, body string) {
+func sendSMTP(cfg config.Config, subject, body string) error {
 	host := cfg.SMTP.Host
 	if host == "" {
 		host = "localhost"
@@ -240,52 +302,58 @@ func sendSMTP(cfg config.Config, subject, body string) {
 	}, "\r\n")
 
 	helo := smtpHeloDomain(from)
-	conn, err := net.Dial("tcp", addr)
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
-		log.Printf("smtp send failed: %v", err)
-		return
+		return fmt.Errorf("smtp send: %w", err)
 	}
 	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		return fmt.Errorf("smtp deadline: %w", err)
+	}
 	client, err := smtp.NewClient(conn, host)
 	if err != nil {
-		log.Printf("smtp send failed: %v", err)
-		return
+		return fmt.Errorf("smtp send: %w", err)
 	}
-	defer client.Quit()
+	defer client.Close()
 	if err := client.Hello(helo); err != nil {
-		log.Printf("smtp send failed: %v", err)
-		return
+		return fmt.Errorf("smtp send: %w", err)
 	}
-	if (cfg.SMTP.Username != "" || cfg.SMTP.Password != "") && supportsAuth(client) {
+	if ok, _ := client.Extension("STARTTLS"); ok {
+		if err := client.StartTLS(&tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}); err != nil {
+			return fmt.Errorf("smtp STARTTLS: %w", err)
+		}
+	} else if cfg.SMTP.RequireStartTLS {
+		return errors.New("smtp STARTTLS is required but unavailable")
+	}
+	if cfg.SMTP.Username != "" || cfg.SMTP.Password != "" {
+		if !supportsAuth(client) {
+			return errors.New("smtp AUTH is configured but unavailable")
+		}
 		auth := smtp.PlainAuth("", cfg.SMTP.Username, cfg.SMTP.Password, host)
 		if err := client.Auth(auth); err != nil {
-			log.Printf("smtp send failed: %v", err)
-			return
+			return fmt.Errorf("smtp send: %w", err)
 		}
 	}
 	if err := client.Mail(from); err != nil {
-		log.Printf("smtp send failed: %v", err)
-		return
+		return fmt.Errorf("smtp send: %w", err)
 	}
 	if err := client.Rcpt(to); err != nil {
-		log.Printf("smtp send failed: %v", err)
-		return
+		return fmt.Errorf("smtp send: %w", err)
 	}
 	writer, err := client.Data()
 	if err != nil {
-		log.Printf("smtp send failed: %v", err)
-		return
+		return fmt.Errorf("smtp send: %w", err)
 	}
 	if _, err := writer.Write([]byte(msg)); err != nil {
 		_ = writer.Close()
-		log.Printf("smtp send failed: %v", err)
-		return
+		return fmt.Errorf("smtp send: %w", err)
 	}
 	if err := writer.Close(); err != nil {
-		log.Printf("smtp send failed: %v", err)
-		return
+		return fmt.Errorf("smtp send: %w", err)
 	}
+	// DATA close already confirmed acceptance; a QUIT failure must not cause a resend.
 	_ = client.Quit()
+	return nil
 }
 
 func smtpHeloDomain(addr string) string {
@@ -430,8 +498,20 @@ func parseMCPResponse(raw string) (mcpResponse, error) {
 	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
 		return parsed, err
 	}
+	if parsed.JSONRPC != "2.0" {
+		return parsed, errors.New("invalid MCP response version")
+	}
 	if parsed.Error != nil {
 		return parsed, fmt.Errorf("rpc error %d: %s", parsed.Error.Code, parsed.Error.Message)
+	}
+	if len(parsed.Result) == 0 || bytes.Equal(bytes.TrimSpace(parsed.Result), []byte("null")) {
+		return parsed, errors.New("missing MCP result")
+	}
+	var toolResult struct {
+		IsError bool `json:"isError"`
+	}
+	if json.Unmarshal(parsed.Result, &toolResult) == nil && toolResult.IsError {
+		return parsed, errors.New("MCP tool returned isError")
 	}
 	return parsed, nil
 }
@@ -443,7 +523,7 @@ func firstInboxID(result json.RawMessage) (string, error) {
 	if err := json.Unmarshal(result, &payload); err != nil {
 		return "", err
 	}
-	if len(payload.InboxIDs) == 0 {
+	if len(payload.InboxIDs) == 0 || strings.TrimSpace(payload.InboxIDs[0]) == "" {
 		return "", errors.New("empty inbox_ids")
 	}
 	return payload.InboxIDs[0], nil
