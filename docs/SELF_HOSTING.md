@@ -243,10 +243,48 @@ configuration, image and schema versions before changing them.
 2. Stop the runtime and any separate workers; make and verify a fresh backup using
    the procedure above. Back up the other stores and configuration as required.
 3. Check out the chosen ref, review changes to Compose/YAML and preserve your private
-   credentials. Run `docker compose up -d --build --wait` with the same project name
-   and the profiles you use (include `--profile full` before `up` for local Stalwart).
-4. Run `make mcp-test` and verify a synthetic receive/reply through your transport.
-   Check queued/failed deliveries and logs before resuming normal traffic.
+   credentials. Keep external traffic and any separate workers stopped. In the same
+   shell, preserve your deployment's project name, profiles and Compose files
+   (`COMPOSE_PROJECT_NAME`, `COMPOSE_PROFILES`, `COMPOSE_FILE`). The example below
+   defaults to this repository's Compose file; set those variables first if your
+   deployment uses overrides. Start the upgraded runtime with its outbox worker
+   explicitly disabled:
+
+<!-- upgrade-preflight -->
+```sh
+set -eu
+upgrade_base_files=${COMPOSE_FILE:-docker-compose.yml}
+upgrade_override=$(mktemp)
+printf '%s\n' '{"services":{"cortex":{"command":["serve","--with-worker=false"]}}}' > "$upgrade_override"
+export COMPOSE_FILE="$upgrade_base_files${COMPOSE_PATH_SEPARATOR:-:}$upgrade_override"
+docker compose up -d --build --wait cortex
+make mcp-test
+```
+
+4. Before continuing, inspect startup logs, schema compatibility, queued/failed
+   deliveries and read-only MCP results. Test synthetic **inbound** ingestion and
+   read it back; do not enqueue a reply yet. HTTP readiness and `mcp-test` alone
+   are not approval to send. Keep separate workers stopped and avoid `make up`
+   or any other command that replaces the worker-disabled configuration. If any
+   check fails, stop cortex and investigate with outbound workers still disabled.
+5. Only after those checks pass and you have reconciled the pending outbox,
+   explicitly enable delivery in the same shell. This replaces the temporary
+   override with an explicit worker-enabled command, preserving all deployment
+   configuration. Pending mail can be sent immediately at this step:
+
+<!-- upgrade-enable-delivery -->
+```sh
+set -eu
+: "${upgrade_override:?Run the preflight in this shell first}"
+printf '%s\n' '{"services":{"cortex":{"command":["serve","--with-worker=true"]}}}' > "$upgrade_override"
+docker compose up -d --force-recreate --wait cortex
+```
+
+6. Verify a synthetic reply through your transport, then resume external traffic
+   and your intended worker topology. Keep the override until you have persisted
+   that topology in your normal deployment configuration; remove the temporary
+   file only after switching back to those files. Do not start additional workers
+   unless they are part of your deployment's intended topology.
 
 Startup applies/verifies only its supported migration window. An incompatible
 schema is a reason to stop and investigate, not to disable verification. Returning
