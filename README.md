@@ -68,7 +68,7 @@ Legacy aliases are still supported during migration:
 - Local two-repo loop guide: `docs/TWO_REPO_DEV_LOOP.md`
 
 ## License
-- NeuralMail code: Apache-2.0
+- NeuralMail code: Apache-2.0 (see [LICENSE](LICENSE) and [NOTICE](NOTICE))
 - Stalwart Mail Server: AGPLv3 (separate container dependency)
 
 ## Branding

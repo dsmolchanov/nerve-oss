@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
+	"neuralmail/internal/localauth"
 )
 
 const (
@@ -71,11 +73,19 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "forbidden", http.StatusForbidden)
 				return
 			}
-			writeInvalidToken(w)
+			writeInvalidToken(w, router.config)
 			return
 		}
 		authenticated = true
 		ctx = auth.WithPrincipal(ctx, principal)
+	}
+	if !router.config.Cloud.Mode {
+		ctx, err = localauth.Authenticate(router.config, r)
+		if err != nil {
+			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 	}
 	if err := authorizeOrigin(router.config, origin, principal, authenticated); err != nil {
 		http.Error(w, "forbidden", http.StatusForbidden)
@@ -103,8 +113,12 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func writeInvalidToken(w http.ResponseWriter) {
-	w.Header().Set("WWW-Authenticate", `Bearer resource_metadata="`+protectedResourceMetadataURL+`", error="invalid_token"`)
+func writeInvalidToken(w http.ResponseWriter, configs ...config.Config) {
+	metadataURL := protectedResourceMetadataURL
+	if len(configs) > 0 && configs[0].Cloud.PublicBaseURL != "" {
+		metadataURL = strings.TrimRight(configs[0].Cloud.PublicBaseURL, "/") + ProtectedResourceMetadataMCPPath
+	}
+	w.Header().Set("WWW-Authenticate", `Bearer resource_metadata="`+metadataURL+`", error="invalid_token"`)
 	http.Error(w, "unauthorized", http.StatusUnauthorized)
 }
 

@@ -1,0 +1,79 @@
+name: codex-verdict-waker
+# This file is a STUB. The waker itself lives in dsmolchanov/codex-review-gate
+# beside the gate it serves, with the same host/stub split for the same reason:
+# the logic is reviewed once, where its tests are.
+#
+# What it does: `codex-review-window` no longer holds a runner for 15 minutes
+# waiting for a Codex verdict — that wait cost 424 billed minutes across the
+# fleet in one day, 263 of them in runs cancelled mid-sleep. The gate now waits
+# briefly and fails closed, and a verdict that arrives later re-enters through
+# THIS workflow, which re-runs the gate's PR-bound run so the check reports
+# against the PR head: a clean-summary comment via `issue_comment`, and a
+# formal review via `pull_request_review` — the gate's own review trigger
+# starts a NEW run, so this workflow also drains the earlier run that failed
+# for want of a verdict, which would otherwise keep the status rollup red
+# beside a green run of the same context. (A comment event runs from the
+# default branch, so it could never satisfy the required check directly —
+# which is also why the gate itself must not listen to `issue_comment`.)
+#
+# `issue_comment` must be declared HERE, in the consumer, because the event
+# fires in the repository where the comment lands. The called workflow reads
+# the same `github.event` this caller received.
+on:
+  issue_comment:
+    types: [created]
+  # A formal review leaves a stale failed gate run behind too: the gate's own
+  # re-entry starts a NEW check run while the earlier one that failed for want
+  # of a verdict stays on the commit, and GitHub's status rollup counts the red
+  # one — the pull request reports BLOCKED with a green run of the same context
+  # beside it. Cleared by hand four times on 2026-08-31 before this trigger.
+  pull_request_review:
+    types: [submitted]
+
+# NO workflow-level `concurrency:` — it would be claimed by EVERY comment on
+# the pull request before any `if:` is evaluated, so a human replying "thanks"
+# while a wake is mid-flight would cancel that wake, and the comment event is
+# one-shot: nothing would retry it. The group lives at the JOB level below,
+# behind the same guard the reusable workflow applies, so only Codex verdict
+# comments ever enter it.
+
+jobs:
+  # PINNED TO A COMMIT SHA, not to a tag, for the same reason as the gate stub:
+  # a tag is mutable, and this caller grants `actions: write` — the power to
+  # re-run workflows in this repository — to whatever the ref resolves to.
+  # Keep this pin IN LOCKSTEP with the pin in codex-review-window.yml: the gate
+  # and the waker are two halves of one protocol (the gate's short window is
+  # only safe because this waker re-enters it), reviewed and tagged together.
+  # To move the pin, read the host diff first, then change this line: the bump
+  # is the review.
+  wake:
+    # The guard is duplicated from the reusable workflow ON PURPOSE, because it
+    # has a second job here that the callee's copy cannot do: only a run that
+    # passes it claims the concurrency group below. Without it, any comment's
+    # run would enter the group first and cancel-in-progress would kill a live
+    # wake. The callee keeps its own copy as defense in depth.
+    if: >-
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
+       contains(github.event.comment.body, 'Codex Review')) ||
+      (github.event_name == 'pull_request_review' &&
+       github.event.review.user.login == 'chatgpt-codex-connector[bot]')
+    # Keyed on the ISSUE number and on this workflow's OWN name: sharing the
+    # gate's group would cancel the very run this workflow exists to re-run
+    # (see the gate stub's header for the probe that found the caller/callee
+    # trap). A burst of Codex comments on one PR should cost one wake, and the
+    # newest comment is the one that matters, so cancel-in-progress is right.
+    concurrency:
+      # `issue_comment` carries the PR as an issue, `pull_request_review` as a
+      # pull request. Exactly one is ever set.
+      group: codex-verdict-waker-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: true
+    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-verdict-waker.yml@4d05f6909650381037fee2cfed40c6a5cab591af
+    permissions:
+      # A called workflow's permissions cannot exceed its caller's, so the
+      # re-run scope has to be granted here. Nothing else: the waker decides
+      # nothing, posts nothing, and needs no secrets.
+      actions: write
+      contents: read
+      pull-requests: read

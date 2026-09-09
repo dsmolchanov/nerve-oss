@@ -3,10 +3,11 @@ package store
 import (
 	"context"
 	"database/sql"
+	"embed"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 
@@ -373,30 +374,33 @@ func withGoose(tableName string, operation func() error) error {
 	if err := goose.SetDialect("postgres"); err != nil {
 		return fmt.Errorf("configure goose dialect: %w", err)
 	}
+	goose.SetBaseFS(migrationFiles{})
+	defer goose.SetBaseFS(nil)
 	goose.SetTableName(tableName)
 	return operation()
 }
 
-func migrationDir(scope string) string {
-	// Prefer resolving from current working directory.
-	if local := filepath.Join("internal", "store", "migrations", scope); dirExists(local) {
-		return local
-	}
+//go:embed migrations/core/*.sql migrations/cloud/*.sql
+var embeddedMigrations embed.FS
 
-	// Fallback to a path relative to this source file for tests run from package subdirs.
-	_, currentFile, _, ok := runtime.Caller(0)
-	if !ok {
-		panic(fmt.Sprintf("resolve migration directory for %s: missing caller info", scope))
-	}
-	sourceRelative := filepath.Join(filepath.Dir(currentFile), "migrations", scope)
-	if dirExists(sourceRelative) {
-		return sourceRelative
-	}
+type migrationFiles struct{}
 
-	panic(fmt.Sprintf("resolve migration directory for %s: directory not found", scope))
+func (migrationFiles) Open(name string) (fs.File, error) {
+	if strings.HasPrefix(name, "migrations/") && fs.ValidPath(name) {
+		return embeddedMigrations.Open(name)
+	}
+	return os.Open(name)
 }
 
-func dirExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.IsDir()
+func migrationDir(scope string) string {
+	if root := os.Getenv("NERVE_MIGRATIONS_DIR"); root != "" {
+		// An absolute path avoids ambiguity with bundled paths. Missing overrides
+		// must fail rather than silently selecting another migration history.
+		path, err := filepath.Abs(filepath.Join(root, scope))
+		if err != nil {
+			return filepath.Join(root, scope)
+		}
+		return path
+	}
+	return "migrations/" + scope
 }

@@ -271,6 +271,14 @@ func (a *OutboundAdapter) doSend(ctx context.Context, msg emailtransport.Outboun
 		return "", err
 	}
 	defer conn.Close()
+	// DialContext only bounds dialing; SMTP reads must also honor cancellation.
+	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopClose()
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return "", err
+		}
+	}
 
 	client, err := smtp.NewClient(conn, a.cfg.Host)
 	if err != nil {

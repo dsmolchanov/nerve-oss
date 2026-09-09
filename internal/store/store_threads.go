@@ -53,7 +53,7 @@ func (s *Store) GetThread(ctx context.Context, threadID string) (Thread, []Messa
 	}
 	_ = json.Unmarshal(participantsJSON, &t.Participants)
 
-	rows, err := s.q.QueryContext(ctx, `SELECT message.id, message.inbox_id, message.thread_id, message.direction, coalesce(to_jsonb(message)->>'attachments_state', CASE WHEN message.direction = 'inbound' AND coalesce(message.received_email_id, '') <> '' THEN CASE WHEN message.created_at < now() - interval '30 days' THEN 'unknown_metadata_expired' ELSE 'pending_backfill' END ELSE 'known' END), coalesce(message.subject,''), coalesce(message.text,''), coalesce(message.html,''), message.created_at, coalesce(message.provider_message_id,''), coalesce(message.internet_message_id,''), coalesce(message.from_json,'{}'), coalesce(message.to_json,'[]'), coalesce(message.cc_json,'[]'), message.org_id::text FROM messages message WHERE message.thread_id = $1 ORDER BY message.created_at ASC`, threadID)
+	rows, err := s.q.QueryContext(ctx, `SELECT message.id, message.inbox_id, message.thread_id, message.direction, coalesce(to_jsonb(message)->>'attachments_state', CASE WHEN message.direction = 'inbound' AND coalesce(message.received_email_id, '') <> '' THEN CASE WHEN message.created_at < now() - interval '30 days' THEN 'unknown_metadata_expired' ELSE 'pending_backfill' END ELSE 'known' END), coalesce(message.subject,''), coalesce(message.text,''), coalesce(message.html,''), message.created_at, coalesce(message.provider_message_id,''), coalesce(message.internet_message_id,''), coalesce(message.from_json,'{}'), coalesce(message.to_json,'[]'), coalesce(message.cc_json,'[]'), message.org_id::text FROM messages message WHERE message.thread_id = $1 AND message.inbox_id = $2 ORDER BY message.created_at ASC`, threadID, t.InboxID)
 	if err != nil {
 		return t, nil, err
 	}
@@ -137,7 +137,7 @@ func (s *Store) SearchInboxFTS(ctx context.Context, inboxID string, query string
 		substring(m.text from 1 for 200) AS snippet
 		FROM messages m
 		JOIN threads t ON t.id = m.thread_id
-		WHERE t.inbox_id = $1 AND to_tsvector('simple', coalesce(m.text,'')) @@ plainto_tsquery('simple', $2)
+		WHERE t.inbox_id = $1 AND m.inbox_id = t.inbox_id AND to_tsvector('simple', coalesce(m.text,'')) @@ plainto_tsquery('simple', $2)
 		ORDER BY score DESC
 		LIMIT $3`, inboxID, query, limit)
 	if err != nil {

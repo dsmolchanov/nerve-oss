@@ -14,6 +14,7 @@ import (
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"neuralmail/internal/auth"
+	"neuralmail/internal/localauth"
 	"neuralmail/internal/release"
 )
 
@@ -282,6 +283,9 @@ func newSDKServer(requestContext context.Context, runtime *Server) *sdkmcp.Serve
 	principal, hasPrincipal := auth.PrincipalFromContext(requestContext)
 	server.AddReceivingMiddleware(func(next sdkmcp.MethodHandler) sdkmcp.MethodHandler {
 		return func(ctx context.Context, method string, request sdkmcp.Request) (sdkmcp.Result, error) {
+			if identity, ok := localauth.FromContext(requestContext); ok {
+				ctx = localauth.WithIdentity(ctx, identity)
+			}
 			result, err := next(ctx, method, request)
 			if err == nil {
 				filterModernToolList(result, modernToolCatalog(requestContext, runtime, principal))
@@ -309,6 +313,9 @@ func newSDKServer(requestContext context.Context, runtime *Server) *sdkmcp.Serve
 					Principal: principal, Authorization: onboardingAuthorizationFromContext(requestContext),
 				}, request.Params.Name, request.Params.Arguments)
 			} else if request.Params.Name == billingSubscribeToolName {
+				if _, restricted := localauth.FromContext(ctx); restricted {
+					return nil, nil, localauth.ErrForbidden
+				}
 				result, err = invokeBillingTool(ctx, runtime.Billing, BillingCaller{
 					Principal: principal, Authorization: billingAuthorizationFromContext(requestContext),
 				}, request.Params.Name, request.Params.Arguments)

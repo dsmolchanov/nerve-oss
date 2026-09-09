@@ -2,8 +2,11 @@ package mcp
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"neuralmail/internal/config"
+	"strings"
 )
 
 const (
@@ -20,7 +23,24 @@ var (
 	}()
 )
 
-func ProtectedResourceMetadataHandler() http.Handler {
+func ProtectedResourceMetadataHandler(configs ...config.Config) http.Handler {
+	body := protectedResourceMetadataBody
+	if len(configs) > 0 {
+		var data map[string]any
+		_ = json.Unmarshal(body, &data)
+		cfg := configs[0]
+		if cfg.Cloud.PublicBaseURL != "" {
+			data["resource"] = strings.TrimRight(cfg.Cloud.PublicBaseURL, "/") + "/mcp"
+		}
+		if cfg.Auth.Issuer != "" {
+			data["authorization_servers"] = []string{cfg.Auth.Issuer}
+		}
+		body, _ = json.Marshal(data)
+		body = append(body, '\n')
+	}
+	digest := sha256.Sum256(body)
+	etag := fmt.Sprintf(`"%x"`, digest)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -28,11 +48,11 @@ func ProtectedResourceMetadataHandler() http.Handler {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", protectedResourceCacheControl)
-		w.Header().Set("ETag", protectedResourceMetadataETag)
-		if r.Header.Get("If-None-Match") == protectedResourceMetadataETag {
+		w.Header().Set("ETag", etag)
+		if r.Header.Get("If-None-Match") == etag {
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}
-		_, _ = w.Write(protectedResourceMetadataBody)
+		_, _ = w.Write(body)
 	})
 }

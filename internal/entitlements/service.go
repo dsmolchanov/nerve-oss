@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"os"
+	"neuralmail/configs"
 	"time"
 
 	"github.com/google/uuid"
@@ -347,7 +347,7 @@ func loadToolCosts(path string) (int64, map[string]int64) {
 	if path == "" {
 		return defaultCost, costs
 	}
-	data, err := os.ReadFile(path)
+	data, err := configs.ReadFile(path)
 	if err != nil {
 		return defaultCost, costs
 	}

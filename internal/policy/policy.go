@@ -2,7 +2,7 @@ package policy
 
 import (
 	"errors"
-	"os"
+	"neuralmail/configs"
 	"regexp"
 	"strings"
 
@@ -43,7 +43,7 @@ func Load(path string) (Policy, error) {
 	if path == "" {
 		return p, errors.New("missing policy path")
 	}
-	data, err := os.ReadFile(path)
+	data, err := configs.ReadFile(path)
 	if err != nil {
 		return p, err
 	}

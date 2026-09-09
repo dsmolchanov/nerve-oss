@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/mail"
-	"os"
+	"neuralmail/configs"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -24,6 +24,7 @@ import (
 	"neuralmail/internal/embed"
 	"neuralmail/internal/entitlements"
 	"neuralmail/internal/llm"
+	"neuralmail/internal/localauth"
 	"neuralmail/internal/observability"
 	"neuralmail/internal/policy"
 	"neuralmail/internal/store"
@@ -122,6 +123,9 @@ func (s *Service) ensureMessageBelongsToOrg(ctx context.Context, st *store.Store
 }
 
 func (s *Service) ListThreads(ctx context.Context, inboxID string, status string, limit int) (any, error) {
+	if err := s.CheckLocalAccess(ctx, "inbox", inboxID); err != nil {
+		return nil, err
+	}
 	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
 		if principal.OrgID != "" {
 			if err := s.ensureInboxBelongsToOrg(scopedCtx, st, principal.OrgID, inboxID); err != nil {
@@ -137,6 +141,9 @@ func (s *Service) ListThreads(ctx context.Context, inboxID string, status string
 }
 
 func (s *Service) GetThread(ctx context.Context, threadID string) (any, error) {
+	if err := s.CheckLocalAccess(ctx, "thread", threadID); err != nil {
+		return nil, err
+	}
 	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
 		if principal.OrgID != "" {
 			if err := s.ensureThreadBelongsToOrg(scopedCtx, st, principal.OrgID, threadID); err != nil {
@@ -152,6 +159,9 @@ func (s *Service) GetThread(ctx context.Context, threadID string) (any, error) {
 }
 
 func (s *Service) SearchInbox(ctx context.Context, inboxID string, query string, topK int) (any, error) {
+	if err := s.CheckLocalAccess(ctx, "inbox", inboxID); err != nil {
+		return nil, err
+	}
 	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
 		if principal.OrgID != "" {
 			if err := s.ensureInboxBelongsToOrg(scopedCtx, st, principal.OrgID, inboxID); err != nil {
@@ -189,6 +199,32 @@ func (s *Service) searchVector(ctx context.Context, inboxID, query string, topK 
 	}
 	results := make([]map[string]any, 0, len(hits))
 	for _, hit := range hits {
+		if _, restricted := localauth.FromContext(ctx); restricted {
+			messageID, _ := hit.Payload["message_id"].(string)
+			if err := s.CheckLocalAccess(ctx, "message", messageID); err != nil {
+				if errors.Is(err, localauth.ErrForbidden) {
+					continue
+				}
+				return nil, err
+			}
+			msg, err := s.Store.GetMessage(ctx, messageID)
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			if msg.InboxID != inboxID {
+				continue
+			}
+			// The index supplies ranking, not mailbox ownership or displayed content.
+			snippet := []rune(msg.Text)
+			if len(snippet) > 200 {
+				snippet = snippet[:200]
+			}
+			results = append(results, map[string]any{"message_id": msg.ID, "thread_id": msg.ThreadID, "score": hit.Score, "snippet": string(snippet)})
+			continue
+		}
 		results = append(results, map[string]any{
 			"message_id": hit.Payload["message_id"],
 			"thread_id":  hit.Payload["thread_id"],
@@ -200,11 +236,17 @@ func (s *Service) searchVector(ctx context.Context, inboxID, query string, topK 
 }
 
 func (s *Service) TriageMessage(ctx context.Context, messageID string) (any, error) {
+	if err := s.CheckLocalAccess(ctx, "message", messageID); err != nil {
+		return nil, err
+	}
 	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
 		if principal.OrgID != "" {
 			if err := s.ensureMessageBelongsToOrg(scopedCtx, st, principal.OrgID, messageID); err != nil {
 				return nil, err
 			}
+		}
+		if err := llm.RequireAvailable(s.LLM); err != nil {
+			return nil, err
 		}
 		msg, err := st.GetMessage(scopedCtx, messageID)
 		if err != nil {
@@ -226,11 +268,17 @@ func (s *Service) TriageMessage(ctx context.Context, messageID string) (any, err
 }
 
 func (s *Service) ExtractToSchema(ctx context.Context, messageID string, schemaID string) (any, error) {
+	if err := s.CheckLocalAccess(ctx, "message", messageID); err != nil {
+		return nil, err
+	}
 	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
 		if principal.OrgID != "" {
 			if err := s.ensureMessageBelongsToOrg(scopedCtx, st, principal.OrgID, messageID); err != nil {
 				return nil, err
 			}
+		}
+		if err := llm.RequireAvailable(s.LLM); err != nil {
+			return nil, err
 		}
 		msg, err := st.GetMessage(scopedCtx, messageID)
 		if err != nil {
@@ -268,11 +316,17 @@ func (s *Service) ExtractToSchema(ctx context.Context, messageID string, schemaI
 }
 
 func (s *Service) DraftReply(ctx context.Context, threadID string, goal string) (any, error) {
+	if err := s.CheckLocalAccess(ctx, "thread", threadID); err != nil {
+		return nil, err
+	}
 	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
 		if principal.OrgID != "" {
 			if err := s.ensureThreadBelongsToOrg(scopedCtx, st, principal.OrgID, threadID); err != nil {
 				return nil, err
 			}
+		}
+		if err := llm.RequireAvailable(s.LLM); err != nil {
+			return nil, err
 		}
 		thread, messages, err := st.GetThread(scopedCtx, threadID)
 		if err != nil {
@@ -378,10 +432,13 @@ func (s *Service) requireApprovalOverride(ctx context.Context, needsApproval boo
 }
 
 func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string, body string, bodyHTML string, needsApproval bool, idempotencyKey string, attachments []store.OutboundAttachment) (any, error) {
+	if err := s.CheckLocalAccess(ctx, "thread", threadID); err != nil {
+		return nil, err
+	}
 	if err := s.approvalGate(ctx, body, bodyHTML, needsApproval); err != nil {
 		return nil, err
 	}
-	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
+	return s.withOutboundStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
 		if principal.OrgID != "" {
 			if err := s.ensureThreadBelongsToOrg(scopedCtx, st, principal.OrgID, threadID); err != nil {
 				return nil, err
@@ -391,7 +448,7 @@ func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string,
 		if err != nil {
 			return nil, err
 		}
-		inboxID, _ := st.GetThreadInboxID(scopedCtx, threadID)
+		inboxID := thread.InboxID
 		if len(messages) == 0 {
 			return nil, errors.New("no messages in thread")
 		}
@@ -438,22 +495,12 @@ func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string,
 			return nil, errors.New("missing idempotency_key")
 		}
 
-		if !s.Config.Security.AllowOutbound && !isLocalDevRecipient(to) {
-			return nil, errors.New("outbound disabled for non-local domains")
-		}
-		if len(s.Config.Security.OutboundDomainAllowlist) > 0 && !domainAllowed(to, s.Config.Security.OutboundDomainAllowlist) {
-			return nil, errors.New("recipient domain not allowlisted")
-		}
-
 		provider := strings.TrimSpace(inbox.OutboundProvider)
 		if provider == "" {
 			provider = "smtp"
 		}
-		if s.Transport == nil {
-			return nil, errors.New("missing transport registry")
-		}
-		if _, ok := s.Transport.Outbound(provider); !ok {
-			return nil, fmt.Errorf("unknown outbound provider: %s", provider)
+		if err := s.checkOutboundConfiguration(to, provider); err != nil {
+			return nil, err
 		}
 
 		subject := "Re: " + thread.Subject
@@ -515,6 +562,19 @@ func replyRecipient(ctx context.Context, messagesStore replyMessageStore, princi
 	if len(messages) == 0 {
 		return "", errors.New("no messages in thread")
 	}
+	if principal.Kind == "" {
+		// OSS replies target inbound mail, including JMAP mail without a cloud
+		// received-email ID. A prior outbound reply must never retarget a retry.
+		for index := len(messages) - 1; index >= 0; index-- {
+			message := messages[index]
+			if message.Direction == "inbound" && message.ThreadID == thread.ID && message.InboxID == thread.InboxID {
+				if recipient := strings.TrimSpace(message.From.Email); recipient != "" {
+					return recipient, nil
+				}
+			}
+		}
+		return "", errors.New("no inbound reply target")
+	}
 	if principal.Kind != auth.PrincipalM2MOrg {
 		return messages[len(messages)-1].From.Email, nil
 	}
@@ -542,6 +602,9 @@ func (s *Service) ComposeEmail(ctx context.Context, inboxID, toAddress, subject,
 }
 
 func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddress, subject, body string, bodyHTML string, idempotencyKey string, options ComposeEmailOptions) (any, error) {
+	if err := s.CheckLocalAccess(ctx, "inbox", inboxID); err != nil {
+		return nil, err
+	}
 	if subject == "" {
 		return nil, errors.New("missing subject")
 	}
@@ -564,7 +627,7 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 		return nil, err
 	}
 
-	return s.withScopedStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
+	return s.withOutboundStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
 		if principal.OrgID != "" {
 			if err := s.ensureInboxBelongsToOrg(scopedCtx, st, principal.OrgID, inboxID); err != nil {
 				return nil, err
@@ -602,22 +665,12 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 			return nil, errors.New("missing idempotency_key")
 		}
 
-		if !s.Config.Security.AllowOutbound && !isLocalDevRecipient(toAddress) {
-			return nil, errors.New("outbound disabled for non-local domains")
-		}
-		if len(s.Config.Security.OutboundDomainAllowlist) > 0 && !domainAllowed(toAddress, s.Config.Security.OutboundDomainAllowlist) {
-			return nil, errors.New("recipient domain not allowlisted")
-		}
-
 		provider := strings.TrimSpace(inbox.OutboundProvider)
 		if provider == "" {
 			provider = "smtp"
 		}
-		if s.Transport == nil {
-			return nil, errors.New("missing transport registry")
-		}
-		if _, ok := s.Transport.Outbound(provider); !ok {
-			return nil, fmt.Errorf("unknown outbound provider: %s", provider)
+		if err := s.checkOutboundConfiguration(toAddress, provider); err != nil {
+			return nil, err
 		}
 
 		outboxID, err := st.EnqueueOutboxMessage(scopedCtx, store.OutboxMessage{
@@ -801,7 +854,7 @@ func LoadSchema(schemaID string) (map[string]any, error) {
 	if filepath.Dir(resolved) != root {
 		return nil, errors.New("invalid schema id")
 	}
-	data, err := os.ReadFile(path)
+	data, err := configs.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}

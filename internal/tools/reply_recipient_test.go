@@ -55,3 +55,18 @@ func TestReplyRecipientPreservesLegacyLatestMessageBehavior(t *testing.T) {
 		t.Fatalf("legacy recipient=%q", recipient)
 	}
 }
+
+func TestOSSReplyRecipientDoesNotRetargetAfterAnOutboundReply(t *testing.T) {
+	thread := store.Thread{ID: "thread-1", InboxID: "inbox-1"}
+	inbound := store.Message{ID: "inbound", ThreadID: thread.ID, InboxID: thread.InboxID, Direction: "inbound", From: store.Participant{Email: "sender@example.test"}}
+	for _, afterReply := range []bool{false, true} {
+		messages := []store.Message{inbound}
+		if afterReply {
+			messages = append(messages, store.Message{ThreadID: thread.ID, InboxID: thread.InboxID, Direction: "outbound", From: store.Participant{Email: "agent@example.test"}})
+		}
+		got, err := replyRecipient(context.Background(), nil, auth.Principal{}, thread, messages)
+		if err != nil || got != "sender@example.test" {
+			t.Fatalf("afterReply=%t got=%s err=%v", afterReply, got, err)
+		}
+	}
+}
