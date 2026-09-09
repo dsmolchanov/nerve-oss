@@ -36,6 +36,13 @@ func main() {
 		log.Fatalf("config error: %v", err)
 	}
 
+	if handled, err := startup.SchemaQuiescence(context.Background(), os.Getenv("NERVE_SCHEMA_TRANSITION_MODE"), cfg.Cloud.Mode, "administrative-command", ""); handled {
+		if err != nil {
+			log.Fatalf("schema quiescence: %v", err)
+		}
+		return
+	}
+
 	switch cmd {
 	case "up":
 		runCompose("up", "-d")
