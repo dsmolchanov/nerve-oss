@@ -80,6 +80,10 @@ func TestUnavailableAILegacyHTTP(t *testing.T) {
 func TestUnavailableAIModernHTTP(t *testing.T) {
 	for _, jsonResponse := range []bool{true, false} {
 		cfg := config.Default()
+		// A client can receive an SSE result before its handler releases memory.
+		// Allow overlap of this fixture's initialize, initialized, and tool requests;
+		// shared-budget admission is tested separately in sdk_server_test.go.
+		cfg.Memory.BudgetBytes = int64(len(unavailableCalls)+2) * maxModernRequestMemoryBytes
 		srv := NewServer(cfg, &tools.Service{LLM: llm.NewNoop()}, nil, nil)
 		hosted := httptest.NewServer(NewRouter(cfg, nil, NewLegacyHandler(srv), NewSDKHandler(srv, jsonResponse)))
 		client := newModernSDKTestClient()

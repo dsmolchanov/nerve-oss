@@ -29,6 +29,13 @@ import (
 )
 
 func main() {
+	if handled, err := release.HandleRuntimeCompatibility(os.Args[1:], os.Stdout); handled {
+		if err != nil {
+			log.Fatalf("runtime compatibility: %v", err)
+		}
+		return
+	}
+
 	if len(os.Args) < 2 {
 		usage()
 		return
