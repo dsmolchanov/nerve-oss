@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"sort"
@@ -105,11 +106,13 @@ type Config struct {
 		Timeout          time.Duration `yaml:"timeout"`
 	} `yaml:"onboarding"`
 	Security struct {
-		APIKey                  string   `yaml:"api_key"`
-		TokenSigningKey         string   `yaml:"token_signing_key"`
-		AllowOutbound           bool     `yaml:"allow_outbound"`
-		AllowSendWithWarnings   bool     `yaml:"allow_send_with_warnings"`
-		OutboundDomainAllowlist []string `yaml:"outbound_domain_allowlist"`
+		APIKey                  string        `yaml:"api_key"`
+		LocalAPIKeys            []LocalAPIKey `yaml:"local_api_keys"`
+		AllowUnauthenticated    bool          `yaml:"allow_unauthenticated"`
+		TokenSigningKey         string        `yaml:"token_signing_key"`
+		AllowOutbound           bool          `yaml:"allow_outbound"`
+		AllowSendWithWarnings   bool          `yaml:"allow_send_with_warnings"`
+		OutboundDomainAllowlist []string      `yaml:"outbound_domain_allowlist"`
 	} `yaml:"security"`
 	Log struct {
 		Level string `yaml:"level"`
@@ -118,7 +121,7 @@ type Config struct {
 
 func Default() Config {
 	var cfg Config
-	cfg.HTTP.Addr = ":8088"
+	cfg.HTTP.Addr = "127.0.0.1:8088"
 	cfg.HTTP.ReadTimeout = 30 * time.Second
 	cfg.Memory.BudgetBytes = 64 << 20
 	cfg.Dev.Mode = true
@@ -161,6 +164,12 @@ func Load(path string) (Config, error) {
 
 	legacyOnly := applyPreferredEnvAliases()
 	applyEnv(&cfg)
+	if v := os.Getenv("NERVE_ALLOW_UNAUTHENTICATED"); v != "" {
+		if v != "true" && v != "false" {
+			return cfg, fmt.Errorf("NERVE_ALLOW_UNAUTHENTICATED must be true or false")
+		}
+		cfg.Security.AllowUnauthenticated = v == "true"
+	}
 	if len(legacyOnly) > 0 {
 		log.Printf("config warning: legacy NM_* env vars are deprecated; prefer NERVE_* (using: %s)", strings.Join(legacyOnly, ", "))
 	}

@@ -7,6 +7,7 @@ import (
 
 	"neuralmail/internal/auth"
 	"neuralmail/internal/llm"
+	"neuralmail/internal/localauth"
 	"neuralmail/internal/store"
 	"neuralmail/internal/tools"
 )
@@ -36,6 +37,13 @@ func (invoker *Invoker) Invoke(ctx context.Context, invocation ToolInvocation) (
 	}
 	if invocation.Name == "" {
 		return nil, errors.New("tool name is required")
+	}
+	if _, restricted := localauth.FromContext(ctx); restricted {
+		switch invocation.Name {
+		case "list_threads", "get_thread", "search_inbox", "triage_message", "extract_to_schema", "draft_reply_with_policy", "send_reply", "compose_email":
+		default:
+			return nil, localauth.ErrForbidden
+		}
 	}
 	if invoker.server.Config.Cloud.Mode {
 		principal, ok := auth.PrincipalFromContext(ctx)

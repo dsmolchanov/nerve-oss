@@ -96,6 +96,9 @@ func serveWorkerOption(cloudMode bool, args []string) (bool, error) {
 }
 
 func runServe(ctx context.Context, cfg config.Config, withWorker bool) error {
+	if err := cfg.ValidateSelfhost(); err != nil {
+		return err
+	}
 	appInstance, err := app.New(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("app init: %w", err)

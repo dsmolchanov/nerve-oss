@@ -61,6 +61,8 @@ RUN ln -s /app/nerve-runtime /app/neuralmaild
 COPY configs /app/configs
 COPY internal/store/migrations /app/internal/store/migrations
 
+ENV NERVE_HTTP_ADDR=0.0.0.0:8088
+
 EXPOSE 8088
 ENTRYPOINT ["/app/nerve-runtime"]
 CMD ["serve"]
