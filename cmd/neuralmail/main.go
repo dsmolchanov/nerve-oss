@@ -107,6 +107,9 @@ func runCompose(args ...string) {
 }
 
 func runMigrations(cfg config.Config, migrate func(context.Context, *sql.DB) error) {
+	if err := startup.CheckEmbeddedMigration(); err != nil {
+		log.Fatalf("migration policy: %v", err)
+	}
 	db, err := sql.Open("pgx", cfg.Database.DSN)
 	if err != nil {
 		log.Fatalf("open database: %v", err)
