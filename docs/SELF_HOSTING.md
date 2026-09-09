@@ -230,3 +230,26 @@ historical rows are excluded from thread/search results and denied by direct
 message resources; this does not delete or repair them. Local vector results
 use the database for ownership and displayed content, so a stale index cannot
 supply another inbox's snippet or thread identifier.
+
+## Updating a deployment
+
+Choose a reviewed commit or release compatible with your current schema and
+configuration. The local Compose stack builds the checked-out source; `docker
+compose pull` alone does not update the runtime. Record your current commit,
+configuration, image and schema versions before changing them.
+
+1. Read the target's release notes and migration window. Test the update against
+   an isolated restored database with outbound workers disabled.
+2. Stop the runtime and any separate workers; make and verify a fresh backup using
+   the procedure above. Back up the other stores and configuration as required.
+3. Check out the chosen ref, review changes to Compose/YAML and preserve your private
+   credentials. Run `docker compose up -d --build --wait` with the same project name
+   and the profiles you use (include `--profile full` before `up` for local Stalwart).
+4. Run `make mcp-test` and verify a synthetic receive/reply through your transport.
+   Check queued/failed deliveries and logs before resuming normal traffic.
+
+Startup applies/verifies only its supported migration window. An incompatible
+schema is a reason to stop and investigate, not to disable verification. Returning
+to an older image after migrations is not a guaranteed rollback. Restore into a
+separate database and reconcile deliveries before any cutover; old snapshots may
+contain messages that were already sent. Do not run down migrations blindly.

@@ -1,75 +1,87 @@
-# Nerve (powered by NeuralMail OSS engine)
+# Nerve
 
-Nerve is an open-source email agent runtime: JMAP-first inboxes, vector memory, and workflow-grade MCP tools. The repo name remains `neuralmail`, while the product brand is **Nerve**.
+Nerve is an Apache-2.0 email agent runtime, powered by the NeuralMail engine.
+It reads an inbox through JMAP and exposes MCP tools to list, read, search and
+reply to email. Run it with your own PostgreSQL, Redis and mail transport, or
+start the local Docker environment below.
 
 ## Quickstart
 
-```bash
+Requires Docker with Compose v2, `make`, and `openssl`. From a checkout of this
+repository, run these three commands. The first creates private random credentials
+and refuses to overwrite an existing `.env`; keep your existing file on later runs.
+
+```sh
+( set -eu; umask 077; set -C; key=$(openssl rand -hex 32); db=$(openssl rand -hex 32); mail=$(openssl rand -hex 32); printf 'NERVE_API_KEY=%s\nPOSTGRES_PASSWORD=%s\nSTALWART_PASSWORD=%s\n' "$key" "$db" "$mail" > .env )
 make up
-make seed
 make mcp-test
 ```
 
-By default, the Make targets use `configs/dev/host.yaml` (localhost ports). To run against a different config:
-```bash
-CONFIG=configs/dev/cortex.yaml make seed
+Go is not required for these container commands. MCP is at
+`http://localhost:8088/mcp` and requires the bearer token in `.env`'s `NERVE_API_KEY`.
+The [Mailpit viewer](http://localhost:8025) captures outbound messages. The default
+sandbox starts the runtime with its outbox worker, PostgreSQL and persistent Redis.
+It does not receive Internet email.
+
+For real local inbound ingestion, start Stalwart and seed its inbox:
+
+```sh
+docker compose --profile full up -d --wait
+make seed-full
+# Allow up to 30 seconds for JMAP polling.
+make mcp-test
 ```
 
-Then open:
-- `http://localhost:8088/healthz`
-- `http://localhost:8088/debug`
+`make seed` targets Mailpit's viewer only; it does not populate the runtime inbox.
+See [self-hosting](docs/SELF_HOSTING.md) for seed markers, local ports, authentication,
+your own SMTP/JMAP server, persistent volumes, upgrades and tested backup/restore.
 
-## What You Get
-- Local inbox stack: Stalwart + Postgres + Redis + Qdrant + MinIO
-- MCP tools: list/get/search, triage, extract, draft, send
-- Policy guardrails and audit logging
-- A static landing page in `site/`
+## Self-host and Cloud
 
-## MCP Tools
-- `list_threads`
-- `get_thread`
-- `search_inbox`
-- `triage_message`
-- `extract_to_schema`
-- `draft_reply_with_policy`
-- `send_reply`
-- `compose_email`
+| Responsibility | Self-host runtime | Cloud operating model |
+| --- | --- | --- |
+| Runtime, database and upgrades | Operated by you | Operated by the service |
+| Mail transport | Your JMAP/SMTP server or configured provider | Managed mail operations |
+| Domains and delivery | You configure DNS, TLS and sender authentication | Hosted domain onboarding and operations |
+| Local agent access | Owner bearer key or inbox-scoped local keys | Organization and machine-client access |
+| Backup and recovery | You operate and verify recovery | Service-managed operations |
 
-See `docs/MCP_Contract.md` for schemas.
+Cloud access follows the hosted onboarding process. This repository's local
+quickstart does not require a subscription or license key. Hybrid onboarding is
+not part of this quickstart.
 
-## Developer Experience
-- `make up`: start local stack
-- `make seed`: send dramatic demo emails (outage + refund)
-- `make mcp-test`: validate MCP endpoint
-- `make doctor`: connectivity checks
+## MCP tools and current limits
 
-## Configuration
-Defaults live in `configs/dev/cortex.yaml`. Environment variables override config.
+- `list_threads`, `get_thread`, `search_inbox`: read and search email. Default search
+  uses PostgreSQL full-text search; Qdrant is optional.
+- `send_reply`, `compose_email`: enqueue mail through the configured outbound
+  transport. Use an idempotency key for retries.
+- `triage_message`, `extract_to_schema`, `draft_reply_with_policy`: exposed in the
+  contract, but the default noop provider returns `ai_unavailable`. The OpenAI and
+  Ollama adapters in this version are placeholders; selecting them does not enable AI.
 
-Key env vars (preferred):
-- `NERVE_JMAP_URL`
-- `NERVE_DB_DSN`
-- `NERVE_QDRANT_URL`
-- `NERVE_REDIS_URL`
-- `NERVE_SMTP_HOST`
-- `NERVE_POLICY_PATH`
+See the [MCP contract](docs/MCP_Contract.md) for protocol profiles and schemas.
+The runtime binary is `nerve-runtime`; `neuralmaild` remains its legacy alias in
+the container. Go module and package paths still use `neuralmail`.
 
-Legacy aliases are still supported during migration:
-- `NM_JMAP_URL`
-- `NM_DB_DSN`
-- `NM_QDRANT_URL`
-- `NM_REDIS_URL`
-- `NM_SMTP_HOST`
-- `NM_POLICY_PATH`
+## Configuration and development
 
-## Repo Split Transition
-- Runtime pin for cloud deploys: `deploy/cloud/runtime.lock`
-- Cloud deploy order (core migrations -> cloud migrations -> deploys): `scripts/deploy/cloud_deploy.sh`
-- Local two-repo loop guide: `docs/TWO_REPO_DEV_LOOP.md`
+[Configuration reference](docs/CONFIGURATION.md) lists the runtime environment
+variables and their YAML fields. [.env.example](.env.example) covers the variables
+consumed by the local Compose stack. An arbitrary variable added to `.env` is not
+automatically forwarded into a container: use an explicit Compose override.
+
+- `make up`, `make down`, `make logs`: manage the local stack; `down` preserves volumes.
+- `make mcp-test`: check the container's MCP endpoint.
+- `make build`, `make test`, `make lint`: build binaries, run Go tests and check formatting/vet.
+- `make run`: run the host binary using `CONFIG` (requires configured host-accessible services).
+- `make selfhost-smoke`: run the isolated SMTP/JMAP, persistence and restore checks.
+
+See [CONTRIBUTING](CONTRIBUTING.md), [security reporting](SECURITY.md),
+[community conduct](CODE_OF_CONDUCT.md), and the [changelog](CHANGELOG.md).
 
 ## License
-- NeuralMail code: Apache-2.0 (see [LICENSE](LICENSE) and [NOTICE](NOTICE))
-- Stalwart Mail Server: AGPLv3 (separate container dependency)
 
-## Branding
-The OSS runtime service is `nerve-runtime` (legacy binary alias: `neuralmaild`); the product is **Nerve** (`nerve.email`).
+Runtime code is [Apache-2.0](LICENSE); see [NOTICE](NOTICE). Separately distributed
+containers and dependencies retain their own licenses. Stalwart is a separate
+mail-server dependency, not part of the Apache-licensed runtime.
