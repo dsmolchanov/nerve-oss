@@ -47,12 +47,16 @@ func compiledRuntimeManifest() (map[string]string, error) {
 	if err != nil || built.Format("2006-01-02T15:04:05Z") != BuildTime {
 		return nil, errors.New("runtime build time is not canonical UTC")
 	}
+	window, err := startup.EffectiveMigrationWindow()
+	if err != nil {
+		return nil, err
+	}
 	return map[string]string{
 		"runtime_version":           RuntimeVersion,
 		"mcp_contract_hash":         MCPContractHash,
 		"core_schema_hash":          CoreSchemaHash,
-		"core_schema_min_required":  strconv.FormatInt(startup.CoreMinRequired, 10),
-		"core_schema_max_supported": strconv.FormatInt(startup.CoreMaxSupported, 10),
+		"core_schema_min_required":  strconv.FormatInt(window.CoreMinRequired, 10),
+		"core_schema_max_supported": strconv.FormatInt(window.CoreMaxSupported, 10),
 		"outbound_policy_version":   OutboundPolicyVersion,
 		"outbound_policy_sha256":    OutboundPolicySHA256,
 		"build_commit":              BuildCommit,

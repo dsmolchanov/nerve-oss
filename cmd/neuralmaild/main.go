@@ -83,10 +83,16 @@ func main() {
 }
 
 func migrateCoreToRuntimeWindow(ctx context.Context, db *sql.DB) error {
+	if err := startup.CheckEmbeddedMigration(); err != nil {
+		return err
+	}
 	return store.MigrateUpToCore(ctx, db, startup.CoreMaxSupported)
 }
 
 func migrateCloudToRuntimeWindow(ctx context.Context, db *sql.DB) error {
+	if err := startup.CheckEmbeddedMigration(); err != nil {
+		return err
+	}
 	return store.MigrateUpToCloud(ctx, db, startup.RuntimeCloudMaxSupported)
 }
 
@@ -260,6 +266,9 @@ func runStdio(ctx context.Context, cfg config.Config) {
 }
 
 func runMigrations(ctx context.Context, cfg config.Config, migrateFn func(context.Context, *sql.DB) error) {
+	if err := startup.CheckEmbeddedMigration(); err != nil {
+		log.Fatalf("migration policy: %v", err)
+	}
 	storeInstance, err := store.Open(cfg.Database.DSN)
 	if err != nil {
 		log.Fatalf("store error: %v", err)

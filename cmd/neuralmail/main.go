@@ -77,10 +77,16 @@ func main() {
 }
 
 func migrateCoreToRuntimeWindow(ctx context.Context, db *sql.DB) error {
+	if err := startup.CheckEmbeddedMigration(); err != nil {
+		return err
+	}
 	return store.MigrateUpToCore(ctx, db, startup.CoreMaxSupported)
 }
 
 func migrateCloudToRuntimeWindow(ctx context.Context, db *sql.DB) error {
+	if err := startup.CheckEmbeddedMigration(); err != nil {
+		return err
+	}
 	return store.MigrateUpToCloud(ctx, db, startup.RuntimeCloudMaxSupported)
 }
 
@@ -101,6 +107,9 @@ func runCompose(args ...string) {
 }
 
 func runMigrations(cfg config.Config, migrate func(context.Context, *sql.DB) error) {
+	if err := startup.CheckEmbeddedMigration(); err != nil {
+		log.Fatalf("migration policy: %v", err)
+	}
 	db, err := sql.Open("pgx", cfg.Database.DSN)
 	if err != nil {
 		log.Fatalf("open database: %v", err)
