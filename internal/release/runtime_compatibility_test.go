@@ -29,7 +29,7 @@ func TestRuntimeCompatibilityMetadataValidation(t *testing.T) {
 	if _, err := compiledRuntimeManifest(); err != nil {
 		t.Fatal(err)
 	}
-	for i, values := range [][]string{{"", "dev", "bad\nversion"}, {"unknown", strings.Repeat("A", 64)}, {"bad", ""}, {"unknown", "bad policy"}, {"bad", ""}, {"short", strings.Repeat("D", 40)}, {"2026-02-30T00:00:00Z", "2026-09-09T00:00:00+00:00"}} {
+	for i, values := range [][]string{{"", "dev", "unknown", "bad\nversion"}, {"unknown", strings.Repeat("A", 64)}, {"bad", ""}, {"unknown", "bad policy"}, {"bad", ""}, {"short", strings.Repeat("D", 40)}, {"2026-02-30T00:00:00Z", "2026-09-09T00:00:00+00:00"}} {
 		for _, value := range values {
 			*variables[i] = value
 			if _, err := compiledRuntimeManifest(); err == nil {

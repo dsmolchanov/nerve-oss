@@ -42,3 +42,9 @@ After acceptance of PR #93, branch `codex/mcp2-runtime-compatibility` starts at 
 This increment implements the native report prerequisite with the existing frozen Core29 window. Configurable bridge/target windows, versioned image publishing, source-pin adoption and combined DB rehearsal remain unchecked. No future migration number is allocated. Tests must build/run the real command with invalid config/DB environment, compare all manifest fields with the existing generator and hash the binary independently; malformed flags and dev metadata fail without application startup.
 
 Native report validation: `go test -race ./internal/release ./internal/startup ./cmd/neuralmaild -count=1`, targeted `go vet`, and `scripts/ci/test_schema_quiescence_executables.py` PASS. The executable test builds release/dev binaries, compares all nine generator fields, hashes the running artifact independently, and verifies environment overrides cannot supply release identity. The current Core29 window remains frozen; this is not a bridge/target or DB admission claim.
+
+## Native report review and CI follow-up — 2026-09-09
+
+Reject the explicit `unknown` runtime identity as well as `dev`, with negative metadata coverage. The authorized CI fix also includes `internal/mcp/ai_unavailable_test.go`: size only this wire-test fixture budget for its bounded initialize/initialized/tool requests, whose server cleanup may overlap after the SDK receives SSE results. Keep AI error assertions and production memory limits unchanged; existing SDK budget rejection/release tests remain required.
+
+Follow-up validation: `go test -race ./internal/release ./internal/mcp ./cmd/neuralmaild -count=1`, `go test -race ./internal/mcp -run '^TestUnavailableAIModernHTTP$' -count=50 -timeout=90s`, and `go vet ./internal/release ./internal/mcp ./cmd/neuralmaild` PASS. The MCP package run includes shared-budget rejection and release regression coverage.

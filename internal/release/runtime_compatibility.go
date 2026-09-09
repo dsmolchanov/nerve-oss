@@ -33,7 +33,7 @@ var metadataRevision = regexp.MustCompile(`^[0-9a-f]{40}$`)
 var metadataVersion = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 
 func compiledRuntimeManifest() (map[string]string, error) {
-	if !metadataVersion.MatchString(RuntimeVersion) || RuntimeVersion == "dev" ||
+	if !metadataVersion.MatchString(RuntimeVersion) || RuntimeVersion == "dev" || RuntimeVersion == "unknown" ||
 		!metadataVersion.MatchString(OutboundPolicyVersion) || OutboundPolicyVersion == "unknown" ||
 		!metadataRevision.MatchString(BuildCommit) {
 		return nil, errors.New("runtime release identity is not compiled")
