@@ -76,6 +76,13 @@ makes a review loop unable to terminate.
   generic "not found" is not proof and must refuse. Enforced by
   `scripts/ci/test_candidate_version_probe.sh`.
 
+- Schema quiescence opens no listener and constructs no HTTP/auth/store/provider
+  dependency; serve and worker wait only for cancellation. Retryable maintenance
+  responses belong to the external ingress and require deployment verification.
+  Enforced by `TestSchemaQuiescenceOpensNoListener`,
+  `TestSchemaQuiescenceHasNoNetworkDependency`, and
+  `scripts/ci/test_schema_quiescence_executables.py`.
+
 - Cloud mode must never reach the local debug renderer, even if the handler is
   accidentally mounted. OSS debug accepts the owner key and rejects mailbox
   keys. Enforced by `TestDebugAccessMatrix` in internal/app/debug_access_test.go.

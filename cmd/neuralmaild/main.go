@@ -44,6 +44,13 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	if handled, err := startup.SchemaQuiescence(ctx, os.Getenv("NERVE_SCHEMA_TRANSITION_MODE"), cfg.Cloud.Mode, cmd, cfg.HTTP.Addr); handled {
+		if err != nil {
+			log.Fatalf("schema quiescence: %v", err)
+		}
+		return
+	}
+
 	switch cmd {
 	case "serve":
 		withWorker, err := serveWorkerOption(cfg.Cloud.Mode, os.Args[2:])
