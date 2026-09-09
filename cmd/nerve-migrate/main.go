@@ -84,6 +84,10 @@ func run(ctx context.Context, args []string, stdout io.Writer, openBackend openB
 		return err
 	}
 
+	if err := validateCompiledCommand(cmd); err != nil {
+		return err
+	}
+
 	backend, err := openBackend()
 	if err != nil {
 		if backend != nil {
@@ -283,6 +287,9 @@ func isHelp(value string) bool {
 }
 
 func execute(ctx context.Context, cmd command, backend migrationBackend) (string, error) {
+	if err := validateCompiledCommand(cmd); err != nil {
+		return "", err
+	}
 	switch cmd.action {
 	case actionStatus:
 		statuses, err := readStatuses(ctx, backend, cmd.scope)
@@ -357,7 +364,11 @@ func execute(ctx context.Context, cmd command, backend migrationBackend) (string
 func defaultTarget(scope migrationScope) int64 {
 	switch scope {
 	case scopeCore:
-		return startup.CoreMaxSupported
+		window, err := startup.EffectiveMigrationWindow()
+		if err != nil {
+			return -1
+		} // execute validates before reading the backend.
+		return window.CoreMaxSupported
 	case scopeCloud:
 		return startup.RuntimeCloudMaxSupported
 	default:
@@ -511,4 +522,24 @@ func (b *storeBackend) Down(ctx context.Context, scope migrationScope) error {
 
 func (b *storeBackend) Close() error {
 	return b.store.Close()
+}
+
+func validateCompiledCommand(cmd command) error {
+	window, err := startup.EffectiveMigrationWindow()
+	if err != nil {
+		return err
+	}
+	if startup.CompiledSchemaWindow == "" {
+		return nil
+	}
+	if cmd.action == actionDown {
+		return errors.New("successor Core down is forbidden")
+	}
+	if cmd.scope != scopeCore {
+		return errors.New("successor migrator requires explicit --scope core")
+	}
+	if cmd.target != nil && (*cmd.target < window.CoreMinRequired || *cmd.target > window.CoreMaxSupported) {
+		return errors.New("successor migration target is outside the compiled window")
+	}
+	return nil
 }

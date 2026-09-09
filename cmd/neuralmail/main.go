@@ -77,10 +77,16 @@ func main() {
 }
 
 func migrateCoreToRuntimeWindow(ctx context.Context, db *sql.DB) error {
+	if err := startup.CheckEmbeddedMigration(); err != nil {
+		return err
+	}
 	return store.MigrateUpToCore(ctx, db, startup.CoreMaxSupported)
 }
 
 func migrateCloudToRuntimeWindow(ctx context.Context, db *sql.DB) error {
+	if err := startup.CheckEmbeddedMigration(); err != nil {
+		return err
+	}
 	return store.MigrateUpToCloud(ctx, db, startup.RuntimeCloudMaxSupported)
 }
 

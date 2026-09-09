@@ -2,6 +2,10 @@ FROM golang:1.25.13-alpine AS build
 
 WORKDIR /src
 
+ARG RUNTIME_MANIFEST_VERSION=1
+ARG ARTIFACT_ROLE
+ARG CORE_SCHEMA_MIN_REQUIRED
+ARG CORE_SCHEMA_MAX_SUPPORTED
 ARG RUNTIME_VERSION=dev
 ARG MCP_CONTRACT_HASH=unknown
 ARG CORE_SCHEMA_HASH=unknown
@@ -11,11 +15,17 @@ ARG BUILD_COMMIT=unknown
 ARG BUILD_TIME=unknown
 
 COPY go.mod ./
+RUN apk add --no-cache bash
 RUN go mod download
 
 COPY . .
+RUN bash scripts/release/runtime_schema_window.sh > /tmp/runtime-window && \
+  if [ "$RUNTIME_MANIFEST_VERSION" = 2 ]; then \
+    test "$(cat /tmp/runtime-window)" = "2:${CORE_SCHEMA_MIN_REQUIRED}:${CORE_SCHEMA_MAX_SUPPORTED}"; \
+  fi
 RUN CGO_ENABLED=0 GOOS=linux go build \
   -ldflags "-s -w \
+    -X neuralmail/internal/startup.CompiledSchemaWindow=$(cat /tmp/runtime-window) \
     -X neuralmail/internal/release.RuntimeVersion=${RUNTIME_VERSION} \
     -X neuralmail/internal/release.MCPContractHash=${MCP_CONTRACT_HASH} \
     -X neuralmail/internal/release.CoreSchemaHash=${CORE_SCHEMA_HASH} \
@@ -25,9 +35,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
   -X neuralmail/internal/release.BuildTime=${BUILD_TIME}" \
   -o /out/nerve-runtime ./cmd/neuralmaild
 RUN CGO_ENABLED=0 GOOS=linux go build \
-  -ldflags "-s -w" \
+  -ldflags "-s -w -X neuralmail/internal/startup.CompiledSchemaWindow=$(cat /tmp/runtime-window)" \
   -o /out/nerve-migrate ./cmd/nerve-migrate
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-s -w" -o /out/neuralmail ./cmd/neuralmail
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-s -w -X neuralmail/internal/startup.CompiledSchemaWindow=$(cat /tmp/runtime-window)" -o /out/neuralmail ./cmd/neuralmail
 
 FROM alpine:3.20
 
