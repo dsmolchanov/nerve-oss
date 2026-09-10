@@ -10,10 +10,26 @@
 #
 # Deterministic: git, curl and docker are stubbed on PATH, so no network.
 set -euo pipefail
+[[ $# -eq 0 ]] || { echo "candidate probe suite accepts no arguments" >&2; exit 2; }
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="$ROOT_DIR/scripts/release/prove_candidate_version_unused.sh"
 [[ -x "$SCRIPT" ]] || { echo "missing $SCRIPT" >&2; exit 1; }
+
+# A folded YAML scalar silently passed the second suite as arguments to this
+# script. Require this closed two-command literal step, not text occurrences.
+python3 - "$ROOT_DIR/.github/workflows/ci.yml" <<'PYTHON'
+from pathlib import Path
+import sys
+text=Path(sys.argv[1]).read_text()
+header='      - name: Candidate uniqueness probe contract\n'
+if text.count(header)!=1:
+    raise SystemExit('candidate suite step must occur exactly once')
+step=text.split(header,1)[1].split('      - ',1)[0]
+expected='        run: |\n          ./scripts/ci/test_candidate_version_probe.sh\n          bash scripts/ci/test_runtime_candidate_contract.sh\n'
+if step!=expected:
+    raise SystemExit('candidate suites must be separate unconditional commands in a literal run block')
+PYTHON
 
 failures=0
 
