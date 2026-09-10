@@ -10,6 +10,20 @@ on:
         description: "Frozen final runtime semver (vX.Y.Z). Must be unused everywhere; no tag or Release is created."
         required: true
         type: string
+      manifest_version:
+        description: "Runtime build contract; 1 preserves the historical candidate."
+        required: true
+        default: "1"
+        type: choice
+        options: ["1", "2"]
+      successor_role:
+        description: "For version 2 only: B (bridge) or C (target)."
+        required: false
+        type: string
+      prior_core_head:
+        description: "Version-2 bridge prior Core head; target derives its minimum from source."
+        required: false
+        type: string
       confirm:
         description: Type BUILD-RUNTIME-CANDIDATE.
         required: true
@@ -169,6 +183,13 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - name: Select versioned candidate contract
+        env:
+          RUNTIME_MANIFEST_VERSION: ${{ inputs.manifest_version }}
+          ARTIFACT_ROLE: ${{ inputs.successor_role }}
+          CORE_SCHEMA_MIN_REQUIRED: ${{ inputs.prior_core_head }}
+        run: bash scripts/release/select_runtime_candidate_contract.sh >> "$GITHUB_ENV"
+
       - name: Require a successful main CI run for this exact SHA
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -241,11 +262,12 @@ jobs:
         run: |
           set -euo pipefail
           # Fail here rather than let nerve-cloud reject the artifact later.
-          jq -e --arg version "${FINAL_VERSION}" --arg commit "${GITHUB_SHA}" '
+          jq -e --arg version "${FINAL_VERSION}" --arg commit "${GITHUB_SHA}" \
+            --arg min "${CORE_SCHEMA_MIN_REQUIRED}" --arg max "${CORE_SCHEMA_MAX_SUPPORTED}" '
             .runtime_version == $version and
             .build_commit == $commit and
-            .core_schema_min_required == "29" and
-            .core_schema_max_supported == "29" and
+            .core_schema_min_required == $min and
+            .core_schema_max_supported == $max and
             .outbound_policy_version == "autonomous-outbound-v1" and
             (.mcp_contract_hash | test("^[0-9a-f]{64}$")) and
             (.core_schema_hash | test("^[0-9a-f]{64}$")) and
@@ -273,8 +295,12 @@ jobs:
           push: true
           # A content-addressed tag, never the frozen semver: these bytes must
           # not be reachable by the name Phase 10 will publish.
-          tags: ghcr.io/${{ github.repository_owner }}/nerve-runtime:candidate-${{ github.sha }}
+          tags: ghcr.io/${{ github.repository_owner }}/nerve-runtime:candidate-${{ env.CANDIDATE_TAG_SUFFIX }}
+          platforms: linux/amd64
+          provenance: true
           build-args: |
+            RUNTIME_MANIFEST_VERSION=${{ env.RUNTIME_MANIFEST_VERSION }}
+            ARTIFACT_ROLE=${{ env.ARTIFACT_ROLE }}
             RUNTIME_VERSION=${{ steps.manifest.outputs.runtime_version }}
             MCP_CONTRACT_HASH=${{ steps.manifest.outputs.mcp_contract_hash }}
             CORE_SCHEMA_HASH=${{ steps.manifest.outputs.core_schema_hash }}
@@ -337,7 +363,16 @@ jobs:
             "${reference}" >/dev/null
           echo "candidate signed and verified as ${identity}"
 
+      - name: Check embedded manifest and native report
+        if: inputs.manifest_version == '2'
+        env:
+          INDEX_DIGEST: ${{ steps.digests.outputs.index_digest }}
+        run: |
+          python3 scripts/ci/test_runtime_image_manifest.py \
+            "ghcr.io/${{ github.repository_owner }}/nerve-runtime@${INDEX_DIGEST}" dist/candidate/runtime-manifest.json
+
       - name: Write the candidate lock for the consuming Cloud PR
+        if: inputs.manifest_version != '2'
         env:
           OWNER: ${{ github.repository_owner }}
           FINAL_VERSION: ${{ inputs.final_version }}
@@ -369,6 +404,24 @@ jobs:
           sed -i 's/^          //' dist/candidate/runtime-candidate.lock
           cat dist/candidate/runtime-candidate.lock
 
+      - name: Write successor candidate identity
+        if: inputs.manifest_version == '2'
+        env:
+          INDEX_DIGEST: ${{ steps.digests.outputs.index_digest }}
+          AMD64_DIGEST: ${{ steps.digests.outputs.amd64_digest }}
+        run: |
+          set -euo pipefail
+          manifest_sha="$(sha256sum dist/candidate/runtime-manifest.json | awk '{print $1}')"
+          jq -nSc --arg role "$ARTIFACT_ROLE" --arg source "$GITHUB_SHA" \
+            --arg image "ghcr.io/${{ github.repository_owner }}/nerve-runtime@${INDEX_DIGEST}" \
+            --arg index "$INDEX_DIGEST" --arg platform "$AMD64_DIGEST" --arg manifest "$manifest_sha" \
+            --argjson run "$GITHUB_RUN_ID" \
+            '{schema_version:2,kind:"mcp2026-runtime-successor-candidate",artifact_role:$role,source_revision:$source,
+              image:$image,index_digest:$index,linux_amd64_digest:$platform,manifest_sha256:$manifest,
+              producer:{repository:"dsmolchanov/nerve-oss",ref:"refs/heads/main",
+                workflow:".github/workflows/docker-publish.yml",run_id:$run}}' \
+            > dist/candidate/runtime-successor-candidate.json
+
       - name: Refuse to publish anything
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -388,9 +441,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           # nerve-cloud's fetcher resolves this exact name.
-          name: mcp2026-runtime-candidate-${{ github.sha }}
+          name: ${{ env.CANDIDATE_ARTIFACT_NAME }}
           if-no-files-found: error
           retention-days: 90
           path: |
             dist/candidate/runtime-manifest.json
             dist/candidate/runtime-candidate.lock
+            dist/candidate/runtime-successor-candidate.json

@@ -22,7 +22,7 @@ Tests must exercise the real compiled entrypoints with invalid database/provider
 ## Remaining counterpart deliverables
 
 - [x] Startup quiescence implementation and executable tests. Runtime serve/worker, administrative CLI refusal, invalid mode, ordinary-start negative control and SIGTERM tested with real binaries. CI invocation and actionlint pass.
-- [ ] Immutable compiled bridge/target schema windows and native compatibility output bound to actual runtime manifest/executable bytes.
+- [x] Immutable compiled bridge/target schema windows and native compatibility output bound to actual runtime manifest/executable bytes (accepted #96, #98 and #100; local image extraction validated).
 - [ ] Versioned runtime build pipeline, signed image/provenance, source pin adoption in Cloud.
 - [ ] Actual Core migrations for pricing A in its own scoped implementation; do not invent future schema heads here.
 - [ ] Disposable combined Cloud/OSS rehearsal, shutdown of all old writers, dump/restore and reopening only after archived disabled CAS.
@@ -70,3 +70,11 @@ Owner-fence validation: the new real-binary test first reproduced nerve-runtime 
 Scope: `deploy/docker/cortex/Dockerfile` and `scripts/ci/test_runtime_image_manifest.py`, alongside existing `internal/release` regression coverage. Embed `/app/runtime-manifest.json` generated from the same build inputs/source catalog as the offline runtime report and candidate manifest. This closes the extraction prerequisite for phase 0: a collector obtains actual manifest bytes from the digest-pinned image rather than reconstructing them from labels or substituting a detached file. The report/manifest comparison and image signature/provenance remain mandatory; no runtime image is published by this source change.
 
 Validation: built a local successor role-B image at actual Core29; the embedded manifest bytes exactly equal generator output, its nine fields equal the native report, and the executable SHA matches independently extracted bytes. Environment schema overrides do not alter the report. `go test -race ./internal/release -count=1` PASS. The image is local test output, not published provenance.
+
+## Versioned runtime candidate producer — 2026-09-10
+
+Scope: `.github/workflows/docker-publish.yml`, `.github/workflows/ci.yml`, `scripts/release/select_runtime_candidate_contract.sh` and `scripts/ci/test_runtime_candidate_contract.sh`. Add explicit manifest-version selection to the existing protected-main candidate producer, preserving the default historical candidate/artifact/lock contract. Version 2 selects bridge B or target C, derives maxima from actual source SQL, keeps prior minima as signed successor-set validation inputs, passes the same contract to manifest and Docker, verifies the embedded/native manifest, and emits a separate successor identity artifact with role/source/run-bound names. Existing CI provenance, unused-semver checks and image signing stay mandatory. No extra trusted producer, semver release, deployment or dispatch occurs here.
+
+Producer validation: dispatch-contract positive/negative suite, existing candidate uniqueness probe matrix, runtime manifest generator/build-window tests and actionlint for both workflows PASS. No protected workflow has been dispatched; image publication/provenance remains an execution gate after merge.
+
+Producer rebase validation: prerequisite #100 merged as `06d6f4f`; branch rebased onto that accepted main, including ownership cleanup #99. Candidate dispatch matrix, candidate-version uniqueness regressions and actionlint pass on the combined tree. Runtime release package and reachability tests also pass on the merged prerequisite. No runtime publishing dispatch, source pin adoption or schema rehearsal is claimed.
