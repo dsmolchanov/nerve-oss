@@ -118,8 +118,12 @@ func (s *Store) ReserveRecipients(ctx context.Context, org, period, outbox strin
 	if n != 1 {
 		return "", ErrRecipientLedgerConflict
 	}
+	// The initial SELECT may evaluate time before waiting on an unchanged row.
+	// Recheck the live period at the actual admission UPDATE after acquiring it.
 	result, err = s.q.ExecContext(ctx, `UPDATE org_recipient_periods SET reserved=reserved+$3
-  WHERE org_id=$1 AND period_id=$2 AND $3 <= 9223372036854775807-committed-reserved
+  WHERE org_id=$1 AND period_id=$2
+  AND NOT admission_closed AND starts_at <= clock_timestamp() AND ends_at > clock_timestamp()
+  AND $3 <= 9223372036854775807-committed-reserved
   AND (recipient_limit IS NULL OR $3 <= recipient_limit-committed-reserved)`, org, period, count)
 	if err != nil {
 		return "", err

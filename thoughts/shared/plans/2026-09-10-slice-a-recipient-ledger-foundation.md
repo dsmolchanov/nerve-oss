@@ -48,7 +48,7 @@ Rehearsal/manual acceptance and release activation remain outside this increment
 
 ## Local validation 2026-09-10
 
-PostgreSQL 16 disposable databases: all seven recipient-ledger suites passed
+PostgreSQL 16 disposable databases: all eight recipient-ledger suites passed
 with the race detector and no SKIP, including 100 concurrent requests for ten
 remaining recipients. Historical 15-to-29 regression passed after explicit
 historical targeting. Startup, neuralmaild, nerve-migrate and release tests passed.
@@ -62,3 +62,11 @@ This is recorded as a full-run limitation; no outbox change is included.
 These are local schema/primitive tests, not a signed release rehearsal or proof
 of active commercial quota enforcement. Migration 30 must be adopted through
 accepted source, signed compatible artifacts and phase-0 admission.
+
+
+Review correction: admission rechecks closure and PostgreSQL time in the final
+counter UPDATE after the period lock is acquired. A deterministic lock-wait
+regression reproduced a stale pre-lock time projection on the prior predicate:
+waiting across ends_at incorrectly succeeded. With the final predicate, all
+eight ledger suites pass under the race detector and the waiting reservation
+is rejected without changing ledger/counters.

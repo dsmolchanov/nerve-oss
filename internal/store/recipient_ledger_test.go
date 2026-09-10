@@ -415,3 +415,78 @@ func TestRecipientLedgerRLS(t *testing.T) {
 		}
 	})
 }
+
+func TestRecipientLedgerLockWaitCannotAdmitAfterExpiry(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		_, p := recipientFixture(t, ctx, db, sql.NullInt64{Int64: 10, Valid: true})
+		if _, err := db.ExecContext(ctx, `UPDATE org_recipient_periods SET ends_at=clock_timestamp()+interval '2 seconds' WHERE org_id=$1 AND period_id=$2`, p.OrgID, p.PeriodID); err != nil {
+			t.Fatal(err)
+		}
+		blocker, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer blocker.Rollback()
+		if _, err := blocker.ExecContext(ctx, `SELECT period_id FROM org_recipient_periods WHERE org_id=$1 AND period_id=$2 FOR UPDATE`, p.OrgID, p.PeriodID); err != nil {
+			t.Fatal(err)
+		}
+		waiter, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = blocker.Rollback(); _ = waiter.Rollback() }()
+		var pid int
+		if err := waiter.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+			t.Fatal(err)
+		}
+		result := make(chan error, 1)
+		go func() {
+			_, err := (&Store{db: db, q: waiter, inTx: true}).ReserveRecipients(ctx, p.OrgID, p.PeriodID, uuid.NewString(), 1)
+			result <- err
+		}()
+		// Observe the actual lock wait before crossing the database's period end.
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			var blocked bool
+			if err := db.QueryRowContext(ctx, `SELECT cardinality(pg_blocking_pids($1))>0`, pid).Scan(&blocked); err != nil {
+				t.Fatal(err)
+			}
+			if blocked {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("reservation did not enter the lock wait")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		for {
+			var expired bool
+			if err := db.QueryRowContext(ctx, `SELECT ends_at <= clock_timestamp() FROM org_recipient_periods WHERE org_id=$1 AND period_id=$2`, p.OrgID, p.PeriodID).Scan(&expired); err != nil {
+				t.Fatal(err)
+			}
+			if expired {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("period did not expire")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		// Do not UPDATE the row: PostgreSQL may retain the pre-lock projection.
+		if err := blocker.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-result:
+			if !errors.Is(err, ErrRecipientLimit) {
+				t.Fatalf("post-expiry reservation: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("reservation remained blocked")
+		}
+		if err := waiter.Rollback(); err != nil {
+			t.Fatal(err)
+		}
+		assertRecipientCounters(t, ctx, db, p, 0, 0)
+	})
+}
