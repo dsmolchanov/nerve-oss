@@ -183,16 +183,19 @@ func (w *OutboxWorker) claimAndDeliver(ctx context.Context) error {
 
 type batchDrainContextKey struct{}
 
-// One deadline bounds all delivery, acknowledgement and requeue operations in
-// a claim. A signal stops new deliveries without multiplying the drain budget
+// One total deadline bounds a claim, with the final seventh (up to ten
+// seconds) reserved for outcome persistence and requeue after work times out. A signal stops new deliveries without multiplying the drain budget
 // by the number of unstarted rows. Failed requeues retain their leases for stale
 // claim recovery and are returned to the process owner.
 func (w *OutboxWorker) deliverClaimedBatch(ctx context.Context, msgs []store.OutboxMessage, timeout time.Duration) error {
 	drainCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer stop()
+	reserve := min(timeout/7, 10*time.Second)
+	workCtx, stopWork := context.WithTimeout(drainCtx, timeout-reserve)
+	defer stopWork()
 	var requeueErrors []error
 	for _, msg := range msgs {
-		if ctx.Err() != nil || drainCtx.Err() != nil {
+		if ctx.Err() != nil || workCtx.Err() != nil {
 			if msg.LockedBy.Valid {
 				if err := w.Store.RequeueClaimedOutboxMessage(drainCtx, msg.ID, msg.LockedBy.String, time.Now().UTC(), "worker stopping before delivery"); err != nil {
 					requeueErrors = append(requeueErrors, fmt.Errorf("requeue unstarted outbox %s: %w", msg.ID, err))
@@ -200,7 +203,7 @@ func (w *OutboxWorker) deliverClaimedBatch(ctx context.Context, msgs []store.Out
 			}
 			continue
 		}
-		deliveryCtx, cancel := context.WithTimeout(drainCtx, time.Minute)
+		deliveryCtx, cancel := context.WithTimeout(workCtx, time.Minute)
 		deliveryCtx = context.WithValue(deliveryCtx, batchDrainContextKey{}, drainCtx)
 		err := w.deliverOne(deliveryCtx, msg)
 		cancel()
@@ -223,11 +226,31 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		return errors.New("outbox message is missing claim lease")
 	}
 	claimLeaseID := msg.LockedBy.String
+	// Allocate the outcome context only when the first state transition is
+	// needed. Starting its timeout before provider I/O would consume cleanup
+	// time while the provider is still running.
+	var outcomeCtx context.Context
+	var stopOutcome context.CancelFunc
+	outcomeContext := func() context.Context {
+		if outcomeCtx == nil {
+			parent := context.WithoutCancel(ctx)
+			if batchCtx, ok := ctx.Value(batchDrainContextKey{}).(context.Context); ok {
+				parent = batchCtx
+			}
+			outcomeCtx, stopOutcome = context.WithTimeout(parent, 10*time.Second)
+		}
+		return outcomeCtx
+	}
+	defer func() {
+		if stopOutcome != nil {
+			stopOutcome()
+		}
+	}()
 	adapter, ok := w.Registry.Outbound(msg.Provider)
 	if !ok {
 		next := time.Now().UTC().Add(30 * time.Second)
-		_ = w.Store.RequeueClaimedOutboxMessage(ctx, msg.ID, claimLeaseID, next, fmt.Sprintf("unknown provider: %s", msg.Provider))
-		return fmt.Errorf("unknown provider: %s", msg.Provider)
+		requeueErr := w.Store.RequeueClaimedOutboxMessage(outcomeContext(), msg.ID, claimLeaseID, next, fmt.Sprintf("unknown provider: %s", msg.Provider))
+		return errors.Join(fmt.Errorf("unknown provider: %s", msg.Provider), requeueErr)
 	}
 
 	// Per-inbox SMTP config: if provider is "smtp" and inbox has a config ref, use custom SMTP.
@@ -259,7 +282,7 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 				reason = "provider_unknown_replay_window_expired: unresolved provider operation cannot be replayed safely"
 			}
 			w.incDeliver(msg.Provider, "provider_unknown_quarantined")
-			if err := w.Store.QuarantineClaimedOutboxUnknown(ctx, msg.ID, claimLeaseID, operationID, reason); err != nil {
+			if err := w.Store.QuarantineClaimedOutboxUnknown(outcomeContext(), msg.ID, claimLeaseID, operationID, reason); err != nil {
 				return fmt.Errorf("quarantine unreplayable provider operation: %w", err)
 			}
 			return errors.New("unresolved provider operation quarantined without replay")
@@ -284,20 +307,20 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		if errors.Is(err, store.ErrAttachmentsReleased) {
 			w.incDeliver(msg.Provider, "permanent")
 			w.incDLQ(msg.Provider, "attachments_released")
-			if finishErr := w.Store.MarkClaimedOutboxMessageFailed(ctx, msg.ID, claimLeaseID, err.Error()); finishErr != nil {
+			if finishErr := w.Store.MarkClaimedOutboxMessageFailed(outcomeContext(), msg.ID, claimLeaseID, err.Error()); finishErr != nil {
 				return fmt.Errorf("record released attachment failure: %w", finishErr)
 			}
 			return err
 		}
 		next := time.Now().UTC().Add(w.BaseBackoff)
-		_ = w.Store.RequeueClaimedOutboxMessage(ctx, msg.ID, claimLeaseID, next, fmt.Sprintf("load attachment metadata: %v", err))
-		return fmt.Errorf("load outbox attachment metadata: %w", err)
+		requeueErr := w.Store.RequeueClaimedOutboxMessage(outcomeContext(), msg.ID, claimLeaseID, next, fmt.Sprintf("load attachment metadata: %v", err))
+		return errors.Join(fmt.Errorf("load outbox attachment metadata: %w", err), requeueErr)
 	}
 	if attachmentBytes > w.MemoryBudget.Limit() {
 		err := fmt.Errorf("attachment bytes exceed configured memory budget: requested=%d limit=%d", attachmentBytes, w.MemoryBudget.Limit())
 		w.incDeliver(msg.Provider, "permanent")
 		w.incDLQ(msg.Provider, "attachment_memory_limit")
-		if finishErr := w.Store.MarkClaimedOutboxMessageFailed(ctx, msg.ID, claimLeaseID, err.Error()); finishErr != nil {
+		if finishErr := w.Store.MarkClaimedOutboxMessageFailed(outcomeContext(), msg.ID, claimLeaseID, err.Error()); finishErr != nil {
 			return fmt.Errorf("record attachment memory failure: %w", finishErr)
 		}
 		return err
@@ -305,8 +328,8 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 	releaseMemory, err := w.MemoryBudget.Acquire(ctx, attachmentBytes)
 	if err != nil {
 		next := time.Now().UTC().Add(w.BaseBackoff)
-		_ = w.Store.RequeueClaimedOutboxMessage(ctx, msg.ID, claimLeaseID, next, fmt.Sprintf("reserve attachment memory: %v", err))
-		return fmt.Errorf("reserve outbox attachment memory: %w", err)
+		requeueErr := w.Store.RequeueClaimedOutboxMessage(outcomeContext(), msg.ID, claimLeaseID, next, fmt.Sprintf("reserve attachment memory: %v", err))
+		return errors.Join(fmt.Errorf("reserve outbox attachment memory: %w", err), requeueErr)
 	}
 	defer releaseMemory()
 
@@ -315,14 +338,14 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		if errors.Is(err, store.ErrAttachmentsReleased) {
 			w.incDeliver(msg.Provider, "permanent")
 			w.incDLQ(msg.Provider, "attachments_released")
-			if finishErr := w.Store.MarkClaimedOutboxMessageFailed(ctx, msg.ID, claimLeaseID, err.Error()); finishErr != nil {
+			if finishErr := w.Store.MarkClaimedOutboxMessageFailed(outcomeContext(), msg.ID, claimLeaseID, err.Error()); finishErr != nil {
 				return fmt.Errorf("record released attachment failure: %w", finishErr)
 			}
 			return err
 		}
 		next := time.Now().UTC().Add(w.BaseBackoff)
-		_ = w.Store.RequeueClaimedOutboxMessage(ctx, msg.ID, claimLeaseID, next, fmt.Sprintf("load attachments: %v", err))
-		return fmt.Errorf("load outbox attachments: %w", err)
+		requeueErr := w.Store.RequeueClaimedOutboxMessage(outcomeContext(), msg.ID, claimLeaseID, next, fmt.Sprintf("load attachments: %v", err))
+		return errors.Join(fmt.Errorf("load outbox attachments: %w", err), requeueErr)
 	}
 
 	out := OutboundMessage{
@@ -373,8 +396,8 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 			return err
 		}
 		next := time.Now().UTC().Add(w.BaseBackoff)
-		_ = w.Store.RequeueClaimedOutboxMessage(ctx, msg.ID, claimLeaseID, next, fmt.Sprintf("provider-start fence: %v", err))
-		return fmt.Errorf("begin outbox provider operation: %w", err)
+		requeueErr := w.Store.RequeueClaimedOutboxMessage(outcomeContext(), msg.ID, claimLeaseID, next, fmt.Sprintf("provider-start fence: %v", err))
+		return errors.Join(fmt.Errorf("begin outbox provider operation: %w", err), requeueErr)
 	}
 	operationID := operation.ID
 	providerStartedAt := operation.StartedAt
@@ -390,13 +413,7 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		w.incDeliver(msg.Provider, "ok")
 		// SMTP may acknowledge DATA and then exhaust the deadline during QUIT.
 		// Persist known acceptance even when the provider consumed its budget.
-		acknowledgementParent := context.WithoutCancel(ctx)
-		if batchCtx, ok := ctx.Value(batchDrainContextKey{}).(context.Context); ok {
-			acknowledgementParent = batchCtx
-		}
-		acknowledgementCtx, cancel := context.WithTimeout(acknowledgementParent, 10*time.Second)
-		defer cancel()
-		return w.Store.MarkClaimedOutboxMessageSent(acknowledgementCtx, msg.ID, claimLeaseID, operationID, providerMessageID)
+		return w.Store.MarkClaimedOutboxMessageSent(outcomeContext(), msg.ID, claimLeaseID, operationID, providerMessageID)
 	}
 
 	// Classify the provider error. Permanent errors terminate the message
@@ -416,7 +433,7 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		)
 		w.incDeliver(msg.Provider, "permanent")
 		w.incDLQ(msg.Provider, classified.Reason)
-		if finishErr := w.Store.MarkClaimedOutboxProviderFailure(ctx, msg.ID, claimLeaseID, operationID, fmt.Sprintf("permanent:%s: %s", classified.Reason, err.Error())); finishErr != nil {
+		if finishErr := w.Store.MarkClaimedOutboxProviderFailure(outcomeContext(), msg.ID, claimLeaseID, operationID, fmt.Sprintf("permanent:%s: %s", classified.Reason, err.Error())); finishErr != nil {
 			return fmt.Errorf("record permanent provider failure: %w", finishErr)
 		}
 		return err
@@ -433,7 +450,7 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		// Quarantine immediately; the unresolved fence keeps lifecycle cleanup
 		// blocked until an operator/provider reconciliation establishes outcome.
 		w.incDeliver(msg.Provider, "provider_unknown_quarantined")
-		if quarantineErr := w.Store.QuarantineClaimedOutboxUnknown(ctx, msg.ID, claimLeaseID, operationID, "provider_unknown_non_idempotent: "+err.Error()); quarantineErr != nil {
+		if quarantineErr := w.Store.QuarantineClaimedOutboxUnknown(outcomeContext(), msg.ID, claimLeaseID, operationID, "provider_unknown_non_idempotent: "+err.Error()); quarantineErr != nil {
 			return fmt.Errorf("quarantine ambiguous provider outcome: %w", quarantineErr)
 		}
 		return err
@@ -446,14 +463,14 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 			next := time.Now().UTC().Add(w.MaxBackoff)
 			if replayDeadline, ok := adapterReplayDeadline(adapter, providerStartedAt); !ok || !next.Before(replayDeadline) {
 				w.incDeliver(msg.Provider, "provider_unknown_quarantined")
-				if quarantineErr := w.Store.QuarantineClaimedOutboxUnknown(ctx, msg.ID, claimLeaseID, operationID, "provider_unknown_replay_window_expired: retry would exceed safe replay window"); quarantineErr != nil {
+				if quarantineErr := w.Store.QuarantineClaimedOutboxUnknown(outcomeContext(), msg.ID, claimLeaseID, operationID, "provider_unknown_replay_window_expired: retry would exceed safe replay window"); quarantineErr != nil {
 					return fmt.Errorf("quarantine expiring provider operation: %w", quarantineErr)
 				}
 				return err
 			}
 			w.incDeliver(msg.Provider, "provider_unknown")
-			_ = w.Store.RequeueClaimedOutboxMessage(ctx, msg.ID, claimLeaseID, next, err.Error())
-			return err
+			requeueErr := w.Store.RequeueClaimedOutboxMessage(outcomeContext(), msg.ID, claimLeaseID, next, err.Error())
+			return errors.Join(err, requeueErr)
 		}
 		slog.WarnContext(ctx, "outbox: retry budget exhausted, terminating",
 			slog.String("worker_id", w.WorkerID),
@@ -469,7 +486,7 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 			reason = classified.Reason
 		}
 		w.incDLQ(msg.Provider, reason)
-		if finishErr := w.Store.MarkClaimedOutboxProviderFailure(ctx, msg.ID, claimLeaseID, operationID, err.Error()); finishErr != nil {
+		if finishErr := w.Store.MarkClaimedOutboxProviderFailure(outcomeContext(), msg.ID, claimLeaseID, operationID, err.Error()); finishErr != nil {
 			return fmt.Errorf("record exhausted provider failure: %w", finishErr)
 		}
 		return err
@@ -479,13 +496,13 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 	backoff := w.backoffForAttempt(msg.AttemptCount)
 	next := time.Now().UTC().Add(backoff)
 	if knownOutcome && operationID != "" {
-		if requeueErr := w.Store.RequeueClaimedOutboxKnownProviderFailure(ctx, msg.ID, claimLeaseID, operationID, next, err.Error()); requeueErr != nil {
+		if requeueErr := w.Store.RequeueClaimedOutboxKnownProviderFailure(outcomeContext(), msg.ID, claimLeaseID, operationID, next, err.Error()); requeueErr != nil {
 			return fmt.Errorf("resolve and requeue provider failure: %w", requeueErr)
 		}
 		return err
 	}
-	_ = w.Store.RequeueClaimedOutboxMessage(ctx, msg.ID, claimLeaseID, next, err.Error())
-	return err
+	requeueErr := w.Store.RequeueClaimedOutboxMessage(outcomeContext(), msg.ID, claimLeaseID, next, err.Error())
+	return errors.Join(err, requeueErr)
 }
 
 func adapterSupportsIdempotentReplay(adapter OutboundAdapter) bool {

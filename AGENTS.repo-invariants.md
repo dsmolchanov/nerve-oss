@@ -90,3 +90,10 @@ makes a review loop unable to terminate.
 - Self-host smoke process failures must not log credentials through argv, stderr,
   timeout/spawn exceptions or chained tracebacks. Enforced by the restored/empty
   database failure matrix in `scripts/ci/test_selfhost_smoke.py`.
+
+- Outbox provider/budget timeouts must leave a live, bounded context for every
+  outcome transition and unstarted-claim requeue within the shared batch drain
+  limit; a normally expired batch must not stop Run after successful cleanup.
+  Enforced by TestOutboxTimeoutPersistsEveryProviderOutcome,
+  TestOutboxBatchTimeoutRequeuesUnstartedClaimsAndCanContinue and
+  TestTenClaimedRowsShareOneDrainDeadlineWhenRequeueBlocks.
