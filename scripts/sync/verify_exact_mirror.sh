@@ -19,6 +19,20 @@ jq -e '
         (contains("..") | not)))
 ' "$manifest" >/dev/null
 
+# A bulk exact mirror may never contain a cloud-owned path: rsync --delete
+# would erase it even when the changed-file filter excludes it.
+jq -e '
+  def overlaps($a; $b):
+    ($a | rtrimstr("/")) as $a | ($b | rtrimstr("/")) as $b |
+    $a == $b or ($a | startswith($b + "/")) or ($b | startswith($a + "/"));
+  . as $manifest |
+  all(."exact-mirror"[]; . as $exact |
+    all($manifest."cloud-only"[]; overlaps($exact; .) | not))
+' "$manifest" >/dev/null || {
+  echo "exact-mirror overlaps cloud-only ownership" >&2
+  exit 1
+}
+
 failed=0
 while IFS= read -r manifest_path; do
   relative_path="${manifest_path%/}"

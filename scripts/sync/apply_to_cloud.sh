@@ -106,6 +106,11 @@ sync_exact_path() {
 }
 
 while IFS= read -r exact_path; do
+  # Defense in depth: cloud-only paths never enter a bulk copy/delete.
+  if is_cloud_only "$exact_path"; then
+    echo "cloud-only path in exact-mirror: $exact_path" >&2
+    exit 1
+  fi
   sync_exact_path "$exact_path"
 done < <(jq -r '."exact-mirror"[]' "$manifest")
 

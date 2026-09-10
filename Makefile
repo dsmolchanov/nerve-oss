@@ -1,4 +1,4 @@
-.PHONY: up down logs seed seed-full mcp-test mcp-test-host selfhost-smoke doctor cloud-e2e-test build test lint run
+.PHONY: up down logs seed seed-full mcp-test mcp-test-host selfhost-smoke doctor build test lint run
 
 CONFIG ?= configs/dev/host.yaml
 GOCACHE ?= /tmp/go-build
@@ -26,9 +26,6 @@ mcp-test:
 
 doctor:
 	NERVE_CONFIG="$(CONFIG)" $(GOENV) go run ./cmd/neuralmail doctor
-
-cloud-e2e-test:
-	$(GOENV) go test ./internal/cloudapi -run TestCloudE2EMatrix -count=1
 
 mcp-test-host:
 	NERVE_CONFIG="$(CONFIG)" $(GOENV) go run ./cmd/neuralmail mcp-test

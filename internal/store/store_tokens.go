@@ -87,64 +87,6 @@ func (s *Store) GetServiceToken(ctx context.Context, tokenID string) (ServiceTok
 	return token, nil
 }
 
-func (s *Store) CreateCloudAPIKey(ctx context.Context, orgID string, keyPrefix string, keyHash string, label string, scopes []string) (CloudAPIKey, error) {
-	var key CloudAPIKey
-	var scopesText string
-	row := s.q.QueryRowContext(ctx, `
-		INSERT INTO cloud_api_keys (org_id, key_prefix, key_hash, label, scopes)
-		VALUES ($1, $2, $3, nullif($4, ''), $5)
-		RETURNING id, org_id, key_prefix, coalesce(label, ''), scopes::text, created_at, revoked_at
-	`, orgID, keyPrefix, keyHash, label, scopes)
-	if err := row.Scan(&key.ID, &key.OrgID, &key.KeyPrefix, &key.Label, &scopesText, &key.CreatedAt, &key.RevokedAt); err != nil {
-		return key, err
-	}
-	key.Scopes = parseScopes(scopesText)
-	return key, nil
-}
-
-func (s *Store) ListCloudAPIKeys(ctx context.Context, orgID string) ([]CloudAPIKey, error) {
-	rows, err := s.q.QueryContext(ctx, `
-		SELECT id, org_id, key_prefix, coalesce(label, ''), scopes::text, created_at, revoked_at
-		FROM cloud_api_keys
-		WHERE org_id = $1
-		ORDER BY created_at DESC
-	`, orgID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	keys := make([]CloudAPIKey, 0)
-	for rows.Next() {
-		var key CloudAPIKey
-		var scopesText string
-		if err := rows.Scan(&key.ID, &key.OrgID, &key.KeyPrefix, &key.Label, &scopesText, &key.CreatedAt, &key.RevokedAt); err != nil {
-			return nil, err
-		}
-		key.Scopes = parseScopes(scopesText)
-		keys = append(keys, key)
-	}
-	return keys, rows.Err()
-}
-
-func (s *Store) RevokeCloudAPIKey(ctx context.Context, orgID string, keyID string) (bool, error) {
-	result, err := s.q.ExecContext(ctx, `
-		UPDATE cloud_api_keys
-		SET revoked_at = now()
-		WHERE id = $1
-		  AND org_id = $2
-		  AND revoked_at IS NULL
-	`, keyID, orgID)
-	if err != nil {
-		return false, err
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return rows > 0, nil
-}
-
 func parseScopes(raw string) []string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" || raw == "{}" || raw == "null" {
