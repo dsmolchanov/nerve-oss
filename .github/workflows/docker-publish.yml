@@ -290,14 +290,14 @@ jobs:
         id: build
         uses: docker/build-push-action@v5
         with:
-          context: .
+          context: https://github.com/${{ github.repository }}.git#${{ github.sha }}
           file: deploy/docker/cortex/Dockerfile
           push: true
           # A content-addressed tag, never the frozen semver: these bytes must
           # not be reachable by the name Phase 10 will publish.
           tags: ghcr.io/${{ github.repository_owner }}/nerve-runtime:candidate-${{ env.CANDIDATE_TAG_SUFFIX }}
           platforms: linux/amd64
-          provenance: true
+          provenance: mode=min,version=v0.2
           build-args: |
             RUNTIME_MANIFEST_VERSION=${{ env.RUNTIME_MANIFEST_VERSION }}
             ARTIFACT_ROLE=${{ env.ARTIFACT_ROLE }}
