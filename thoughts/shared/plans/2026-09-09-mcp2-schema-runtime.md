@@ -78,3 +78,8 @@ Scope: `.github/workflows/docker-publish.yml`, `.github/workflows/ci.yml`, `scri
 Producer validation: dispatch-contract positive/negative suite, existing candidate uniqueness probe matrix, runtime manifest generator/build-window tests and actionlint for both workflows PASS. No protected workflow has been dispatched; image publication/provenance remains an execution gate after merge.
 
 Producer rebase validation: prerequisite #100 merged as `06d6f4f`; branch rebased onto that accepted main, including ownership cleanup #99. Candidate dispatch matrix, candidate-version uniqueness regressions and actionlint pass on the combined tree. Runtime release package and reachability tests also pass on the merged prerequisite. No runtime publishing dispatch, source pin adoption or schema rehearsal is claimed.
+
+
+## Producer review correction — 2026-09-10
+
+Fix #101's folded CI scalar: both candidate contract suites must execute as separate commands in a literal run block. Explicitly include the already-executed `scripts/ci/test_candidate_version_probe.sh` to enforce that closed two-command step and reject unexpected arguments, so a folded continuation cannot silently pass. The named workflow's other run steps were checked; no sibling folded suite invocation was found. Preserve all contract assertions and rerun both suites and actionlint.
