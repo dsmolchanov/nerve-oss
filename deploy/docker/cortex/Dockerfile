@@ -39,6 +39,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
   -o /out/nerve-migrate ./cmd/nerve-migrate
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-s -w -X neuralmail/internal/startup.CompiledSchemaWindow=$(cat /tmp/runtime-window)" -o /out/neuralmail ./cmd/neuralmail
 
+RUN GIT_COMMIT="$BUILD_COMMIT" bash scripts/release/generate_runtime_manifest.sh "$RUNTIME_VERSION" /out/runtime-manifest.json
+
 FROM alpine:3.20
 
 ARG RUNTIME_VERSION=dev
@@ -67,6 +69,7 @@ USER neuralmail
 WORKDIR /app
 
 COPY --from=build /out/nerve-runtime /app/nerve-runtime
+COPY --from=build /out/runtime-manifest.json /app/runtime-manifest.json
 COPY --from=build /out/nerve-migrate /app/nerve-migrate
 COPY --from=build /out/neuralmail /app/neuralmail
 RUN ln -s /app/nerve-runtime /app/neuralmaild
