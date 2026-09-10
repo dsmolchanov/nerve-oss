@@ -9,6 +9,12 @@ prior="${CORE_SCHEMA_MIN_REQUIRED:-}"
 case "$version" in
   1)
     [[ -z "$role" && -z "$prior" ]] || { echo "historical candidate rejects successor inputs" >&2; exit 2; }
+    core_dir="${CORE_MIGRATIONS_PATH:-$root/internal/store/migrations/core}"
+    core_head="$(find "$core_dir" -maxdepth 1 -type f -name '*.sql' | LC_ALL=C sort | tail -1)"
+    [[ "${core_head##*/}" == 0029_outbox_policy_fence.sql ]] || {
+      echo "historical candidate requires exact Core 29 source; successor schemas require manifest v2" >&2
+      exit 2
+    }
     min=29; max=29
     suffix="${GITHUB_SHA}"
     artifact="mcp2026-runtime-candidate-${GITHUB_SHA}"

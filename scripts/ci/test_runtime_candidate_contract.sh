@@ -7,9 +7,25 @@ export CORE_SCHEMA_MAX_SUPPORTED='' CORE_MIGRATIONS_PATH="$root/internal/store/m
 select_contract() {
   RUNTIME_MANIFEST_VERSION="$1" ARTIFACT_ROLE="$2" CORE_SCHEMA_MIN_REQUIRED="$3" bash "$script"
 }
-legacy="$(select_contract 1 '' '')"
+fixture="$(mktemp -d)"
+trap 'rm -rf "$fixture"' EXIT
+mkdir "$fixture/core29"
+for sql in "$root"/internal/store/migrations/core/*.sql; do
+  name="${sql##*/}"; version="${name%%_*}"
+  if (( 10#$version <= 29 )); then cp "$sql" "$fixture/core29/"; fi
+done
+legacy="$(CORE_MIGRATIONS_PATH="$fixture/core29" select_contract 1 '' '')"
 [[ "$legacy" == *"CORE_SCHEMA_MIN_REQUIRED=29"* && "$legacy" == *"CORE_SCHEMA_MAX_SUPPORTED=29"* ]]
 [[ "$legacy" == *"CANDIDATE_ARTIFACT_NAME=mcp2026-runtime-candidate-${GITHUB_SHA}"* ]]
+# The historical candidate is valid only at its exact Core29 source catalog.
+# Source30 must take v2; copying its hash into a v1/window29 manifest is refused.
+mkdir "$fixture/core30"
+cp "$fixture/core29/"*.sql "$fixture/core30/"
+cp "$root/internal/store/migrations/core/0030_recipient_ledger.sql" "$fixture/core30/"
+if CORE_MIGRATIONS_PATH="$fixture/core30" select_contract 1 '' '' >"$fixture/refusal" 2>&1; then
+  echo 'historical candidate accepted Core30 source' >&2; exit 1
+fi
+grep -q 'historical candidate requires exact Core 29 source' "$fixture/refusal"
 for role in B C; do
   prior=''; [[ "$role" != B ]] || prior=29
   output="$(select_contract 2 "$role" "$prior")"

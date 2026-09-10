@@ -46,8 +46,8 @@ func TestCoreMigrationUpgradeFrom15To29(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToVersion(t, ctx, db, 15)
 
-		if err := MigrateCore(ctx, db); err != nil {
-			t.Fatalf("upgrade core migrations from 15 to latest: %v", err)
+		if err := MigrateUpToCore(ctx, db, 29); err != nil {
+			t.Fatalf("upgrade core migrations from 15 to 29: %v", err)
 		}
 
 		var version int64
