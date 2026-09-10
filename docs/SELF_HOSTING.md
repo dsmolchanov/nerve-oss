@@ -145,6 +145,8 @@ On SIGTERM/SIGINT, the runtime stops loops, waits for the in-flight delivery
 and its database acknowledgement, then closes the shared store. An in-flight
 worker delivery has a one-minute deadline; the whole claimed batch, including
 acknowledgements and returning unstarted messages, has a shared 70-second limit.
+Provider work uses at most 60 seconds of that batch; the final 10 seconds are
+reserved for persisting outcomes and returning unstarted claims to the queue.
 Failed requeues are reported to the process; their leases remain until stale-claim
 recovery. Allow sufficient container shutdown time (at least
 90 seconds) for the HTTP drain and worker acknowledgement. A hard kill, an
