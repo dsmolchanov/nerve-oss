@@ -193,6 +193,12 @@ func (w *OutboxWorker) deliverClaimedBatch(ctx context.Context, msgs []store.Out
 	reserve := min(timeout/7, 10*time.Second)
 	workCtx, stopWork := context.WithTimeout(drainCtx, timeout-reserve)
 	defer stopWork()
+	return w.deliverClaimedBatchContexts(ctx, msgs, drainCtx, workCtx)
+}
+
+// The production deadline owner above and deterministic deadline regressions
+// share this exact delivery/cleanup loop. The drain context outlives work expiry.
+func (w *OutboxWorker) deliverClaimedBatchContexts(ctx context.Context, msgs []store.OutboxMessage, drainCtx, workCtx context.Context) error {
 	var requeueErrors []error
 	for _, msg := range msgs {
 		if ctx.Err() != nil || workCtx.Err() != nil {

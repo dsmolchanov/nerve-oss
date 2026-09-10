@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -96,24 +97,45 @@ func TestTenClaimedRowsShareOneDrainDeadlineWhenRequeueBlocks(t *testing.T) {
 	})
 }
 
+// A manually fired deadline lets real store work reach the chosen provider call
+// before time expires. No scheduler/DB latency determines which branch is tested.
+type controlledDeadline struct {
+	context.Context
+	done     chan struct{}
+	once     sync.Once
+	deadline time.Time
+}
+
+func newControlledDeadline(parent context.Context) *controlledDeadline {
+	return &controlledDeadline{Context: context.WithoutCancel(parent), done: make(chan struct{}), deadline: time.Now().Add(time.Hour)}
+}
+func (c *controlledDeadline) Deadline() (time.Time, bool) { return c.deadline, true }
+func (c *controlledDeadline) Done() <-chan struct{}       { return c.done }
+func (c *controlledDeadline) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+func (c *controlledDeadline) expire() { c.once.Do(func() { close(c.done) }) }
+
 type deadlineOutcomeAdapter struct {
-	result error
-	calls  int
-	delay  time.Duration
+	result       error
+	calls        int
+	acceptBefore int
+	expire       func()
 }
 
 func (a *deadlineOutcomeAdapter) Name() string { return "capture" }
 func (a *deadlineOutcomeAdapter) SendMessage(ctx context.Context, _ OutboundMessage, _ string) (string, error) {
 	a.calls++
-	if a.delay > 0 {
-		select {
-		case <-time.After(a.delay):
-			return "accepted", nil
-		case <-ctx.Done():
-		}
-	} else {
-		<-ctx.Done()
+	if a.calls <= a.acceptBefore {
+		return "accepted", nil
 	}
+	a.expire()
+	<-ctx.Done()
 	return "", a.result
 }
 func (a *deadlineOutcomeAdapter) GetDeliveryStatus(context.Context, string) (DeliveryStatus, error) {
@@ -143,10 +165,10 @@ func TestOutboxTimeoutPersistsEveryProviderOutcome(t *testing.T) {
 					}
 				}
 				claimed := claimWorkerPolicyOutbox(t, ctx, st, id, "timeout")
-				adapter := &deadlineOutcomeAdapter{result: tc.result}
+				delivery := newControlledDeadline(ctx)
+				defer delivery.expire()
+				adapter := &deadlineOutcomeAdapter{result: tc.result, expire: delivery.expire}
 				worker := policyFenceWorker(t, st, adapter, "timeout")
-				delivery, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-				defer cancel()
 				if err := worker.deliverOne(delivery, claimed); err == nil {
 					t.Fatal("expected provider failure")
 				}
@@ -177,9 +199,13 @@ func TestOutboxBatchTimeoutRequeuesUnstartedClaimsAndCanContinue(t *testing.T) {
 		if err != nil || len(claimed) != 4 {
 			t.Fatalf("claim %d %v", len(claimed), err)
 		}
-		adapter := &deadlineOutcomeAdapter{result: context.DeadlineExceeded, delay: 250 * time.Millisecond}
+		work := newControlledDeadline(ctx)
+		defer work.expire()
+		drain, cancelDrain := context.WithTimeout(ctx, time.Minute)
+		defer cancelDrain()
+		adapter := &deadlineOutcomeAdapter{result: context.DeadlineExceeded, acceptBefore: 2, expire: work.expire}
 		worker := policyFenceWorker(t, st, adapter, "batch-timeout")
-		if err := worker.deliverClaimedBatch(ctx, claimed, 700*time.Millisecond); err != nil {
+		if err := worker.deliverClaimedBatchContexts(ctx, claimed, drain, work); err != nil {
 			t.Fatalf("routine timeout kills worker: %v", err)
 		}
 		var queued int
