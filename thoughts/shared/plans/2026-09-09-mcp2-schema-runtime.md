@@ -83,3 +83,18 @@ Producer rebase validation: prerequisite #100 merged as `06d6f4f`; branch rebase
 ## Producer review correction — 2026-09-10
 
 Fix #101's folded CI scalar: both candidate contract suites must execute as separate commands in a literal run block. Explicitly include the already-executed `scripts/ci/test_candidate_version_probe.sh` to enforce that closed two-command step and reject unexpected arguments, so a folded continuation cannot silently pass. The named workflow's other run steps were checked; no sibling folded suite invocation was found. Preserve all contract assertions and rerun both suites and actionlint.
+
+
+### Immutable candidate source correction — 2026-09-10
+
+Scope: `.github/workflows/docker-publish.yml` candidate job and
+`scripts/ci/test_runtime_candidate_contract.sh`. Both bridge and target candidates
+use an HTTPS Git context pinned to the full workflow SHA, including the Dockerfile.
+They emit compact SLSA v0.2 provenance with configSource commit and resolved Git
+material; no local or additional build contexts enter this producer. The existing
+tag-release job is unchanged. Cloud #210 verifies the source-material commitment
+before executing any successor artifact; VCS labels alone are insufficient.
+
+Validation includes existing dispatch/version tests, a workflow contract guard,
+actionlint, and real small immutable Git-context OCI exports in SLSA v0.2/v1.
+The small exports validate BuildKit format, not a published runtime candidate.
