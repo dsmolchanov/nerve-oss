@@ -9,8 +9,13 @@ BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 MCP_CONTRACT_PATH="${MCP_CONTRACT_PATH:-docs/MCP_Contract.md}"
 CORE_MIGRATIONS_PATH="${CORE_MIGRATIONS_PATH:-internal/store/migrations/core}"
 OUTBOUND_POLICY_PATH="${OUTBOUND_POLICY_PATH:-configs/policy/autonomous-outbound-v1.yaml}"
-CORE_SCHEMA_MIN_REQUIRED="29"
-CORE_SCHEMA_MAX_SUPPORTED="29"
+window="$(bash "$(dirname "${BASH_SOURCE[0]}")/runtime_schema_window.sh")"
+if [[ -n "$window" ]]; then
+ IFS=: read -r window_version CORE_SCHEMA_MIN_REQUIRED CORE_SCHEMA_MAX_SUPPORTED <<< "$window"
+else
+ CORE_SCHEMA_MIN_REQUIRED="29"
+ CORE_SCHEMA_MAX_SUPPORTED="29"
+fi
 
 hash_file() {
   local path="$1"

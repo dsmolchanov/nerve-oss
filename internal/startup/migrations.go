@@ -30,7 +30,13 @@ func Migrate(ctx context.Context, db *sql.DB, cloudMode bool) error {
 	if err != nil {
 		return err
 	}
-	window := runtimeMigrationWindow
+	window, err := EffectiveMigrationWindow()
+	if err != nil {
+		return err
+	}
+	if CompiledSchemaWindow != "" && mode != store.StartupMigrationVerify {
+		return fmt.Errorf("successor services require NM_MIGRATE_ON_START=verify; only nerve-migrate owns migrations")
+	}
 	if !cloudMode {
 		window.IncludeCloud = true
 		window.CloudMinRequired = RuntimeCloudMinRequired

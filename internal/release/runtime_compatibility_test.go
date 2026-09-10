@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"neuralmail/internal/startup"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +29,13 @@ func TestRuntimeCompatibilityMetadataValidation(t *testing.T) {
 	})
 	if _, err := compiledRuntimeManifest(); err != nil {
 		t.Fatal(err)
+	}
+	oldWindow := startup.CompiledSchemaWindow
+	startup.CompiledSchemaWindow = "invalid"
+	_, windowErr := compiledRuntimeManifest()
+	startup.CompiledSchemaWindow = oldWindow
+	if windowErr == nil {
+		t.Fatal("malformed compiled window accepted")
 	}
 	for i, values := range [][]string{{"", "dev", "unknown", "bad\nversion"}, {"unknown", strings.Repeat("A", 64)}, {"bad", ""}, {"unknown", "bad policy"}, {"bad", ""}, {"short", strings.Repeat("D", 40)}, {"2026-02-30T00:00:00Z", "2026-09-09T00:00:00+00:00"}} {
 		for _, value := range values {
@@ -98,6 +106,34 @@ func TestRuntimeCompatibilityExecutableMatchesManifest(t *testing.T) {
 	}
 	if report.SchemaVersion != 1 || report.Kind != "nerve-runtime-compatibility" || report.DatabaseVerified || report.AdmissionVerified || report.ExecutableSHA256 != expectedHash || report.Executable != "nerve-runtime" || !reflect.DeepEqual(report.Manifest, manifest) {
 		t.Fatalf("report does not bind executable/manifest: %+v", report)
+	}
+	// The same executable path uses successor linker metadata and ignores env.
+	for _, compiled := range []string{"2:29:30", "2:30:30", "broken"} {
+		build := exec.Command("go", "build", "-ldflags", strings.Join(flags, " ")+" -X neuralmail/internal/startup.CompiledSchemaWindow="+compiled, "-o", binary, "./cmd/neuralmaild")
+		build.Dir = root
+		if out, err := build.CombinedOutput(); err != nil {
+			t.Fatalf("successor build: %v %s", err, out)
+		}
+		run := exec.Command(binary, "compatibility", "--json")
+		run.Env = isolatedCommandEnvironment("CORE_SCHEMA_MIN_REQUIRED=1", "CORE_SCHEMA_MAX_SUPPORTED=9999")
+		out, err := run.Output()
+		if compiled == "broken" {
+			if err == nil || len(out) != 0 {
+				t.Fatal("invalid window emitted a report")
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		var successor RuntimeCompatibilityReport
+		if err := json.Unmarshal(out, &successor); err != nil {
+			t.Fatal(err)
+		}
+		parts := strings.Split(compiled, ":")
+		if successor.Manifest["core_schema_min_required"] != parts[1] || successor.Manifest["core_schema_max_supported"] != parts[2] {
+			t.Fatalf("wrong successor report: %+v", successor)
+		}
 	}
 	// A dev binary cannot report a release identity using environment overrides.
 	dev := filepath.Join(dir, "dev-runtime")
