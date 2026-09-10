@@ -70,3 +70,27 @@ regression reproduced a stale pre-lock time projection on the prior predicate:
 waiting across ends_at incorrectly succeeded. With the final predicate, all
 eight ledger suites pass under the race detector and the waiting reservation
 is rejected without changing ledger/counters.
+
+
+## Candidate consumer compatibility
+
+Additional approved scope: `scripts/release/select_runtime_candidate_contract.sh`
+and `scripts/ci/test_runtime_candidate_contract.sh`. The historical v1 candidate
+must refuse a source catalog beyond its fixed Core29 window. The generic runtime
+manifest generator currently hashes the entire catalog and does not independently
+reject Core30 with v1/window29, so this candidate-only guard runs before protected
+candidate build/publication. It does not change tag-release behavior or widen
+any historical window. Tests prove valid historical29 selection, explicit30
+refusal and unchanged v2 B/C selection.
+
+The unchanged optional historical `Validate exact R0 authority` CI check refuses
+Core30 by design. It is not a required branch check. Preparing a test-only legacy
+workflow boundary was rejected by automatic approval review as outside the user's
+legacy scope; those edits were preserved separately for review and removed from
+this PR. No legacy verifier, producer or workflow is changed. This report does
+not describe every CI check as green.
+
+Candidate guard verification: the updated dispatch suite passes. Running that
+same suite against the previous helper in an isolated temporary fixture fails
+with `historical candidate accepted Core30 source`, confirming the negative
+regression. Existing candidate-version absence/auth-failure probes pass.
