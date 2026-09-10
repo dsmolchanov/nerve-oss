@@ -1,5 +1,9 @@
 # Runtime security boundaries
 
+For private vulnerability reports, see the root [security policy](../SECURITY.md).
+The protocol details below describe hosted mode; local bearer keys and network
+binding are documented in [SELF_HOSTING.md](SELF_HOSTING.md).
+
 The hosted `/mcp` endpoint validates `Origin` before authentication, authenticates
 exactly once, and routes only an exact `MCP-Protocol-Version`. Browser callers
 must use an allowlisted HTTPS origin. Native clients may omit `Origin` only when
