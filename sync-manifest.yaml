@@ -10,6 +10,8 @@
     "internal/store/store_orgs.go",
     "internal/store/store_test.go",
     "internal/store/store_tx_test.go",
+    "internal/store/recipient_ledger.go",
+    "internal/store/recipient_ledger_test.go",
     "internal/store/store_threads.go",
     "internal/store/store_threads_test.go",
     "internal/store/outbox.go",
