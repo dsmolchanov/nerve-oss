@@ -32,4 +32,14 @@ if grep -qi 'dashboard' "$DOCKERFILE"; then
   exit 1
 fi
 
+# Every package must be part of a command's production dependency graph.
+# Collect both lists before comparing so go-list errors cannot look like success.
+all_packages="$(go list ./...)"
+command_deps="$(go list -deps ./cmd/...)"
+unreachable="$(comm -23 <(printf '%s\n' "$all_packages" | LC_ALL=C sort -u) <(printf '%s\n' "$command_deps" | LC_ALL=C sort -u))"
+if [[ -n "$unreachable" ]]; then
+  printf 'packages unreachable from cmd/:\n%s\n' "$unreachable" >&2
+  exit 1
+fi
+
 echo "runtime boundary checks passed"

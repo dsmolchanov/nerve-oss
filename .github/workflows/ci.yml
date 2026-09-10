@@ -47,6 +47,8 @@ jobs:
         run: python3 scripts/ci/test_schema_quiescence_executables.py
       - name: Targeted race suites
         run: go test -race ./internal/auth ./internal/mcp ./internal/memguard
+      - name: Test runtime reachability guard
+        run: ./scripts/ci/test_runtime_boundaries.sh
       - name: Verify runtime boundaries
         run: ./scripts/ci/verify_runtime_boundaries.sh
       - name: Verify migration ownership
