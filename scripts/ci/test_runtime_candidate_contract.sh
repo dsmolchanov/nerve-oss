@@ -42,3 +42,14 @@ done
 if GITHUB_SHA=main select_contract 2 B 29 >/dev/null 2>&1; then exit 1; fi
 if GITHUB_RUN_ID=0 select_contract 2 B 29 >/dev/null 2>&1; then exit 1; fi
 echo 'historical and successor candidate dispatch contracts passed'
+
+# The candidate Dockerfile and COPY bytes must come from the asserted Git tree.
+python3 - "$root/.github/workflows/docker-publish.yml" <<'PYTEST'
+from pathlib import Path
+import sys
+candidate = Path(sys.argv[1]).read_text().split('  candidate:', 1)[1]
+assert '          context: https://github.com/${{ github.repository }}.git#${{ github.sha }}\n' in candidate
+assert '          provenance: mode=min,version=v0.2\n' in candidate
+assert 'build-contexts:' not in candidate
+assert '          file: deploy/docker/cortex/Dockerfile\n' in candidate
+PYTEST
