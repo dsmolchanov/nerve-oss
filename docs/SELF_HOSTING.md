@@ -246,13 +246,19 @@ This is off unless `hybrid.state_path` is set. Without it nothing changes.
 
 ### What it cannot carry
 
-The Cloud send contract is one recipient, a subject and a plain-text body. A
-reply with an HTML body, attachments, CC or BCC recipients, a Reply-To address
-or custom headers is **refused** rather than sent with those parts missing:
-once Cloud reports the message sent the outbox row is finalized and attachment
-bytes may be released, so a silent omission would surface at the recipient and
-could never be repaired. The refusal is permanent, so the outbox fails the
-message instead of retrying it.
+The Cloud send contract is one recipient, a subject, a plain-text body, and the
+`In-Reply-To`/`References` headers that make a reply thread in the recipient's
+client. A message with an HTML body, attachments, CC or BCC recipients, a
+Reply-To address or any other header is **refused** rather than sent with those
+parts missing: once Cloud reports the message sent the outbox row is finalized
+and attachment bytes may be released, so a silent omission would surface at
+the recipient and could never be repaired. The refusal is permanent, so the
+outbox fails the message instead of retrying it.
+
+Forwarding is also refused. A forwarded message carries a loop guard the
+contract cannot carry, and sending it without that guard could let a
+forwarding loop form. Do not configure forwarding on a mailbox routed through
+Cloud.
 
 ### What the runtime holds
 

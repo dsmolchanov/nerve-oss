@@ -401,6 +401,15 @@ func inboxProviders(t *testing.T, st *store.Store, address string) (string, stri
 	return record.ID, record.InboundProvider, record.OutboundProvider
 }
 
+func inboxOrg(t *testing.T, st *store.Store, inboxID string) string {
+	t.Helper()
+	record, err := st.GetInboxRecordByID(context.Background(), inboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return record.OrgID
+}
+
 // Re-running connect against an installation that is already bound must not
 // rebind. Capturing the routing a second time would snapshot "hybrid" as the
 // providers to restore and lose the real ones, and binding a second mailbox
@@ -489,7 +498,7 @@ func TestHybridConnectUndoesRoutingWhenTheBindingCannotBeRecorded(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.UpdateInboxProviders(ctx, inboxID, "jmap", "resend"); err != nil {
+	if err := st.UpdateInboxProviders(ctx, inboxOrg(t, st, inboxID), inboxID, "jmap", "resend"); err != nil {
 		t.Fatal(err)
 	}
 	_, beforeIn, beforeOut := inboxProviders(t, st, address)
@@ -602,17 +611,18 @@ func TestHybridConnectHandlesBothSidesOfAnUncertainSave(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := st.UpdateInboxProviders(ctx, inboxID, "jmap", "resend"); err != nil {
+		if err := st.UpdateInboxProviders(ctx, inboxOrg(t, st, inboxID), inboxID, "jmap", "resend"); err != nil {
 			t.Fatal(err)
 		}
 		mailbox := hybridtransport.LocalMailbox{
-			InboxID: inboxID, Address: address, PriorInbound: "jmap", PriorOutbound: "resend",
+			InboxID: inboxID, Address: address, OrgID: inboxOrg(t, st, inboxID),
+			PriorInbound: "jmap", PriorOutbound: "resend",
 		}
 		state.LocalMailbox = &mailbox
 		if err := (hybridtransport.Store{Path: cfg.Hybrid.StatePath}).Save(state); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.UpdateInboxTransportProviders(ctx, inboxID, "hybrid"); err != nil {
+		if err := st.UpdateInboxTransportProviders(ctx, inboxOrg(t, st, inboxID), inboxID, "hybrid"); err != nil {
 			t.Fatal(err)
 		}
 
@@ -639,7 +649,7 @@ func TestHybridConnectHandlesBothSidesOfAnUncertainSave(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := st.UpdateInboxTransportProviders(ctx, inboxID, "hybrid"); err != nil {
+		if err := st.UpdateInboxTransportProviders(ctx, inboxOrg(t, st, inboxID), inboxID, "hybrid"); err != nil {
 			t.Fatal(err)
 		}
 		var out bytes.Buffer

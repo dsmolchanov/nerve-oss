@@ -14,6 +14,15 @@ import (
 // inbound/outbound provider columns.
 const ProviderName = "hybrid"
 
+// The headers the outbox worker sets. Threading is carried by the Cloud send
+// contract; the forwarding loop guard is not, and a forward without it could
+// loop, so it is refused rather than dropped.
+const (
+	headerInReplyTo  = "In-Reply-To"
+	headerReferences = "References"
+	headerLoopGuard  = "X-Nerve-Loop"
+)
+
 // ErrSendUncertain means Cloud accepted the message and then lost track of
 // whether the mail provider took it. Resending would risk a duplicate on the
 // recipient's side, so the operation stops here and waits for Cloud's
@@ -63,6 +72,7 @@ func (a *OutboundAdapter) SendMessage(ctx context.Context, msg emailtransport.Ou
 	}
 	receipt, err := a.Client.Send(ctx, SendRequest{
 		OperationKey: key, Kind: kind, To: msg.To, Subject: msg.Subject, Body: msg.TextBody,
+		InReplyTo: msg.Headers[headerInReplyTo], References: msg.Headers[headerReferences],
 	})
 	if err != nil {
 		return "", err
@@ -102,8 +112,23 @@ func checkSendable(msg emailtransport.OutboundMessage) error {
 	if len(msg.ReplyTo) != 0 {
 		unsupported = append(unsupported, "a Reply-To address")
 	}
-	if len(msg.Headers) != 0 {
-		unsupported = append(unsupported, "custom headers")
+	// The outbox sets threading headers on every reply, so refusing all
+	// headers would refuse the ordinary case; the contract carries these two
+	// and nothing else. A header the outbox learns to set later must be added
+	// to the contract or named here, which TestHybridSendableCoversEveryHeader
+	// the worker emits enforces.
+	for name := range msg.Headers {
+		switch name {
+		case headerInReplyTo, headerReferences:
+		case headerLoopGuard:
+			// Forwarding relies on this header to stop a loop forming, and
+			// the contract cannot carry it. Refuse the forward rather than
+			// send it without its guard.
+			return permanentSendRefusal("unsupported_forwarding",
+				errors.New("hybrid transport cannot carry forwarded mail"))
+		default:
+			unsupported = append(unsupported, fmt.Sprintf("header %q", name))
+		}
 	}
 	if len(unsupported) != 0 {
 		return permanentSendRefusal("unsupported_content",

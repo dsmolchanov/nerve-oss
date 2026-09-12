@@ -112,8 +112,14 @@ type State struct {
 // LocalMailbox records which local mailbox is routed through Cloud and what
 // it was routed to beforehand.
 type LocalMailbox struct {
-	InboxID       string `json:"inbox_id"`
-	Address       string `json:"address"`
+	InboxID string `json:"inbox_id"`
+	Address string `json:"address"`
+	// OrgID scopes the provider updates that bind and restore this mailbox.
+	// Outside cloud mode the inbox policy does not filter by tenant, so an
+	// update keyed on the inbox UUID alone could reroute another
+	// organization's mailbox. Empty in a binding recorded before this field
+	// existed, and then read back from the inbox.
+	OrgID         string `json:"org_id,omitempty"`
 	PriorInbound  string `json:"prior_inbound"`
 	PriorOutbound string `json:"prior_outbound"`
 }
