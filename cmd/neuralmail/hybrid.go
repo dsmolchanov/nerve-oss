@@ -118,26 +118,58 @@ func hybridConnect(ctx context.Context, cfg config.Config, stateStore hybridtran
 	// Begin only needs the parameters on a first run. A resumed connect reads
 	// them back from the state file, so an operator re-running the command
 	// after approving does not have to retype them.
-	if _, err := stateStore.Load(); errors.Is(err, hybridtransport.ErrNotConnected) {
+	pairing, loadErr := stateStore.Load()
+	if errors.Is(loadErr, hybridtransport.ErrNotConnected) {
 		params := hybridtransport.ConnectParams{
 			CloudBaseURL: *cloudURL, TokenEndpoint: *tokenEndpoint, Resource: *resource,
 			ClientID: *clientID, Generation: *generation, InboxID: *inboxID, AuthorityID: *authorityID,
 		}
-		state, err := hybridtransport.Begin(stateStore, params)
+		var beginErr error
+		pairing, beginErr = hybridtransport.Begin(stateStore, params)
+		// A write that landed but could not be confirmed still put the key on
+		// disk, and Begin hands it back. Carry on to print it: a run that
+		// stopped here would leave the operator with a key they never saw,
+		// and the next run would reach Cloud with one never admitted.
+		if beginErr != nil && pairing.Key.KID == "" {
+			return beginErr
+		}
+		loadErr = beginErr
+	} else if loadErr != nil {
+		return loadErr
+	}
+
+	if !pairing.Installed() {
+		// Every run that resumes a pairing rewrites the state, which is what
+		// retries a directory sync that never succeeded, and re-prints the key
+		// to admit. Returning early on either would tell the operator to
+		// re-run a command that then confirms nothing and shows nothing.
+		saveErr := stateStore.Save(pairing)
+		if saveErr != nil {
+			// Show a key only when the runtime holds it. A rewrite that never
+			// landed leaves whatever was already stored, which is still the
+			// key to admit; one that could not be written at all on a first
+			// run leaves nothing to show.
+			if stored, loadErr := stateStore.Load(); loadErr != nil || stored.Key.KID != pairing.Key.KID {
+				return fmt.Errorf("the installation key could not be written: %w", saveErr)
+			}
+		}
+		record, err := hybridtransport.Admission(pairing)
 		if err != nil {
 			return err
 		}
-		record, err := hybridtransport.Admission(state)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "Generated installation key %s.\n", record.KeyID)
+		fmt.Fprintf(out, "Installation key %s.\n", record.KeyID)
 		fmt.Fprintln(out, "Admit this public key to the Cloud machine-client inventory before continuing:")
 		if err := writeJSONBlock(out, record); err != nil {
 			return err
 		}
-	} else if err != nil {
-		return err
+		if saveErr != nil {
+			fmt.Fprintln(out, "The key is on disk but the filesystem would not confirm it survives a reboot.")
+			fmt.Fprintln(out, "Check the disk, then re-run `hybrid connect`: it rewrites the file and retries the sync.")
+			return fmt.Errorf("installation key %s is not confirmed durable: %w", record.KeyID, saveErr)
+		}
+		if loadErr != nil {
+			return loadErr
+		}
 	}
 
 	if err := requireStoppedRuntime(ctx, cfg, *allowRunning, "connecting"); err != nil {
@@ -169,6 +201,17 @@ func hybridConnect(ctx context.Context, cfg config.Config, stateStore hybridtran
 			return fmt.Errorf("installation %s already carries local mailbox %s; disconnect before binding %s",
 				state.InstallationID, existing.Address, address)
 		}
+		// Re-save rather than returning straight away. A previous run whose
+		// directory sync never succeeded tells the operator to re-run this
+		// command to confirm the binding, and a path that reports success
+		// without performing any durability operation would confirm nothing.
+		// Save rewrites the same state and retries the sync.
+		if err := stateStore.Save(state); err != nil {
+			// The binding is already recorded and the routing already set, so
+			// nothing is rolled back here; only the confirmation failed.
+			fmt.Fprintln(out, "The installation file could not be confirmed durable. Check the disk before relying on this binding.")
+			return fmt.Errorf("local mailbox %s is bound but its durability is unconfirmed: %w", existing.Address, err)
+		}
 		fmt.Fprintf(out, "Local mailbox %s (%s) already sends and receives through Cloud.\n", existing.Address, existing.InboxID)
 		fmt.Fprintln(out, "Restart the runtime so it loads this installation.")
 		return nil
@@ -195,26 +238,27 @@ func hybridConnect(ctx context.Context, cfg config.Config, stateStore hybridtran
 // reconcileBinding decides what to do when recording the binding failed.
 //
 // A save error does not mean nothing was written. The state file is installed
-// by rename and the directory entry is synced afterwards, so a failure can
-// come either before the rename — nothing is recorded — or after it, with the
-// binding already durable. Rolling the database back in the second case would
-// leave the file naming a mailbox whose providers no longer route to Cloud,
-// and the runtime would then poll an inbox that no longer pulls from it.
+// by rename and its directory entry synced afterwards, so a failure can come
+// before the rename — nothing changed — or after it, where the new state is
+// what a reader sees but may not survive a power loss. Save reports which,
+// and the two need opposite handling: rolling the database back on the second
+// would leave the file naming a mailbox whose providers no longer route to
+// Cloud.
 //
-// So read the state back and follow whatever is actually on disk.
+// Neither outcome is reported as success. A binding whose durability is
+// unconfirmed can still vanish on the next reboot and strand the mailbox, so
+// the operator is told exactly what to check rather than left believing the
+// pairing is finished.
 func reconcileBinding(ctx context.Context, cfg config.Config, stateStore hybridtransport.Store,
 	mailbox hybridtransport.LocalMailbox, saveErr error, out io.Writer) error {
-	recorded, loadErr := stateStore.Load()
-	if loadErr == nil && recorded.LocalMailbox != nil && recorded.LocalMailbox.InboxID == mailbox.InboxID {
-		// The binding is on disk. Keep the routing and say what is unproven,
-		// rather than undoing a change the file already describes.
-		fmt.Fprintf(out, "Local mailbox %s (%s) now sends and receives through Cloud.\n",
+	if hybridtransport.Unconfirmed(saveErr) {
+		fmt.Fprintf(out, "Local mailbox %s (%s) is routed through Cloud and the installation file was written,\n",
 			mailbox.Address, mailbox.InboxID)
-		fmt.Fprintf(out, "The installation file was written but its durability could not be confirmed (%v).\n", saveErr)
-		fmt.Fprintln(out, "Verify with `hybrid status` after restarting the runtime.")
-		return nil
+		fmt.Fprintln(out, "but the filesystem would not confirm that the file will survive a reboot.")
+		fmt.Fprintln(out, "Check the disk, then re-run `hybrid connect`: it re-writes the file and retries the sync.")
+		return fmt.Errorf("installation binding for %s is not proven durable: %w", mailbox.Address, saveErr)
 	}
-	// Nothing durable records the binding, so the routing must not stand.
+	// Nothing was written, so the routing must not stand on its own.
 	if restoreErr := restoreLocalInbox(ctx, cfg, mailbox); restoreErr != nil {
 		return fmt.Errorf("local mailbox %s is routed through Cloud, the binding was not recorded (%v), "+
 			"and the routing could not be undone: %w", mailbox.Address, saveErr, restoreErr)
@@ -360,13 +404,24 @@ func hybridRotate(ctx context.Context, cfg config.Config, stateStore hybridtrans
 		fmt.Fprintln(out, "Restart the runtime, confirm it is healthy, then remove the previous key from the Cloud inventory.")
 		return nil
 	}
+	// An unconfirmed write still put the replacement on disk, so print it
+	// either way: the operator has to admit that exact key, and a run that
+	// showed nothing would leave them unable to.
 	record, err := hybridtransport.PrepareRotation(stateStore)
-	if err != nil {
+	if err != nil && record.KeyID == "" {
 		return err
 	}
 	fmt.Fprintf(out, "Prepared replacement key %s. The runtime keeps using its current key until you commit.\n", record.KeyID)
 	fmt.Fprintln(out, "Admit this public key, have the owner rotate the installation onto it, then re-run with -commit:")
-	return writeJSONBlock(out, record)
+	if blockErr := writeJSONBlock(out, record); blockErr != nil {
+		return blockErr
+	}
+	if err != nil {
+		fmt.Fprintln(out, "The key is on disk but the filesystem would not confirm it survives a reboot.")
+		fmt.Fprintln(out, "Check the disk, then re-run `hybrid rotate`: it rewrites the file and retries the sync.")
+		return fmt.Errorf("replacement key %s is not confirmed durable: %w", record.KeyID, err)
+	}
+	return nil
 }
 
 func hybridDisconnect(ctx context.Context, cfg config.Config, stateStore hybridtransport.Store, args []string, out io.Writer) error {

@@ -3,10 +3,12 @@ package hybrid
 import (
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -243,5 +245,126 @@ func TestHybridPublicJWKMatchesAdmissionShape(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "PRIVATE") || jwk["d"] != nil {
 		t.Fatal("public JWK carries private material")
+	}
+}
+
+// The one Save outcome a normal filesystem will not produce: the rename
+// succeeded, so the new state is what a reader sees, but its directory entry
+// could not be made durable. A caller that has already committed something
+// elsewhere has to tell that apart from a failure before the rename.
+func TestHybridStateSaveReportsHowFarItGot(t *testing.T) {
+	restore := syncDirectoryFunc
+	delay := directorySyncRetryDelay
+	t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
+	directorySyncRetryDelay = time.Millisecond
+
+	store := Store{Path: filepath.Join(t.TempDir(), "installation.json")}
+	first := testState(t, testKey(t))
+	if err := store.Save(first); err != nil {
+		t.Fatal(err)
+	}
+
+	// A persistent post-rename sync failure is retried, then reported as
+	// installed-but-unconfirmed.
+	attempts := 0
+	syncDirectoryFunc = func(string) error {
+		attempts++
+		return errors.New("input/output error")
+	}
+	second := first
+	second.Key = testKey(t)
+	err := store.Save(second)
+	if err == nil {
+		t.Fatal("a failed directory sync was reported as success")
+	}
+	if !Unconfirmed(err) {
+		t.Fatalf("a post-rename failure was reported as nothing written: %v", err)
+	}
+	if attempts < 2 {
+		t.Fatalf("directory sync was attempted %d time(s); a transient fsync error is worth retrying", attempts)
+	}
+	// The rename did happen, so the new state is what a reader sees.
+	loaded, loadErr := store.Load()
+	if loadErr != nil || loaded.Key.KID != second.Key.KID {
+		t.Fatalf("the installed state is not readable: %v", loadErr)
+	}
+
+	// A transient failure that clears on retry is not reported at all.
+	attempts = 0
+	syncDirectoryFunc = func(path string) error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("temporary failure")
+		}
+		return restore(path)
+	}
+	third := second
+	third.Key = testKey(t)
+	if err := store.Save(third); err != nil {
+		t.Fatalf("a transient sync failure was not absorbed by the retry: %v", err)
+	}
+
+	// And a failure before the rename says nothing was written. A state that
+	// does not validate never reaches the filesystem at all.
+	syncDirectoryFunc = restore
+	invalid := third
+	invalid.OrgID = "not-a-uuid"
+	if err := store.Save(invalid); err == nil {
+		t.Fatal("saved invalid state")
+	} else if Unconfirmed(err) {
+		t.Fatalf("a pre-rename failure claimed the state was installed: %v", err)
+	}
+	final, err := store.Load()
+	if err != nil || final.Key.KID != third.Key.KID {
+		t.Fatalf("a refused save disturbed the installed state: %v", err)
+	}
+}
+
+// A filesystem without directory synchronization returns fs.ErrInvalid.
+// Treating that as success would turn a durability operation that never
+// happened into a claim that it did — for a saved key and for a removed one
+// alike, where an operator would believe a revoked key is gone while a power
+// loss can still bring it back.
+func TestHybridStateRefusesToClaimUnsupportedSyncIsDurable(t *testing.T) {
+	restore := syncDirectoryFunc
+	delay := directorySyncRetryDelay
+	t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
+	directorySyncRetryDelay = time.Millisecond
+
+	for name, injected := range map[string]error{
+		"unsupported on this filesystem": fs.ErrInvalid,
+		"device error":                   errors.New("input/output error"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			syncDirectoryFunc = restore
+			store := Store{Path: filepath.Join(t.TempDir(), "installation.json")}
+			state := testState(t, testKey(t))
+			if err := store.Save(state); err != nil {
+				t.Fatal(err)
+			}
+			syncDirectoryFunc = func(string) error { return injected }
+
+			next := state
+			next.Key = testKey(t)
+			saveErr := store.Save(next)
+			if saveErr == nil {
+				t.Fatal("an unconfirmed write was reported as durable")
+			}
+			if !Unconfirmed(saveErr) || !errors.Is(saveErr, injected) {
+				t.Fatalf("save error %v does not report an unconfirmed change", saveErr)
+			}
+
+			removeErr := store.Remove()
+			if removeErr == nil {
+				t.Fatal("an unconfirmed removal was reported as durable")
+			}
+			if !Unconfirmed(removeErr) || !errors.Is(removeErr, injected) {
+				t.Fatalf("remove error %v does not report an unconfirmed change", removeErr)
+			}
+			// The change itself did happen; only its durability is unproven.
+			if _, err := os.Stat(store.Path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the file survived a removal that reported only unconfirmed durability: %v", err)
+			}
+		})
 	}
 }

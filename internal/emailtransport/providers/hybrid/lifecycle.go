@@ -65,6 +65,14 @@ func Begin(store Store, params ConnectParams) (State, error) {
 		InboxID: params.InboxID, AuthorityID: params.AuthorityID, Key: key,
 	}
 	if err := store.Save(state); err != nil {
+		// Hand the state back only when the key really is readable. An
+		// unconfirmed write left it there and the operator must see it to
+		// admit it; a write that never landed has no key to show, and
+		// printing one the runtime does not hold would send them to admit
+		// the wrong thing.
+		if stored, loadErr := store.Load(); loadErr == nil && stored.Key.KID == state.Key.KID {
+			return stored, err
+		}
 		return State{}, err
 	}
 	return state, nil
@@ -238,11 +246,26 @@ func PrepareRotation(store Store) (AdmissionRecord, error) {
 			return AdmissionRecord{}, err
 		}
 		state.PendingKey = &key
-		if err := store.Save(state); err != nil {
-			return AdmissionRecord{}, err
-		}
 	}
-	return admissionRecord(state, *state.PendingKey)
+	record, err := admissionRecord(state, *state.PendingKey)
+	if err != nil {
+		return AdmissionRecord{}, err
+	}
+	// Save on every call, not only when the key is new. A rerun after a write
+	// that was never confirmed durable must complete it, or the owner could
+	// rotate Cloud onto a key whose directory entry disappears on the next
+	// power loss, leaving the runtime with no identity Cloud accepts.
+	if err := store.Save(state); err != nil {
+		// As in Begin: return the record only when the replacement is
+		// readable, so the operator is never sent to admit a key the runtime
+		// does not hold.
+		if stored, loadErr := store.Load(); loadErr == nil && stored.PendingKey != nil &&
+			stored.PendingKey.KID == record.KeyID {
+			return record, err
+		}
+		return AdmissionRecord{}, err
+	}
+	return record, nil
 }
 
 // CommitRotation promotes the prepared key once Cloud actually accepts it.
