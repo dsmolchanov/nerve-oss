@@ -12,6 +12,7 @@ import (
 	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
 	"neuralmail/internal/emailtransport"
+	hybridtransport "neuralmail/internal/emailtransport/providers/hybrid"
 	jmaptransport "neuralmail/internal/emailtransport/providers/jmap"
 	resendtransport "neuralmail/internal/emailtransport/providers/resend"
 	smtptransport "neuralmail/internal/emailtransport/providers/smtp"
@@ -44,6 +45,10 @@ type App struct {
 	MCPRouter *mcp.Router
 
 	EmailTransport *emailtransport.Registry
+	// Hybrid is the Cloud-paired transport, or nil when this runtime holds no
+	// installation. It is the same adapters the registry carries, kept here so
+	// the poll loop can use the installation's own mailbox and interval.
+	Hybrid *hybridtransport.Runtime
 }
 
 func New(ctx context.Context, cfg config.Config) (*App, error) {
@@ -94,30 +99,24 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		vectorStore = vector.NewQdrant(cfg.Qdrant.URL, cfg.Qdrant.Collection)
 	}
 
-	transportRegistry := emailtransport.NewRegistry()
-
-	outboundAdapter := smtptransport.NewOutboundAdapter(smtptransport.Config{
-		Host:            cfg.SMTP.Host,
-		Port:            cfg.SMTP.Port,
-		Username:        cfg.SMTP.Username,
-		Password:        cfg.SMTP.Password,
-		RequireStartTLS: cfg.SMTP.RequireStartTLS,
-		HeloDomain:      cfg.SMTP.HeloDomain,
-	})
-	_ = transportRegistry.RegisterOutbound(outboundAdapter)
-
-	if strings.TrimSpace(cfg.Resend.APIKey) != "" {
-		_ = transportRegistry.RegisterOutbound(resendtransport.NewOutboundAdapter(resendtransport.Config{
-			APIKey:  cfg.Resend.APIKey,
-			BaseURL: cfg.Resend.BaseURL,
-		}))
+	hybridRuntime, err := newHybridRuntime(cfg)
+	if err != nil {
+		return nil, err
 	}
-
+	transportRegistry, err := newTransportRegistry(cfg, hybridRuntime)
+	if err != nil {
+		return nil, err
+	}
 	jmapClient, err := jmap.NewClient(cfg)
 	if err != nil {
 		jmapClient = jmap.NoopClient{}
 	}
 	_ = transportRegistry.RegisterInbound(jmaptransport.NewInboundAdapter(jmapClient))
+	if hybridRuntime != nil {
+		if err := transportRegistry.RegisterInbound(hybridRuntime.Inbound); err != nil {
+			return nil, fmt.Errorf("register hybrid inbound: %w", err)
+		}
+	}
 
 	toolSvc := tools.NewService(cfg, st, llmProvider, vectorStore, pol, embedder, transportRegistry)
 	authSvc := auth.NewService(cfg, st)
@@ -142,7 +141,88 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		MCPRouter: mcpRouter,
 
 		EmailTransport: transportRegistry,
+		Hybrid:         hybridRuntime,
 	}, nil
+}
+
+// NewOutboundRegistry builds the outbound providers every execution path must
+// share.
+//
+// `serve` and the standalone `worker` both claim outbox rows, and the outbox
+// worker routes by the inbox's provider name. A registry that differs between
+// them means rows addressed to a missing provider are requeued forever with
+// no delivery and no failure, which is exactly what a hybrid reply would hit
+// in the documented serve-plus-worker split.
+func NewOutboundRegistry(cfg config.Config) (*emailtransport.Registry, error) {
+	hybridRuntime, err := newHybridRuntime(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return newTransportRegistry(cfg, hybridRuntime)
+}
+
+func newTransportRegistry(cfg config.Config, hybridRuntime *hybridtransport.Runtime) (*emailtransport.Registry, error) {
+	registry := emailtransport.NewRegistry()
+	_ = registry.RegisterOutbound(smtptransport.NewOutboundAdapter(smtptransport.Config{
+		Host:            cfg.SMTP.Host,
+		Port:            cfg.SMTP.Port,
+		Username:        cfg.SMTP.Username,
+		Password:        cfg.SMTP.Password,
+		RequireStartTLS: cfg.SMTP.RequireStartTLS,
+		HeloDomain:      cfg.SMTP.HeloDomain,
+	}))
+	if strings.TrimSpace(cfg.Resend.APIKey) != "" {
+		_ = registry.RegisterOutbound(resendtransport.NewOutboundAdapter(resendtransport.Config{
+			APIKey:  cfg.Resend.APIKey,
+			BaseURL: cfg.Resend.BaseURL,
+		}))
+	}
+	if hybridRuntime != nil {
+		if err := registry.RegisterOutbound(hybridRuntime.Outbound); err != nil {
+			return nil, fmt.Errorf("register hybrid outbound: %w", err)
+		}
+		log.Printf("hybrid transport active: installation=%s inbox=%s key=%s",
+			hybridRuntime.State.InstallationID, hybridRuntime.State.InboxID, hybridRuntime.State.Key.KID)
+	}
+	return registry, nil
+}
+
+// HybridMailbox is the local mailbox a completed pairing bound, or empty when
+// this runtime carries no installation. The poll loop uses it instead of the
+// configured default, which `hybrid connect -local-inbox` may not have chosen.
+func (a *App) HybridMailbox() string {
+	if a.Hybrid == nil || a.Hybrid.State.LocalMailbox == nil {
+		return ""
+	}
+	return a.Hybrid.State.LocalMailbox.InboxID
+}
+
+// newHybridRuntime loads the local installation, if there is one.
+//
+// An unset state path means hybrid is off. A configured path with no state
+// yet means the operator has started pairing but not finished, which is a
+// normal intermediate state and must not stop the runtime from serving. Any
+// other failure — an unreadable file, a key that is not its own thumbprint,
+// permissions that expose the key — is refused, because starting with a
+// half-understood identity is worse than not starting.
+func newHybridRuntime(cfg config.Config) (*hybridtransport.Runtime, error) {
+	path := strings.TrimSpace(cfg.Hybrid.StatePath)
+	if path == "" {
+		return nil, nil
+	}
+	state, err := hybridtransport.Store{Path: path}.Load()
+	if errors.Is(err, hybridtransport.ErrNotConnected) {
+		log.Printf("hybrid transport configured but not connected: run `neuralmail hybrid connect`")
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load hybrid installation: %w", err)
+	}
+	if !state.Installed() {
+		log.Printf("hybrid pairing %s is waiting for owner approval: run `neuralmail hybrid connect`", state.Key.KID)
+		return nil, nil
+	}
+	return hybridtransport.NewRuntime(state, &http.Client{Timeout: cfg.Hybrid.Timeout})
 }
 
 func newMCPServer(
@@ -324,6 +404,17 @@ func (a *App) renderDebug(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "</ul></body></html>")
 }
 
+// pollInterval is the hybrid interval when this runtime carries a Cloud
+// mailbox, and the JMAP interval otherwise. Hybrid pulls are the only way mail
+// reaches a paired host, so waiting a JMAP mirror's half-minute between
+// checks would add that delay to every inbound message.
+func (a *App) pollInterval() time.Duration {
+	if a.Hybrid != nil && a.Config.Hybrid.PollInterval > 0 {
+		return a.Config.Hybrid.PollInterval
+	}
+	return a.Config.JMAP.PollInterval
+}
+
 func (a *App) PollLoop(ctx context.Context, inboxID string) error {
 	if a.EmailTransport == nil {
 		return errors.New("missing email transport registry")
@@ -332,7 +423,7 @@ func (a *App) PollLoop(ctx context.Context, inboxID string) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(a.Config.JMAP.PollInterval):
+		case <-time.After(a.pollInterval()):
 			inbox, err := a.Store.GetInboxRecordByID(ctx, inboxID)
 			if err != nil {
 				return err

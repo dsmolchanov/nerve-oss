@@ -85,6 +85,9 @@ Secrets have no documented sample value: supply your own key/password privately.
 | `NERVE_ONBOARDING_DELEGATION_KEY_ID` | `Onboarding.DelegationKeyID` |
 | `NERVE_ONBOARDING_DELEGATION_SECRET` | `Onboarding.DelegationSecret` |
 | `NERVE_ONBOARDING_TIMEOUT` | `Onboarding.Timeout` |
+| `NERVE_HYBRID_STATE_PATH` | `Hybrid.StatePath` |
+| `NERVE_HYBRID_POLL_INTERVAL` | `Hybrid.PollInterval` |
+| `NERVE_HYBRID_TIMEOUT` | `Hybrid.Timeout` |
 | `NERVE_API_KEY` | `Security.APIKey` |
 | `NERVE_ALLOW_OUTBOUND` | `Security.AllowOutbound` |
 | `NERVE_ALLOW_SEND_WITH_WARNINGS` | `Security.AllowSendWithWarnings` |

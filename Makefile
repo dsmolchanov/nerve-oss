@@ -1,4 +1,4 @@
-.PHONY: up down logs seed seed-full mcp-test mcp-test-host selfhost-smoke doctor build test lint run
+.PHONY: up down logs seed seed-full mcp-test mcp-test-host selfhost-smoke hybrid-selfhost-smoke doctor build test lint run
 
 CONFIG ?= configs/dev/host.yaml
 GOCACHE ?= /tmp/go-build
@@ -32,6 +32,9 @@ mcp-test-host:
 
 selfhost-smoke:
 	python3 scripts/ci/selfhost_smoke.py
+
+hybrid-selfhost-smoke:
+	python3 scripts/ci/hybrid_selfhost_smoke.py
 
 build:
 	mkdir -p dist

@@ -71,6 +71,12 @@ func main() {
 		if err := mcpTest(cfg, os.Stdout); err != nil {
 			log.Fatalf("mcp-test failed: %v", err)
 		}
+	case "hybrid":
+		hybridCtx, cancel := hybridSignalContext()
+		defer cancel()
+		if err := runHybrid(hybridCtx, cfg, os.Args[2:], os.Stdout); err != nil {
+			log.Fatalf("hybrid: %v", err)
+		}
 	default:
 		usage()
 	}
@@ -496,7 +502,8 @@ func pingTCP(rawURL string) error {
 }
 
 func usage() {
-	fmt.Println("Usage: neuralmail <up|down|migrate-core|migrate-cloud|migrate-all|seed|doctor|send-test|mcp-test>")
+	fmt.Println("Usage: neuralmail <up|down|migrate-core|migrate-cloud|migrate-all|seed|doctor|send-test|mcp-test|hybrid>")
+	fmt.Println("       neuralmail hybrid <connect|status|rotate|disconnect>")
 }
 
 type mcpResponse struct {
