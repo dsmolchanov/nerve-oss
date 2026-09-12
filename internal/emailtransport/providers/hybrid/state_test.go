@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -243,5 +244,77 @@ func TestHybridPublicJWKMatchesAdmissionShape(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "PRIVATE") || jwk["d"] != nil {
 		t.Fatal("public JWK carries private material")
+	}
+}
+
+// The one Save outcome a normal filesystem will not produce: the rename
+// succeeded, so the new state is what a reader sees, but its directory entry
+// could not be made durable. A caller that has already committed something
+// elsewhere has to tell that apart from a failure before the rename.
+func TestHybridStateSaveReportsHowFarItGot(t *testing.T) {
+	restore := syncDirectoryFunc
+	delay := directorySyncRetryDelay
+	t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
+	directorySyncRetryDelay = time.Millisecond
+
+	store := Store{Path: filepath.Join(t.TempDir(), "installation.json")}
+	first := testState(t, testKey(t))
+	if err := store.Save(first); err != nil {
+		t.Fatal(err)
+	}
+
+	// A persistent post-rename sync failure is retried, then reported as
+	// installed-but-unconfirmed.
+	attempts := 0
+	syncDirectoryFunc = func(string) error {
+		attempts++
+		return errors.New("input/output error")
+	}
+	second := first
+	second.Key = testKey(t)
+	err := store.Save(second)
+	if err == nil {
+		t.Fatal("a failed directory sync was reported as success")
+	}
+	if !StateInstalled(err) {
+		t.Fatalf("a post-rename failure was reported as nothing written: %v", err)
+	}
+	if attempts < 2 {
+		t.Fatalf("directory sync was attempted %d time(s); a transient fsync error is worth retrying", attempts)
+	}
+	// The rename did happen, so the new state is what a reader sees.
+	loaded, loadErr := store.Load()
+	if loadErr != nil || loaded.Key.KID != second.Key.KID {
+		t.Fatalf("the installed state is not readable: %v", loadErr)
+	}
+
+	// A transient failure that clears on retry is not reported at all.
+	attempts = 0
+	syncDirectoryFunc = func(path string) error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("temporary failure")
+		}
+		return restore(path)
+	}
+	third := second
+	third.Key = testKey(t)
+	if err := store.Save(third); err != nil {
+		t.Fatalf("a transient sync failure was not absorbed by the retry: %v", err)
+	}
+
+	// And a failure before the rename says nothing was written. A state that
+	// does not validate never reaches the filesystem at all.
+	syncDirectoryFunc = restore
+	invalid := third
+	invalid.OrgID = "not-a-uuid"
+	if err := store.Save(invalid); err == nil {
+		t.Fatal("saved invalid state")
+	} else if StateInstalled(err) {
+		t.Fatalf("a pre-rename failure claimed the state was installed: %v", err)
+	}
+	final, err := store.Load()
+	if err != nil || final.Key.KID != third.Key.KID {
+		t.Fatalf("a refused save disturbed the installed state: %v", err)
 	}
 }

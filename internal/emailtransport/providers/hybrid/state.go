@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -385,6 +386,38 @@ func (s Store) Load() (State, error) {
 	return state, nil
 }
 
+// SaveError says how far a failed Save got.
+//
+// Installed means the rename succeeded, so the new state is what a reader
+// sees, but its directory entry could not be made durable — a power loss may
+// still resurrect the previous state. That is a different situation from a
+// failure before the rename, where nothing changed at all, and a caller that
+// has already committed something elsewhere has to tell them apart.
+type SaveError struct {
+	Installed bool
+	Err       error
+}
+
+func (e *SaveError) Error() string {
+	if e.Installed {
+		return "hybrid installation state was installed but its durability is unconfirmed: " + e.Err.Error()
+	}
+	return "hybrid installation state was not written: " + e.Err.Error()
+}
+
+func (e *SaveError) Unwrap() error { return e.Err }
+
+// StateInstalled reports whether a Save error left the new state readable.
+func StateInstalled(err error) bool {
+	var saveErr *SaveError
+	return errors.As(err, &saveErr) && saveErr.Installed
+}
+
+// directorySyncAttempts bounds the retry on the one step that can fail after
+// the rename. A transient fsync error is worth retrying; a persistent one is
+// a fact the caller has to be told.
+const directorySyncAttempts = 3
+
 // Save replaces the state atomically. A crash leaves either the previous
 // installation or the new one, never a truncated key, so an interrupted
 // rotation is always recoverable from one side or the other.
@@ -426,10 +459,32 @@ func (s Store) Save(state State) error {
 		return err
 	}
 	if err := os.Rename(name, s.Path); err != nil {
-		return err
+		return &SaveError{Err: err}
 	}
-	return syncDirectory(directory)
+	// Past this point the new state is what a reader sees. Only its
+	// durability is still in question, so retry the one remaining step
+	// before reporting an outcome the caller cannot undo by itself.
+	var syncErr error
+	for attempt := range directorySyncAttempts {
+		if syncErr = syncDirectory(directory); syncErr == nil {
+			return nil
+		}
+		if attempt < directorySyncAttempts-1 {
+			time.Sleep(directorySyncRetryDelay)
+		}
+	}
+	return &SaveError{Installed: true, Err: syncErr}
 }
+
+// directorySyncRetryDelay is short: this runs inside an operator command.
+var directorySyncRetryDelay = 50 * time.Millisecond
+
+// syncDirectoryFunc is the seam a test uses to inject a post-rename failure,
+// which is the one Save outcome that cannot be produced with a normal
+// filesystem.
+var syncDirectoryFunc = realSyncDirectory
+
+func syncDirectory(path string) error { return syncDirectoryFunc(path) }
 
 // Remove deletes the installation state. A runtime that has been disconnected
 // keeps no private key: the key is useless once Cloud has revoked it, and a
@@ -441,10 +496,10 @@ func (s Store) Remove() error {
 	return syncDirectory(filepath.Dir(s.Path))
 }
 
-// syncDirectory makes the rename or unlink durable. Without it a power loss can
-// leave the directory entry pointing at the old file even though the data was
-// written.
-func syncDirectory(path string) error {
+// realSyncDirectory makes the rename or unlink durable. Without it a power
+// loss can leave the directory entry pointing at the old file even though the
+// data was written.
+func realSyncDirectory(path string) error {
 	directory, err := os.Open(path)
 	if err != nil {
 		return err

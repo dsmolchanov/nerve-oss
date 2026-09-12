@@ -586,69 +586,76 @@ func TestHybridConnectComparesMailboxesCanonically(t *testing.T) {
 	}
 }
 
-// Save installs the state file by rename and syncs the directory afterwards,
-// so an error can arrive with the binding already durable. Rolling the
-// database back then would leave the file naming a mailbox whose providers no
-// longer route to Cloud, and the runtime would poll an inbox that no longer
-// pulls from it. The command follows whatever is actually on disk.
-func TestHybridConnectFollowsTheStateFileAfterAnUncertainSave(t *testing.T) {
-	cfg, st, address := hybridRuntimeDatabase(t)
+// Save reports which side of the rename it failed on, and the two need
+// opposite handling. A pre-rename failure changed nothing, so the routing
+// must be undone. A post-rename failure leaves the new state readable but
+// not proven durable, so undoing the routing would contradict the file — and
+// neither outcome may be reported as success, because a binding that vanishes
+// on the next reboot strands the mailbox.
+func TestHybridConnectHandlesBothSidesOfAnUncertainSave(t *testing.T) {
 	ctx := context.Background()
-	state := writeConnectedState(t, cfg.Hybrid.StatePath, nil)
-	inboxID, err := st.EnsureDefaults(ctx, address)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.UpdateInboxProviders(ctx, inboxID, "jmap", "resend"); err != nil {
-		t.Fatal(err)
-	}
 
-	// Stand in for a save that failed after the rename: the binding is on
-	// disk exactly as a successful save would have left it.
-	installed := state
-	installed.LocalMailbox = &hybridtransport.LocalMailbox{
-		InboxID: inboxID, Address: address, PriorInbound: "jmap", PriorOutbound: "resend",
-	}
-	if err := (hybridtransport.Store{Path: cfg.Hybrid.StatePath}).Save(installed); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.UpdateInboxTransportProviders(ctx, inboxID, "hybrid"); err != nil {
-		t.Fatal(err)
-	}
+	t.Run("installed but unconfirmed", func(t *testing.T) {
+		cfg, st, address := hybridRuntimeDatabase(t)
+		state := writeConnectedState(t, cfg.Hybrid.StatePath, nil)
+		inboxID, err := st.EnsureDefaults(ctx, address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.UpdateInboxProviders(ctx, inboxID, "jmap", "resend"); err != nil {
+			t.Fatal(err)
+		}
+		mailbox := hybridtransport.LocalMailbox{
+			InboxID: inboxID, Address: address, PriorInbound: "jmap", PriorOutbound: "resend",
+		}
+		state.LocalMailbox = &mailbox
+		if err := (hybridtransport.Store{Path: cfg.Hybrid.StatePath}).Save(state); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.UpdateInboxTransportProviders(ctx, inboxID, "hybrid"); err != nil {
+			t.Fatal(err)
+		}
 
-	var out bytes.Buffer
-	if err := reconcileBinding(ctx, cfg, hybridtransport.Store{Path: cfg.Hybrid.StatePath},
-		*installed.LocalMailbox, errors.New("sync: input/output error"), &out); err != nil {
-		t.Fatalf("a durable binding was reported as failed: %v", err)
-	}
-	_, inbound, outbound := inboxProviders(t, st, address)
-	if inbound != "hybrid" || outbound != "hybrid" {
-		t.Fatalf("routing was rolled back under a durable binding: %s/%s", inbound, outbound)
-	}
-	if !strings.Contains(out.String(), "durability could not be confirmed") {
-		t.Fatalf("the uncertain save was not reported: %q", out.String())
-	}
+		var out bytes.Buffer
+		err = reconcileBinding(ctx, cfg, hybridtransport.Store{Path: cfg.Hybrid.StatePath}, mailbox,
+			&hybridtransport.SaveError{Installed: true, Err: errors.New("input/output error")}, &out)
+		if err == nil || !strings.Contains(err.Error(), "not proven durable") {
+			t.Fatalf("an unproven binding was reported as finished: %v", err)
+		}
+		// The file describes this routing, so it stays.
+		_, inbound, outbound := inboxProviders(t, st, address)
+		if inbound != "hybrid" || outbound != "hybrid" {
+			t.Fatalf("routing was rolled back under an installed binding: %s/%s", inbound, outbound)
+		}
+		if !strings.Contains(out.String(), "survive a reboot") {
+			t.Fatalf("the operator was not told what to check: %q", out.String())
+		}
+	})
 
-	// And when nothing was written, the routing really is undone.
-	bare, bareStore, bareAddress := hybridRuntimeDatabase(t)
-	writeConnectedState(t, bare.Hybrid.StatePath, nil)
-	bareInbox, err := bareStore.EnsureDefaults(ctx, bareAddress)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := bareStore.UpdateInboxTransportProviders(ctx, bareInbox, "hybrid"); err != nil {
-		t.Fatal(err)
-	}
-	var undone bytes.Buffer
-	err = reconcileBinding(ctx, bare, hybridtransport.Store{Path: bare.Hybrid.StatePath},
-		hybridtransport.LocalMailbox{InboxID: bareInbox, Address: bareAddress,
-			PriorInbound: "jmap", PriorOutbound: "smtp"},
-		errors.New("no space left on device"), &undone)
-	if err == nil || !strings.Contains(err.Error(), "returned to its previous providers") {
-		t.Fatalf("an unrecorded binding was not undone: %v", err)
-	}
-	_, bareIn, bareOut := inboxProviders(t, bareStore, bareAddress)
-	if bareIn == "hybrid" || bareOut == "hybrid" {
-		t.Fatalf("mailbox left on hybrid with nothing recording it: %s/%s", bareIn, bareOut)
-	}
+	t.Run("nothing written", func(t *testing.T) {
+		cfg, st, address := hybridRuntimeDatabase(t)
+		writeConnectedState(t, cfg.Hybrid.StatePath, nil)
+		inboxID, err := st.EnsureDefaults(ctx, address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.UpdateInboxTransportProviders(ctx, inboxID, "hybrid"); err != nil {
+			t.Fatal(err)
+		}
+		var out bytes.Buffer
+		err = reconcileBinding(ctx, cfg, hybridtransport.Store{Path: cfg.Hybrid.StatePath},
+			hybridtransport.LocalMailbox{InboxID: inboxID, Address: address,
+				PriorInbound: "jmap", PriorOutbound: "smtp"},
+			&hybridtransport.SaveError{Err: errors.New("no space left on device")}, &out)
+		if err == nil || !strings.Contains(err.Error(), "returned to its previous providers") {
+			t.Fatalf("an unrecorded binding was not undone: %v", err)
+		}
+		_, inbound, outbound := inboxProviders(t, st, address)
+		if inbound == "hybrid" || outbound == "hybrid" {
+			t.Fatalf("mailbox left on hybrid with nothing recording it: %s/%s", inbound, outbound)
+		}
+		if state, loadErr := (hybridtransport.Store{Path: cfg.Hybrid.StatePath}).Load(); loadErr != nil || state.LocalMailbox != nil {
+			t.Fatalf("durable state kept a binding that was never committed: %v", loadErr)
+		}
+	})
 }
