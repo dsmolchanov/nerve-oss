@@ -443,3 +443,124 @@ func TestHybridRuntimeRequiresACompletedPairing(t *testing.T) {
 		t.Fatalf("runtime client cannot reach cloud: %q %v", state, err)
 	}
 }
+
+// Every path that resumes a transitional state must complete the write the
+// previous run could not confirm, and must still hand back the key the
+// operator has to admit.
+//
+// A run that stopped without showing the key would leave an operator unable
+// to admit it, and the next run would reach Cloud with a key that was
+// therefore never admitted. A rotation whose pending key was never made
+// durable could be rotated onto at Cloud and then vanish on a power loss,
+// leaving the runtime with no identity Cloud accepts.
+func TestHybridTransitionalWritesAreCompletedOnResume(t *testing.T) {
+	restoreSync := syncDirectoryFunc
+	delay := directorySyncRetryDelay
+	t.Cleanup(func() { syncDirectoryFunc = restoreSync; directorySyncRetryDelay = delay })
+	directorySyncRetryDelay = time.Millisecond
+
+	// failOnce makes the first save report an unconfirmed write — the rename
+	// lands, the directory sync exhausts its retries — and lets every later
+	// one succeed.
+	failing := true
+	syncDirectoryFunc = func(path string) error {
+		if failing {
+			return errors.New("input/output error")
+		}
+		return restoreSync(path)
+	}
+
+	t.Run("pairing", func(t *testing.T) {
+		failing = true
+		cloud := newPairingCloud(t)
+		store := lifecycleStore(t)
+
+		state, err := Begin(store, cloud.params())
+		if err == nil {
+			t.Fatal("an unconfirmed write was reported as durable")
+		}
+		if !Unconfirmed(err) {
+			t.Fatalf("Begin reported %v, want an unconfirmed write", err)
+		}
+		// The key must still be usable by the caller, or it can never be shown
+		// to the operator who has to admit it.
+		record, err := Admission(state)
+		if err != nil || record.KeyID == "" {
+			t.Fatalf("Begin returned no usable key alongside the unconfirmed write: %+v err=%v", record, err)
+		}
+		onDisk, err := store.Load()
+		if err != nil || onDisk.Key.KID != record.KeyID {
+			t.Fatalf("the key is not readable after an unconfirmed write: %v", err)
+		}
+		before, err := os.Stat(store.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// The fault clears; resuming must rewrite the same state, which is
+		// what retries the sync, and keep the key the operator admitted.
+		failing = false
+		if err := store.Save(onDisk); err != nil {
+			t.Fatalf("the resumed write still failed: %v", err)
+		}
+		after, err := os.Stat(store.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if os.SameFile(before, after) {
+			t.Fatal("the resumed write did not rewrite the installation file")
+		}
+		resumed, err := store.Load()
+		if err != nil || resumed.Key.KID != record.KeyID {
+			t.Fatalf("resuming changed the key the operator admitted: %v", err)
+		}
+	})
+
+	t.Run("rotation", func(t *testing.T) {
+		failing = false
+		store, _ := connectedStore(t)
+		active, err := store.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		failing = true
+		record, err := PrepareRotation(store)
+		if err == nil {
+			t.Fatal("an unconfirmed replacement was reported as durable")
+		}
+		if !Unconfirmed(err) {
+			t.Fatalf("PrepareRotation reported %v, want an unconfirmed write", err)
+		}
+		if record.KeyID == "" || record.KeyID == active.Key.KID {
+			t.Fatalf("PrepareRotation returned no usable replacement: %+v", record)
+		}
+		before, err := os.Stat(store.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Rerunning after the fault clears must complete the write rather
+		// than reporting the same key as if it were already durable.
+		failing = false
+		again, err := PrepareRotation(store)
+		if err != nil {
+			t.Fatalf("the resumed rotation still failed: %v", err)
+		}
+		if again.KeyID != record.KeyID {
+			t.Fatalf("resuming replaced the key the operator admitted: %s -> %s", record.KeyID, again.KeyID)
+		}
+		after, err := os.Stat(store.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if os.SameFile(before, after) {
+			t.Fatal("the resumed rotation did not rewrite the installation file")
+		}
+		// The active key is still untouched throughout.
+		held, err := store.Load()
+		if err != nil || held.Key.KID != active.Key.KID || held.PendingKey == nil {
+			t.Fatalf("the active key was disturbed: %+v err=%v", held.Redacted(), err)
+		}
+	})
+}

@@ -727,3 +727,201 @@ func TestHybridConnectRerunPerformsTheDurabilityOperationItPromises(t *testing.T
 		t.Fatalf("a failed confirmation rolled back a binding that is recorded: %s/%s", stillIn, stillOut)
 	}
 }
+
+// A rerun of connect while still pairing must rewrite the state, which
+// retries a directory sync that never succeeded, and re-print the key to
+// admit — before it contacts Cloud. An operator who never sees the key cannot
+// admit it, and the run would then reach Cloud with a key that was therefore
+// never admitted.
+func TestHybridConnectRerunWhilePairingReprintsTheKeyBeforeCallingCloud(t *testing.T) {
+	cfg := hybridTestConfig(t)
+	ctx := context.Background()
+	args := []string{
+		"connect",
+		// Unreachable on purpose: the admission record has to appear without
+		// Cloud, and its appearance proves it is printed before the call.
+		"-cloud-url", "https://cloud.invalid",
+		"-token-endpoint", "https://auth.invalid/oauth/token",
+		"-resource", "https://runtime.invalid/mcp",
+		"-client-id", "hybrid-client", "-generation", "1",
+		"-cloud-inbox-id", uuid.NewString(), "-authority-id", "cloud.invalid",
+	}
+	var first bytes.Buffer
+	if err := runHybrid(ctx, cfg, args, &first); err == nil {
+		t.Fatal("expected the unreachable cloud to fail the pairing")
+	}
+	begun, err := (hybridtransport.Store{Path: cfg.Hybrid.StatePath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(first.String(), begun.Key.KID) {
+		t.Fatalf("the first run did not print the key to admit: %q", first.String())
+	}
+	before, err := os.Stat(cfg.Hybrid.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Rerun with no flags, as a resuming operator would.
+	var second bytes.Buffer
+	if err := runHybrid(ctx, cfg, []string{"connect"}, &second); err == nil {
+		t.Fatal("expected the unreachable cloud to fail again")
+	}
+	if !strings.Contains(second.String(), begun.Key.KID) {
+		t.Fatalf("the rerun did not re-print the key to admit: %q", second.String())
+	}
+	if !strings.Contains(second.String(), "Admit this public key") {
+		t.Fatalf("the rerun printed no admission instructions: %q", second.String())
+	}
+	after, err := os.Stat(cfg.Hybrid.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Save installs by rename, so a rerun that performed the durability
+	// operation leaves a different file behind.
+	if os.SameFile(before, after) {
+		t.Fatal("the rerun did not rewrite the installation file")
+	}
+	resumed, err := (hybridtransport.Store{Path: cfg.Hybrid.StatePath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Key.KID != begun.Key.KID || resumed.Phase != hybridtransport.PhaseConnecting {
+		t.Fatalf("the rerun changed the pairing: %+v", resumed.Redacted())
+	}
+
+	// When the state cannot be rewritten at all, the key is still shown and
+	// the command says so rather than carrying on to Cloud.
+	directory := filepath.Dir(cfg.Hybrid.StatePath)
+	if err := os.Chmod(directory, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(directory, 0o700) })
+	var blocked bytes.Buffer
+	err = runHybrid(ctx, cfg, []string{"connect"}, &blocked)
+	if err == nil || !strings.Contains(err.Error(), "not confirmed durable") {
+		t.Fatalf("a rerun that could not confirm reported something else: %v", err)
+	}
+	if !strings.Contains(blocked.String(), begun.Key.KID) {
+		t.Fatalf("the key was withheld when the write could not be confirmed: %q", blocked.String())
+	}
+}
+
+// The same for a prepared rotation: the operator must see the replacement to
+// admit it, and a rerun must complete the write rather than reporting a key
+// whose directory entry may not survive a reboot.
+func TestHybridRotatePrepareShowsTheKeyEvenWhenUnconfirmed(t *testing.T) {
+	cfg := hybridTestConfig(t)
+	ctx := context.Background()
+	writeConnectedState(t, cfg.Hybrid.StatePath, nil)
+
+	var first bytes.Buffer
+	if err := runHybrid(ctx, cfg, []string{"rotate"}, &first); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := (hybridtransport.Store{Path: cfg.Hybrid.StatePath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(first.String(), prepared.PendingKey.KID) {
+		t.Fatalf("prepare did not print the replacement: %q", first.String())
+	}
+	before, err := os.Stat(cfg.Hybrid.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var second bytes.Buffer
+	if err := runHybrid(ctx, cfg, []string{"rotate"}, &second); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(second.String(), prepared.PendingKey.KID) {
+		t.Fatalf("the rerun did not re-print the same replacement: %q", second.String())
+	}
+	after, err := os.Stat(cfg.Hybrid.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(before, after) {
+		t.Fatal("the rerun did not rewrite the installation file")
+	}
+
+	directory := filepath.Dir(cfg.Hybrid.StatePath)
+	if err := os.Chmod(directory, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(directory, 0o700) })
+	var blocked bytes.Buffer
+	err = runHybrid(ctx, cfg, []string{"rotate"}, &blocked)
+	if err == nil || !strings.Contains(err.Error(), "not confirmed durable") {
+		t.Fatalf("an unconfirmed replacement was reported as ready: %v", err)
+	}
+	if !strings.Contains(blocked.String(), prepared.PendingKey.KID) {
+		t.Fatalf("the replacement was withheld when the write could not be confirmed: %q", blocked.String())
+	}
+}
+
+// The other side of the same rule: a key the runtime does not hold must never
+// be printed. An operator who admits a key that was never stored has admitted
+// the wrong thing, and the runtime will not be able to use it.
+func TestHybridNeverShowsAKeyThatWasNotStored(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("first pairing", func(t *testing.T) {
+		cfg := hybridTestConfig(t)
+		directory := filepath.Dir(cfg.Hybrid.StatePath)
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(directory, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(directory, 0o700) })
+		var out bytes.Buffer
+		err := runHybrid(ctx, cfg, []string{
+			"connect",
+			"-cloud-url", "https://cloud.invalid",
+			"-token-endpoint", "https://auth.invalid/oauth/token",
+			"-resource", "https://runtime.invalid/mcp",
+			"-client-id", "hybrid-client", "-generation", "1",
+			"-cloud-inbox-id", uuid.NewString(), "-authority-id", "cloud.invalid",
+		}, &out)
+		if err == nil {
+			t.Fatal("a pairing that stored nothing reported success")
+		}
+		if strings.Contains(out.String(), "Admit this public key") {
+			t.Fatalf("a key that was never stored was offered for admission: %q", out.String())
+		}
+	})
+
+	t.Run("first rotation", func(t *testing.T) {
+		cfg := hybridTestConfig(t)
+		writeConnectedState(t, cfg.Hybrid.StatePath, nil)
+		before, err := (hybridtransport.Store{Path: cfg.Hybrid.StatePath}).Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		directory := filepath.Dir(cfg.Hybrid.StatePath)
+		if err := os.Chmod(directory, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(directory, 0o700) })
+		var out bytes.Buffer
+		if err := runHybrid(ctx, cfg, []string{"rotate"}, &out); err == nil {
+			t.Fatal("a rotation that stored nothing reported success")
+		}
+		if strings.Contains(out.String(), "Admit this public key") {
+			t.Fatalf("a replacement that was never stored was offered for admission: %q", out.String())
+		}
+		if err := os.Chmod(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		after, err := (hybridtransport.Store{Path: cfg.Hybrid.StatePath}).Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.PendingKey != nil || after.Key.KID != before.Key.KID {
+			t.Fatalf("a failed rotation disturbed the installation: %+v", after.Redacted())
+		}
+	})
+}
