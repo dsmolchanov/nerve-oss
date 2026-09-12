@@ -386,36 +386,35 @@ func (s Store) Load() (State, error) {
 	return state, nil
 }
 
-// SaveError says how far a failed Save got.
+// UnconfirmedError means the change was applied — a reader sees the new state,
+// or the removed file is gone — but the filesystem would not confirm that the
+// directory entry survives a power loss.
 //
-// Installed means the rename succeeded, so the new state is what a reader
-// sees, but its directory entry could not be made durable — a power loss may
-// still resurrect the previous state. That is a different situation from a
-// failure before the rename, where nothing changed at all, and a caller that
-// has already committed something elsewhere has to tell them apart.
-type SaveError struct {
-	Installed bool
-	Err       error
+// It is a different situation from a failure before the change, where nothing
+// happened at all, and a caller that has already committed something
+// elsewhere has to tell the two apart: one must be rolled back, the other
+// must not, because rolling back would contradict what a reader already sees.
+type UnconfirmedError struct {
+	Op  string
+	Err error
 }
 
-func (e *SaveError) Error() string {
-	if e.Installed {
-		return "hybrid installation state was installed but its durability is unconfirmed: " + e.Err.Error()
-	}
-	return "hybrid installation state was not written: " + e.Err.Error()
+func (e *UnconfirmedError) Error() string {
+	return "hybrid installation state " + e.Op + " is not confirmed durable: " + e.Err.Error()
 }
 
-func (e *SaveError) Unwrap() error { return e.Err }
+func (e *UnconfirmedError) Unwrap() error { return e.Err }
 
-// StateInstalled reports whether a Save error left the new state readable.
-func StateInstalled(err error) bool {
-	var saveErr *SaveError
-	return errors.As(err, &saveErr) && saveErr.Installed
+// Unconfirmed reports whether err means the change was applied but not proven
+// to survive a power loss.
+func Unconfirmed(err error) bool {
+	var unconfirmed *UnconfirmedError
+	return errors.As(err, &unconfirmed)
 }
 
 // directorySyncAttempts bounds the retry on the one step that can fail after
-// the rename. A transient fsync error is worth retrying; a persistent one is
-// a fact the caller has to be told.
+// the change is already visible. A transient fsync error is worth retrying; a
+// persistent one is a fact the caller has to be told.
 const directorySyncAttempts = 3
 
 // Save replaces the state atomically. A crash leaves either the previous
@@ -459,21 +458,30 @@ func (s Store) Save(state State) error {
 		return err
 	}
 	if err := os.Rename(name, s.Path); err != nil {
-		return &SaveError{Err: err}
+		return err
 	}
 	// Past this point the new state is what a reader sees. Only its
 	// durability is still in question, so retry the one remaining step
 	// before reporting an outcome the caller cannot undo by itself.
-	var syncErr error
+	if err := confirmDirectory(directory); err != nil {
+		return &UnconfirmedError{Op: "write", Err: err}
+	}
+	return nil
+}
+
+// confirmDirectory makes a directory change durable, retrying a sync that may
+// simply have been unlucky.
+func confirmDirectory(path string) error {
+	var err error
 	for attempt := range directorySyncAttempts {
-		if syncErr = syncDirectory(directory); syncErr == nil {
+		if err = syncDirectory(path); err == nil {
 			return nil
 		}
 		if attempt < directorySyncAttempts-1 {
 			time.Sleep(directorySyncRetryDelay)
 		}
 	}
-	return &SaveError{Installed: true, Err: syncErr}
+	return err
 }
 
 // directorySyncRetryDelay is short: this runs inside an operator command.
@@ -493,20 +501,33 @@ func (s Store) Remove() error {
 	if err := os.Remove(s.Path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
-	return syncDirectory(filepath.Dir(s.Path))
+	// The unlink is visible immediately; only its durability is in question.
+	// Reporting an unconfirmed removal as success would let an operator
+	// believe a revoked key is gone when a power loss can still bring it
+	// back. Re-running the removal retries the sync.
+	if err := confirmDirectory(filepath.Dir(s.Path)); err != nil {
+		return &UnconfirmedError{Op: "removal", Err: err}
+	}
+	return nil
 }
 
 // realSyncDirectory makes the rename or unlink durable. Without it a power
 // loss can leave the directory entry pointing at the old file even though the
 // data was written.
+//
+// Every failure is propagated, including the fs.ErrInvalid that a filesystem
+// without directory synchronization returns. Treating that as success would
+// turn a durability operation that did not happen into a claim that it did,
+// which is the one thing the caller is relying on this to tell it.
 func realSyncDirectory(path string) error {
 	directory, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	defer directory.Close()
-	if err := directory.Sync(); err != nil && !errors.Is(err, fs.ErrInvalid) {
+	if err := directory.Sync(); err != nil {
+		directory.Close()
 		return err
 	}
-	return nil
+	// Some filesystems only surface a write error on close.
+	return directory.Close()
 }

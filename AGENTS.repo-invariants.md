@@ -91,6 +91,20 @@ makes a review loop unable to terminate.
   timeout/spawn exceptions or chained tracebacks. Enforced by the restored/empty
   database failure matrix in `scripts/ci/test_selfhost_smoke.py`.
 
+- Does every hybrid installation-state change either confirm its directory
+  synchronization or report the change as unconfirmed, and never report an
+  unconfirmed change as success? A directory mutation is not durable until the
+  sync positively succeeds, so `realSyncDirectory` propagates every failure
+  including the `fs.ErrInvalid` of a filesystem without directory sync, `Save`
+  and `Remove` retry it and return `*UnconfirmedError` when it does not
+  succeed, and any command that tells an operator to re-run in order to
+  confirm a binding must itself perform that write on the re-run rather than
+  returning from a fast path. Enforced by
+  `TestHybridStateSaveReportsHowFarItGot`,
+  `TestHybridStateRefusesToClaimUnsupportedSyncIsDurable`,
+  `TestHybridConnectHandlesBothSidesOfAnUncertainSave` and
+  `TestHybridConnectRerunPerformsTheDurabilityOperationItPromises`.
+
 - Outbox provider/budget timeouts must leave a live, bounded context for every
   outcome transition and unstarted-claim requeue within the shared batch drain
   limit; a normally expired batch must not stop Run after successful cleanup.

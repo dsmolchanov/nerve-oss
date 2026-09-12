@@ -169,6 +169,17 @@ func hybridConnect(ctx context.Context, cfg config.Config, stateStore hybridtran
 			return fmt.Errorf("installation %s already carries local mailbox %s; disconnect before binding %s",
 				state.InstallationID, existing.Address, address)
 		}
+		// Re-save rather than returning straight away. A previous run whose
+		// directory sync never succeeded tells the operator to re-run this
+		// command to confirm the binding, and a path that reports success
+		// without performing any durability operation would confirm nothing.
+		// Save rewrites the same state and retries the sync.
+		if err := stateStore.Save(state); err != nil {
+			// The binding is already recorded and the routing already set, so
+			// nothing is rolled back here; only the confirmation failed.
+			fmt.Fprintln(out, "The installation file could not be confirmed durable. Check the disk before relying on this binding.")
+			return fmt.Errorf("local mailbox %s is bound but its durability is unconfirmed: %w", existing.Address, err)
+		}
 		fmt.Fprintf(out, "Local mailbox %s (%s) already sends and receives through Cloud.\n", existing.Address, existing.InboxID)
 		fmt.Fprintln(out, "Restart the runtime so it loads this installation.")
 		return nil
@@ -208,11 +219,11 @@ func hybridConnect(ctx context.Context, cfg config.Config, stateStore hybridtran
 // pairing is finished.
 func reconcileBinding(ctx context.Context, cfg config.Config, stateStore hybridtransport.Store,
 	mailbox hybridtransport.LocalMailbox, saveErr error, out io.Writer) error {
-	if hybridtransport.StateInstalled(saveErr) {
+	if hybridtransport.Unconfirmed(saveErr) {
 		fmt.Fprintf(out, "Local mailbox %s (%s) is routed through Cloud and the installation file was written,\n",
 			mailbox.Address, mailbox.InboxID)
 		fmt.Fprintln(out, "but the filesystem would not confirm that the file will survive a reboot.")
-		fmt.Fprintln(out, "Check the disk, then re-run `hybrid connect` to confirm the binding before relying on it.")
+		fmt.Fprintln(out, "Check the disk, then re-run `hybrid connect`: it re-writes the file and retries the sync.")
 		return fmt.Errorf("installation binding for %s is not proven durable: %w", mailbox.Address, saveErr)
 	}
 	// Nothing was written, so the routing must not stand on its own.

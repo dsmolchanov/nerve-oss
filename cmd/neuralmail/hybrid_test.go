@@ -618,7 +618,7 @@ func TestHybridConnectHandlesBothSidesOfAnUncertainSave(t *testing.T) {
 
 		var out bytes.Buffer
 		err = reconcileBinding(ctx, cfg, hybridtransport.Store{Path: cfg.Hybrid.StatePath}, mailbox,
-			&hybridtransport.SaveError{Installed: true, Err: errors.New("input/output error")}, &out)
+			&hybridtransport.UnconfirmedError{Op: "write", Err: errors.New("input/output error")}, &out)
 		if err == nil || !strings.Contains(err.Error(), "not proven durable") {
 			t.Fatalf("an unproven binding was reported as finished: %v", err)
 		}
@@ -646,7 +646,7 @@ func TestHybridConnectHandlesBothSidesOfAnUncertainSave(t *testing.T) {
 		err = reconcileBinding(ctx, cfg, hybridtransport.Store{Path: cfg.Hybrid.StatePath},
 			hybridtransport.LocalMailbox{InboxID: inboxID, Address: address,
 				PriorInbound: "jmap", PriorOutbound: "smtp"},
-			&hybridtransport.SaveError{Err: errors.New("no space left on device")}, &out)
+			errors.New("no space left on device"), &out)
 		if err == nil || !strings.Contains(err.Error(), "returned to its previous providers") {
 			t.Fatalf("an unrecorded binding was not undone: %v", err)
 		}
@@ -658,4 +658,72 @@ func TestHybridConnectHandlesBothSidesOfAnUncertainSave(t *testing.T) {
 			t.Fatalf("durable state kept a binding that was never committed: %v", loadErr)
 		}
 	})
+}
+
+// A run whose directory sync never succeeded tells the operator to re-run
+// connect to confirm the binding. A rerun that reported success without
+// performing any durability operation would confirm nothing, so this checks
+// that the rerun actually rewrites the state file — which is what retries the
+// sync — rather than returning from a fast path.
+func TestHybridConnectRerunPerformsTheDurabilityOperationItPromises(t *testing.T) {
+	cfg, st, address := hybridRuntimeDatabase(t)
+	ctx := context.Background()
+	writeConnectedState(t, cfg.Hybrid.StatePath, nil)
+
+	var first bytes.Buffer
+	if err := runHybrid(ctx, cfg, []string{"connect"}, &first); err != nil {
+		t.Fatal(err)
+	}
+	bound, err := (hybridtransport.Store{Path: cfg.Hybrid.StatePath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(cfg.Hybrid.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var rerun bytes.Buffer
+	if err := runHybrid(ctx, cfg, []string{"connect"}, &rerun); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(cfg.Hybrid.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Save installs by rename, so a rerun that actually re-wrote the state
+	// leaves a different file behind. Same file means the fast path returned
+	// success without touching the disk.
+	if os.SameFile(before, after) {
+		t.Fatal("the rerun reported success without rewriting the installation file")
+	}
+	// And it changed nothing else: same binding, same routing, same key.
+	again, err := (hybridtransport.Store{Path: cfg.Hybrid.StatePath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *again.LocalMailbox != *bound.LocalMailbox || again.Key.KID != bound.Key.KID {
+		t.Fatalf("the rerun altered the installation: %+v", again.Redacted())
+	}
+	_, inbound, outbound := inboxProviders(t, st, address)
+	if inbound != "hybrid" || outbound != "hybrid" {
+		t.Fatalf("the rerun disturbed the routing: %s/%s", inbound, outbound)
+	}
+
+	// When the confirmation still cannot be made, the rerun must not claim
+	// the binding is good, and must leave the routing alone.
+	directory := filepath.Dir(cfg.Hybrid.StatePath)
+	if err := os.Chmod(directory, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(directory, 0o700) })
+	var blocked bytes.Buffer
+	err = runHybrid(ctx, cfg, []string{"connect"}, &blocked)
+	if err == nil || !strings.Contains(err.Error(), "durability is unconfirmed") {
+		t.Fatalf("a rerun that could not confirm reported success: %v", err)
+	}
+	_, stillIn, stillOut := inboxProviders(t, st, address)
+	if stillIn != "hybrid" || stillOut != "hybrid" {
+		t.Fatalf("a failed confirmation rolled back a binding that is recorded: %s/%s", stillIn, stillOut)
+	}
 }
