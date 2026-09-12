@@ -195,26 +195,27 @@ func hybridConnect(ctx context.Context, cfg config.Config, stateStore hybridtran
 // reconcileBinding decides what to do when recording the binding failed.
 //
 // A save error does not mean nothing was written. The state file is installed
-// by rename and the directory entry is synced afterwards, so a failure can
-// come either before the rename — nothing is recorded — or after it, with the
-// binding already durable. Rolling the database back in the second case would
-// leave the file naming a mailbox whose providers no longer route to Cloud,
-// and the runtime would then poll an inbox that no longer pulls from it.
+// by rename and its directory entry synced afterwards, so a failure can come
+// before the rename — nothing changed — or after it, where the new state is
+// what a reader sees but may not survive a power loss. Save reports which,
+// and the two need opposite handling: rolling the database back on the second
+// would leave the file naming a mailbox whose providers no longer route to
+// Cloud.
 //
-// So read the state back and follow whatever is actually on disk.
+// Neither outcome is reported as success. A binding whose durability is
+// unconfirmed can still vanish on the next reboot and strand the mailbox, so
+// the operator is told exactly what to check rather than left believing the
+// pairing is finished.
 func reconcileBinding(ctx context.Context, cfg config.Config, stateStore hybridtransport.Store,
 	mailbox hybridtransport.LocalMailbox, saveErr error, out io.Writer) error {
-	recorded, loadErr := stateStore.Load()
-	if loadErr == nil && recorded.LocalMailbox != nil && recorded.LocalMailbox.InboxID == mailbox.InboxID {
-		// The binding is on disk. Keep the routing and say what is unproven,
-		// rather than undoing a change the file already describes.
-		fmt.Fprintf(out, "Local mailbox %s (%s) now sends and receives through Cloud.\n",
+	if hybridtransport.StateInstalled(saveErr) {
+		fmt.Fprintf(out, "Local mailbox %s (%s) is routed through Cloud and the installation file was written,\n",
 			mailbox.Address, mailbox.InboxID)
-		fmt.Fprintf(out, "The installation file was written but its durability could not be confirmed (%v).\n", saveErr)
-		fmt.Fprintln(out, "Verify with `hybrid status` after restarting the runtime.")
-		return nil
+		fmt.Fprintln(out, "but the filesystem would not confirm that the file will survive a reboot.")
+		fmt.Fprintln(out, "Check the disk, then re-run `hybrid connect` to confirm the binding before relying on it.")
+		return fmt.Errorf("installation binding for %s is not proven durable: %w", mailbox.Address, saveErr)
 	}
-	// Nothing durable records the binding, so the routing must not stand.
+	// Nothing was written, so the routing must not stand on its own.
 	if restoreErr := restoreLocalInbox(ctx, cfg, mailbox); restoreErr != nil {
 		return fmt.Errorf("local mailbox %s is routed through Cloud, the binding was not recorded (%v), "+
 			"and the routing could not be undone: %w", mailbox.Address, saveErr, restoreErr)
