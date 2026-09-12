@@ -23,7 +23,7 @@ func testKey(t *testing.T) Key {
 func testState(t *testing.T, key Key) State {
 	t.Helper()
 	return State{
-		Version: StateVersion, CloudBaseURL: "https://cloud.example.test",
+		Version: StateVersion, Phase: PhaseInstalled, CloudBaseURL: "https://cloud.example.test",
 		TokenEndpoint: "https://auth.example.test/oauth/token", Resource: "https://runtime.example.test/mcp",
 		ClientID: "hybrid-client", Generation: 1, OrgID: uuid.NewString(),
 		InstallationID: uuid.NewString(), InboxID: uuid.NewString(),

@@ -54,6 +54,21 @@ var (
 	ErrStateUnsafePermissions = errors.New("hybrid installation state is readable beyond its owner")
 	ErrStateVersion           = errors.New("hybrid installation state was written by a newer runtime")
 	ErrNoPendingKey           = errors.New("hybrid installation has no prepared replacement key")
+
+	// ErrPairingIncomplete means the key and connection parameters are on disk
+	// but the pairing was never approved and completed, so there is no
+	// installation to carry mail for yet.
+	ErrPairingIncomplete = errors.New("hybrid pairing has not been completed")
+)
+
+// Connecting holds a key and the Cloud parameters while the operator admits
+// the key and the owner approves the pairing. Installed is a live
+// installation. The phase is explicit rather than inferred from a missing
+// installation ID, so a truncated or hand-edited file cannot quietly present
+// itself as a fresh pairing.
+const (
+	PhaseConnecting = "connecting"
+	PhaseInstalled  = "installed"
 )
 
 // Key is one RSA keypair admitted to the Cloud M2M inventory. KID is the
@@ -73,6 +88,7 @@ type Key struct {
 // never admitted cannot strand the runtime without a usable identity.
 type State struct {
 	Version        int    `json:"version"`
+	Phase          string `json:"phase"`
 	CloudBaseURL   string `json:"cloud_base_url"`
 	TokenEndpoint  string `json:"token_endpoint"`
 	Resource       string `json:"resource"`
@@ -120,12 +136,25 @@ func (s State) Validate() error {
 	if s.Generation <= 0 {
 		return errors.New("hybrid generation must be positive")
 	}
-	for name, value := range map[string]string{
-		"org_id": s.OrgID, "installation_id": s.InstallationID, "inbox_id": s.InboxID,
-	} {
-		if parsed, err := uuid.Parse(value); err != nil || parsed.String() != value {
-			return fmt.Errorf("hybrid %s must be a canonical UUID", name)
+	if parsed, err := uuid.Parse(s.InboxID); err != nil || parsed.String() != s.InboxID {
+		return errors.New("hybrid inbox_id must be a canonical UUID")
+	}
+	switch s.Phase {
+	case PhaseConnecting:
+		// Cloud names the organization and the installation when it completes
+		// the pairing. Carrying either beforehand would mean this runtime had
+		// decided its own identity.
+		if s.OrgID != "" || s.InstallationID != "" {
+			return errors.New("hybrid state is connecting but already names an installation")
 		}
+	case PhaseInstalled:
+		for name, value := range map[string]string{"org_id": s.OrgID, "installation_id": s.InstallationID} {
+			if parsed, err := uuid.Parse(value); err != nil || parsed.String() != value {
+				return fmt.Errorf("hybrid %s must be a canonical UUID", name)
+			}
+		}
+	default:
+		return fmt.Errorf("hybrid state phase %q must be %q or %q", s.Phase, PhaseConnecting, PhaseInstalled)
 	}
 	// The authority ID namespaces local deduplication keys. A colon would let
 	// one authority forge another's key by splitting the joined form.
@@ -275,6 +304,10 @@ func (k Key) PublicJWK() (json.RawMessage, error) {
 
 // Store reads and writes installation state at one path.
 type Store struct{ Path string }
+
+// Installed reports whether the pairing completed and Cloud named an
+// installation for this runtime.
+func (s State) Installed() bool { return s.Phase == PhaseInstalled }
 
 // Load returns the installation state, or ErrNotConnected when this runtime has
 // never been paired. It refuses state that any account but the owner can read:
