@@ -158,12 +158,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.25.13"
-      # NM_REQUIRE_DB makes the ingest tests fail rather than skip without a
-      # database. Deduplication across a restart is the claim this package
-      # rests on, and it is enforced by the store, so a skipped run here would
-      # be a green build that proved nothing.
-      - name: Verify hybrid ingest deduplication against the runtime store
+      # NM_REQUIRE_DB makes these tests fail rather than skip without a
+      # database. Ingest deduplication and mailbox routing are both enforced
+      # by the store, so a skipped run here would be a green build that
+      # proved nothing about either.
+      - name: Verify hybrid ingest and mailbox routing against the runtime store
         env:
           NM_REQUIRE_DB: "1"
           NM_TEST_DB_DSN: postgres://neuralmail:neuralmail@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/neuralmail?sslmode=disable
-        run: go test -race ./internal/emailtransport/providers/hybrid -count=1
+        run: go test -race ./internal/emailtransport/providers/hybrid ./cmd/neuralmail -count=1

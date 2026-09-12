@@ -46,7 +46,7 @@ func TestHybridOutboundRefusesContentItCannotCarry(t *testing.T) {
 				if action == "send" {
 					t.Error("an unsendable message reached cloud")
 				}
-				return http.StatusOK, SendReceipt{Status: "sent", ProviderMessageID: "p1"}
+				return http.StatusOK, bound(client, "op-1", SendReceipt{Status: "sent", ProviderMessageID: "p1"})
 			}
 			adapter := &OutboundAdapter{Client: client, Kind: "reply"}
 			message := base()
@@ -68,7 +68,7 @@ func TestHybridOutboundRefusesContentItCannotCarry(t *testing.T) {
 	server, state := newCloudServer(t, client.InstallationID, client.InboxID)
 	client.BaseURL = server.URL
 	state.handler = func(string, map[string]any) (int, any) {
-		return http.StatusOK, SendReceipt{Status: "sent", ProviderMessageID: "p1", OperationKey: "op-1"}
+		return http.StatusOK, bound(client, "op-1", SendReceipt{Status: "sent", ProviderMessageID: "p1"})
 	}
 	adapter := &OutboundAdapter{Client: client, Kind: "reply"}
 	if _, err := adapter.SendMessage(context.Background(), base(), "op-1"); err != nil {
@@ -131,6 +131,17 @@ func inboundFixture(t *testing.T, deliveries []Delivery) (*InboundAdapter, *clou
 		return http.StatusOK, map[string]any{}
 	}
 	return &InboundAdapter{Client: client, AuthorityID: "cloud.example.test"}, state
+}
+
+// bound stamps the client's own identity onto a receipt. Cloud always names
+// the organization, installation and operation it is answering for, and the
+// client now requires it, so a fixture without them is not a response Cloud
+// would produce.
+func bound(c *Client, operationKey string, receipt SendReceipt) SendReceipt {
+	receipt.OrgID = c.OrgID
+	receipt.InstallationID = c.InstallationID
+	receipt.OperationKey = operationKey
+	return receipt
 }
 
 func delivery(id, providerID string) Delivery {
@@ -308,7 +319,9 @@ func TestHybridOutboundResolvesEverySendStatus(t *testing.T) {
 			client, _ := newTestClient(t, "")
 			server, state := newCloudServer(t, client.InstallationID, client.InboxID)
 			client.BaseURL = server.URL
-			state.handler = func(string, map[string]any) (int, any) { return http.StatusOK, want.receipt }
+			state.handler = func(string, map[string]any) (int, any) {
+				return http.StatusOK, bound(client, "op-1", want.receipt)
+			}
 			adapter := &OutboundAdapter{Client: client, Kind: "reply"}
 			id, err := adapter.SendMessage(context.Background(),
 				emailtransport.OutboundMessage{To: []string{"a@example.test"}, Subject: "s", TextBody: "b"}, "op-1")
@@ -330,7 +343,7 @@ func TestHybridOutboundPassesTheIdempotencyKeyThrough(t *testing.T) {
 		if action == "send" {
 			seen = append(seen, fmt.Sprint(input["operation_key"]))
 		}
-		return http.StatusOK, SendReceipt{Status: "sent", ProviderMessageID: "p1"}
+		return http.StatusOK, bound(client, "outbox-42", SendReceipt{Status: "sent", ProviderMessageID: "p1"})
 	}
 	adapter := &OutboundAdapter{Client: client, Kind: "reply"}
 	message := emailtransport.OutboundMessage{To: []string{"a@example.test"}, Subject: "s", TextBody: "b"}
@@ -358,7 +371,7 @@ func TestHybridOutboundRefusesUnsendableRequests(t *testing.T) {
 	client.BaseURL = server.URL
 	state.handler = func(string, map[string]any) (int, any) {
 		t.Error("an unsendable request reached cloud")
-		return http.StatusOK, SendReceipt{Status: "sent", ProviderMessageID: "p1"}
+		return http.StatusOK, bound(client, "op-1", SendReceipt{Status: "sent", ProviderMessageID: "p1"})
 	}
 	adapter := &OutboundAdapter{Client: client, Kind: "reply"}
 	cases := map[string]struct {
@@ -398,7 +411,7 @@ func TestHybridOutboundReportsDeliveryStatusByOperationKey(t *testing.T) {
 			var asked string
 			state.handler = func(action string, input map[string]any) (int, any) {
 				asked = fmt.Sprint(input["operation_key"])
-				return http.StatusOK, SendReceipt{Status: status, ProviderMessageID: "p1"}
+				return http.StatusOK, bound(client, "outbox-42", SendReceipt{Status: status, ProviderMessageID: "p1"})
 			}
 			adapter := &OutboundAdapter{Client: client}
 			got, err := adapter.GetDeliveryStatus(context.Background(), "outbox-42")

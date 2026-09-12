@@ -155,6 +155,21 @@ func hybridConnect(ctx context.Context, cfg config.Config, stateStore hybridtran
 	if address == "" {
 		address = cfg.SMTP.From
 	}
+	// A rerun against an installation that is already bound must not rebind.
+	// Capturing the routing a second time would snapshot "hybrid" as the
+	// providers to restore and lose the real ones, and pointing at a
+	// different mailbox would leave the first one on a provider nothing
+	// polls or restores.
+	if existing := state.LocalMailbox; existing != nil {
+		if !strings.EqualFold(existing.Address, address) {
+			return fmt.Errorf("installation %s already carries local mailbox %s; disconnect before binding %s",
+				state.InstallationID, existing.Address, address)
+		}
+		fmt.Fprintf(out, "Local mailbox %s (%s) already sends and receives through Cloud.\n", existing.Address, existing.InboxID)
+		fmt.Fprintln(out, "Restart the runtime so it loads this installation.")
+		return nil
+	}
+
 	mailbox, err := bindLocalInbox(ctx, cfg, address)
 	if err != nil {
 		// The installation is real and recorded; only the local routing is
@@ -166,7 +181,16 @@ func hybridConnect(ctx context.Context, cfg config.Config, stateStore hybridtran
 	// polls that mailbox, and disconnect puts the routing back.
 	state.LocalMailbox = mailbox
 	if err := stateStore.Save(state); err != nil {
-		return fmt.Errorf("local mailbox %s is routed through Cloud but the binding was not recorded: %w", address, err)
+		// The routing is already committed but nothing durable now records
+		// it: the runtime would poll the configured default and disconnect
+		// would have no routing to restore, stranding this mailbox in both
+		// directions. Put it back before reporting.
+		if restoreErr := restoreLocalInbox(ctx, cfg, *mailbox); restoreErr != nil {
+			return fmt.Errorf("local mailbox %s is routed through Cloud, the binding was not recorded (%v), "+
+				"and the routing could not be undone: %w", address, err, restoreErr)
+		}
+		return fmt.Errorf("local mailbox %s was returned to its previous providers because the binding "+
+			"could not be recorded: %w", address, err)
 	}
 	fmt.Fprintf(out, "Local mailbox %s (%s) now sends and receives through Cloud.\n", address, mailbox.InboxID)
 	fmt.Fprintln(out, "Restart the runtime so it loads this installation.")

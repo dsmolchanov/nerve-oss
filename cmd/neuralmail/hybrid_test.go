@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +17,7 @@ import (
 
 	"neuralmail/internal/config"
 	hybridtransport "neuralmail/internal/emailtransport/providers/hybrid"
+	"neuralmail/internal/store"
 )
 
 func writeConnectedState(t *testing.T, path string, mutate func(*hybridtransport.State)) hybridtransport.State {
@@ -359,5 +361,164 @@ func TestHybridDisconnectWithoutARecordedMailbox(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Restart the runtime") {
 		t.Fatalf("disconnect did not tell the operator to restart: %q", out.String())
+	}
+}
+
+// hybridRuntimeDatabase gives the CLI a real store. Mailbox routing is the
+// thing under test here and it lives in PostgreSQL, so a fake would prove
+// nothing about what connect and disconnect actually leave behind.
+func hybridRuntimeDatabase(t *testing.T) (config.Config, *store.Store, string) {
+	t.Helper()
+	dsn := os.Getenv("NM_TEST_DB_DSN")
+	if dsn == "" {
+		if os.Getenv("NM_REQUIRE_DB") == "1" {
+			t.Fatal("NM_REQUIRE_DB=1 but NM_TEST_DB_DSN is unset")
+		}
+		t.Skip("set NM_TEST_DB_DSN to exercise hybrid mailbox routing")
+	}
+	cfg := hybridTestConfig(t)
+	cfg.Database.DSN = dsn
+	st, err := store.Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	ctx := context.Background()
+	if err := store.MigrateCore(ctx, st.DB()); err != nil {
+		t.Fatal(err)
+	}
+	address := fmt.Sprintf("hybrid-cli-%s@local.nerve.email", strings.ReplaceAll(uuid.NewString(), "-", ""))
+	cfg.SMTP.From = address
+	return cfg, st, address
+}
+
+func inboxProviders(t *testing.T, st *store.Store, address string) (string, string, string) {
+	t.Helper()
+	record, err := st.GetInboxByAddress(context.Background(), address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return record.ID, record.InboundProvider, record.OutboundProvider
+}
+
+// Re-running connect against an installation that is already bound must not
+// rebind. Capturing the routing a second time would snapshot "hybrid" as the
+// providers to restore and lose the real ones, and binding a second mailbox
+// would leave the first on a provider nothing polls or later restores.
+func TestHybridConnectRebindIsIdempotentAndRefusesADifferentMailbox(t *testing.T) {
+	cfg, st, address := hybridRuntimeDatabase(t)
+	ctx := context.Background()
+	writeConnectedState(t, cfg.Hybrid.StatePath, nil)
+
+	var first bytes.Buffer
+	if err := runHybrid(ctx, cfg, []string{"connect"}, &first); err != nil {
+		t.Fatal(err)
+	}
+	inboxID, inbound, outbound := inboxProviders(t, st, address)
+	if inbound != "hybrid" || outbound != "hybrid" {
+		t.Fatalf("mailbox routed to %s/%s, want hybrid both ways", inbound, outbound)
+	}
+	bound, err := (hybridtransport.Store{Path: cfg.Hybrid.StatePath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bound.LocalMailbox == nil || bound.LocalMailbox.InboxID != inboxID {
+		t.Fatalf("binding not recorded: %+v", bound.LocalMailbox)
+	}
+	// The providers to restore are the real ones, not "hybrid".
+	if bound.LocalMailbox.PriorInbound == "hybrid" || bound.LocalMailbox.PriorOutbound == "hybrid" {
+		t.Fatalf("recorded hybrid as the routing to restore: %+v", bound.LocalMailbox)
+	}
+	prior := *bound.LocalMailbox
+
+	// Same mailbox again: a no-op that keeps the original snapshot.
+	var second bytes.Buffer
+	if err := runHybrid(ctx, cfg, []string{"connect"}, &second); err != nil {
+		t.Fatal(err)
+	}
+	rebound, err := (hybridtransport.Store{Path: cfg.Hybrid.StatePath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *rebound.LocalMailbox != prior {
+		t.Fatalf("rerunning connect changed the binding: %+v -> %+v", prior, *rebound.LocalMailbox)
+	}
+	if !strings.Contains(second.String(), "already sends and receives") {
+		t.Fatalf("rerun did not report the existing binding: %q", second.String())
+	}
+
+	// A different mailbox is refused rather than silently stranding the first.
+	other := fmt.Sprintf("hybrid-other-%s@local.nerve.email", strings.ReplaceAll(uuid.NewString(), "-", ""))
+	var third bytes.Buffer
+	err = runHybrid(ctx, cfg, []string{"connect", "-local-inbox", other}, &third)
+	if err == nil || !strings.Contains(err.Error(), "disconnect before binding") {
+		t.Fatalf("connect rebound a different mailbox: %v", err)
+	}
+	var routed int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT count(*) FROM inboxes WHERE inbound_provider = 'hybrid' AND address IN ($1, $2)`,
+		address, other).Scan(&routed); err != nil {
+		t.Fatal(err)
+	}
+	if routed != 1 {
+		t.Fatalf("%d mailboxes route through hybrid, want exactly 1", routed)
+	}
+
+	// Disconnect puts the original providers back.
+	var fourth bytes.Buffer
+	if err := runHybrid(ctx, cfg, []string{"disconnect"}, &fourth); err != nil {
+		t.Fatal(err)
+	}
+	_, restoredIn, restoredOut := inboxProviders(t, st, address)
+	if restoredIn == "hybrid" || restoredOut == "hybrid" {
+		t.Fatalf("disconnect left the mailbox on hybrid: %s/%s", restoredIn, restoredOut)
+	}
+}
+
+// The routing update commits before the state file is written. If that write
+// fails the mailbox is on hybrid with nothing recording it: the runtime would
+// poll the configured default and disconnect would have no routing to
+// restore, stranding the mailbox in both directions.
+func TestHybridConnectUndoesRoutingWhenTheBindingCannotBeRecorded(t *testing.T) {
+	cfg, st, address := hybridRuntimeDatabase(t)
+	ctx := context.Background()
+	writeConnectedState(t, cfg.Hybrid.StatePath, nil)
+	// Give the mailbox a routing worth returning to, rather than letting
+	// connect create it: the point is that a real prior setup survives.
+	inboxID, err := st.EnsureDefaults(ctx, address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateInboxProviders(ctx, inboxID, "jmap", "resend"); err != nil {
+		t.Fatal(err)
+	}
+	_, beforeIn, beforeOut := inboxProviders(t, st, address)
+
+	// A state directory that cannot take a new file: Save writes through a
+	// temporary file in it, while the existing state still reads.
+	directory := filepath.Dir(cfg.Hybrid.StatePath)
+	if err := os.Chmod(directory, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(directory, 0o700) })
+
+	var out bytes.Buffer
+	err = runHybrid(ctx, cfg, []string{"connect"}, &out)
+	if err == nil {
+		t.Fatal("connect reported success though the binding was never recorded")
+	}
+	if !strings.Contains(err.Error(), "returned to its previous providers") {
+		t.Fatalf("connect did not undo the routing: %v", err)
+	}
+	_, afterIn, afterOut := inboxProviders(t, st, address)
+	if afterIn != beforeIn || afterOut != beforeOut {
+		t.Fatalf("mailbox left on %s/%s, want the pre-connect %s/%s", afterIn, afterOut, beforeIn, beforeOut)
+	}
+	state, err := (hybridtransport.Store{Path: cfg.Hybrid.StatePath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.LocalMailbox != nil {
+		t.Fatalf("durable state kept a binding that was never committed: %+v", state.LocalMailbox)
 	}
 }

@@ -102,6 +102,7 @@ func newTestClient(t *testing.T, cloudURL string) (*Client, *tokenServer) {
 	tokenEndpoint, tokenState := newTokenServer(t, key)
 	return &Client{
 		BaseURL: cloudURL, Tokens: newTestTokenSource(tokenEndpoint.URL, key),
+		OrgID:          "33333333-3333-4333-8333-333333333333",
 		InstallationID: "11111111-1111-4111-8111-111111111111",
 		InboxID:        "22222222-2222-4222-8222-222222222222",
 	}, tokenState
@@ -118,7 +119,9 @@ func TestHybridClientCarriesTheInstallationBindingOnEveryAction(t *testing.T) {
 		case "poll":
 			return http.StatusOK, map[string]any{"delivery": validDelivery(client)}
 		case "send", "receipt":
-			return http.StatusOK, SendReceipt{Status: "sent", ProviderMessageID: "p1", OperationKey: "k"}
+			return http.StatusOK, SendReceipt{
+				OrgID: client.OrgID, InstallationID: client.InstallationID,
+				OperationKey: "k", Status: "sent", ProviderMessageID: "p1"}
 		case "status":
 			return http.StatusOK, map[string]any{"installation_id": client.InstallationID, "state": "active"}
 		default:
@@ -319,10 +322,16 @@ func TestHybridClientRejectsResponsesForAnotherBinding(t *testing.T) {
 			LeaseToken: "55555555-5555-4555-8555-555555555555",
 		}
 	}
+	// Absence is not acceptance: an omitted identity is the easy case for a
+	// broken or hostile peer to produce, so each required field is dropped
+	// independently as well as replaced with a foreign value.
 	deliveries := map[string]func(*Delivery){
 		"foreign organization": func(d *Delivery) { d.OrgID = "66666666-6666-4666-8666-666666666666" },
 		"foreign installation": func(d *Delivery) { d.InstallationID = "77777777-7777-4777-8777-777777777777" },
 		"foreign mailbox":      func(d *Delivery) { d.InboxID = "88888888-8888-4888-8888-888888888888" },
+		"absent organization":  func(d *Delivery) { d.OrgID = "" },
+		"absent installation":  func(d *Delivery) { d.InstallationID = "" },
+		"absent mailbox":       func(d *Delivery) { d.InboxID = "" },
 		"unusable id":          func(d *Delivery) { d.ID = "not-a-uuid" },
 		"no lease":             func(d *Delivery) { d.LeaseToken = "" },
 		"no sender":            func(d *Delivery) { d.Sender = "" },
@@ -331,7 +340,6 @@ func TestHybridClientRejectsResponsesForAnotherBinding(t *testing.T) {
 	for name, mutate := range deliveries {
 		t.Run("poll "+name, func(t *testing.T) {
 			client, _ := newTestClient(t, "")
-			client.OrgID = "33333333-3333-4333-8333-333333333333"
 			server, state := newCloudServer(t, client.InstallationID, client.InboxID)
 			client.BaseURL = server.URL
 			delivery := good(client)
@@ -345,17 +353,27 @@ func TestHybridClientRejectsResponsesForAnotherBinding(t *testing.T) {
 		})
 	}
 
-	receipts := map[string]SendReceipt{
-		"foreign organization": {OrgID: "66666666-6666-4666-8666-666666666666", Status: "sent", OperationKey: "op-1", ProviderMessageID: "p"},
-		"foreign installation": {InstallationID: "77777777-7777-4777-8777-777777777777", Status: "sent", OperationKey: "op-1", ProviderMessageID: "p"},
-		"foreign operation":    {Status: "sent", OperationKey: "someone-elses", ProviderMessageID: "p"},
-		"no status":            {OperationKey: "op-1"},
+	org, installation := "33333333-3333-4333-8333-333333333333", "11111111-1111-4111-8111-111111111111"
+	complete := SendReceipt{OrgID: org, InstallationID: installation, OperationKey: "op-1",
+		Status: "sent", ProviderMessageID: "p"}
+	receipts := map[string]SendReceipt{}
+	for name, mutate := range map[string]func(*SendReceipt){
+		"foreign organization": func(r *SendReceipt) { r.OrgID = "66666666-6666-4666-8666-666666666666" },
+		"foreign installation": func(r *SendReceipt) { r.InstallationID = "77777777-7777-4777-8777-777777777777" },
+		"foreign operation":    func(r *SendReceipt) { r.OperationKey = "someone-elses" },
+		"absent organization":  func(r *SendReceipt) { r.OrgID = "" },
+		"absent installation":  func(r *SendReceipt) { r.InstallationID = "" },
+		"absent operation":     func(r *SendReceipt) { r.OperationKey = "" },
+		"absent status":        func(r *SendReceipt) { r.Status = "" },
+	} {
+		receipt := complete
+		mutate(&receipt)
+		receipts[name] = receipt
 	}
 	for name, receipt := range receipts {
 		for _, action := range []string{"send", "receipt"} {
 			t.Run(action+" "+name, func(t *testing.T) {
 				client, _ := newTestClient(t, "")
-				client.OrgID = "33333333-3333-4333-8333-333333333333"
 				server, state := newCloudServer(t, client.InstallationID, client.InboxID)
 				client.BaseURL = server.URL
 				state.handler = func(string, map[string]any) (int, any) { return http.StatusOK, receipt }
@@ -377,8 +395,9 @@ func TestHybridClientRejectsResponsesForAnotherBinding(t *testing.T) {
 	// for this installation, so an empty or foreign answer must not pass.
 	for name, body := range map[string]map[string]any{
 		"foreign installation": {"installation_id": "77777777-7777-4777-8777-777777777777", "state": "active"},
-		"no installation":      {"state": "active"},
-		"no state":             {"installation_id": "11111111-1111-4111-8111-111111111111"},
+		"absent installation":  {"state": "active"},
+		"absent state":         {"installation_id": "11111111-1111-4111-8111-111111111111"},
+		"empty body":           {},
 	} {
 		t.Run("status "+name, func(t *testing.T) {
 			client, _ := newTestClient(t, "")

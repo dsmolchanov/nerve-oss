@@ -154,15 +154,28 @@ func (c *Client) checkDelivery(d Delivery) error {
 	return nil
 }
 
-// checkBinding rejects a response naming a different tenant or installation.
+// checkBinding requires a response to name this tenant and installation.
+//
+// Absence is not acceptance. A check that only rejected a *different* value
+// would pass any response that simply omitted the field, which is the easy
+// case for a broken or hostile peer to produce: an empty org_id would then be
+// stored as this tenant's mail, and an empty installation_id would let a
+// receipt finalize an outbox row it does not describe.
 func (c *Client) checkBinding(action, orgID, installationID string) error {
-	if c.OrgID != "" && orgID != "" && orgID != c.OrgID {
+	forbidden := func(format string, args ...any) error {
 		return emailtransport.NewPermanentError(0, "forbidden",
-			fmt.Errorf("%w: %s answered for another organization", ErrAuthority, action))
+			fmt.Errorf(format, args...))
 	}
-	if c.InstallationID != "" && installationID != "" && installationID != c.InstallationID {
-		return emailtransport.NewPermanentError(0, "forbidden",
-			fmt.Errorf("%w: %s answered for another installation", ErrAuthority, action))
+	// The client itself must know what to compare against. An installed
+	// runtime always does; anything else cannot verify and must not guess.
+	if c.OrgID == "" || c.InstallationID == "" {
+		return forbidden("%w: %s cannot be verified without an installation binding", ErrAuthority, action)
+	}
+	if orgID != c.OrgID {
+		return forbidden("%w: %s did not answer for this organization", ErrAuthority, action)
+	}
+	if installationID != c.InstallationID {
+		return forbidden("%w: %s did not answer for this installation", ErrAuthority, action)
 	}
 	return nil
 }
@@ -173,9 +186,11 @@ func (c *Client) checkReceipt(action, operationKey string, receipt SendReceipt) 
 	if err := c.checkBinding(action, receipt.OrgID, receipt.InstallationID); err != nil {
 		return err
 	}
-	if receipt.OperationKey != "" && receipt.OperationKey != operationKey {
+	// Likewise exact: a receipt with no operation key does not answer the
+	// operation this call asked about.
+	if receipt.OperationKey != operationKey {
 		return emailtransport.NewPermanentError(0, "forbidden",
-			fmt.Errorf("%w: %s answered for operation %q", ErrAuthority, action, receipt.OperationKey))
+			fmt.Errorf("%w: %s did not answer for this operation", ErrAuthority, action))
 	}
 	if receipt.Status == "" {
 		return emailtransport.NewTransientError(0, "server_error",
@@ -230,12 +245,14 @@ func (c *Client) Status(ctx context.Context) (string, error) {
 		return "", err
 	}
 	// Rotation treats a successful status as proof that Cloud accepts the
-	// replacement key for this installation. An empty or foreign answer must
-	// not be allowed to stand in for that.
-	if err := c.checkBinding("status", "", body.InstallationID); err != nil {
-		return "", err
+	// replacement key for this installation, so an empty or foreign answer
+	// must not be allowed to stand in for that. The status body names no
+	// organization, so this compares the installation exactly.
+	if c.InstallationID == "" || body.InstallationID != c.InstallationID {
+		return "", emailtransport.NewPermanentError(0, "forbidden",
+			fmt.Errorf("%w: status did not answer for this installation", ErrAuthority))
 	}
-	if body.InstallationID == "" || body.State == "" {
+	if body.State == "" {
 		return "", emailtransport.NewTransientError(0, "server_error",
 			fmt.Errorf("%w: status returned no installation state", ErrUnavailable))
 	}
