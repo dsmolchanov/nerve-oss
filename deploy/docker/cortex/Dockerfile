@@ -65,6 +65,13 @@ LABEL io.nerve.runtime.version="${RUNTIME_VERSION}" \
 
 RUN addgroup -S neuralmail && adduser -S neuralmail -G neuralmail
 
+# Durable runtime-local state that is not in Postgres. A hybrid installation's
+# private key lives here, so the directory is owned by the runtime user and
+# closed to everyone else, and it must be mounted from a volume: anything left
+# in the image layer is destroyed by the next upgrade.
+RUN mkdir -p /var/lib/nerve && chown neuralmail:neuralmail /var/lib/nerve && chmod 0700 /var/lib/nerve
+VOLUME ["/var/lib/nerve"]
+
 USER neuralmail
 WORKDIR /app
 

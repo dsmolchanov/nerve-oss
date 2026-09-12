@@ -101,8 +101,12 @@ jobs:
         run: python3 scripts/ci/test_selfhost_upgrade_docs.py
       - name: Self-host process diagnostics regression
         run: python3 scripts/ci/test_selfhost_smoke.py
+      - name: Hybrid smoke process diagnostics regression
+        run: python3 scripts/ci/test_hybrid_selfhost_smoke.py
       - name: Compose SMTP/JMAP, persistence and restore
         run: python3 scripts/ci/selfhost_smoke.py
+      - name: Hybrid installation clean start, upgrade and backup boundary
+        run: python3 scripts/ci/hybrid_selfhost_smoke.py
 
   outbox-timeout-regression:
     runs-on: ubuntu-latest
@@ -131,3 +135,35 @@ jobs:
           NM_REQUIRE_DB: "1"
           NM_TEST_DB_DSN: postgres://neuralmail:neuralmail@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/neuralmail?sslmode=disable
         run: go test -race ./internal/emailtransport -count=1
+
+  hybrid-transport:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: neuralmail
+          POSTGRES_PASSWORD: neuralmail
+          POSTGRES_DB: neuralmail
+        ports:
+          - 5432
+        options: >-
+          --health-cmd="pg_isready -U neuralmail"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.13"
+      # NM_REQUIRE_DB makes the ingest tests fail rather than skip without a
+      # database. Deduplication across a restart is the claim this package
+      # rests on, and it is enforced by the store, so a skipped run here would
+      # be a green build that proved nothing.
+      - name: Verify hybrid ingest deduplication against the runtime store
+        env:
+          NM_REQUIRE_DB: "1"
+          NM_TEST_DB_DSN: postgres://neuralmail:neuralmail@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/neuralmail?sslmode=disable
+        run: go test -race ./internal/emailtransport/providers/hybrid -count=1
