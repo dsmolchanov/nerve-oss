@@ -244,6 +244,16 @@ runtime acknowledges it.
 
 This is off unless `hybrid.state_path` is set. Without it nothing changes.
 
+### What it cannot carry
+
+The Cloud send contract is one recipient, a subject and a plain-text body. A
+reply with an HTML body, attachments, CC or BCC recipients, a Reply-To address
+or custom headers is **refused** rather than sent with those parts missing:
+once Cloud reports the message sent the outbox row is finalized and attachment
+bytes may be released, so a silent omission would surface at the recipient and
+could never be repaired. The refusal is permanent, so the outbox fails the
+message instead of retrying it.
+
 ### What the runtime holds
 
 One file, at `hybrid.state_path`, containing an RSA private key this runtime
@@ -271,8 +281,17 @@ Pairing needs two people and cannot be done by the runtime alone: an operator
 admits the runtime's public key to Cloud's machine-client inventory, and the
 mailbox owner approves the pairing in the Cloud dashboard.
 
+Every command that changes the installation — `connect`, `rotate -commit`,
+`disconnect` — refuses while the runtime is serving, and says so. A running
+daemon holds the key, the adapters and the mailbox routing it loaded at
+startup, so the change would not take effect until a restart while the command
+reported success. Stop the runtime, run the command with `docker compose run`,
+then start it again. `-allow-running` overrides the check for an operator who
+will restart immediately.
+
 ```sh
-docker compose exec cortex /app/neuralmail hybrid connect \
+docker compose stop cortex
+docker compose run --rm --no-deps --entrypoint /app/neuralmail cortex hybrid connect \
   -cloud-url https://cloud.example.com \
   -token-endpoint https://auth.example.com/oauth/token \
   -resource https://runtime.example.com/mcp \
@@ -280,6 +299,7 @@ docker compose exec cortex /app/neuralmail hybrid connect \
   -generation 1 \
   -cloud-inbox-id 00000000-0000-0000-0000-000000000000 \
   -authority-id cloud.example.com
+docker compose start cortex
 ```
 
 The command generates the key, prints the public JWK to admit, and then waits
@@ -304,25 +324,37 @@ reports the unreachable half rather than failing.
 Rotation is two steps, for the same reason pairing is:
 
 ```sh
-docker compose exec cortex /app/neuralmail hybrid rotate            # prepare
-# admit the printed key, then have the owner rotate the installation onto it
-docker compose exec cortex /app/neuralmail hybrid rotate -commit    # switch
+# Preparing does not change what the runtime uses, so it needs no downtime.
+docker compose exec cortex /app/neuralmail hybrid rotate
+# Admit the printed key, then have the owner rotate the installation onto it.
+docker compose stop cortex
+docker compose run --rm --no-deps --entrypoint /app/neuralmail cortex hybrid rotate -commit
+docker compose start cortex
 ```
 
 The runtime keeps using its current key until `-commit` succeeds, and
 `-commit` only succeeds once it has minted a token with the replacement and
-reached Cloud with it. Remove the old key from the inventory after that, not
-before. `-abandon` discards a replacement that was never admitted.
+reached Cloud with it. Remove the old key from the inventory only after the
+restarted runtime is healthy — until it restarts it is still signing with the
+old one. `-abandon` discards a replacement that was never admitted.
 
 ### Disconnecting
 
 ```sh
-docker compose exec cortex /app/neuralmail hybrid disconnect
+docker compose stop cortex
+docker compose run --rm --no-deps --entrypoint /app/neuralmail cortex hybrid disconnect
+docker compose start cortex
 ```
 
-This deletes the local key. **It does not revoke anything**: only the mailbox
-owner can revoke the installation in Cloud, and until they do it remains
-usable by anyone holding a copy of the key. Ask them to revoke it.
+This puts the mailbox back on the providers it used before Cloud took over,
+then deletes the local key. The routing is restored first and the command
+stops if it cannot be: a mailbox left pointing at `hybrid` after the adapters
+are gone halts the poll loop and requeues every outbound message forever, so a
+stale key is the lesser of the two failures.
+
+**It does not revoke anything**: only the mailbox owner can revoke the
+installation in Cloud, and until they do it remains usable by anyone holding a
+copy of the key. Ask them to revoke it.
 
 ### Upgrading
 

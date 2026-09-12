@@ -172,3 +172,87 @@ func TestHybridPollIntervalOverridesTheMirrorInterval(t *testing.T) {
 		t.Fatal("the hybrid default should poll more often than the JMAP mirror")
 	}
 }
+
+// `serve` and the standalone `worker` both claim outbox rows and both route
+// by the inbox's provider name. A registry that differs between them requeues
+// every row addressed to the missing provider forever, with no delivery and
+// no failure — which is exactly what a hybrid reply hits in the documented
+// serve-plus-worker split.
+func TestOutboundRegistryIsTheSameForServeAndWorker(t *testing.T) {
+	cfg := config.Default()
+	cfg.Resend.APIKey = "test-resend-key"
+	cfg.Hybrid.StatePath = hybridStatePath(t)
+	writeHybridState(t, cfg.Hybrid.StatePath, nil)
+
+	// What serve builds, through app.New's own path.
+	runtime, err := newHybridRuntime(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveRegistry, err := newTransportRegistry(cfg, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What the standalone worker builds.
+	workerRegistry, err := NewOutboundRegistry(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, provider := range []string{"smtp", "resend", hybridtransport.ProviderName} {
+		if _, ok := serveRegistry.Outbound(provider); !ok {
+			t.Fatalf("serve registry is missing outbound provider %q", provider)
+		}
+		if _, ok := workerRegistry.Outbound(provider); !ok {
+			t.Fatalf("worker registry is missing outbound provider %q", provider)
+		}
+	}
+	// And an unpaired host registers no hybrid provider in either.
+	plain := config.Default()
+	plainRegistry, err := NewOutboundRegistry(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := plainRegistry.Outbound(hybridtransport.ProviderName); ok {
+		t.Fatal("an unpaired host registered the hybrid outbound provider")
+	}
+}
+
+// `hybrid connect -local-inbox` can bind a mailbox other than the configured
+// default. Polling the default instead would leave that mailbox's Cloud
+// deliveries queued indefinitely.
+func TestHybridPollsTheBoundMailboxNotTheDefault(t *testing.T) {
+	cfg := config.Default()
+	cfg.Hybrid.StatePath = hybridStatePath(t)
+	bound := uuid.NewString()
+	writeHybridState(t, cfg.Hybrid.StatePath, func(s *hybridtransport.State) {
+		s.LocalMailbox = &hybridtransport.LocalMailbox{
+			InboxID: bound, Address: "agent@example.test",
+			PriorInbound: "jmap", PriorOutbound: "smtp",
+		}
+	})
+	runtime, err := newHybridRuntime(cfg)
+	if err != nil || runtime == nil {
+		t.Fatalf("runtime=%v err=%v", runtime, err)
+	}
+	paired := &App{Config: cfg, Hybrid: runtime}
+	if paired.HybridMailbox() != bound {
+		t.Fatalf("HybridMailbox()=%q, want the bound mailbox %q", paired.HybridMailbox(), bound)
+	}
+
+	// An installation with no recorded mailbox leaves the default in place,
+	// so an upgrade from a state file written before the binding existed does
+	// not suddenly poll nothing.
+	older := config.Default()
+	older.Hybrid.StatePath = hybridStatePath(t)
+	writeHybridState(t, older.Hybrid.StatePath, nil)
+	olderRuntime, err := newHybridRuntime(older)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := (&App{Config: older, Hybrid: olderRuntime}).HybridMailbox(); got != "" {
+		t.Fatalf("HybridMailbox()=%q without a recorded binding, want empty", got)
+	}
+	if got := (&App{Config: config.Default()}).HybridMailbox(); got != "" {
+		t.Fatalf("HybridMailbox()=%q on an unpaired host, want empty", got)
+	}
+}

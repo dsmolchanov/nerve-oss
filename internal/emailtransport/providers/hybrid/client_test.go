@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"neuralmail/internal/emailtransport"
 )
 
 // cloudServer is a stand-in for the Cloud hybrid machine API. It enforces the
@@ -82,6 +84,18 @@ func (s *cloudServer) serve(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
+// validDelivery is one Cloud would actually return for this client: real
+// identifiers and the client's own binding, which Poll now checks.
+func validDelivery(c *Client) Delivery {
+	return Delivery{
+		ID: "44444444-4444-4444-8444-444444444444", OrgID: c.OrgID,
+		InstallationID: c.InstallationID, InboxID: c.InboxID,
+		ProviderMessageID: "provider-1", Sender: "sender@example.test",
+		Recipient: "agent@example.test", Subject: "Synthetic", Body: "synthetic",
+		LeaseToken: "55555555-5555-4555-8555-555555555555",
+	}
+}
+
 func newTestClient(t *testing.T, cloudURL string) (*Client, *tokenServer) {
 	t.Helper()
 	key := testKey(t)
@@ -102,9 +116,9 @@ func TestHybridClientCarriesTheInstallationBindingOnEveryAction(t *testing.T) {
 		seen[action] = true
 		switch action {
 		case "poll":
-			return http.StatusOK, map[string]any{"delivery": Delivery{ID: "d1", LeaseToken: "l1"}}
+			return http.StatusOK, map[string]any{"delivery": validDelivery(client)}
 		case "send", "receipt":
-			return http.StatusOK, SendReceipt{Status: "sent", ProviderMessageID: "p1"}
+			return http.StatusOK, SendReceipt{Status: "sent", ProviderMessageID: "p1", OperationKey: "k"}
 		case "status":
 			return http.StatusOK, map[string]any{"installation_id": client.InstallationID, "state": "active"}
 		default:
@@ -115,7 +129,7 @@ func TestHybridClientCarriesTheInstallationBindingOnEveryAction(t *testing.T) {
 	if _, err := client.Poll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := client.Ack(ctx, "d1", "l1"); err != nil {
+	if err := client.Ack(ctx, validDelivery(client).ID, validDelivery(client).LeaseToken); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := client.Send(ctx, SendRequest{OperationKey: "k", Kind: "reply", To: []string{"a@example.test"}}); err != nil {
@@ -156,7 +170,7 @@ func TestHybridClientRenewsOnceAfterAnUnauthorizedCall(t *testing.T) {
 	server, state := newCloudServer(t, client.InstallationID, client.InboxID)
 	client.BaseURL = server.URL
 	state.handler = func(string, map[string]any) (int, any) {
-		return http.StatusOK, map[string]any{"delivery": Delivery{ID: "d1", LeaseToken: "l1"}}
+		return http.StatusOK, map[string]any{"delivery": validDelivery(client)}
 	}
 	if _, err := client.Poll(context.Background()); err != nil {
 		t.Fatal(err)
@@ -234,5 +248,146 @@ func TestHybridClientSurfacesTokenDenialAsAuthority(t *testing.T) {
 	tokens.body = `{"error":"invalid_client"}`
 	if _, err := client.Poll(context.Background()); !errors.Is(err, ErrAuthority) {
 		t.Fatalf("revoked key: %v", err)
+	}
+}
+
+// The outbox worker decides retry budget from the error type alone. An
+// untyped error is classified transient, so a revoked installation or a
+// malformed request would be retried until the message was quarantined as an
+// ambiguous outcome instead of terminating as the known rejection it is.
+func TestHybridClientClassifiesEveryRefusalForTheOutboxWorker(t *testing.T) {
+	cases := map[int]struct {
+		permanent bool
+		reason    string
+		sentinel  error
+	}{
+		http.StatusUnauthorized:          {true, "unauthorized", ErrAuthority},
+		http.StatusForbidden:             {true, "forbidden", ErrAuthority},
+		http.StatusBadRequest:            {true, "bad_request", ErrAuthority},
+		http.StatusRequestEntityTooLarge: {true, "bad_request", ErrAuthority},
+		http.StatusConflict:              {true, "payload_conflict", ErrPayloadConflict},
+		http.StatusNotFound:              {true, "not_found", ErrMissing},
+		http.StatusTooManyRequests:       {false, "rate_limited", ErrSendLimit},
+		http.StatusInternalServerError:   {false, "server_error", ErrUnavailable},
+		http.StatusBadGateway:            {false, "server_error", ErrUnavailable},
+		http.StatusServiceUnavailable:    {false, "server_error", ErrUnavailable},
+		http.StatusGatewayTimeout:        {false, "server_error", ErrUnavailable},
+	}
+	for status, want := range cases {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			client, _ := newTestClient(t, "")
+			server, state := newCloudServer(t, client.InstallationID, client.InboxID)
+			client.BaseURL = server.URL
+			// 401 is retried once with a fresh token before it is reported,
+			// so make every attempt fail the same way.
+			state.handler = func(string, map[string]any) (int, any) { return status, nil }
+			_, err := client.Send(context.Background(), SendRequest{
+				OperationKey: "k", Kind: "reply", To: []string{"a@example.test"},
+			})
+			if !errors.Is(err, want.sentinel) {
+				t.Fatalf("status %d gave %v, want %v", status, err, want.sentinel)
+			}
+			classified := emailtransport.ClassifyProviderError(err)
+			if classified.Permanent != want.permanent || classified.Reason != want.reason {
+				t.Fatalf("status %d classified %+v, want permanent=%v reason=%q",
+					status, classified, want.permanent, want.reason)
+			}
+		})
+	}
+
+	// A transport fault is transient and carries no status.
+	client, _ := newTestClient(t, "")
+	server, _ := newCloudServer(t, client.InstallationID, client.InboxID)
+	client.BaseURL = server.URL
+	server.Close()
+	_, err := client.Poll(context.Background())
+	classified := emailtransport.ClassifyProviderError(err)
+	if classified.Permanent || classified.Reason != "network_error" {
+		t.Fatalf("unreachable cloud classified %+v", classified)
+	}
+}
+
+// Cloud is multi-tenant. A misrouted or malformed 200 that this client
+// accepted would be stored as somebody else's mail, finalize the wrong outbox
+// row, or stand in as proof that a rotation succeeded.
+func TestHybridClientRejectsResponsesForAnotherBinding(t *testing.T) {
+	good := func(c *Client) Delivery {
+		return Delivery{
+			ID: "44444444-4444-4444-8444-444444444444", OrgID: c.OrgID,
+			InstallationID: c.InstallationID, InboxID: c.InboxID,
+			ProviderMessageID: "provider-1", Sender: "s@example.test",
+			LeaseToken: "55555555-5555-4555-8555-555555555555",
+		}
+	}
+	deliveries := map[string]func(*Delivery){
+		"foreign organization": func(d *Delivery) { d.OrgID = "66666666-6666-4666-8666-666666666666" },
+		"foreign installation": func(d *Delivery) { d.InstallationID = "77777777-7777-4777-8777-777777777777" },
+		"foreign mailbox":      func(d *Delivery) { d.InboxID = "88888888-8888-4888-8888-888888888888" },
+		"unusable id":          func(d *Delivery) { d.ID = "not-a-uuid" },
+		"no lease":             func(d *Delivery) { d.LeaseToken = "" },
+		"no sender":            func(d *Delivery) { d.Sender = "" },
+		"no provider id":       func(d *Delivery) { d.ProviderMessageID = "" },
+	}
+	for name, mutate := range deliveries {
+		t.Run("poll "+name, func(t *testing.T) {
+			client, _ := newTestClient(t, "")
+			client.OrgID = "33333333-3333-4333-8333-333333333333"
+			server, state := newCloudServer(t, client.InstallationID, client.InboxID)
+			client.BaseURL = server.URL
+			delivery := good(client)
+			mutate(&delivery)
+			state.handler = func(string, map[string]any) (int, any) {
+				return http.StatusOK, map[string]any{"delivery": delivery}
+			}
+			if _, err := client.Poll(context.Background()); err == nil {
+				t.Fatal("accepted a delivery that is not this installation's")
+			}
+		})
+	}
+
+	receipts := map[string]SendReceipt{
+		"foreign organization": {OrgID: "66666666-6666-4666-8666-666666666666", Status: "sent", OperationKey: "op-1", ProviderMessageID: "p"},
+		"foreign installation": {InstallationID: "77777777-7777-4777-8777-777777777777", Status: "sent", OperationKey: "op-1", ProviderMessageID: "p"},
+		"foreign operation":    {Status: "sent", OperationKey: "someone-elses", ProviderMessageID: "p"},
+		"no status":            {OperationKey: "op-1"},
+	}
+	for name, receipt := range receipts {
+		for _, action := range []string{"send", "receipt"} {
+			t.Run(action+" "+name, func(t *testing.T) {
+				client, _ := newTestClient(t, "")
+				client.OrgID = "33333333-3333-4333-8333-333333333333"
+				server, state := newCloudServer(t, client.InstallationID, client.InboxID)
+				client.BaseURL = server.URL
+				state.handler = func(string, map[string]any) (int, any) { return http.StatusOK, receipt }
+				var err error
+				if action == "send" {
+					_, err = client.Send(context.Background(), SendRequest{
+						OperationKey: "op-1", Kind: "reply", To: []string{"a@example.test"}})
+				} else {
+					_, err = client.Receipt(context.Background(), "op-1")
+				}
+				if err == nil {
+					t.Fatal("accepted a receipt that does not answer this operation")
+				}
+			})
+		}
+	}
+
+	// Rotation treats a successful status as proof Cloud accepts the new key
+	// for this installation, so an empty or foreign answer must not pass.
+	for name, body := range map[string]map[string]any{
+		"foreign installation": {"installation_id": "77777777-7777-4777-8777-777777777777", "state": "active"},
+		"no installation":      {"state": "active"},
+		"no state":             {"installation_id": "11111111-1111-4111-8111-111111111111"},
+	} {
+		t.Run("status "+name, func(t *testing.T) {
+			client, _ := newTestClient(t, "")
+			server, state := newCloudServer(t, client.InstallationID, client.InboxID)
+			client.BaseURL = server.URL
+			state.handler = func(string, map[string]any) (int, any) { return http.StatusOK, body }
+			if _, err := client.Status(context.Background()); err == nil {
+				t.Fatal("accepted a status that does not describe this installation")
+			}
+		})
 	}
 }

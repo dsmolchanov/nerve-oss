@@ -171,7 +171,7 @@ func (t *TokenSource) mint(ctx context.Context) (string, time.Time, error) {
 		return "", time.Time{}, fmt.Errorf("%w: %v", ErrTokenUnavailable, err)
 	}
 	if response.StatusCode != http.StatusOK {
-		return "", time.Time{}, t.statusError(response.StatusCode, raw)
+		return "", time.Time{}, t.statusError(response.StatusCode)
 	}
 	var body struct {
 		AccessToken string `json:"access_token"`
@@ -193,27 +193,28 @@ func (t *TokenSource) mint(ctx context.Context) (string, time.Time, error) {
 	// The server may narrow the grant. Continuing with fewer scopes than asked
 	// for turns a clear failure here into a confusing 403 on the first send.
 	if err := requireScopes(t.Scopes, body.Scope); err != nil {
+		// requireScopes names only scopes this client asked for, never a
+		// value the server chose.
 		return "", time.Time{}, fmt.Errorf("%w: %v", ErrTokenDenied, err)
 	}
 	return body.AccessToken, now.Add(lifetime), nil
 }
 
-func (t *TokenSource) statusError(status int, raw []byte) error {
-	var body struct {
-		Error       string `json:"error"`
-		Description string `json:"error_description"`
-	}
-	_ = json.Unmarshal(raw, &body)
-	detail := body.Error
-	if detail == "" {
-		detail = fmt.Sprintf("status %d", status)
-	}
+// statusError reports only the status the endpoint returned.
+//
+// Nothing from the response body reaches the error. The OAuth `error` member
+// is chosen by whatever is answering the token endpoint, and these errors are
+// printed by `hybrid connect` and `hybrid status` and logged by the outbox
+// worker. An endpoint that echoed the submitted client assertion back in that
+// field would otherwise get it written into an operator's terminal and the
+// runtime's logs.
+func (t *TokenSource) statusError(status int) error {
 	// 4xx other than 408/429 means the request as formed will keep failing.
 	// Everything else is worth another attempt on the next tick.
 	if status >= 400 && status < 500 && status != http.StatusRequestTimeout && status != http.StatusTooManyRequests {
-		return fmt.Errorf("%w: %s", ErrTokenDenied, detail)
+		return fmt.Errorf("%w: token endpoint status %d", ErrTokenDenied, status)
 	}
-	return fmt.Errorf("%w: %s", ErrTokenUnavailable, detail)
+	return fmt.Errorf("%w: token endpoint status %d", ErrTokenUnavailable, status)
 }
 
 func requireScopes(want []string, granted string) error {

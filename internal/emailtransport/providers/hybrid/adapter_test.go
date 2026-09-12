@@ -15,6 +15,67 @@ import (
 	"neuralmail/internal/store"
 )
 
+// The Cloud send contract carries one recipient, a subject and a plain-text
+// body. Everything else an outbound message can hold has nowhere to go, and
+// dropping it silently is unrecoverable: Cloud answers "sent", the outbox row
+// is finalized and the attachment bytes released, so the loss surfaces at the
+// recipient and can never be repaired.
+func TestHybridOutboundRefusesContentItCannotCarry(t *testing.T) {
+	base := func() emailtransport.OutboundMessage {
+		return emailtransport.OutboundMessage{To: []string{"a@example.test"}, Subject: "s", TextBody: "b"}
+	}
+	cases := map[string]func(*emailtransport.OutboundMessage){
+		"html body":    func(m *emailtransport.OutboundMessage) { m.HTMLBody = "<p>hello</p>" },
+		"attachment":   func(m *emailtransport.OutboundMessage) { m.Attachments = []store.OutboundAttachment{{}} },
+		"cc":           func(m *emailtransport.OutboundMessage) { m.CC = []string{"c@example.test"} },
+		"bcc":          func(m *emailtransport.OutboundMessage) { m.BCC = []string{"d@example.test"} },
+		"reply to":     func(m *emailtransport.OutboundMessage) { m.ReplyTo = []string{"e@example.test"} },
+		"headers":      func(m *emailtransport.OutboundMessage) { m.Headers = map[string]string{"In-Reply-To": "<x@y>"} },
+		"empty":        func(m *emailtransport.OutboundMessage) { m.Subject = ""; m.TextBody = "" },
+		"no recipient": func(m *emailtransport.OutboundMessage) { m.To = nil },
+		"two recipients": func(m *emailtransport.OutboundMessage) {
+			m.To = []string{"a@example.test", "b@example.test"}
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			client, _ := newTestClient(t, "")
+			server, state := newCloudServer(t, client.InstallationID, client.InboxID)
+			client.BaseURL = server.URL
+			state.handler = func(action string, _ map[string]any) (int, any) {
+				if action == "send" {
+					t.Error("an unsendable message reached cloud")
+				}
+				return http.StatusOK, SendReceipt{Status: "sent", ProviderMessageID: "p1"}
+			}
+			adapter := &OutboundAdapter{Client: client, Kind: "reply"}
+			message := base()
+			mutate(&message)
+			_, err := adapter.SendMessage(context.Background(), message, "op-1")
+			if err == nil {
+				t.Fatal("accepted a message the transport cannot carry")
+			}
+			// The worker must terminate it rather than spend retry budget on
+			// a message that can never become sendable.
+			classified := emailtransport.ClassifyProviderError(err)
+			if !classified.Permanent {
+				t.Fatalf("refusal is retryable: %+v", classified)
+			}
+		})
+	}
+	// A message the contract does carry still goes through.
+	client, _ := newTestClient(t, "")
+	server, state := newCloudServer(t, client.InstallationID, client.InboxID)
+	client.BaseURL = server.URL
+	state.handler = func(string, map[string]any) (int, any) {
+		return http.StatusOK, SendReceipt{Status: "sent", ProviderMessageID: "p1", OperationKey: "op-1"}
+	}
+	adapter := &OutboundAdapter{Client: client, Kind: "reply"}
+	if _, err := adapter.SendMessage(context.Background(), base(), "op-1"); err != nil {
+		t.Fatalf("a plain-text reply was refused: %v", err)
+	}
+}
+
 // hybridRuntimeStore opens the runtime database these adapters write into.
 // The deduplication guarantee belongs to the store's own
 // (inbox_id, provider_message_id) key, so proving it against a fake would

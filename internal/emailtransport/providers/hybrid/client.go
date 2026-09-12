@@ -10,6 +10,10 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
+
+	"neuralmail/internal/emailtransport"
 )
 
 const (
@@ -85,6 +89,10 @@ type Client struct {
 	BaseURL    string
 	Tokens     *TokenSource
 
+	// OrgID is empty until a pairing completes. Once set, every response
+	// must name it: Cloud is multi-tenant, and a response for another
+	// organization stored here would be somebody else's mail.
+	OrgID          string
 	InstallationID string
 	InboxID        string
 }
@@ -109,7 +117,71 @@ func (c *Client) Poll(ctx context.Context) (Delivery, error) {
 	if body.Delivery == nil || body.Delivery.ID == "" {
 		return Delivery{}, ErrMissing
 	}
+	if err := c.checkDelivery(*body.Delivery); err != nil {
+		return Delivery{}, err
+	}
 	return *body.Delivery, nil
+}
+
+// checkDelivery refuses a delivery that is not this installation's.
+//
+// A misrouted or malformed response would otherwise be written into the local
+// mailbox and acknowledged, and the deduplication key is built from the
+// organization and installation the response carries — so an unchecked
+// response also decides where future replays land.
+func (c *Client) checkDelivery(d Delivery) error {
+	if _, err := uuid.Parse(d.ID); err != nil {
+		return emailtransport.NewTransientError(0, "server_error",
+			fmt.Errorf("%w: poll returned a delivery without a usable id", ErrUnavailable))
+	}
+	if _, err := uuid.Parse(d.LeaseToken); err != nil {
+		return emailtransport.NewTransientError(0, "server_error",
+			fmt.Errorf("%w: poll returned delivery %s without a lease", ErrUnavailable, d.ID))
+	}
+	if err := c.checkBinding("poll", d.OrgID, d.InstallationID); err != nil {
+		return err
+	}
+	if d.InboxID != c.InboxID {
+		return emailtransport.NewPermanentError(0, "forbidden",
+			fmt.Errorf("%w: poll returned a delivery for mailbox %s", ErrAuthority, d.InboxID))
+	}
+	// Content-free fields are allowed to be empty; a sender is not. Storing a
+	// message with no sender would produce a thread nobody can reply to.
+	if strings.TrimSpace(d.Sender) == "" || strings.TrimSpace(d.ProviderMessageID) == "" {
+		return emailtransport.NewTransientError(0, "server_error",
+			fmt.Errorf("%w: poll returned an incomplete delivery %s", ErrUnavailable, d.ID))
+	}
+	return nil
+}
+
+// checkBinding rejects a response naming a different tenant or installation.
+func (c *Client) checkBinding(action, orgID, installationID string) error {
+	if c.OrgID != "" && orgID != "" && orgID != c.OrgID {
+		return emailtransport.NewPermanentError(0, "forbidden",
+			fmt.Errorf("%w: %s answered for another organization", ErrAuthority, action))
+	}
+	if c.InstallationID != "" && installationID != "" && installationID != c.InstallationID {
+		return emailtransport.NewPermanentError(0, "forbidden",
+			fmt.Errorf("%w: %s answered for another installation", ErrAuthority, action))
+	}
+	return nil
+}
+
+// checkReceipt refuses a receipt that does not answer the operation asked
+// about. A foreign "sent" receipt would finalize the wrong outbox row.
+func (c *Client) checkReceipt(action, operationKey string, receipt SendReceipt) error {
+	if err := c.checkBinding(action, receipt.OrgID, receipt.InstallationID); err != nil {
+		return err
+	}
+	if receipt.OperationKey != "" && receipt.OperationKey != operationKey {
+		return emailtransport.NewPermanentError(0, "forbidden",
+			fmt.Errorf("%w: %s answered for operation %q", ErrAuthority, action, receipt.OperationKey))
+	}
+	if receipt.Status == "" {
+		return emailtransport.NewTransientError(0, "server_error",
+			fmt.Errorf("%w: %s returned a receipt with no status", ErrUnavailable, action))
+	}
+	return nil
 }
 
 // Ack tells Cloud the delivery is durably stored here. Cloud may then purge
@@ -128,6 +200,9 @@ func (c *Client) Send(ctx context.Context, request SendRequest) (SendReceipt, er
 	if err := c.call(ctx, "send", input, &receipt); err != nil {
 		return SendReceipt{}, err
 	}
+	if err := c.checkReceipt("send", request.OperationKey, receipt); err != nil {
+		return SendReceipt{}, err
+	}
 	return receipt, nil
 }
 
@@ -137,6 +212,9 @@ func (c *Client) Send(ctx context.Context, request SendRequest) (SendReceipt, er
 func (c *Client) Receipt(ctx context.Context, operationKey string) (SendReceipt, error) {
 	var receipt SendReceipt
 	if err := c.call(ctx, "receipt", map[string]any{"operation_key": operationKey}, &receipt); err != nil {
+		return SendReceipt{}, err
+	}
+	if err := c.checkReceipt("receipt", operationKey, receipt); err != nil {
 		return SendReceipt{}, err
 	}
 	return receipt, nil
@@ -150,6 +228,16 @@ func (c *Client) Status(ctx context.Context) (string, error) {
 	}
 	if err := c.call(ctx, "status", map[string]any{}, &body); err != nil {
 		return "", err
+	}
+	// Rotation treats a successful status as proof that Cloud accepts the
+	// replacement key for this installation. An empty or foreign answer must
+	// not be allowed to stand in for that.
+	if err := c.checkBinding("status", "", body.InstallationID); err != nil {
+		return "", err
+	}
+	if body.InstallationID == "" || body.State == "" {
+		return "", emailtransport.NewTransientError(0, "server_error",
+			fmt.Errorf("%w: status returned no installation state", ErrUnavailable))
 	}
 	return body.State, nil
 }
@@ -185,20 +273,26 @@ func (c *Client) call(ctx context.Context, action string, input map[string]any, 
 		}
 		decoder := json.NewDecoder(bytes.NewReader(body))
 		if err := decoder.Decode(output); err != nil {
-			return fmt.Errorf("%w: unreadable %s response", ErrUnavailable, action)
+			return emailtransport.NewTransientError(0, "server_error",
+				fmt.Errorf("%w: unreadable %s response", ErrUnavailable, action))
 		}
 		return nil
 	}
-	return fmt.Errorf("%w: %s rejected the renewed token", ErrAuthority, action)
+	return emailtransport.NewPermanentError(http.StatusUnauthorized, "unauthorized",
+		fmt.Errorf("%w: %s rejected the renewed token", ErrAuthority, action))
 }
 
 func (c *Client) attempt(ctx context.Context, action string, raw []byte) (int, []byte, error) {
 	token, err := c.Tokens.Token(ctx)
 	if err != nil {
+		// A denial the authorization server will keep making is terminal for
+		// this message; anything else is worth another attempt.
 		if errors.Is(err, ErrTokenDenied) {
-			return 0, nil, fmt.Errorf("%w: %v", ErrAuthority, err)
+			return 0, nil, emailtransport.NewPermanentError(0, "unauthorized",
+				fmt.Errorf("%w: %v", ErrAuthority, err))
 		}
-		return 0, nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return 0, nil, emailtransport.NewTransientError(0, "network_error",
+			fmt.Errorf("%w: %v", ErrUnavailable, err))
 	}
 	url := strings.TrimSuffix(c.BaseURL, "/") + "/v1/hybrid/" + action
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
@@ -210,34 +304,57 @@ func (c *Client) attempt(ctx context.Context, action string, raw []byte) (int, [
 	request.Header.Set("Accept", "application/json")
 	response, err := c.httpClient().Do(request)
 	if err != nil {
-		return 0, nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return 0, nil, emailtransport.NewTransientError(0, "network_error",
+			fmt.Errorf("%w: %s", ErrUnavailable, action))
 	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes))
 	if err != nil {
-		return 0, nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return 0, nil, emailtransport.NewTransientError(0, "network_error",
+			fmt.Errorf("%w: %s response body", ErrUnavailable, action))
 	}
 	return response.StatusCode, body, nil
 }
 
 // statusError maps the Cloud contract onto the caller's decision: stop, back
-// off, or treat the operation as already recorded. The response body is never
-// included — it is attacker-influenced and would land in runtime logs.
+// off, or treat the operation as already recorded.
+//
+// Every result is a *emailtransport.ProviderError, because the outbox worker
+// decides retry budget from that type alone. An untyped error is classified
+// transient, so a revoked installation or a malformed request would be
+// retried until the message was quarantined as an ambiguous outcome instead
+// of terminating as the known rejection it is.
+//
+// The response body is never included: it is attacker-influenced and these
+// errors reach runtime logs.
 func statusError(action string, status int) error {
+	permanent := func(reason string, sentinel error) error {
+		return emailtransport.NewPermanentError(status, reason,
+			fmt.Errorf("%w: hybrid %s", sentinel, action))
+	}
+	transient := func(reason string, sentinel error) error {
+		return emailtransport.NewTransientError(status, reason,
+			fmt.Errorf("%w: hybrid %s", sentinel, action))
+	}
 	switch status {
-	case http.StatusUnauthorized, http.StatusForbidden:
-		return fmt.Errorf("%w: %s", ErrAuthority, action)
+	case http.StatusUnauthorized:
+		return permanent("unauthorized", ErrAuthority)
+	case http.StatusForbidden:
+		return permanent("forbidden", ErrAuthority)
 	case http.StatusConflict:
-		return ErrPayloadConflict
+		// This operation key is already bound to different content. Sending
+		// it again cannot change that, and must not overwrite what Cloud
+		// accepted first.
+		return permanent("payload_conflict", ErrPayloadConflict)
 	case http.StatusTooManyRequests:
-		return fmt.Errorf("%w: %s", ErrSendLimit, action)
+		return transient("rate_limited", ErrSendLimit)
 	case http.StatusNotFound:
-		return fmt.Errorf("%w: %s", ErrMissing, action)
+		return permanent("not_found", ErrMissing)
 	case http.StatusBadRequest, http.StatusRequestEntityTooLarge:
 		// Cloud rejected the request as formed. Resending it unchanged cannot
 		// succeed, so this is terminal for this message, not an outage.
-		return fmt.Errorf("%w: %s rejected the request", ErrAuthority, action)
+		return permanent("bad_request", ErrAuthority)
 	default:
-		return fmt.Errorf("%w: %s status %d", ErrUnavailable, action, status)
+		return transient("server_error", ErrUnavailable)
 	}
 }

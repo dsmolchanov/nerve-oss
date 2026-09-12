@@ -404,3 +404,45 @@ func TestHybridAssertionAudienceIsTheCalledEndpoint(t *testing.T) {
 		t.Fatalf("assertion carries %d claims, want exactly iss/sub/aud/jti/iat/exp: %v", len(claims), claims)
 	}
 }
+
+// These errors are printed by `hybrid connect` and `hybrid status` and logged
+// by the outbox worker. The OAuth error member is chosen by whatever answers
+// the token endpoint, so echoing it would write an endpoint's payload — a
+// misconfigured or hostile one might echo the submitted client assertion —
+// into an operator's terminal and the runtime's logs.
+func TestHybridTokenErrorsCarryNothingFromTheResponse(t *testing.T) {
+	key := testKey(t)
+	source := newTestTokenSource("https://auth.example.test/oauth/token", key)
+	assertion, err := source.Assertion(time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []int{400, 401, 403, 404, 429, 500, 503} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server, state := newTokenServer(t, key)
+			state.status = status
+			// The endpoint echoes the assertion and a marker back at us.
+			body, err := json.Marshal(map[string]string{
+				"error":             assertion,
+				"error_description": "leaked-marker-" + assertion,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			state.body = string(body)
+			attempt := newTestTokenSource(server.URL, key)
+			_, tokenErr := attempt.Token(context.Background())
+			if tokenErr == nil {
+				t.Fatal("expected a refusal")
+			}
+			rendered := tokenErr.Error()
+			if strings.Contains(rendered, assertion) || strings.Contains(rendered, "leaked-marker") {
+				t.Fatalf("error carries the response body: %q", rendered)
+			}
+			// It still has to say enough to diagnose.
+			if !strings.Contains(rendered, fmt.Sprint(status)) {
+				t.Fatalf("error does not name the status: %q", rendered)
+			}
+		})
+	}
+}

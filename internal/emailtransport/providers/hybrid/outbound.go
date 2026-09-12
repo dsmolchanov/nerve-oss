@@ -51,12 +51,11 @@ func (a *OutboundAdapter) SendMessage(ctx context.Context, msg emailtransport.Ou
 	}
 	key := strings.TrimSpace(idempotencyKey)
 	if key == "" || key != idempotencyKey || len(key) > 128 {
-		return "", errors.New("hybrid send requires a bounded operation key")
+		return "", permanentSendRefusal("invalid_operation_key",
+			errors.New("hybrid send requires a bounded operation key"))
 	}
-	// Cloud accepts exactly one recipient per operation so that a partial
-	// delivery can never hide inside one receipt.
-	if len(msg.To) != 1 {
-		return "", fmt.Errorf("hybrid send takes exactly one recipient, got %d", len(msg.To))
+	if err := checkSendable(msg); err != nil {
+		return "", err
 	}
 	kind := a.Kind
 	if kind == "" {
@@ -71,19 +70,77 @@ func (a *OutboundAdapter) SendMessage(ctx context.Context, msg emailtransport.Ou
 	return resolveReceipt(receipt)
 }
 
+// checkSendable refuses a message the Cloud send contract cannot carry.
+//
+// That contract is one recipient, a subject and a plain-text body. Everything
+// else an outbound message can hold — HTML, attachments, copies, reply
+// headers — has nowhere to go. Dropping those silently is the dangerous
+// option: Cloud would answer "sent", the outbox row would be finalized, and
+// the attachment bytes released, so the loss is discovered by the recipient
+// and can never be repaired. Refusing is permanent rather than retryable,
+// because the same message will keep being unsendable.
+func checkSendable(msg emailtransport.OutboundMessage) error {
+	// Cloud accepts exactly one recipient per operation so that a partial
+	// delivery can never hide inside one receipt.
+	if len(msg.To) != 1 {
+		return permanentSendRefusal("invalid_recipient",
+			fmt.Errorf("hybrid send takes exactly one recipient, got %d", len(msg.To)))
+	}
+	unsupported := make([]string, 0, 6)
+	if strings.TrimSpace(msg.HTMLBody) != "" {
+		unsupported = append(unsupported, "an HTML body")
+	}
+	if len(msg.Attachments) != 0 {
+		unsupported = append(unsupported, fmt.Sprintf("%d attachment(s)", len(msg.Attachments)))
+	}
+	if len(msg.CC) != 0 {
+		unsupported = append(unsupported, "CC recipients")
+	}
+	if len(msg.BCC) != 0 {
+		unsupported = append(unsupported, "BCC recipients")
+	}
+	if len(msg.ReplyTo) != 0 {
+		unsupported = append(unsupported, "a Reply-To address")
+	}
+	if len(msg.Headers) != 0 {
+		unsupported = append(unsupported, "custom headers")
+	}
+	if len(unsupported) != 0 {
+		return permanentSendRefusal("unsupported_content",
+			fmt.Errorf("hybrid transport cannot carry %s", strings.Join(unsupported, ", ")))
+	}
+	// A message with neither a subject nor a body would be delivered empty.
+	if strings.TrimSpace(msg.Subject) == "" && strings.TrimSpace(msg.TextBody) == "" {
+		return permanentSendRefusal("empty_message",
+			errors.New("hybrid send needs a subject or a plain-text body"))
+	}
+	return nil
+}
+
+// permanentSendRefusal marks a refusal the outbox worker must not retry.
+// Without the type the worker treats it as transient and burns the retry
+// budget on a message that can never be sent.
+func permanentSendRefusal(reason string, cause error) error {
+	return emailtransport.NewPermanentError(0, reason, cause)
+}
+
 func resolveReceipt(receipt SendReceipt) (string, error) {
 	switch receipt.Status {
 	case "sent":
 		if receipt.ProviderMessageID == "" {
-			return "", fmt.Errorf("%w: cloud reported sent without a provider id", ErrUnavailable)
+			return "", emailtransport.NewTransientError(0, "server_error",
+				fmt.Errorf("%w: cloud reported sent without a provider id", ErrUnavailable))
 		}
 		return receipt.ProviderMessageID, nil
 	case "uncertain":
-		return "", ErrSendUncertain
+		// Retrying would risk a duplicate at the recipient. Wait for Cloud's
+		// reconciliation instead of consuming retry budget.
+		return "", emailtransport.NewTransientError(0, "outcome_unknown", ErrSendUncertain)
 	case "accepted", "claimed":
-		return "", ErrSendPending
+		return "", emailtransport.NewTransientError(0, "provider_pending", ErrSendPending)
 	default:
-		return "", fmt.Errorf("%w: unknown send status %q", ErrUnavailable, receipt.Status)
+		return "", emailtransport.NewTransientError(0, "server_error",
+			fmt.Errorf("%w: unknown send status %q", ErrUnavailable, receipt.Status))
 	}
 }
 

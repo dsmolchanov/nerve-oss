@@ -99,47 +99,23 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		vectorStore = vector.NewQdrant(cfg.Qdrant.URL, cfg.Qdrant.Collection)
 	}
 
-	transportRegistry := emailtransport.NewRegistry()
-
-	outboundAdapter := smtptransport.NewOutboundAdapter(smtptransport.Config{
-		Host:            cfg.SMTP.Host,
-		Port:            cfg.SMTP.Port,
-		Username:        cfg.SMTP.Username,
-		Password:        cfg.SMTP.Password,
-		RequireStartTLS: cfg.SMTP.RequireStartTLS,
-		HeloDomain:      cfg.SMTP.HeloDomain,
-	})
-	_ = transportRegistry.RegisterOutbound(outboundAdapter)
-
-	if strings.TrimSpace(cfg.Resend.APIKey) != "" {
-		_ = transportRegistry.RegisterOutbound(resendtransport.NewOutboundAdapter(resendtransport.Config{
-			APIKey:  cfg.Resend.APIKey,
-			BaseURL: cfg.Resend.BaseURL,
-		}))
+	hybridRuntime, err := newHybridRuntime(cfg)
+	if err != nil {
+		return nil, err
 	}
-
+	transportRegistry, err := newTransportRegistry(cfg, hybridRuntime)
+	if err != nil {
+		return nil, err
+	}
 	jmapClient, err := jmap.NewClient(cfg)
 	if err != nil {
 		jmapClient = jmap.NoopClient{}
 	}
 	_ = transportRegistry.RegisterInbound(jmaptransport.NewInboundAdapter(jmapClient))
-
-	// A runtime paired to a Cloud mailbox carries mail in both directions over
-	// the hybrid transport. An unconfigured or unpaired host registers nothing
-	// and behaves exactly as before.
-	hybridRuntime, err := newHybridRuntime(cfg)
-	if err != nil {
-		return nil, err
-	}
 	if hybridRuntime != nil {
 		if err := transportRegistry.RegisterInbound(hybridRuntime.Inbound); err != nil {
 			return nil, fmt.Errorf("register hybrid inbound: %w", err)
 		}
-		if err := transportRegistry.RegisterOutbound(hybridRuntime.Outbound); err != nil {
-			return nil, fmt.Errorf("register hybrid outbound: %w", err)
-		}
-		log.Printf("hybrid transport active: installation=%s inbox=%s key=%s",
-			hybridRuntime.State.InstallationID, hybridRuntime.State.InboxID, hybridRuntime.State.Key.KID)
 	}
 
 	toolSvc := tools.NewService(cfg, st, llmProvider, vectorStore, pol, embedder, transportRegistry)
@@ -167,6 +143,58 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		EmailTransport: transportRegistry,
 		Hybrid:         hybridRuntime,
 	}, nil
+}
+
+// NewOutboundRegistry builds the outbound providers every execution path must
+// share.
+//
+// `serve` and the standalone `worker` both claim outbox rows, and the outbox
+// worker routes by the inbox's provider name. A registry that differs between
+// them means rows addressed to a missing provider are requeued forever with
+// no delivery and no failure, which is exactly what a hybrid reply would hit
+// in the documented serve-plus-worker split.
+func NewOutboundRegistry(cfg config.Config) (*emailtransport.Registry, error) {
+	hybridRuntime, err := newHybridRuntime(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return newTransportRegistry(cfg, hybridRuntime)
+}
+
+func newTransportRegistry(cfg config.Config, hybridRuntime *hybridtransport.Runtime) (*emailtransport.Registry, error) {
+	registry := emailtransport.NewRegistry()
+	_ = registry.RegisterOutbound(smtptransport.NewOutboundAdapter(smtptransport.Config{
+		Host:            cfg.SMTP.Host,
+		Port:            cfg.SMTP.Port,
+		Username:        cfg.SMTP.Username,
+		Password:        cfg.SMTP.Password,
+		RequireStartTLS: cfg.SMTP.RequireStartTLS,
+		HeloDomain:      cfg.SMTP.HeloDomain,
+	}))
+	if strings.TrimSpace(cfg.Resend.APIKey) != "" {
+		_ = registry.RegisterOutbound(resendtransport.NewOutboundAdapter(resendtransport.Config{
+			APIKey:  cfg.Resend.APIKey,
+			BaseURL: cfg.Resend.BaseURL,
+		}))
+	}
+	if hybridRuntime != nil {
+		if err := registry.RegisterOutbound(hybridRuntime.Outbound); err != nil {
+			return nil, fmt.Errorf("register hybrid outbound: %w", err)
+		}
+		log.Printf("hybrid transport active: installation=%s inbox=%s key=%s",
+			hybridRuntime.State.InstallationID, hybridRuntime.State.InboxID, hybridRuntime.State.Key.KID)
+	}
+	return registry, nil
+}
+
+// HybridMailbox is the local mailbox a completed pairing bound, or empty when
+// this runtime carries no installation. The poll loop uses it instead of the
+// configured default, which `hybrid connect -local-inbox` may not have chosen.
+func (a *App) HybridMailbox() string {
+	if a.Hybrid == nil || a.Hybrid.State.LocalMailbox == nil {
+		return ""
+	}
+	return a.Hybrid.State.LocalMailbox.InboxID
 }
 
 // newHybridRuntime loads the local installation, if there is one.

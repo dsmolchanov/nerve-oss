@@ -144,7 +144,12 @@ def main():
             # Stand in for a completed pairing. Reaching a real Cloud is not
             # this test's job; what it proves is what the image does with the
             # file a pairing leaves behind.
-            connect = ['/app/neuralmail', 'hybrid', 'connect',
+            # -allow-running: connect normally refuses while the daemon is
+            # serving, because the daemon would keep using the previous
+            # installation until it restarts. Here the daemon has no
+            # installation at all, and the point is to exercise the offline
+            # admission step rather than the guard.
+            connect = ['/app/neuralmail', 'hybrid', 'connect', '-allow-running',
                        '-cloud-url', 'https://cloud.invalid',
                        '-token-endpoint', 'https://auth.invalid/oauth/token',
                        '-resource', 'https://runtime.invalid/mcp',

@@ -9,15 +9,12 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
 	"neuralmail/internal/app"
 	"neuralmail/internal/config"
 	"neuralmail/internal/emailtransport"
-	resendtransport "neuralmail/internal/emailtransport/providers/resend"
-	smtptransport "neuralmail/internal/emailtransport/providers/smtp"
 	"neuralmail/internal/embed"
 	"neuralmail/internal/mcp"
 	"neuralmail/internal/memguard"
@@ -132,6 +129,13 @@ func runServe(ctx context.Context, cfg config.Config, withWorker bool) error {
 	if err != nil {
 		return fmt.Errorf("default inbox: %w", err)
 	}
+	// A paired runtime polls the mailbox the installation was bound to, which
+	// `hybrid connect -local-inbox` may have pointed somewhere other than the
+	// configured default. Polling the default instead would leave the bound
+	// mailbox's Cloud deliveries queued forever.
+	if mailbox := appInstance.HybridMailbox(); mailbox != "" {
+		inboxID = mailbox
+	}
 	loops := []serveLoop{
 		{name: "HTTP", run: appInstance.Serve},
 		{name: "poll", run: func(ctx context.Context) error { return appInstance.PollLoop(ctx, inboxID) }},
@@ -180,20 +184,13 @@ func runWorker(ctx context.Context, cfg config.Config) {
 		log.Printf("qdrant ensure collection failed: %v", err)
 	}
 
-	transportRegistry := emailtransport.NewRegistry()
-	_ = transportRegistry.RegisterOutbound(smtptransport.NewOutboundAdapter(smtptransport.Config{
-		Host:            cfg.SMTP.Host,
-		Port:            cfg.SMTP.Port,
-		Username:        cfg.SMTP.Username,
-		Password:        cfg.SMTP.Password,
-		RequireStartTLS: cfg.SMTP.RequireStartTLS,
-		HeloDomain:      cfg.SMTP.HeloDomain,
-	}))
-	if strings.TrimSpace(cfg.Resend.APIKey) != "" {
-		_ = transportRegistry.RegisterOutbound(resendtransport.NewOutboundAdapter(resendtransport.Config{
-			APIKey:  cfg.Resend.APIKey,
-			BaseURL: cfg.Resend.BaseURL,
-		}))
+	// The same providers `serve` registers. A standalone worker with a
+	// narrower registry silently requeues every outbox row whose inbox routes
+	// to a provider it is missing, which is how a hybrid reply would never be
+	// delivered in the documented serve/worker split.
+	transportRegistry, err := app.NewOutboundRegistry(cfg)
+	if err != nil {
+		log.Fatalf("transport registry error: %v", err)
 	}
 	memoryBudget, err := memguard.New(cfg.Memory.BudgetBytes)
 	if err != nil {

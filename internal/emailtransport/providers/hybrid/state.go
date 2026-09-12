@@ -100,6 +100,21 @@ type State struct {
 	AuthorityID    string `json:"authority_id"`
 	Key            Key    `json:"key"`
 	PendingKey     *Key   `json:"pending_key,omitempty"`
+	// LocalMailbox is the mailbox in this runtime's own database that the
+	// installation carries, and the routing it had before. The runtime polls
+	// that mailbox rather than the configured default, and disconnect puts
+	// the routing back: an inbox still pointed at a provider that is no
+	// longer registered stops the poll loop and strands every outbound row.
+	LocalMailbox *LocalMailbox `json:"local_mailbox,omitempty"`
+}
+
+// LocalMailbox records which local mailbox is routed through Cloud and what
+// it was routed to beforehand.
+type LocalMailbox struct {
+	InboxID       string `json:"inbox_id"`
+	Address       string `json:"address"`
+	PriorInbound  string `json:"prior_inbound"`
+	PriorOutbound string `json:"prior_outbound"`
 }
 
 // Redacted returns the state with every private key removed, for status output
@@ -170,6 +185,14 @@ func (s State) Validate() error {
 		}
 		if s.PendingKey.KID == s.Key.KID {
 			return errors.New("hybrid pending_key must differ from the active key")
+		}
+	}
+	if s.LocalMailbox != nil {
+		if parsed, err := uuid.Parse(s.LocalMailbox.InboxID); err != nil || parsed.String() != s.LocalMailbox.InboxID {
+			return errors.New("hybrid local_mailbox.inbox_id must be a canonical UUID")
+		}
+		if strings.TrimSpace(s.LocalMailbox.Address) == "" {
+			return errors.New("hybrid local_mailbox.address must be set")
 		}
 	}
 	return nil

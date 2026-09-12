@@ -756,9 +756,16 @@ func (s *Store) UpdateInboxOutboundProvider(ctx context.Context, inboxID string,
 // Cloud but sends over local SMTP would be replying from an address Cloud
 // owns, with none of Cloud's DKIM, suppression or recipient policy applied.
 func (s *Store) UpdateInboxTransportProviders(ctx context.Context, inboxID string, provider string) error {
+	return s.UpdateInboxProviders(ctx, inboxID, provider, provider)
+}
+
+// UpdateInboxProviders sets a mailbox's inbound and outbound providers
+// independently, which is what putting one back after hybrid disconnect
+// needs: the two may have differed before Cloud took over.
+func (s *Store) UpdateInboxProviders(ctx context.Context, inboxID string, inbound, outbound string) error {
 	_, err := s.q.ExecContext(ctx, `
-		UPDATE inboxes SET inbound_provider = $2, outbound_provider = $2 WHERE id = $1
-	`, inboxID, provider)
+		UPDATE inboxes SET inbound_provider = $2, outbound_provider = $3 WHERE id = $1
+	`, inboxID, inbound, outbound)
 	return err
 }
 

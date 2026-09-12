@@ -320,6 +320,10 @@ func tokenSourceFor(state State, key Key, httpClient *http.Client) *TokenSource 
 func newClient(state State, key Key, httpClient *http.Client) *Client {
 	return &Client{
 		HTTPClient: httpClient, BaseURL: state.CloudBaseURL,
+		// OrgID is empty while pairing, which is correct: Cloud names the
+		// organization when it completes the pairing, and until then there is
+		// nothing to check a response against.
+		OrgID:          state.OrgID,
 		InstallationID: state.InstallationID, InboxID: state.InboxID,
 		Tokens: tokenSourceFor(state, key, httpClient),
 	}
