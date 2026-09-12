@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -235,6 +236,112 @@ func (s *Store) EnsureThread(ctx context.Context, inboxID string, providerThread
 		return "", err
 	}
 	return id, nil
+}
+
+// ThreadReplyTarget is the message a reply should thread onto, and the chain
+// leading to it.
+//
+// Empty when the thread holds no inbound message carrying a Message-ID, which
+// is the case for a thread the runtime started itself. A reply then has no
+// parent to reference and must not invent one.
+type ThreadReplyTarget struct {
+	InReplyTo  string
+	References string
+}
+
+// GetThreadReplyTarget returns the RFC 5322 threading a reply in this thread
+// should carry.
+//
+// Without it a reply arrives as a new conversation in the recipient's client,
+// which is how it looked until now: nothing populated these fields, so no
+// provider emitted them. The parent is the newest inbound message that has a
+// Message-ID, and References is that message's own chain with its ID appended,
+// which is what RFC 5322 asks for.
+func (s *Store) GetThreadReplyTarget(ctx context.Context, inboxID, threadID string) (ThreadReplyTarget, error) {
+	var target ThreadReplyTarget
+	var messageID, parentInReplyTo, chain string
+	// array_to_string keeps the reference chain out of the driver's array
+	// handling: it is only ever joined with spaces for the header anyway.
+	err := s.q.QueryRowContext(ctx, `
+		SELECT coalesce(internet_message_id, ''), coalesce(in_reply_to, ''),
+		       coalesce(array_to_string("references", ' '), '')
+		FROM messages
+		WHERE thread_id = $1 AND inbox_id = $2 AND direction = 'inbound'
+		  AND coalesce(internet_message_id, '') <> ''
+		ORDER BY created_at DESC, id DESC
+		LIMIT 1
+	`, threadID, inboxID).Scan(&messageID, &parentInReplyTo, &chain)
+	if errors.Is(err, sql.ErrNoRows) {
+		return target, nil
+	}
+	if err != nil {
+		return target, err
+	}
+	// Every value here came from an inbound message, so it is chosen by
+	// whoever sent that mail. A Message-ID carrying a newline would either be
+	// refused by the SMTP adapter — failing the whole reply — or, in a less
+	// careful consumer, append headers of the sender's choosing. Anything not
+	// well formed is dropped: a reply that does not thread is a far smaller
+	// problem than one that cannot be sent or that carries injected headers.
+	if !validMessageID(messageID) {
+		return ThreadReplyTarget{}, nil
+	}
+	target.InReplyTo = messageID
+	// The parent's chain, then the parent itself. A parent with no recorded
+	// chain still had a parent of its own when in_reply_to is set, so that is
+	// the oldest ancestor this can honestly name.
+	if chain == "" {
+		chain = parentInReplyTo
+	}
+	ancestors := make([]string, 0, 8)
+	for _, ancestor := range strings.Fields(chain) {
+		if validMessageID(ancestor) {
+			ancestors = append(ancestors, ancestor)
+		}
+	}
+	ancestors = append(ancestors, messageID)
+	// References grows by one ID per hop. Keep the newest, which are the ones
+	// a client threads on, and drop the oldest rather than emit an unbounded
+	// header.
+	references := strings.Join(ancestors, " ")
+	for len(references) > maxReferencesBytes && len(ancestors) > 1 {
+		ancestors = ancestors[1:]
+		references = strings.Join(ancestors, " ")
+	}
+	if len(references) > maxReferencesBytes {
+		// A single ID longer than the whole budget: thread on it alone via
+		// In-Reply-To and send no References at all.
+		return ThreadReplyTarget{InReplyTo: messageID}, nil
+	}
+	target.References = references
+	return target, nil
+}
+
+// maxReferencesBytes bounds the References header. The hybrid send contract
+// refuses more than this, and no mail agent needs a longer chain.
+const maxReferencesBytes = 8192
+
+// validMessageID accepts the angle-addr form RFC 5322 requires, with no
+// whitespace or control characters, so a value can be placed in a header
+// without further escaping.
+func validMessageID(value string) bool {
+	if len(value) < 3 || len(value) > 998 {
+		return false
+	}
+	if value[0] != '<' || value[len(value)-1] != '>' {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if character < 0x21 || character > 0x7e {
+			return false
+		}
+		// No nested or premature delimiters: one identifier per token.
+		if (character == '<' && index != 0) || (character == '>' && index != len(value)-1) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Store) UpdateThreadSignals(ctx context.Context, threadID string, sentiment *float64, priority string) error {

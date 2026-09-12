@@ -508,6 +508,17 @@ func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string,
 			subject = "Reply"
 		}
 
+		// RFC 5322 threading. Without it a reply arrives as a new conversation
+		// in the recipient's client, which is how every reply looked until
+		// now: the outbox carried these columns but nothing populated them, so
+		// no provider emitted the headers. A thread with no inbound Message-ID
+		// yields an empty target, and a reply then references nothing rather
+		// than inventing a parent.
+		threading, err := st.GetThreadReplyTarget(scopedCtx, inboxID, thread.ID)
+		if err != nil {
+			return nil, err
+		}
+
 		outboxID, err := st.EnqueueOutboxMessage(scopedCtx, store.OutboxMessage{
 			OrgID:                        inbox.OrgID,
 			InboxID:                      inboxID,
@@ -520,6 +531,8 @@ func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string,
 			TextBody:                     body,
 			HTMLBody:                     bodyHTML,
 			Attachments:                  attachments,
+			InReplyToMessageID:           threading.InReplyTo,
+			References:                   threading.References,
 			AutonomousLimits: autonomousLimitInput(
 				principal, "send_reply", idempotencyKey, to, composeEnabled,
 			),

@@ -14,6 +14,7 @@
     "internal/store/recipient_ledger_test.go",
     "internal/store/store_threads.go",
     "internal/store/store_threads_test.go",
+    "internal/store/thread_reply_target_test.go",
     "internal/store/outbox.go",
     "internal/store/outbox_fence.go",
     "internal/store/outbox_fence_test.go",
