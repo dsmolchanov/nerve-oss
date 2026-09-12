@@ -410,3 +410,67 @@ func TestHybridClientRejectsResponsesForAnotherBinding(t *testing.T) {
 		})
 	}
 }
+
+// Cloud has already been asked to send. A receipt this client cannot verify
+// is an unknown outcome, not a refusal: terminating the outbox row would
+// report failure for a message the recipient may have received, and would
+// stop the stable operation key from ever being replayed to read the
+// authoritative receipt back.
+func TestHybridUnverifiableSendOutcomesStayRetryable(t *testing.T) {
+	org, installation := "33333333-3333-4333-8333-333333333333", "11111111-1111-4111-8111-111111111111"
+	complete := SendReceipt{OrgID: org, InstallationID: installation, OperationKey: "op-1",
+		Status: "sent", ProviderMessageID: "p"}
+	for name, mutate := range map[string]func(*SendReceipt){
+		"foreign organization": func(r *SendReceipt) { r.OrgID = "66666666-6666-4666-8666-666666666666" },
+		"foreign installation": func(r *SendReceipt) { r.InstallationID = "77777777-7777-4777-8777-777777777777" },
+		"foreign operation":    func(r *SendReceipt) { r.OperationKey = "someone-elses" },
+		"absent organization":  func(r *SendReceipt) { r.OrgID = "" },
+		"absent installation":  func(r *SendReceipt) { r.InstallationID = "" },
+		"absent operation":     func(r *SendReceipt) { r.OperationKey = "" },
+		"absent status":        func(r *SendReceipt) { r.Status = "" },
+	} {
+		receipt := complete
+		mutate(&receipt)
+		for _, action := range []string{"send", "receipt"} {
+			t.Run(action+" "+name, func(t *testing.T) {
+				client, _ := newTestClient(t, "")
+				server, state := newCloudServer(t, client.InstallationID, client.InboxID)
+				client.BaseURL = server.URL
+				state.handler = func(string, map[string]any) (int, any) { return http.StatusOK, receipt }
+				var err error
+				if action == "send" {
+					_, err = client.Send(context.Background(), SendRequest{
+						OperationKey: "op-1", Kind: "reply", To: []string{"a@example.test"}})
+				} else {
+					_, err = client.Receipt(context.Background(), "op-1")
+				}
+				if err == nil {
+					t.Fatal("accepted an unverifiable receipt")
+				}
+				classified := emailtransport.ClassifyProviderError(err)
+				if classified.Permanent {
+					t.Fatalf("a possibly-delivered send was terminalized: %+v", classified)
+				}
+				if classified.Reason != "outcome_unknown" {
+					t.Fatalf("reason %q, want outcome_unknown so the operation key is replayed", classified.Reason)
+				}
+			})
+		}
+	}
+
+	// Inbound is the other way round: there is no outbox row to strand, and a
+	// delivery that is not this installation's must never be stored, however
+	// often it arrives.
+	client, _ := newTestClient(t, "")
+	server, state := newCloudServer(t, client.InstallationID, client.InboxID)
+	client.BaseURL = server.URL
+	foreign := validDelivery(client)
+	foreign.OrgID = "66666666-6666-4666-8666-666666666666"
+	state.handler = func(string, map[string]any) (int, any) {
+		return http.StatusOK, map[string]any{"delivery": foreign}
+	}
+	_, err := client.Poll(context.Background())
+	if classified := emailtransport.ClassifyProviderError(err); !classified.Permanent {
+		t.Fatalf("a foreign delivery was treated as retryable: %+v", classified)
+	}
+}

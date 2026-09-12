@@ -161,7 +161,11 @@ func hybridConnect(ctx context.Context, cfg config.Config, stateStore hybridtran
 	// different mailbox would leave the first one on a provider nothing
 	// polls or restores.
 	if existing := state.LocalMailbox; existing != nil {
-		if !strings.EqualFold(existing.Address, address) {
+		same, err := sameLocalMailbox(ctx, cfg, *existing, address)
+		if err != nil {
+			return err
+		}
+		if !same {
 			return fmt.Errorf("installation %s already carries local mailbox %s; disconnect before binding %s",
 				state.InstallationID, existing.Address, address)
 		}
@@ -180,21 +184,70 @@ func hybridConnect(ctx context.Context, cfg config.Config, stateStore hybridtran
 	// Record which mailbox this is and what it was routed to. The runtime
 	// polls that mailbox, and disconnect puts the routing back.
 	state.LocalMailbox = mailbox
-	if err := stateStore.Save(state); err != nil {
-		// The routing is already committed but nothing durable now records
-		// it: the runtime would poll the configured default and disconnect
-		// would have no routing to restore, stranding this mailbox in both
-		// directions. Put it back before reporting.
-		if restoreErr := restoreLocalInbox(ctx, cfg, *mailbox); restoreErr != nil {
-			return fmt.Errorf("local mailbox %s is routed through Cloud, the binding was not recorded (%v), "+
-				"and the routing could not be undone: %w", address, err, restoreErr)
-		}
-		return fmt.Errorf("local mailbox %s was returned to its previous providers because the binding "+
-			"could not be recorded: %w", address, err)
+	if saveErr := stateStore.Save(state); saveErr != nil {
+		return reconcileBinding(ctx, cfg, stateStore, *mailbox, saveErr, out)
 	}
 	fmt.Fprintf(out, "Local mailbox %s (%s) now sends and receives through Cloud.\n", address, mailbox.InboxID)
 	fmt.Fprintln(out, "Restart the runtime so it loads this installation.")
 	return nil
+}
+
+// reconcileBinding decides what to do when recording the binding failed.
+//
+// A save error does not mean nothing was written. The state file is installed
+// by rename and the directory entry is synced afterwards, so a failure can
+// come either before the rename — nothing is recorded — or after it, with the
+// binding already durable. Rolling the database back in the second case would
+// leave the file naming a mailbox whose providers no longer route to Cloud,
+// and the runtime would then poll an inbox that no longer pulls from it.
+//
+// So read the state back and follow whatever is actually on disk.
+func reconcileBinding(ctx context.Context, cfg config.Config, stateStore hybridtransport.Store,
+	mailbox hybridtransport.LocalMailbox, saveErr error, out io.Writer) error {
+	recorded, loadErr := stateStore.Load()
+	if loadErr == nil && recorded.LocalMailbox != nil && recorded.LocalMailbox.InboxID == mailbox.InboxID {
+		// The binding is on disk. Keep the routing and say what is unproven,
+		// rather than undoing a change the file already describes.
+		fmt.Fprintf(out, "Local mailbox %s (%s) now sends and receives through Cloud.\n",
+			mailbox.Address, mailbox.InboxID)
+		fmt.Fprintf(out, "The installation file was written but its durability could not be confirmed (%v).\n", saveErr)
+		fmt.Fprintln(out, "Verify with `hybrid status` after restarting the runtime.")
+		return nil
+	}
+	// Nothing durable records the binding, so the routing must not stand.
+	if restoreErr := restoreLocalInbox(ctx, cfg, mailbox); restoreErr != nil {
+		return fmt.Errorf("local mailbox %s is routed through Cloud, the binding was not recorded (%v), "+
+			"and the routing could not be undone: %w", mailbox.Address, saveErr, restoreErr)
+	}
+	return fmt.Errorf("local mailbox %s was returned to its previous providers because the binding "+
+		"could not be recorded: %w", mailbox.Address, saveErr)
+}
+
+// sameLocalMailbox reports whether a requested address names the mailbox the
+// installation already carries.
+//
+// It compares resolved inbox identity, not address text. This repository has
+// one canonical-equivalence rule for inbox addresses, applied by the store, so
+// `Agent@EXAMPLE.COM.` and `agent@example.com` are the same mailbox. Comparing
+// the strings would reject an equivalent spelling and force an operator to
+// disconnect for no reason.
+func sameLocalMailbox(ctx context.Context, cfg config.Config, existing hybridtransport.LocalMailbox, address string) (bool, error) {
+	if strings.TrimSpace(address) == "" {
+		return false, errors.New("no local mailbox address; pass -local-inbox or set smtp.from")
+	}
+	st, err := store.Open(cfg.Database.DSN)
+	if err != nil {
+		return false, err
+	}
+	defer st.Close()
+	// A lookup, never a create: resolving a genuinely different address must
+	// not leave a stray mailbox behind on the way to refusing.
+	record, err := st.GetInboxByAddress(ctx, address)
+	if err != nil {
+		// No such mailbox means it is not the one already bound.
+		return false, nil
+	}
+	return record.ID == existing.InboxID, nil
 }
 
 // bindLocalInbox points one local mailbox at the hybrid transport and returns

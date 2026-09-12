@@ -522,3 +522,133 @@ func TestHybridConnectUndoesRoutingWhenTheBindingCannotBeRecorded(t *testing.T) 
 		t.Fatalf("durable state kept a binding that was never committed: %+v", state.LocalMailbox)
 	}
 }
+
+// This repository has one canonical-equivalence rule for inbox addresses, and
+// the store applies it. Comparing address text instead would reject an
+// equivalent spelling of the mailbox already bound and force an operator to
+// disconnect for no reason.
+func TestHybridConnectComparesMailboxesCanonically(t *testing.T) {
+	cfg, st, address := hybridRuntimeDatabase(t)
+	ctx := context.Background()
+	writeConnectedState(t, cfg.Hybrid.StatePath, nil)
+	var first bytes.Buffer
+	if err := runHybrid(ctx, cfg, []string{"connect"}, &first); err != nil {
+		t.Fatal(err)
+	}
+	bound, err := (hybridtransport.Store{Path: cfg.Hybrid.StatePath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior := *bound.LocalMailbox
+
+	local, domain, ok := strings.Cut(address, "@")
+	if !ok {
+		t.Fatalf("unexpected fixture address %q", address)
+	}
+	equivalents := map[string]string{
+		"uppercase domain":  local + "@" + strings.ToUpper(domain),
+		"mixed case local":  strings.ToUpper(local[:1]) + local[1:] + "@" + domain,
+		"trailing dot":      address + ".",
+		"surrounding space": " " + address + " ",
+	}
+	for name, spelling := range equivalents {
+		t.Run(name, func(t *testing.T) {
+			var out bytes.Buffer
+			if err := runHybrid(ctx, cfg, []string{"connect", "-local-inbox", spelling}, &out); err != nil {
+				t.Fatalf("%q was treated as a different mailbox: %v", spelling, err)
+			}
+			if !strings.Contains(out.String(), "already sends and receives") {
+				t.Fatalf("%q did not resolve to the bound mailbox: %q", spelling, out.String())
+			}
+			again, err := (hybridtransport.Store{Path: cfg.Hybrid.StatePath}).Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if *again.LocalMailbox != prior {
+				t.Fatalf("%q changed the binding: %+v", spelling, *again.LocalMailbox)
+			}
+		})
+	}
+
+	// A genuinely different mailbox is still refused, and looking it up must
+	// not create one on the way to refusing.
+	other := fmt.Sprintf("hybrid-distinct-%s@local.nerve.email", strings.ReplaceAll(uuid.NewString(), "-", ""))
+	var refused bytes.Buffer
+	if err := runHybrid(ctx, cfg, []string{"connect", "-local-inbox", other}, &refused); err == nil {
+		t.Fatal("a different mailbox was accepted")
+	}
+	var created int
+	if err := st.DB().QueryRowContext(ctx, `SELECT count(*) FROM inboxes WHERE address = $1`, other).Scan(&created); err != nil {
+		t.Fatal(err)
+	}
+	if created != 0 {
+		t.Fatal("refusing a different mailbox created it anyway")
+	}
+}
+
+// Save installs the state file by rename and syncs the directory afterwards,
+// so an error can arrive with the binding already durable. Rolling the
+// database back then would leave the file naming a mailbox whose providers no
+// longer route to Cloud, and the runtime would poll an inbox that no longer
+// pulls from it. The command follows whatever is actually on disk.
+func TestHybridConnectFollowsTheStateFileAfterAnUncertainSave(t *testing.T) {
+	cfg, st, address := hybridRuntimeDatabase(t)
+	ctx := context.Background()
+	state := writeConnectedState(t, cfg.Hybrid.StatePath, nil)
+	inboxID, err := st.EnsureDefaults(ctx, address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateInboxProviders(ctx, inboxID, "jmap", "resend"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stand in for a save that failed after the rename: the binding is on
+	// disk exactly as a successful save would have left it.
+	installed := state
+	installed.LocalMailbox = &hybridtransport.LocalMailbox{
+		InboxID: inboxID, Address: address, PriorInbound: "jmap", PriorOutbound: "resend",
+	}
+	if err := (hybridtransport.Store{Path: cfg.Hybrid.StatePath}).Save(installed); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateInboxTransportProviders(ctx, inboxID, "hybrid"); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := reconcileBinding(ctx, cfg, hybridtransport.Store{Path: cfg.Hybrid.StatePath},
+		*installed.LocalMailbox, errors.New("sync: input/output error"), &out); err != nil {
+		t.Fatalf("a durable binding was reported as failed: %v", err)
+	}
+	_, inbound, outbound := inboxProviders(t, st, address)
+	if inbound != "hybrid" || outbound != "hybrid" {
+		t.Fatalf("routing was rolled back under a durable binding: %s/%s", inbound, outbound)
+	}
+	if !strings.Contains(out.String(), "durability could not be confirmed") {
+		t.Fatalf("the uncertain save was not reported: %q", out.String())
+	}
+
+	// And when nothing was written, the routing really is undone.
+	bare, bareStore, bareAddress := hybridRuntimeDatabase(t)
+	writeConnectedState(t, bare.Hybrid.StatePath, nil)
+	bareInbox, err := bareStore.EnsureDefaults(ctx, bareAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bareStore.UpdateInboxTransportProviders(ctx, bareInbox, "hybrid"); err != nil {
+		t.Fatal(err)
+	}
+	var undone bytes.Buffer
+	err = reconcileBinding(ctx, bare, hybridtransport.Store{Path: bare.Hybrid.StatePath},
+		hybridtransport.LocalMailbox{InboxID: bareInbox, Address: bareAddress,
+			PriorInbound: "jmap", PriorOutbound: "smtp"},
+		errors.New("no space left on device"), &undone)
+	if err == nil || !strings.Contains(err.Error(), "returned to its previous providers") {
+		t.Fatalf("an unrecorded binding was not undone: %v", err)
+	}
+	_, bareIn, bareOut := inboxProviders(t, bareStore, bareAddress)
+	if bareIn == "hybrid" || bareOut == "hybrid" {
+		t.Fatalf("mailbox left on hybrid with nothing recording it: %s/%s", bareIn, bareOut)
+	}
+}

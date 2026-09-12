@@ -139,7 +139,9 @@ func (c *Client) checkDelivery(d Delivery) error {
 			fmt.Errorf("%w: poll returned delivery %s without a lease", ErrUnavailable, d.ID))
 	}
 	if err := c.checkBinding("poll", d.OrgID, d.InstallationID); err != nil {
-		return err
+		// Inbound has no outbox row to strand. A delivery that is not this
+		// installation's must never be stored, however often it arrives.
+		return emailtransport.NewPermanentError(0, "forbidden", err)
 	}
 	if d.InboxID != c.InboxID {
 		return emailtransport.NewPermanentError(0, "forbidden",
@@ -161,21 +163,21 @@ func (c *Client) checkDelivery(d Delivery) error {
 // case for a broken or hostile peer to produce: an empty org_id would then be
 // stored as this tenant's mail, and an empty installation_id would let a
 // receipt finalize an outbox row it does not describe.
+// The result is deliberately unclassified. What an unverifiable response means
+// depends on what the caller was doing: a delivery that is not ours is an
+// authority failure, while a send whose receipt cannot be verified is an
+// unknown outcome, because Cloud may already have delivered the message.
 func (c *Client) checkBinding(action, orgID, installationID string) error {
-	forbidden := func(format string, args ...any) error {
-		return emailtransport.NewPermanentError(0, "forbidden",
-			fmt.Errorf(format, args...))
-	}
 	// The client itself must know what to compare against. An installed
 	// runtime always does; anything else cannot verify and must not guess.
 	if c.OrgID == "" || c.InstallationID == "" {
-		return forbidden("%w: %s cannot be verified without an installation binding", ErrAuthority, action)
+		return fmt.Errorf("%w: %s cannot be verified without an installation binding", ErrAuthority, action)
 	}
 	if orgID != c.OrgID {
-		return forbidden("%w: %s did not answer for this organization", ErrAuthority, action)
+		return fmt.Errorf("%w: %s did not answer for this organization", ErrAuthority, action)
 	}
 	if installationID != c.InstallationID {
-		return forbidden("%w: %s did not answer for this installation", ErrAuthority, action)
+		return fmt.Errorf("%w: %s did not answer for this installation", ErrAuthority, action)
 	}
 	return nil
 }
@@ -189,14 +191,24 @@ func (c *Client) checkReceipt(action, operationKey string, receipt SendReceipt) 
 	// Likewise exact: a receipt with no operation key does not answer the
 	// operation this call asked about.
 	if receipt.OperationKey != operationKey {
-		return emailtransport.NewPermanentError(0, "forbidden",
-			fmt.Errorf("%w: %s did not answer for this operation", ErrAuthority, action))
+		return fmt.Errorf("%w: %s did not answer for this operation", ErrAuthority, action)
 	}
 	if receipt.Status == "" {
-		return emailtransport.NewTransientError(0, "server_error",
-			fmt.Errorf("%w: %s returned a receipt with no status", ErrUnavailable, action))
+		return fmt.Errorf("%w: %s returned a receipt with no status", ErrUnavailable, action)
 	}
 	return nil
+}
+
+// unverifiedOutcome is how Send and Receipt report a receipt they could not
+// verify.
+//
+// Cloud has already been asked to send, and this response is the only thing
+// that would say whether it did. Terminating the outbox row here would report
+// failure for a message the recipient may well have received, and would stop
+// the stable operation key from ever being replayed to read the authoritative
+// receipt back. So the row stays unresolved and retryable.
+func unverifiedOutcome(cause error) error {
+	return emailtransport.NewTransientError(0, "outcome_unknown", cause)
 }
 
 // Ack tells Cloud the delivery is durably stored here. Cloud may then purge
@@ -216,7 +228,7 @@ func (c *Client) Send(ctx context.Context, request SendRequest) (SendReceipt, er
 		return SendReceipt{}, err
 	}
 	if err := c.checkReceipt("send", request.OperationKey, receipt); err != nil {
-		return SendReceipt{}, err
+		return SendReceipt{}, unverifiedOutcome(err)
 	}
 	return receipt, nil
 }
@@ -230,7 +242,7 @@ func (c *Client) Receipt(ctx context.Context, operationKey string) (SendReceipt,
 		return SendReceipt{}, err
 	}
 	if err := c.checkReceipt("receipt", operationKey, receipt); err != nil {
-		return SendReceipt{}, err
+		return SendReceipt{}, unverifiedOutcome(err)
 	}
 	return receipt, nil
 }
