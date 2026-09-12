@@ -105,6 +105,15 @@ type Config struct {
 		DelegationSecret string        `yaml:"delegation_secret"`
 		Timeout          time.Duration `yaml:"timeout"`
 	} `yaml:"onboarding"`
+	// Hybrid pairs a self-hosted runtime to a Cloud mailbox. It holds no
+	// secret: the only credential is the RSA private key inside StatePath,
+	// which the runtime generates and never transmits. An unset StatePath
+	// leaves hybrid transport off entirely.
+	Hybrid struct {
+		StatePath    string        `yaml:"state_path"`
+		PollInterval time.Duration `yaml:"poll_interval"`
+		Timeout      time.Duration `yaml:"timeout"`
+	} `yaml:"hybrid"`
 	Security struct {
 		APIKey                  string        `yaml:"api_key"`
 		LocalAPIKeys            []LocalAPIKey `yaml:"local_api_keys"`
@@ -143,6 +152,8 @@ func Default() Config {
 	cfg.Metering.PastDueGraceDays = 7
 	cfg.MCP.ProtocolVersion = "2025-11-25"
 	cfg.Onboarding.Timeout = 4 * time.Second
+	cfg.Hybrid.PollInterval = 5 * time.Second
+	cfg.Hybrid.Timeout = 10 * time.Second
 	cfg.Log.Level = "info"
 	return cfg
 }
@@ -242,6 +253,9 @@ func applyPreferredEnvAliases() []string {
 		"NM_ONBOARDING_DELEGATION_KEY_ID",
 		"NM_ONBOARDING_DELEGATION_SECRET",
 		"NM_ONBOARDING_TIMEOUT",
+		"NM_HYBRID_STATE_PATH",
+		"NM_HYBRID_POLL_INTERVAL",
+		"NM_HYBRID_TIMEOUT",
 		"NM_API_KEY",
 		"NM_ALLOW_OUTBOUND",
 		"NM_ALLOW_SEND_WITH_WARNINGS",
@@ -447,6 +461,19 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("NM_ONBOARDING_TIMEOUT"); v != "" {
 		if duration, err := time.ParseDuration(v); err == nil && duration > 0 {
 			cfg.Onboarding.Timeout = duration
+		}
+	}
+	if v := os.Getenv("NM_HYBRID_STATE_PATH"); v != "" {
+		cfg.Hybrid.StatePath = v
+	}
+	if v := os.Getenv("NM_HYBRID_POLL_INTERVAL"); v != "" {
+		if duration, err := time.ParseDuration(v); err == nil && duration > 0 {
+			cfg.Hybrid.PollInterval = duration
+		}
+	}
+	if v := os.Getenv("NM_HYBRID_TIMEOUT"); v != "" {
+		if duration, err := time.ParseDuration(v); err == nil && duration > 0 {
+			cfg.Hybrid.Timeout = duration
 		}
 	}
 	if v := os.Getenv("NM_API_KEY"); v != "" {
