@@ -78,7 +78,8 @@ For a consistent application snapshot, stop the runtime and any separately runni
 workers before dumping PostgreSQL. Preserve the source mailbox and prevent inbound
 changes during a coordinated full-system backup. These scripts back up PostgreSQL
 only; they do not back up Stalwart raw mail, Redis jobs, Qdrant, external object
-storage, `.env` or custom configuration.
+storage, `.env`, custom configuration, or a hybrid installation's private key
+(see [Hybrid](#hybrid-a-cloud-mailbox-on-a-self-hosted-runtime)).
 
 ```sh
 mkdir -p backups
@@ -232,6 +233,104 @@ historical rows are excluded from thread/search results and denied by direct
 message resources; this does not delete or repair them. Local vector results
 use the database for ownership and displayed content, so a stale index cannot
 supply another inbox's snippet or thread identifier.
+
+## Hybrid: a Cloud mailbox on a self-hosted runtime
+
+Hybrid mode keeps mail on your host and uses Nerve Cloud only as the mail
+transport. The runtime pulls inbound messages from Cloud, stores them in your
+PostgreSQL, and hands replies back for Cloud's provider to deliver. Message
+content lives in your database; Cloud holds each message only until this
+runtime acknowledges it.
+
+This is off unless `hybrid.state_path` is set. Without it nothing changes.
+
+### What the runtime holds
+
+One file, at `hybrid.state_path`, containing an RSA private key this runtime
+generated and never transmits, plus the Cloud coordinates it was paired with.
+There is no long-lived bearer token anywhere: the runtime signs a short
+assertion with that key and exchanges it for an access token that expires in
+minutes, and there is no refresh token to store or rotate.
+
+The file is written with mode `0600` in a `0700` directory and is replaced
+atomically. The runtime refuses to start if any other account can read it,
+because the key would then have to be treated as disclosed.
+
+**It is not in PostgreSQL, so a database backup does not contain it.** Back up
+this file separately, with the same care as a TLS private key. Restoring a
+database dump onto a new host gives you a runtime that serves but is not
+paired; `neuralmail hybrid status` says so. Recover by restoring the file, or
+by pairing again.
+
+In Compose the file lives on the `cortex-state` volume, which `docker compose
+down -v` deletes along with everything else.
+
+### Connecting
+
+Pairing needs two people and cannot be done by the runtime alone: an operator
+admits the runtime's public key to Cloud's machine-client inventory, and the
+mailbox owner approves the pairing in the Cloud dashboard.
+
+```sh
+docker compose exec cortex /app/neuralmail hybrid connect \
+  -cloud-url https://cloud.example.com \
+  -token-endpoint https://auth.example.com/oauth/token \
+  -resource https://runtime.example.com/mcp \
+  -client-id your-machine-client \
+  -generation 1 \
+  -cloud-inbox-id 00000000-0000-0000-0000-000000000000 \
+  -authority-id cloud.example.com
+```
+
+The command generates the key, prints the public JWK to admit, and then waits
+for the owner to approve. It is safe to interrupt and re-run: the key and the
+parameters are already on disk, so a second run neither asks for the flags
+again nor generates a key that would have to be admitted a second time. Once
+the owner approves, the local mailbox (`-local-inbox`, defaulting to
+`smtp.from`) is routed through Cloud in both directions.
+
+`-authority-id` names the Cloud deployment. It namespaces the local
+deduplication key, so two Cloud deployments that happen to issue the same
+delivery identifier cannot be mistaken for each other. Do not change it on a
+live installation: a runtime that has already stored mail under one authority
+would store it again under the other.
+
+### Checking and rotating
+
+`neuralmail hybrid status` prints the local installation and, when Cloud is
+reachable, what Cloud says about it. It works during a Cloud outage and
+reports the unreachable half rather than failing.
+
+Rotation is two steps, for the same reason pairing is:
+
+```sh
+docker compose exec cortex /app/neuralmail hybrid rotate            # prepare
+# admit the printed key, then have the owner rotate the installation onto it
+docker compose exec cortex /app/neuralmail hybrid rotate -commit    # switch
+```
+
+The runtime keeps using its current key until `-commit` succeeds, and
+`-commit` only succeeds once it has minted a token with the replacement and
+reached Cloud with it. Remove the old key from the inventory after that, not
+before. `-abandon` discards a replacement that was never admitted.
+
+### Disconnecting
+
+```sh
+docker compose exec cortex /app/neuralmail hybrid disconnect
+```
+
+This deletes the local key. **It does not revoke anything**: only the mailbox
+owner can revoke the installation in Cloud, and until they do it remains
+usable by anyone holding a copy of the key. Ask them to revoke it.
+
+### Upgrading
+
+The key is on a volume, so recreating the container keeps it. Do not rebuild a
+deployment by deleting the volume; the replacement key would have to be
+admitted to Cloud by hand again. `scripts/ci/hybrid_selfhost_smoke.py`
+exercises clean start, upgrade and the backup boundary against the built
+image.
 
 ## Updating a deployment
 
