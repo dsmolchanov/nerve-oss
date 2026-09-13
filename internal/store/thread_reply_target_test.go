@@ -63,9 +63,11 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 			if target.InReplyTo != "<third@example.test>" {
 				t.Fatalf("in-reply-to = %q, want the newest inbound message", target.InReplyTo)
 			}
-			want := "<root@example.test> <second@example.test> <third@example.test>"
+			// Ancestors only: the outbox worker appends the reply target when
+			// it builds the header, so naming it here would emit it twice.
+			want := "<root@example.test> <second@example.test>"
 			if target.References != want {
-				t.Fatalf("references = %q, want %q", target.References, want)
+				t.Fatalf("references = %q, want the ancestors alone %q", target.References, want)
 			}
 		})
 
@@ -75,8 +77,8 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if target.References != "<parent@example.test> <only@example.test>" {
-				t.Fatalf("references = %q", target.References)
+			if target.References != "<parent@example.test>" {
+				t.Fatalf("references = %q, want the ancestor alone", target.References)
 			}
 		})
 
@@ -86,8 +88,8 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if target.References != "<first@example.test>" || target.InReplyTo != "<first@example.test>" {
-				t.Fatalf("target = %+v", target)
+			if target.References != "" || target.InReplyTo != "<first@example.test>" {
+				t.Fatalf("target = %+v, want no ancestors and the parent alone", target)
 			}
 		})
 
@@ -164,29 +166,63 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := "<root@example.test> <second@example.test> <good@example.test>"
+			want := "<root@example.test> <second@example.test>"
 			if target.References != want {
 				t.Fatalf("references = %q, want %q", target.References, want)
 			}
 		})
 
 		// References grows one ID per hop, so it is bounded by dropping the
-		// oldest rather than emitting an unbounded header.
+		// oldest. The bound covers the reply target the worker appends, and
+		// the assembled header must stay inside a protocol line.
 		t.Run("bounded chain", func(t *testing.T) {
 			ancestors := make([]string, 0, 400)
-			for index := range 400 {
-				ancestors = append(ancestors, "<"+strings.Repeat("x", 40)+uuid.NewString()+"-"+string(rune('a'+index%26))+"@example.test>")
+			for range 400 {
+				ancestors = append(ancestors, "<"+uuid.NewString()+"@example.test>")
 			}
 			threadID := inbound("<newest@example.test>", "", ancestors, now)
 			target, err := st.GetThreadReplyTarget(ctx, inboxID, threadID)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(target.References) > maxReferencesBytes {
-				t.Fatalf("references is %d bytes, over the %d bound", len(target.References), maxReferencesBytes)
+			// What the worker will actually emit.
+			assembled := target.References + " " + target.InReplyTo
+			if len(assembled) > maxReferencesBytes {
+				t.Fatalf("assembled references is %d bytes, over the %d bound", len(assembled), maxReferencesBytes)
 			}
-			if !strings.HasSuffix(target.References, "<newest@example.test>") {
+			if len("References: "+assembled) > 998 {
+				t.Fatalf("the References line would be %d characters, over RFC 5322's limit",
+					len("References: "+assembled))
+			}
+			// The newest ancestors are the ones a client threads on.
+			if !strings.HasSuffix(target.References, ancestors[len(ancestors)-1]) {
 				t.Fatal("the newest ancestor was dropped instead of the oldest")
+			}
+			if strings.Contains(target.References, ancestors[0]) {
+				t.Fatal("the oldest ancestor was kept over newer ones")
+			}
+			// The reply target appears exactly once in the assembled header.
+			if strings.Count(assembled, target.InReplyTo) != 1 {
+				t.Fatalf("the reply target appears %d times in %q",
+					strings.Count(assembled, target.InReplyTo), assembled)
+			}
+		})
+
+		// A parent whose own identifier fills the budget leaves no room for
+		// ancestors, and must still thread rather than emit an over-long line.
+		t.Run("parent fills the budget", func(t *testing.T) {
+			long := "<" + strings.Repeat("a", maxMessageIDBytes-2) + ">"
+			threadID := inbound(long, "", []string{"<root@example.test>"}, now)
+			target, err := st.GetThreadReplyTarget(ctx, inboxID, threadID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assembled := strings.TrimSpace(target.References + " " + target.InReplyTo)
+			if len("References: "+assembled) > 998 || len("In-Reply-To: "+target.InReplyTo) > 998 {
+				t.Fatalf("a long parent produced an over-long header: %d bytes", len(assembled))
+			}
+			if target.InReplyTo != long {
+				t.Fatalf("in-reply-to = %q", target.InReplyTo)
 			}
 		})
 	})

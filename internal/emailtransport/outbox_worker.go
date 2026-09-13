@@ -369,16 +369,7 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 	}
 
 	// Set In-Reply-To and References headers for reply-chain threading.
-	if msg.InReplyToMessageID != "" {
-		out.Headers = map[string]string{
-			"In-Reply-To": msg.InReplyToMessageID,
-		}
-		if msg.References != "" {
-			out.Headers["References"] = msg.References + " " + msg.InReplyToMessageID
-		} else {
-			out.Headers["References"] = msg.InReplyToMessageID
-		}
-	}
+	out.Headers = threadingHeaders(msg.InReplyToMessageID, msg.References)
 
 	// For forwarded messages (idempotency key starts with "fwd:"), add forwarding headers.
 	if strings.HasPrefix(msg.IdempotencyKey, "fwd:") {
@@ -626,4 +617,26 @@ func (w *OutboxWorker) backoffForAttempt(attempt int) time.Duration {
 		return w.MaxBackoff
 	}
 	return d
+}
+
+// threadingHeaders builds the RFC 5322 threading headers for one outbound
+// message.
+//
+// References holds the ancestors and the reply target is appended here, which
+// is the contract the outbox columns have always had: a caller that included
+// the target in References too would emit it twice, and a client reading a
+// duplicated chain cannot tell where the conversation actually forked.
+//
+// Nil when there is no reply target, so a first message in a conversation
+// carries no threading headers at all rather than empty ones.
+func threadingHeaders(inReplyTo, references string) map[string]string {
+	inReplyTo = strings.TrimSpace(inReplyTo)
+	if inReplyTo == "" {
+		return nil
+	}
+	chain := inReplyTo
+	if ancestors := strings.TrimSpace(references); ancestors != "" {
+		chain = ancestors + " " + inReplyTo
+	}
+	return map[string]string{"In-Reply-To": inReplyTo, "References": chain}
 }

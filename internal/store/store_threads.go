@@ -238,8 +238,13 @@ func (s *Store) EnsureThread(ctx context.Context, inboxID string, providerThread
 	return id, nil
 }
 
-// ThreadReplyTarget is the message a reply should thread onto, and the chain
-// leading to it.
+// ThreadReplyTarget is the message a reply should thread onto, and the
+// ancestors leading to it.
+//
+// References holds the ancestors only, not InReplyTo: the outbox worker
+// appends the reply target when it builds the header, which is the contract
+// the outbox columns have always had. Including it here would emit the parent
+// twice.
 //
 // Empty when the thread holds no inbound message carrying a Message-ID, which
 // is the case for a thread the runtime started itself. A reply then has no
@@ -299,33 +304,42 @@ func (s *Store) GetThreadReplyTarget(ctx context.Context, inboxID, threadID stri
 			ancestors = append(ancestors, ancestor)
 		}
 	}
-	ancestors = append(ancestors, messageID)
 	// References grows by one ID per hop. Keep the newest, which are the ones
-	// a client threads on, and drop the oldest rather than emit an unbounded
-	// header.
+	// a client threads on, and drop the oldest rather than emit a header the
+	// protocol cannot carry. The budget accounts for the reply target the
+	// worker appends, so the assembled value stays inside it.
+	budget := maxReferencesBytes - len(messageID) - 1
 	references := strings.Join(ancestors, " ")
-	for len(references) > maxReferencesBytes && len(ancestors) > 1 {
+	for len(references) > budget && len(ancestors) > 0 {
 		ancestors = ancestors[1:]
 		references = strings.Join(ancestors, " ")
-	}
-	if len(references) > maxReferencesBytes {
-		// A single ID longer than the whole budget: thread on it alone via
-		// In-Reply-To and send no References at all.
-		return ThreadReplyTarget{InReplyTo: messageID}, nil
 	}
 	target.References = references
 	return target, nil
 }
 
-// maxReferencesBytes bounds the References header. The hybrid send contract
-// refuses more than this, and no mail agent needs a longer chain.
-const maxReferencesBytes = 8192
+// maxReferencesBytes bounds the assembled References header value, after the
+// outbox worker has appended the reply target.
+//
+// RFC 5322 limits a line to 998 characters and SMTP a DATA line to 1000
+// octets, and the SMTP adapter writes each header on one unfolded line. The
+// budget leaves room for "References: " so the serialized line stays inside
+// that limit for every provider, without the adapters having to differ. A
+// longer chain keeps its newest identifiers, which are the ones a client
+// threads on.
+const maxReferencesBytes = 900
+
+// maxMessageIDBytes bounds one identifier, so "In-Reply-To: " plus it stays
+// inside a header line too.
+const maxMessageIDBytes = 512
 
 // validMessageID accepts the angle-addr form RFC 5322 requires, with no
 // whitespace or control characters, so a value can be placed in a header
 // without further escaping.
 func validMessageID(value string) bool {
-	if len(value) < 3 || len(value) > 998 {
+	// Bounded well inside a header line: "In-Reply-To: " plus this must also
+	// fit RFC 5322's 998-character limit, and no real Message-ID approaches it.
+	if len(value) < 3 || len(value) > maxMessageIDBytes {
 		return false
 	}
 	if value[0] != '<' || value[len(value)-1] != '>' {
