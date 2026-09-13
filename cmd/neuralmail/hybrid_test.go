@@ -20,6 +20,10 @@ import (
 	"neuralmail/internal/store"
 )
 
+// hybridSchemaLock is the advisory key every migrator of a shared test
+// database takes, matching the hybrid provider suite.
+const hybridSchemaLock = 4021539204
+
 func writeConnectedState(t *testing.T, path string, mutate func(*hybridtransport.State)) hybridtransport.State {
 	t.Helper()
 	key, err := hybridtransport.GenerateKey()
@@ -384,8 +388,24 @@ func hybridRuntimeDatabase(t *testing.T) (config.Config, *store.Store, string) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	ctx := context.Background()
-	if err := store.MigrateCore(ctx, st.DB()); err != nil {
+	// Concurrent migrators of one shared database collide on CREATE EXTENSION,
+	// so migrate under an advisory lock. The migration always runs: Goose skips
+	// applied versions, while probing for a table would treat the first
+	// migration as proof of the head and let a stale database through.
+	connection, err := st.DB().Conn(ctx)
+	if err != nil {
 		t.Fatal(err)
+	}
+	defer connection.Close()
+	if _, err := connection.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, hybridSchemaLock); err != nil {
+		t.Fatal(err)
+	}
+	migrateErr := store.MigrateCore(ctx, st.DB())
+	if _, err := connection.ExecContext(ctx, `SELECT pg_advisory_unlock($1)`, hybridSchemaLock); err != nil {
+		t.Fatal(err)
+	}
+	if migrateErr != nil {
+		t.Fatal(migrateErr)
 	}
 	address := fmt.Sprintf("hybrid-cli-%s@local.nerve.email", strings.ReplaceAll(uuid.NewString(), "-", ""))
 	cfg.SMTP.From = address

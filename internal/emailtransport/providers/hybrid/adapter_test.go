@@ -103,7 +103,7 @@ func hybridRuntimeStore(t *testing.T) (*store.Store, string) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	ctx := context.Background()
-	if err := store.MigrateCore(ctx, st.DB()); err != nil {
+	if err := ensureCoreSchema(ctx, st); err != nil {
 		t.Fatal(err)
 	}
 	// A fresh mailbox per test: deduplication is scoped to the inbox, so this
@@ -114,6 +114,38 @@ func hybridRuntimeStore(t *testing.T) (*store.Store, string) {
 		t.Fatal(err)
 	}
 	return st, inboxID
+}
+
+// hybridSchemaLock is the advisory key every migrator of a shared test
+// database takes.
+const hybridSchemaLock = 4021539204
+
+// ensureCoreSchema brings the shared test database to the current Core head,
+// under an advisory lock.
+//
+// Go runs package tests concurrently, and in a repository that points every
+// package at one DSN two of them calling MigrateCore together collide on
+// `CREATE EXTENSION IF NOT EXISTS pgcrypto`, which is not as idempotent as it
+// reads. The lock serializes migrators across processes.
+//
+// The migration always runs while the lock is held. Goose skips versions that
+// are already applied, so this costs one query on a current database — and
+// probing for a table instead would treat migration 0001 as proof of the head,
+// letting a database left at an older version run these tests against stale
+// tables.
+func ensureCoreSchema(ctx context.Context, st *store.Store) error {
+	connection, err := st.DB().Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer connection.Close()
+	if _, err := connection.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, hybridSchemaLock); err != nil {
+		return err
+	}
+	defer func() {
+		_, _ = connection.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, hybridSchemaLock)
+	}()
+	return store.MigrateCore(ctx, st.DB())
 }
 
 func inboundFixture(t *testing.T, deliveries []Delivery) (*InboundAdapter, *cloudServer) {

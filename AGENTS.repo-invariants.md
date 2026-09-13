@@ -91,6 +91,19 @@ makes a review loop unable to terminate.
   timeout/spawn exceptions or chained tracebacks. Enforced by the restored/empty
   database failure matrix in `scripts/ci/test_selfhost_smoke.py`.
 
+- Do the RFC 5322 threading headers name the reply target exactly once, keep
+  each repeated ancestor at its latest position, and stay inside a header line
+  for every provider? `References` carries the ancestors and the outbox worker
+  appends the reply target, so a producer that also names it there emits it
+  twice; ancestors come from inbound mail, so a sender can repeat one or name
+  the message's own identifier, and both the store read and the shared assembly
+  helper deduplicate. Every size bound is derived from RFC 5322's 998-character
+  line and the header's own name, never a round number, so a valid identifier
+  is discarded only when it genuinely cannot be serialized. Enforced by
+  `TestThreadingHeadersNameTheReplyTargetExactlyOnce`,
+  `TestGetThreadReplyTargetDerivesAndSanitizesThreading` and
+  `TestSMTPThreadingHeadersStayInsideTheLineLimit`.
+
 - Does every hybrid installation-state change either confirm its directory
   synchronization or report the change as unconfirmed, and never report an
   unconfirmed change as success? A directory mutation is not durable until the
