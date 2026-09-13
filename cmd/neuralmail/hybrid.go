@@ -319,7 +319,7 @@ func bindLocalInbox(ctx context.Context, cfg config.Config, address string) (*hy
 		return nil, err
 	}
 	mailbox := &hybridtransport.LocalMailbox{
-		InboxID: inboxID, Address: address,
+		InboxID: inboxID, Address: address, OrgID: record.OrgID,
 		PriorInbound: record.InboundProvider, PriorOutbound: record.OutboundProvider,
 	}
 	// Re-running connect must not record "hybrid" as the routing to restore.
@@ -329,7 +329,7 @@ func bindLocalInbox(ctx context.Context, cfg config.Config, address string) (*hy
 	if mailbox.PriorOutbound == hybridtransport.ProviderName {
 		mailbox.PriorOutbound = ""
 	}
-	if err := st.UpdateInboxTransportProviders(ctx, inboxID, hybridtransport.ProviderName); err != nil {
+	if err := st.UpdateInboxTransportProviders(ctx, record.OrgID, inboxID, hybridtransport.ProviderName); err != nil {
 		return nil, err
 	}
 	return mailbox, nil
@@ -357,7 +357,17 @@ func restoreLocalInbox(ctx context.Context, cfg config.Config, mailbox hybridtra
 	if outbound == "" || outbound == hybridtransport.ProviderName {
 		outbound = "smtp"
 	}
-	return st.UpdateInboxProviders(ctx, mailbox.InboxID, inbound, outbound)
+	orgID := mailbox.OrgID
+	if orgID == "" {
+		// A binding recorded before the organization was stored: read it back
+		// rather than dropping the tenant predicate.
+		record, err := st.GetInboxRecordByID(ctx, mailbox.InboxID)
+		if err != nil {
+			return err
+		}
+		orgID = record.OrgID
+	}
+	return st.UpdateInboxProviders(ctx, orgID, mailbox.InboxID, inbound, outbound)
 }
 
 func hybridStatus(ctx context.Context, stateStore hybridtransport.Store, client *http.Client, out io.Writer) error {

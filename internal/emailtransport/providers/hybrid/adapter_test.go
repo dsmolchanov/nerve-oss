@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -25,12 +26,19 @@ func TestHybridOutboundRefusesContentItCannotCarry(t *testing.T) {
 		return emailtransport.OutboundMessage{To: []string{"a@example.test"}, Subject: "s", TextBody: "b"}
 	}
 	cases := map[string]func(*emailtransport.OutboundMessage){
-		"html body":    func(m *emailtransport.OutboundMessage) { m.HTMLBody = "<p>hello</p>" },
-		"attachment":   func(m *emailtransport.OutboundMessage) { m.Attachments = []store.OutboundAttachment{{}} },
-		"cc":           func(m *emailtransport.OutboundMessage) { m.CC = []string{"c@example.test"} },
-		"bcc":          func(m *emailtransport.OutboundMessage) { m.BCC = []string{"d@example.test"} },
-		"reply to":     func(m *emailtransport.OutboundMessage) { m.ReplyTo = []string{"e@example.test"} },
-		"headers":      func(m *emailtransport.OutboundMessage) { m.Headers = map[string]string{"In-Reply-To": "<x@y>"} },
+		"html body":  func(m *emailtransport.OutboundMessage) { m.HTMLBody = "<p>hello</p>" },
+		"attachment": func(m *emailtransport.OutboundMessage) { m.Attachments = []store.OutboundAttachment{{}} },
+		"cc":         func(m *emailtransport.OutboundMessage) { m.CC = []string{"c@example.test"} },
+		"bcc":        func(m *emailtransport.OutboundMessage) { m.BCC = []string{"d@example.test"} },
+		"reply to":   func(m *emailtransport.OutboundMessage) { m.ReplyTo = []string{"e@example.test"} },
+		"unknown header": func(m *emailtransport.OutboundMessage) {
+			m.Headers = map[string]string{"X-Custom": "value"}
+		},
+		// Forwarding relies on the loop guard, which the contract cannot
+		// carry. Sending the forward without it could let a loop form.
+		"forwarded": func(m *emailtransport.OutboundMessage) {
+			m.Headers = map[string]string{headerLoopGuard: "inbox-1"}
+		},
 		"empty":        func(m *emailtransport.OutboundMessage) { m.Subject = ""; m.TextBody = "" },
 		"no recipient": func(m *emailtransport.OutboundMessage) { m.To = nil },
 		"two recipients": func(m *emailtransport.OutboundMessage) {
@@ -422,5 +430,91 @@ func TestHybridOutboundReportsDeliveryStatusByOperationKey(t *testing.T) {
 				t.Fatalf("cloud was asked about %q", asked)
 			}
 		})
+	}
+}
+
+// A threaded reply is the ordinary hybrid send: the outbox sets In-Reply-To
+// and References on every one, and a reply is the only kind NewRuntime
+// registers. Refusing them would refuse the whole feature, and dropping them
+// would deliver every reply as a new conversation in the recipient's client.
+func TestHybridOutboundCarriesReplyThreading(t *testing.T) {
+	client, _ := newTestClient(t, "")
+	server, state := newCloudServer(t, client.InstallationID, client.InboxID)
+	client.BaseURL = server.URL
+	var seen map[string]any
+	state.handler = func(action string, input map[string]any) (int, any) {
+		if action == "send" {
+			seen = input
+		}
+		return http.StatusOK, bound(client, "op-1", SendReceipt{Status: "sent", ProviderMessageID: "p1"})
+	}
+	adapter := &OutboundAdapter{Client: client, Kind: "reply"}
+
+	// Exactly what the outbox worker builds for a threaded reply.
+	threaded := emailtransport.OutboundMessage{
+		To: []string{"a@example.test"}, Subject: "Re: hello", TextBody: "body",
+		Headers: map[string]string{
+			headerInReplyTo:  "<first@example.test>",
+			headerReferences: "<root@example.test> <first@example.test>",
+		},
+	}
+	if _, err := adapter.SendMessage(context.Background(), threaded, "op-1"); err != nil {
+		t.Fatalf("a threaded reply was refused: %v", err)
+	}
+	if seen["in_reply_to"] != "<first@example.test>" {
+		t.Fatalf("in_reply_to reached cloud as %v", seen["in_reply_to"])
+	}
+	if seen["references"] != "<root@example.test> <first@example.test>" {
+		t.Fatalf("references reached cloud as %v", seen["references"])
+	}
+
+	// A first message has no parent and must not send empty members: they
+	// would change the payload the operation key is recorded under.
+	seen = nil
+	plain := emailtransport.OutboundMessage{To: []string{"a@example.test"}, Subject: "hello", TextBody: "body"}
+	if _, err := adapter.SendMessage(context.Background(), plain, "op-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := seen["in_reply_to"]; ok {
+		t.Fatalf("an unthreaded send carried in_reply_to: %v", seen)
+	}
+	if _, ok := seen["references"]; ok {
+		t.Fatalf("an unthreaded send carried references: %v", seen)
+	}
+}
+
+// Every header the outbox worker can set must be either carried by the Cloud
+// contract or refused by name. A header added to the worker later would
+// otherwise be swept into the generic "unknown header" refusal and
+// permanently fail the ordinary send path, which is exactly how threading
+// headers broke hybrid outbound once.
+func TestHybridSendableCoversEveryHeaderTheWorkerEmits(t *testing.T) {
+	source, err := os.ReadFile("../../outbox_worker.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both shapes the worker uses: a map literal key and an index assignment.
+	pattern := regexp.MustCompile(`out\.Headers(?:\[|\s*=\s*map\[string\]string\{\s*)"([A-Za-z0-9-]+)"`)
+	matches := pattern.FindAllSubmatch(source, -1)
+	if len(matches) == 0 {
+		t.Fatal("no worker headers found; update this test with the worker")
+	}
+	classified := map[string]bool{headerInReplyTo: true, headerReferences: true, headerLoopGuard: true}
+	for _, match := range matches {
+		name := string(match[1])
+		if !classified[name] {
+			t.Fatalf("the outbox worker sets header %q, which hybrid neither carries nor names; "+
+				"add it to the Cloud send contract or refuse it explicitly", name)
+		}
+	}
+	// And the two carried ones really are accepted on their own.
+	for _, name := range []string{headerInReplyTo, headerReferences} {
+		message := emailtransport.OutboundMessage{
+			To: []string{"a@example.test"}, Subject: "s", TextBody: "b",
+			Headers: map[string]string{name: "<x@example.test>"},
+		}
+		if err := checkSendable(message); err != nil {
+			t.Fatalf("header %q is refused although the contract carries it: %v", name, err)
+		}
 	}
 }

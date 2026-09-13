@@ -755,18 +755,36 @@ func (s *Store) UpdateInboxOutboundProvider(ctx context.Context, inboxID string,
 // Hybrid pairing sets both together on purpose: a mailbox that pulls mail from
 // Cloud but sends over local SMTP would be replying from an address Cloud
 // owns, with none of Cloud's DKIM, suppression or recipient policy applied.
-func (s *Store) UpdateInboxTransportProviders(ctx context.Context, inboxID string, provider string) error {
-	return s.UpdateInboxProviders(ctx, inboxID, provider, provider)
+func (s *Store) UpdateInboxTransportProviders(ctx context.Context, orgID string, inboxID string, provider string) error {
+	return s.UpdateInboxProviders(ctx, orgID, inboxID, provider, provider)
 }
 
 // UpdateInboxProviders sets a mailbox's inbound and outbound providers
 // independently, which is what putting one back after hybrid disconnect
 // needs: the two may have differed before Cloud took over.
-func (s *Store) UpdateInboxProviders(ctx context.Context, inboxID string, inbound, outbound string) error {
-	_, err := s.q.ExecContext(ctx, `
-		UPDATE inboxes SET inbound_provider = $2, outbound_provider = $3 WHERE id = $1
-	`, inboxID, inbound, outbound)
-	return err
+//
+// The organization is part of the predicate, not just the caller's belief.
+// Outside cloud mode the inbox row-level policy deliberately does not filter
+// by tenant, so an update keyed on the inbox UUID alone would let one
+// organization reroute another's mailbox to a provider of its choosing. A
+// mismatch matches no row, and that is reported rather than passed off as a
+// successful no-op.
+func (s *Store) UpdateInboxProviders(ctx context.Context, orgID string, inboxID string, inbound, outbound string) error {
+	result, err := s.q.ExecContext(ctx, `
+		UPDATE inboxes SET inbound_provider = $3, outbound_provider = $4
+		WHERE id = $2 AND org_id = $1
+	`, orgID, inboxID, inbound, outbound)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return fmt.Errorf("inbox %s does not belong to organization %s", inboxID, orgID)
+	}
+	return nil
 }
 
 func (s *Store) UpdateInboxesOutboundProviderByDomain(ctx context.Context, orgDomainID string, provider string) error {

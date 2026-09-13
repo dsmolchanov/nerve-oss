@@ -81,6 +81,10 @@ type SendRequest struct {
 	To           []string `json:"to"`
 	Subject      string   `json:"subject"`
 	Body         string   `json:"body"`
+	// InReplyTo and References carry RFC 5322 threading. Omitted when empty,
+	// so a first message in a conversation sends no empty members.
+	InReplyTo  string `json:"in_reply_to,omitempty"`
+	References string `json:"references,omitempty"`
 }
 
 // Client speaks the Cloud hybrid machine API for exactly one installation.
@@ -223,6 +227,14 @@ func (c *Client) Send(ctx context.Context, request SendRequest) (SendReceipt, er
 	input := map[string]any{
 		"operation_key": request.OperationKey, "kind": request.Kind,
 		"to": request.To, "subject": request.Subject, "body": request.Body,
+	}
+	// Only when set: Cloud treats these as optional, and sending empty members
+	// would change the payload a first message is recorded under.
+	if request.InReplyTo != "" {
+		input["in_reply_to"] = request.InReplyTo
+	}
+	if request.References != "" {
+		input["references"] = request.References
 	}
 	if err := c.call(ctx, "send", input, &receipt); err != nil {
 		return SendReceipt{}, err
