@@ -116,35 +116,35 @@ func hybridRuntimeStore(t *testing.T) (*store.Store, string) {
 	return st, inboxID
 }
 
-// ensureCoreSchema migrates the shared test database at most once, under an
-// advisory lock.
+// hybridSchemaLock is the advisory key every migrator of a shared test
+// database takes.
+const hybridSchemaLock = 4021539204
+
+// ensureCoreSchema brings the shared test database to the current Core head,
+// under an advisory lock.
 //
 // Go runs package tests concurrently, and in a repository that points every
 // package at one DSN two of them calling MigrateCore together collide on
 // `CREATE EXTENSION IF NOT EXISTS pgcrypto`, which is not as idempotent as it
-// reads. The lock serializes migrators across processes, and the presence
-// check keeps the common case to a single query.
+// reads. The lock serializes migrators across processes.
+//
+// The migration always runs while the lock is held. Goose skips versions that
+// are already applied, so this costs one query on a current database — and
+// probing for a table instead would treat migration 0001 as proof of the head,
+// letting a database left at an older version run these tests against stale
+// tables.
 func ensureCoreSchema(ctx context.Context, st *store.Store) error {
 	connection, err := st.DB().Conn(ctx)
 	if err != nil {
 		return err
 	}
 	defer connection.Close()
-	// A fixed key: any migrator of this database takes the same one.
-	if _, err := connection.ExecContext(ctx, `SELECT pg_advisory_lock(4021539204)`); err != nil {
+	if _, err := connection.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, hybridSchemaLock); err != nil {
 		return err
 	}
 	defer func() {
-		_, _ = connection.ExecContext(context.Background(), `SELECT pg_advisory_unlock(4021539204)`)
+		_, _ = connection.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, hybridSchemaLock)
 	}()
-	var present bool
-	if err := connection.QueryRowContext(ctx,
-		`SELECT to_regclass('public.messages') IS NOT NULL`).Scan(&present); err != nil {
-		return err
-	}
-	if present {
-		return nil
-	}
 	return store.MigrateCore(ctx, st.DB())
 }
 
