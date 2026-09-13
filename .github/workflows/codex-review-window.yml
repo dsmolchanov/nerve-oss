@@ -58,7 +58,7 @@ jobs:
     # until a human re-runs the gate. Keep both pins in lockstep. To move the
     # pin, read the host diff first, then change this line: the bump is the
     # review.
-    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-review-window.yml@4d05f6909650381037fee2cfed40c6a5cab591af
+    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-review-window.yml@d49bbf81eca6986f40cf1b05cb7951b7f0034924
     permissions:
       # actions:read is for the gate's waker probe — it reads the waker
       # workflow's state to size its verdict window; a called workflow's
