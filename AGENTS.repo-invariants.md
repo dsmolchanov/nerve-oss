@@ -113,8 +113,16 @@ makes a review loop unable to terminate.
   succeed, any path that resumes a transitional state — a pairing awaiting
   admission, a prepared rotation, an existing binding — must itself re-write
   that state rather than returning from a fast path, and a key is offered for
-  admission only when it is readable from disk. Enforced by
+  admission only when it is readable from disk. The confirmed entry is every
+  directory the write creates, not only the destination: `os.MkdirAll` can add
+  several levels at once and each new entry is recorded by its parent, so a
+  first installation on an absent path syncs each created directory's parent
+  before the rename — a failure there is a pre-rename failure and must not be
+  reported as installed-but-unconfirmed. Enforced by
   `TestHybridStateSaveReportsHowFarItGot`,
+  `TestHybridStateSaveSynchronizesEveryDirectoryItCreates`,
+  `TestHybridStateSaveSynchronizesOnlyTheDestinationWhenNothingIsCreated`,
+  `TestHybridStateSaveRefusesWhenANewParentCannotBeSynchronized`,
   `TestHybridStateRefusesToClaimUnsupportedSyncIsDurable`,
   `TestHybridTransitionalWritesAreCompletedOnResume`,
   `TestHybridConnectHandlesBothSidesOfAnUncertainSave`,

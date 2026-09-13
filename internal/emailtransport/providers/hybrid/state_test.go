@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -366,5 +367,102 @@ func TestHybridStateRefusesToClaimUnsupportedSyncIsDurable(t *testing.T) {
 				t.Fatalf("the file survived a removal that reported only unconfirmed durability: %v", err)
 			}
 		})
+	}
+}
+
+// A first installation usually lands on a path that does not exist yet, and
+// os.MkdirAll creates the whole chain at once. Each of those new directory
+// entries lives in its parent, so syncing only the destination would let Save
+// report success while a power loss discards the directory holding the key —
+// leaving the runtime without the one credential that proves its identity.
+func TestHybridStateSaveSynchronizesEveryDirectoryItCreates(t *testing.T) {
+	restore := syncDirectoryFunc
+	delay := directorySyncRetryDelay
+	t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
+	directorySyncRetryDelay = time.Millisecond
+
+	existing := t.TempDir()
+	// Three absent components: the destination and two ancestors.
+	destination := filepath.Join(existing, "state", "hybrid", "installation")
+
+	var synced []string
+	syncDirectoryFunc = func(path string) error {
+		synced = append(synced, path)
+		return restore(path)
+	}
+
+	store := Store{Path: filepath.Join(destination, "installation.json")}
+	if err := store.Save(testState(t, testKey(t))); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every new entry is recorded by its parent, and the destination itself
+	// is recorded by the post-rename confirmation.
+	for _, required := range []string{
+		existing,
+		filepath.Join(existing, "state"),
+		filepath.Join(existing, "state", "hybrid"),
+		destination,
+	} {
+		if !slices.Contains(synced, required) {
+			t.Errorf("Save did not synchronize %q; synchronized %q", required, synced)
+		}
+	}
+
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("the installed state is not readable: %v", err)
+	}
+	if loaded.OrgID == "" {
+		t.Fatal("the installed state is empty")
+	}
+}
+
+// A directory that already exists has nothing to record in its parent, so a
+// save into one must not start synchronizing unrelated ancestors.
+func TestHybridStateSaveSynchronizesOnlyTheDestinationWhenNothingIsCreated(t *testing.T) {
+	restore := syncDirectoryFunc
+	delay := directorySyncRetryDelay
+	t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
+	directorySyncRetryDelay = time.Millisecond
+
+	directory := t.TempDir()
+	store := Store{Path: filepath.Join(directory, "installation.json")}
+
+	var synced []string
+	syncDirectoryFunc = func(path string) error {
+		synced = append(synced, path)
+		return restore(path)
+	}
+	if err := store.Save(testState(t, testKey(t))); err != nil {
+		t.Fatal(err)
+	}
+	if len(synced) != 1 || synced[0] != directory {
+		t.Fatalf("a save into an existing directory synchronized %q", synced)
+	}
+}
+
+// A parent that cannot be made durable is a failure before the rename: the
+// key has not been written, and reporting it as installed-but-unconfirmed
+// would send an operator looking for state that does not exist.
+func TestHybridStateSaveRefusesWhenANewParentCannotBeSynchronized(t *testing.T) {
+	restore := syncDirectoryFunc
+	delay := directorySyncRetryDelay
+	t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
+	directorySyncRetryDelay = time.Millisecond
+
+	existing := t.TempDir()
+	store := Store{Path: filepath.Join(existing, "state", "installation.json")}
+
+	syncDirectoryFunc = func(string) error { return errors.New("input/output error") }
+	err := store.Save(testState(t, testKey(t)))
+	if err == nil {
+		t.Fatal("an unsynchronized new directory was reported as success")
+	}
+	if Unconfirmed(err) {
+		t.Fatalf("a pre-rename failure claimed the state was installed: %v", err)
+	}
+	if _, statErr := os.Stat(store.Path); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("a refused save left state behind: %v", statErr)
 	}
 }

@@ -431,7 +431,7 @@ func (s Store) Save(state State) error {
 		return err
 	}
 	directory := filepath.Dir(s.Path)
-	if err := os.MkdirAll(directory, stateDirMode); err != nil {
+	if err := createStateDirectory(directory); err != nil {
 		return err
 	}
 	raw, err := json.MarshalIndent(state, "", "  ")
@@ -473,6 +473,59 @@ func (s Store) Save(state State) error {
 		return &UnconfirmedError{Op: "write", Err: err}
 	}
 	return nil
+}
+
+// createStateDirectory creates the state directory and makes every directory
+// entry it had to create durable before the caller writes a key into it.
+//
+// os.MkdirAll can create several levels at once, and a new directory entry
+// only survives a power loss once its *parent* has been synchronized. Syncing
+// the destination alone — which is all the post-rename confirmation does —
+// leaves a first installation on a previously absent path able to report a
+// successful Save and then come back from a crash with no directory at all,
+// and therefore without the sole private key. The runtime would restart
+// unable to prove its identity, orphaning the Cloud installation and stopping
+// mail in both directions.
+//
+// This runs before the rename, so a failure here means nothing was written.
+func createStateDirectory(path string) error {
+	absent, err := absentAncestors(path)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(path, stateDirMode); err != nil {
+		return err
+	}
+	// Deepest first, up to and including the first ancestor that already
+	// existed: that ancestor is the one holding the shallowest new entry.
+	for _, created := range absent {
+		if err := confirmDirectory(filepath.Dir(created)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// absentAncestors reports path and every ancestor of it that does not exist
+// yet, deepest first. It is called before the directories are created, so the
+// answer is exactly the set of entries MkdirAll is about to add.
+func absentAncestors(path string) ([]string, error) {
+	var absent []string
+	for current := path; ; {
+		switch _, err := os.Stat(current); {
+		case err == nil:
+			return absent, nil
+		case !errors.Is(err, fs.ErrNotExist):
+			return nil, err
+		}
+		absent = append(absent, current)
+		parent := filepath.Dir(current)
+		if parent == current {
+			// The filesystem root; there is no further entry to record.
+			return absent, nil
+		}
+		current = parent
+	}
 }
 
 // confirmDirectory makes a directory change durable, retrying a sync that may
