@@ -13,6 +13,12 @@ import (
 // Threading is derived from inbound mail, so every value here was chosen by
 // whoever sent it. A reply that does not thread is a far smaller problem than
 // one that cannot be sent, or one carrying headers a sender appended.
+// threadingHeaderValue is the References a provider sees: the ancestors this
+// read returns, with the reply target the outbox worker appends.
+func threadingHeaderValue(target ThreadReplyTarget) string {
+	return strings.TrimSpace(target.References + " " + target.InReplyTo)
+}
+
 func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToLatest(t, ctx, db)
@@ -205,6 +211,53 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 			if strings.Count(assembled, target.InReplyTo) != 1 {
 				t.Fatalf("the reply target appears %d times in %q",
 					strings.Count(assembled, target.InReplyTo), assembled)
+			}
+		})
+
+		// A sender can put the message's own identifier in its References, or
+		// repeat one. The assembled header must still name the target once.
+		t.Run("chain already names the parent", func(t *testing.T) {
+			threadID := inbound("<current@example.test>", "",
+				[]string{"<root@example.test>", "<current@example.test>"}, now)
+			target, err := st.GetThreadReplyTarget(ctx, inboxID, threadID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assembled := threadingHeaderValue(target)
+			if strings.Count(assembled, "<current@example.test>") != 1 {
+				t.Fatalf("the reply target appears more than once in %q", assembled)
+			}
+			if !strings.Contains(assembled, "<root@example.test>") {
+				t.Fatalf("deduplication dropped a real ancestor: %q", assembled)
+			}
+		})
+
+		// The limits come from the header line, so an identifier is discarded
+		// only when it genuinely cannot be serialized — never to satisfy a
+		// round number.
+		t.Run("identifier size boundary", func(t *testing.T) {
+			for _, size := range []int{3, 100, 513, 700, maxMessageIDBytes} {
+				threadID := inbound("<"+strings.Repeat("a", size-2)+">", "", nil, now)
+				target, err := st.GetThreadReplyTarget(ctx, inboxID, threadID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if target.InReplyTo == "" {
+					t.Fatalf("a valid %d-byte identifier was discarded", size)
+				}
+				if len("In-Reply-To: "+target.InReplyTo) > headerLineLimit {
+					t.Fatalf("a %d-byte identifier produced an over-long line", size)
+				}
+			}
+			// One byte past what a line can carry is refused.
+			over := "<" + strings.Repeat("a", maxMessageIDBytes-1) + ">"
+			threadID := inbound(over, "", nil, now)
+			target, err := st.GetThreadReplyTarget(ctx, inboxID, threadID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if target.InReplyTo != "" {
+				t.Fatalf("an identifier that cannot be serialized was kept: %d bytes", len(over))
 			}
 		})
 

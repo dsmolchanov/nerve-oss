@@ -13,32 +13,37 @@ import (
 // headers a reply now carries must stay inside the budget the store's
 // derivation promises.
 func TestSMTPThreadingHeadersStayInsideTheLineLimit(t *testing.T) {
-	// The longest References and In-Reply-To the derivation can produce:
-	// 900 bytes assembled, one identifier of 512.
+	// The longest References and In-Reply-To the derivation can produce.
 	identifier := func(size int) string {
 		return "<" + strings.Repeat("a", size-2) + ">"
 	}
+	budget := 998 - len("References: ")
 	ancestors := make([]string, 0, 32)
-	for len(strings.Join(ancestors, " ")) < 900-64 {
-		ancestors = append(ancestors, identifier(40))
+	for index := 0; len(strings.Join(ancestors, " ")) < budget; index++ {
+		// Distinct identifiers: the worker deduplicates, so repeats would not
+		// reach the wire and the line would be shorter than intended.
+		ancestors = append(ancestors, "<"+strings.Repeat("a", 30)+strings.Repeat("b", index%7+1)+"-"+identifierIndex(index)+">")
 	}
 	references := strings.Join(ancestors, " ")
 	// Trim to the budget the way the derivation does, leaving room for the
 	// reply target the worker appends.
 	parent := identifier(40)
-	for len(references)+1+len(parent) > 900 {
+	for len(references)+1+len(parent) > budget {
 		ancestors = ancestors[1:]
 		references = strings.Join(ancestors, " ")
 	}
 
+	// The longest identifier a line can carry, and one byte less, to pin the
+	// boundary rather than a round number.
+	longest := identifier(998 - len("In-Reply-To: "))
 	cases := map[string]map[string]string{
 		"long chain": {
 			"In-Reply-To": parent,
 			"References":  references + " " + parent,
 		},
 		"longest single identifier": {
-			"In-Reply-To": identifier(512),
-			"References":  identifier(512),
+			"In-Reply-To": longest,
+			"References":  identifier(998 - len("References: ")),
 		},
 	}
 	for name, headers := range cases {
@@ -50,9 +55,15 @@ func TestSMTPThreadingHeadersStayInsideTheLineLimit(t *testing.T) {
 			if err != nil {
 				t.Fatalf("a reply with threading headers could not be built: %v", err)
 			}
-			for _, line := range strings.Split(normalizeNewlines(raw), "\n") {
+			// The adapter emits CRLF; RFC 5322's 998 counts the line without
+			// its terminator, and SMTP's 1000 octets counts it with.
+			for _, line := range strings.Split(raw, "\n") {
+				line = strings.TrimSuffix(line, "\r")
 				if len(line) > 998 {
 					t.Fatalf("line of %d characters exceeds RFC 5322's limit: %.80s…", len(line), line)
+				}
+				if len(line)+2 > 1000 {
+					t.Fatalf("line of %d octets with CRLF exceeds SMTP's DATA limit", len(line)+2)
 				}
 			}
 			// The headers survived rather than being dropped to fit.
@@ -64,4 +75,9 @@ func TestSMTPThreadingHeadersStayInsideTheLineLimit(t *testing.T) {
 			}
 		})
 	}
+}
+
+// identifierIndex keeps generated identifiers distinct.
+func identifierIndex(index int) string {
+	return strings.Repeat("c", index/26+1) + string(rune('a'+index%26))
 }

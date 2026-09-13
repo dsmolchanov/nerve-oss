@@ -634,9 +634,20 @@ func threadingHeaders(inReplyTo, references string) map[string]string {
 	if inReplyTo == "" {
 		return nil
 	}
-	chain := inReplyTo
-	if ancestors := strings.TrimSpace(references); ancestors != "" {
-		chain = ancestors + " " + inReplyTo
+	// The ancestors were copied from an inbound message, so a sender can put
+	// anything in them — including the message's own identifier, or the same
+	// one repeatedly. Enforce the invariant here rather than trusting every
+	// caller: a duplicated chain leaves a client unable to tell where the
+	// conversation forked.
+	seen := map[string]bool{inReplyTo: true}
+	chain := make([]string, 0, 8)
+	for _, ancestor := range strings.Fields(references) {
+		if seen[ancestor] {
+			continue
+		}
+		seen[ancestor] = true
+		chain = append(chain, ancestor)
 	}
-	return map[string]string{"In-Reply-To": inReplyTo, "References": chain}
+	chain = append(chain, inReplyTo)
+	return map[string]string{"In-Reply-To": inReplyTo, "References": strings.Join(chain, " ")}
 }

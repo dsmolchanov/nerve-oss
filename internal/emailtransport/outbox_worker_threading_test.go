@@ -33,6 +33,33 @@ func TestThreadingHeadersNameTheReplyTargetExactlyOnce(t *testing.T) {
 		// threading headers rather than empty ones.
 		"no target":               {want: nil},
 		"ancestors but no target": {references: "<root@example.test>", want: nil},
+		// The ancestors were copied from inbound mail, so a sender can include
+		// the message's own identifier, or repeat one. Neither may reach the
+		// header twice.
+		"ancestors already name the target": {
+			inReplyTo:  "<third@example.test>",
+			references: "<root@example.test> <third@example.test> <second@example.test>",
+			want: map[string]string{
+				"In-Reply-To": "<third@example.test>",
+				"References":  "<root@example.test> <second@example.test> <third@example.test>",
+			},
+		},
+		"repeated ancestors": {
+			inReplyTo:  "<third@example.test>",
+			references: "<root@example.test> <root@example.test> <second@example.test> <root@example.test>",
+			want: map[string]string{
+				"In-Reply-To": "<third@example.test>",
+				"References":  "<root@example.test> <second@example.test> <third@example.test>",
+			},
+		},
+		"ancestors are only the target": {
+			inReplyTo:  "<only@example.test>",
+			references: "<only@example.test> <only@example.test>",
+			want: map[string]string{
+				"In-Reply-To": "<only@example.test>",
+				"References":  "<only@example.test>",
+			},
+		},
 	}
 	for name, input := range cases {
 		t.Run(name, func(t *testing.T) {

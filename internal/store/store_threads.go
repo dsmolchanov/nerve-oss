@@ -298,11 +298,19 @@ func (s *Store) GetThreadReplyTarget(ctx context.Context, inboxID, threadID stri
 	if chain == "" {
 		chain = parentInReplyTo
 	}
+	// Drop malformed entries, and any repeat of an identifier already in the
+	// chain or of the reply target itself: a sender chooses these values and
+	// can name the message's own ID among its ancestors. Filtering here, not
+	// only in the header assembly, keeps the byte budget below honest — it
+	// would otherwise be spent on entries that are about to be removed.
+	seen := map[string]bool{messageID: true}
 	ancestors := make([]string, 0, 8)
 	for _, ancestor := range strings.Fields(chain) {
-		if validMessageID(ancestor) {
-			ancestors = append(ancestors, ancestor)
+		if !validMessageID(ancestor) || seen[ancestor] {
+			continue
 		}
+		seen[ancestor] = true
+		ancestors = append(ancestors, ancestor)
 	}
 	// References grows by one ID per hop. Keep the newest, which are the ones
 	// a client threads on, and drop the oldest rather than emit a header the
@@ -318,20 +326,21 @@ func (s *Store) GetThreadReplyTarget(ctx context.Context, inboxID, threadID stri
 	return target, nil
 }
 
-// maxReferencesBytes bounds the assembled References header value, after the
-// outbox worker has appended the reply target.
-//
-// RFC 5322 limits a line to 998 characters and SMTP a DATA line to 1000
-// octets, and the SMTP adapter writes each header on one unfolded line. The
-// budget leaves room for "References: " so the serialized line stays inside
-// that limit for every provider, without the adapters having to differ. A
-// longer chain keeps its newest identifiers, which are the ones a client
-// threads on.
-const maxReferencesBytes = 900
+// RFC 5322 limits a header line to 998 characters, and SMTP a DATA line to
+// 1000 octets. The SMTP adapter writes each header on one unfolded line, so
+// both bounds below are derived from that limit and the header's own name
+// rather than picked: a value is discarded only when it genuinely cannot be
+// serialized, never to satisfy a round number.
+const headerLineLimit = 998
 
-// maxMessageIDBytes bounds one identifier, so "In-Reply-To: " plus it stays
-// inside a header line too.
-const maxMessageIDBytes = 512
+// maxReferencesBytes bounds the assembled References value, after the outbox
+// worker has appended the reply target. A longer chain keeps its newest
+// identifiers, which are the ones a client threads on.
+const maxReferencesBytes = headerLineLimit - len("References: ")
+
+// maxMessageIDBytes bounds one identifier so that In-Reply-To, which has the
+// longer name of the two, also fits on its line.
+const maxMessageIDBytes = headerLineLimit - len("In-Reply-To: ")
 
 // validMessageID accepts the angle-addr form RFC 5322 requires, with no
 // whitespace or control characters, so a value can be placed in a header
