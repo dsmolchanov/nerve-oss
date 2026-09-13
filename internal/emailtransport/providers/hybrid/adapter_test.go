@@ -103,7 +103,7 @@ func hybridRuntimeStore(t *testing.T) (*store.Store, string) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	ctx := context.Background()
-	if err := store.MigrateCore(ctx, st.DB()); err != nil {
+	if err := ensureCoreSchema(ctx, st); err != nil {
 		t.Fatal(err)
 	}
 	// A fresh mailbox per test: deduplication is scoped to the inbox, so this
@@ -114,6 +114,38 @@ func hybridRuntimeStore(t *testing.T) (*store.Store, string) {
 		t.Fatal(err)
 	}
 	return st, inboxID
+}
+
+// ensureCoreSchema migrates the shared test database at most once, under an
+// advisory lock.
+//
+// Go runs package tests concurrently, and in a repository that points every
+// package at one DSN two of them calling MigrateCore together collide on
+// `CREATE EXTENSION IF NOT EXISTS pgcrypto`, which is not as idempotent as it
+// reads. The lock serializes migrators across processes, and the presence
+// check keeps the common case to a single query.
+func ensureCoreSchema(ctx context.Context, st *store.Store) error {
+	connection, err := st.DB().Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer connection.Close()
+	// A fixed key: any migrator of this database takes the same one.
+	if _, err := connection.ExecContext(ctx, `SELECT pg_advisory_lock(4021539204)`); err != nil {
+		return err
+	}
+	defer func() {
+		_, _ = connection.ExecContext(context.Background(), `SELECT pg_advisory_unlock(4021539204)`)
+	}()
+	var present bool
+	if err := connection.QueryRowContext(ctx,
+		`SELECT to_regclass('public.messages') IS NOT NULL`).Scan(&present); err != nil {
+		return err
+	}
+	if present {
+		return nil
+	}
+	return store.MigrateCore(ctx, st.DB())
 }
 
 func inboundFixture(t *testing.T, deliveries []Delivery) (*InboundAdapter, *cloudServer) {

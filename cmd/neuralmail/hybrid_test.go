@@ -384,7 +384,27 @@ func hybridRuntimeDatabase(t *testing.T) (config.Config, *store.Store, string) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	ctx := context.Background()
-	if err := store.MigrateCore(ctx, st.DB()); err != nil {
+	// Concurrent migrators of one shared database collide on CREATE EXTENSION,
+	// so migrate under an advisory lock and only when the schema is absent.
+	connection, err := st.DB().Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if _, err := connection.ExecContext(ctx, `SELECT pg_advisory_lock(4021539204)`); err != nil {
+		t.Fatal(err)
+	}
+	var present bool
+	if err := connection.QueryRowContext(ctx,
+		`SELECT to_regclass('public.messages') IS NOT NULL`).Scan(&present); err != nil {
+		t.Fatal(err)
+	}
+	if !present {
+		if err := store.MigrateCore(ctx, st.DB()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := connection.ExecContext(ctx, `SELECT pg_advisory_unlock(4021539204)`); err != nil {
 		t.Fatal(err)
 	}
 	address := fmt.Sprintf("hybrid-cli-%s@local.nerve.email", strings.ReplaceAll(uuid.NewString(), "-", ""))
