@@ -47,9 +47,21 @@ func TestThreadingHeadersNameTheReplyTargetExactlyOnce(t *testing.T) {
 		"repeated ancestors": {
 			inReplyTo:  "<third@example.test>",
 			references: "<root@example.test> <root@example.test> <second@example.test> <root@example.test>",
+			// The last occurrence of <root> is the one kept, so it sits after
+			// <second> rather than before it.
 			want: map[string]string{
 				"In-Reply-To": "<third@example.test>",
-				"References":  "<root@example.test> <second@example.test> <third@example.test>",
+				"References":  "<second@example.test> <root@example.test> <third@example.test>",
+			},
+		},
+		// Each repeat keeps its latest position, so a chain the store later
+		// trims from the oldest end does not lose it.
+		"repeat keeps its latest position": {
+			inReplyTo:  "<third@example.test>",
+			references: "<early@example.test> <middle@example.test> <early@example.test>",
+			want: map[string]string{
+				"In-Reply-To": "<third@example.test>",
+				"References":  "<middle@example.test> <early@example.test> <third@example.test>",
 			},
 		},
 		"ancestors are only the target": {

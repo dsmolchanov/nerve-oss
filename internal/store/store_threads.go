@@ -303,15 +303,7 @@ func (s *Store) GetThreadReplyTarget(ctx context.Context, inboxID, threadID stri
 	// can name the message's own ID among its ancestors. Filtering here, not
 	// only in the header assembly, keeps the byte budget below honest — it
 	// would otherwise be spent on entries that are about to be removed.
-	seen := map[string]bool{messageID: true}
-	ancestors := make([]string, 0, 8)
-	for _, ancestor := range strings.Fields(chain) {
-		if !validMessageID(ancestor) || seen[ancestor] {
-			continue
-		}
-		seen[ancestor] = true
-		ancestors = append(ancestors, ancestor)
-	}
+	ancestors := dedupeNewestFirst(strings.Fields(chain), messageID)
 	// References grows by one ID per hop. Keep the newest, which are the ones
 	// a client threads on, and drop the oldest rather than emit a header the
 	// protocol cannot carry. The budget accounts for the reply target the
@@ -341,6 +333,32 @@ const maxReferencesBytes = headerLineLimit - len("References: ")
 // maxMessageIDBytes bounds one identifier so that In-Reply-To, which has the
 // longer name of the two, also fits on its line.
 const maxMessageIDBytes = headerLineLimit - len("In-Reply-To: ")
+
+// dedupeNewestFirst removes malformed and repeated identifiers, keeping each
+// one at its latest position and returning them in chronological order.
+//
+// Latest, not first: the caller trims the oldest entries to fit a header line,
+// so a repeat kept at its earliest position would be discarded by that trim
+// and the identifier lost from the chain altogether — the opposite of keeping
+// the newest ancestry. exclude is the reply target, which the header assembly
+// appends and must not appear among the ancestors.
+func dedupeNewestFirst(candidates []string, exclude string) []string {
+	seen := map[string]bool{exclude: true}
+	newestFirst := make([]string, 0, len(candidates))
+	for index := len(candidates) - 1; index >= 0; index-- {
+		candidate := candidates[index]
+		if !validMessageID(candidate) || seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		newestFirst = append(newestFirst, candidate)
+	}
+	ancestors := make([]string, 0, len(newestFirst))
+	for index := len(newestFirst) - 1; index >= 0; index-- {
+		ancestors = append(ancestors, newestFirst[index])
+	}
+	return ancestors
+}
 
 // validMessageID accepts the angle-addr form RFC 5322 requires, with no
 // whitespace or control characters, so a value can be placed in a header

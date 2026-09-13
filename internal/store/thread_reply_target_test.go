@@ -232,6 +232,33 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 			}
 		})
 
+		// A repeat is kept at its latest position. Keeping the earliest one
+		// instead would put it where the byte-budget trim removes it, losing
+		// the identifier from the chain altogether.
+		t.Run("repeat survives an over-budget trim", func(t *testing.T) {
+			repeated := "<repeated@example.test>"
+			ancestors := []string{repeated}
+			for len(strings.Join(ancestors, " ")) < maxReferencesBytes {
+				ancestors = append(ancestors, "<"+uuid.NewString()+"@example.test>")
+			}
+			ancestors = append(ancestors, repeated)
+			threadID := inbound("<newest@example.test>", "", ancestors, now)
+			target, err := st.GetThreadReplyTarget(ctx, inboxID, threadID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(target.References, repeated) {
+				t.Fatalf("a repeated ancestor was lost to the trim: %q", target.References)
+			}
+			if strings.Count(target.References, repeated) != 1 {
+				t.Fatalf("the repeated ancestor appears more than once: %q", target.References)
+			}
+			assembled := threadingHeaderValue(target)
+			if len("References: "+assembled) > headerLineLimit {
+				t.Fatalf("the References line would be %d characters", len("References: "+assembled))
+			}
+		})
+
 		// The limits come from the header line, so an identifier is discarded
 		// only when it genuinely cannot be serialized — never to satisfy a
 		// round number.

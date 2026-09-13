@@ -639,14 +639,22 @@ func threadingHeaders(inReplyTo, references string) map[string]string {
 	// one repeatedly. Enforce the invariant here rather than trusting every
 	// caller: a duplicated chain leaves a client unable to tell where the
 	// conversation forked.
+	// Each repeat is kept at its latest position, matching how the store read
+	// trims the oldest entries to fit a header line.
+	fields := strings.Fields(references)
 	seen := map[string]bool{inReplyTo: true}
-	chain := make([]string, 0, 8)
-	for _, ancestor := range strings.Fields(references) {
+	newestFirst := make([]string, 0, len(fields))
+	for index := len(fields) - 1; index >= 0; index-- {
+		ancestor := fields[index]
 		if seen[ancestor] {
 			continue
 		}
 		seen[ancestor] = true
-		chain = append(chain, ancestor)
+		newestFirst = append(newestFirst, ancestor)
+	}
+	chain := make([]string, 0, len(newestFirst)+1)
+	for index := len(newestFirst) - 1; index >= 0; index-- {
+		chain = append(chain, newestFirst[index])
 	}
 	chain = append(chain, inReplyTo)
 	return map[string]string{"In-Reply-To": inReplyTo, "References": strings.Join(chain, " ")}
