@@ -469,10 +469,53 @@ func (s Store) Save(state State) error {
 	// Past this point the new state is what a reader sees. Only its
 	// durability is still in question, so retry the one remaining step
 	// before reporting an outcome the caller cannot undo by itself.
-	if err := confirmDirectory(directory); err != nil {
+	if err := confirmChain(directory); err != nil {
 		return &UnconfirmedError{Op: "write", Err: err}
 	}
 	return nil
+}
+
+// confirmChain makes path durable along with every entry it depends on, from
+// path itself up to the filesystem root.
+//
+// A directory entry only survives a power loss once its *parent* has been
+// synchronized, and os.MkdirAll can add several levels at once. Confirming
+// only the destination would let a first installation on a previously absent
+// path report a successful Save and still come back from a crash with no
+// directory at all, and therefore without the sole private key: the runtime
+// would restart unable to prove its identity, orphaning the Cloud installation
+// and stopping mail in both directions.
+//
+// The whole chain is confirmed on every save rather than only the part that
+// was just created. Existence is not proof of durability: a directory can be
+// left behind by an earlier save that created it and then failed to confirm
+// it, and no record of that debt can itself be stored durably. Re-confirming
+// an already durable ancestor costs an fsync on a clean inode; skipping one
+// that was owed costs the installation.
+//
+// A failure is propagated like every other durability failure here, including
+// on an ancestor this process did not create: an ancestor that cannot be
+// synchronized is one whose entry cannot be promised to survive, and saying
+// otherwise is the single thing the caller is relying on this not to do.
+func confirmChain(path string) error {
+	// hybrid.state_path may be relative. Walking a relative chain stops at
+	// "." — filepath.Dir(".") is "." — so it would confirm a couple of
+	// entries and return without ever reaching the working directory's own
+	// ancestors, leaving exactly the gap this walk exists to close.
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	for current := absolute; ; {
+		if err := confirmDirectory(current); err != nil {
+			return err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil
+		}
+		current = parent
+	}
 }
 
 // confirmDirectory makes a directory change durable, retrying a sync that may

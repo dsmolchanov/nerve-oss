@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -364,6 +365,184 @@ func TestHybridStateRefusesToClaimUnsupportedSyncIsDurable(t *testing.T) {
 			// The change itself did happen; only its durability is unproven.
 			if _, err := os.Stat(store.Path); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("the file survived a removal that reported only unconfirmed durability: %v", err)
+			}
+		})
+	}
+}
+
+// A first installation usually lands on a path that does not exist yet, and
+// os.MkdirAll creates the whole chain at once. Each of those new directory
+// entries lives in its parent, so syncing only the destination would let Save
+// report success while a power loss discards the directory holding the key —
+// leaving the runtime without the one credential that proves its identity.
+func TestHybridStateSaveSynchronizesEveryDirectoryItCreates(t *testing.T) {
+	restore := syncDirectoryFunc
+	delay := directorySyncRetryDelay
+	t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
+	directorySyncRetryDelay = time.Millisecond
+
+	existing := t.TempDir()
+	// Three absent components: the destination and two ancestors.
+	destination := filepath.Join(existing, "state", "hybrid", "installation")
+
+	var synced []string
+	syncDirectoryFunc = func(path string) error {
+		synced = append(synced, path)
+		return restore(path)
+	}
+
+	store := Store{Path: filepath.Join(destination, "installation.json")}
+	if err := store.Save(testState(t, testKey(t))); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every new entry is recorded by its parent, and the destination itself
+	// is recorded by the post-rename confirmation.
+	for _, required := range []string{
+		existing,
+		filepath.Join(existing, "state"),
+		filepath.Join(existing, "state", "hybrid"),
+		destination,
+	} {
+		if !slices.Contains(synced, required) {
+			t.Errorf("Save did not synchronize %q; synchronized %q", required, synced)
+		}
+	}
+
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("the installed state is not readable: %v", err)
+	}
+	if loaded.OrgID == "" {
+		t.Fatal("the installed state is empty")
+	}
+}
+
+// The obligation is discharged on every save, not only when a directory is
+// missing. A save into a directory that already exists still confirms the
+// whole chain: that directory may have been created by an earlier save which
+// failed to confirm it, and there is nowhere durable to have recorded that.
+// Treating existence as proof would skip the synchronization that was owed
+// and report success over an ancestor that can still disappear.
+func TestHybridStateSaveConfirmsTheChainEvenWhenNothingIsCreated(t *testing.T) {
+	restore := syncDirectoryFunc
+	delay := directorySyncRetryDelay
+	t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
+	directorySyncRetryDelay = time.Millisecond
+
+	directory := t.TempDir()
+	store := Store{Path: filepath.Join(directory, "installation.json")}
+
+	var synced []string
+	syncDirectoryFunc = func(path string) error {
+		synced = append(synced, path)
+		return restore(path)
+	}
+	if err := store.Save(testState(t, testKey(t))); err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{directory, filepath.Dir(directory), string(filepath.Separator)} {
+		if !slices.Contains(synced, required) {
+			t.Errorf("a save into an existing directory did not confirm %q; confirmed %q", required, synced)
+		}
+	}
+}
+
+// A directory an earlier save created but could not confirm is left on disk,
+// and no durable record of that debt can exist. The retry must therefore
+// synchronize every parent again rather than read the directory's existence
+// as proof that it is durable — otherwise it writes the sole installation key
+// and reports success over an ancestor a power loss can still take.
+func TestHybridStateSaveRetriesTheSynchronizationAFailedSaveOwed(t *testing.T) {
+	restore := syncDirectoryFunc
+	delay := directorySyncRetryDelay
+	t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
+	directorySyncRetryDelay = time.Millisecond
+
+	existing := t.TempDir()
+	store := Store{Path: filepath.Join(existing, "state", "hybrid", "installation.json")}
+
+	// The first save creates the tree and then fails to confirm it.
+	syncDirectoryFunc = func(string) error { return errors.New("input/output error") }
+	if err := store.Save(testState(t, testKey(t))); err == nil {
+		t.Fatal("an unconfirmed directory chain was reported as success")
+	}
+
+	// The directories survive it, so the retry owes every synchronization.
+	var synced []string
+	syncDirectoryFunc = func(path string) error {
+		synced = append(synced, path)
+		return restore(path)
+	}
+	if err := store.Save(testState(t, testKey(t))); err != nil {
+		t.Fatalf("the retry failed: %v", err)
+	}
+	for _, required := range []string{
+		existing,
+		filepath.Join(existing, "state"),
+		filepath.Join(existing, "state", "hybrid"),
+	} {
+		if !slices.Contains(synced, required) {
+			t.Errorf("the retry reported success without confirming %q; confirmed %q", required, synced)
+		}
+	}
+	if _, err := store.Load(); err != nil {
+		t.Fatalf("the installed state is not readable: %v", err)
+	}
+}
+
+// hybrid.state_path may be given relative to the working directory. A
+// relative walk terminates at "." — filepath.Dir(".") is "." — so it would
+// confirm a step or two and return, never reaching the working directory's
+// own ancestors: the same unconfirmed-ancestor gap the chain exists to close,
+// reached by a different spelling of the same file.
+func TestHybridStateSaveConfirmsTheAbsoluteChainForARelativePath(t *testing.T) {
+	for _, relative := range []string{
+		"installation.json",
+		filepath.Join("state", "hybrid", "installation.json"),
+		filepath.Join("state", "..", "state", "installation.json"),
+	} {
+		t.Run(relative, func(t *testing.T) {
+			restore := syncDirectoryFunc
+			delay := directorySyncRetryDelay
+			t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
+			directorySyncRetryDelay = time.Millisecond
+
+			working := t.TempDir()
+			t.Chdir(working)
+
+			var synced []string
+			syncDirectoryFunc = func(path string) error {
+				synced = append(synced, path)
+				return restore(path)
+			}
+			store := Store{Path: relative}
+			if err := store.Save(testState(t, testKey(t))); err != nil {
+				t.Fatal(err)
+			}
+
+			// Nothing relative is ever confirmed, and the walk runs all the
+			// way out to the filesystem root.
+			for _, entry := range synced {
+				if !filepath.IsAbs(entry) {
+					t.Errorf("confirmed a relative entry %q; confirmed %q", entry, synced)
+				}
+			}
+			root := string(filepath.Separator)
+			if !slices.Contains(synced, root) {
+				t.Errorf("the walk stopped before the filesystem root; confirmed %q", synced)
+			}
+			// The working directory itself is an ancestor that a relative
+			// walk would never have reached.
+			absoluteWorking, err := filepath.Abs(working)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Contains(synced, absoluteWorking) {
+				t.Errorf("the working directory %q was not confirmed; confirmed %q", absoluteWorking, synced)
+			}
+			if _, err := store.Load(); err != nil {
+				t.Fatalf("the installed state is not readable: %v", err)
 			}
 		})
 	}
