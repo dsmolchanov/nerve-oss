@@ -498,17 +498,55 @@ func (s Store) Save(state State) error {
 // synchronized is one whose entry cannot be promised to survive, and saying
 // otherwise is the single thing the caller is relying on this not to do.
 func confirmChain(path string) error {
-	// hybrid.state_path may be relative. Walking a relative chain stops at
-	// "." — filepath.Dir(".") is "." — so it would confirm a couple of
-	// entries and return without ever reaching the working directory's own
-	// ancestors, leaving exactly the gap this walk exists to close.
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return err
 	}
-	for current := absolute; ; {
-		if err := confirmDirectory(current); err != nil {
-			return err
+	return confirmReachability(absolute, make(map[string]bool), 0)
+}
+
+// symlinkHopLimit bounds the recursion the way a kernel bounds its own
+// resolution. A cycle is already stopped by the confirmed set; this stops a
+// pathological chain from recursing without end.
+const symlinkHopLimit = 40
+
+// confirmReachability makes durable every directory entry that has to survive
+// for path to still be reachable after a power loss: each prefix of path, and
+// for a prefix that is a symlink, the ancestry of its target as well.
+//
+// Confirming only the fully resolved path and the original spelling is not
+// enough once a path takes more than one hop. With /config/state -> /mnt/vol
+// and /mnt/vol/active -> /srv/hybrid, those two walks cover /srv/hybrid and
+// /config, and opening /config/state does synchronize /mnt/vol — but nothing
+// synchronizes /mnt, whose entry is what records vol. Lose that entry and the
+// installation key is unreachable, though Save reported it durable.
+//
+// A failure is propagated like every other durability failure here, including
+// on an ancestor this process did not create: an ancestor that cannot be
+// synchronized is one whose entry cannot be promised to survive, and saying
+// otherwise is the single thing the caller is relying on this not to do.
+func confirmReachability(path string, confirmed map[string]bool, hops int) error {
+	if hops > symlinkHopLimit {
+		return fmt.Errorf("hybrid state path %q exceeds %d symlink hops", path, symlinkHopLimit)
+	}
+	for current := path; ; {
+		if !confirmed[current] {
+			confirmed[current] = true
+			// Opening follows the link, so this confirms the directory the
+			// entry leads to; the entry itself is confirmed by its parent,
+			// which this walk reaches next.
+			if err := confirmDirectory(current); err != nil {
+				return err
+			}
+			target, err := symlinkTarget(current)
+			if err != nil {
+				return err
+			}
+			if target != "" {
+				if err := confirmReachability(target, confirmed, hops+1); err != nil {
+					return err
+				}
+			}
 		}
 		parent := filepath.Dir(current)
 		if parent == current {
@@ -516,6 +554,34 @@ func confirmChain(path string) error {
 		}
 		current = parent
 	}
+}
+
+// symlinkTarget reports the absolute target of path when path is a symlink,
+// and "" when it is anything else.
+func symlinkTarget(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&fs.ModeSymlink == 0 {
+		return "", nil
+	}
+	target, err := os.Readlink(path)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(target) {
+		// A relative target is interpreted from the link's *physical*
+		// parent. Joining it to the lexical one would invent a path: with
+		// /config/state -> /mnt/volume and /mnt/volume/active -> ../hybrid,
+		// the lexical join yields /config/hybrid instead of /mnt/hybrid.
+		parent, err := filepath.EvalSymlinks(filepath.Dir(path))
+		if err != nil {
+			return "", err
+		}
+		target = filepath.Join(parent, target)
+	}
+	return filepath.Clean(target), nil
 }
 
 // confirmDirectory makes a directory change durable, retrying a sync that may

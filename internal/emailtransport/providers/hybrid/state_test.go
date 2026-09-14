@@ -14,6 +14,34 @@ import (
 	"github.com/google/uuid"
 )
 
+// realPath resolves a path the way confirmChain does, so an expectation is
+// written in the spelling the walk actually confirms. A temporary directory
+// can sit under a symlink — /var is one on macOS — and comparing against the
+// unresolved spelling would test the test, not the walk.
+func realPath(t *testing.T, path string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved
+}
+
+// confirmedSet indexes what a run synchronized by the directory each entry
+// actually names. One directory is reachable by several spellings — fsync
+// acts on the inode — so comparing raw strings would test the spelling the
+// walk happened to use rather than whether the entry was made durable.
+func confirmedSet(synced []string) map[string]bool {
+	confirmed := make(map[string]bool, 2*len(synced))
+	for _, entry := range synced {
+		confirmed[entry] = true
+		if real, err := filepath.EvalSymlinks(entry); err == nil {
+			confirmed[real] = true
+		}
+	}
+	return confirmed
+}
+
 func testKey(t *testing.T) Key {
 	t.Helper()
 	key, err := GenerateKey()
@@ -398,13 +426,15 @@ func TestHybridStateSaveSynchronizesEveryDirectoryItCreates(t *testing.T) {
 
 	// Every new entry is recorded by its parent, and the destination itself
 	// is recorded by the post-rename confirmation.
+	root := realPath(t, existing)
+	confirmed := confirmedSet(synced)
 	for _, required := range []string{
-		existing,
-		filepath.Join(existing, "state"),
-		filepath.Join(existing, "state", "hybrid"),
-		destination,
+		root,
+		filepath.Join(root, "state"),
+		filepath.Join(root, "state", "hybrid"),
+		filepath.Join(root, "state", "hybrid", "installation"),
 	} {
-		if !slices.Contains(synced, required) {
+		if !confirmed[required] {
 			t.Errorf("Save did not synchronize %q; synchronized %q", required, synced)
 		}
 	}
@@ -441,8 +471,10 @@ func TestHybridStateSaveConfirmsTheChainEvenWhenNothingIsCreated(t *testing.T) {
 	if err := store.Save(testState(t, testKey(t))); err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{directory, filepath.Dir(directory), string(filepath.Separator)} {
-		if !slices.Contains(synced, required) {
+	root := realPath(t, directory)
+	confirmed := confirmedSet(synced)
+	for _, required := range []string{root, filepath.Dir(root), string(filepath.Separator)} {
+		if !confirmed[required] {
 			t.Errorf("a save into an existing directory did not confirm %q; confirmed %q", required, synced)
 		}
 	}
@@ -477,12 +509,14 @@ func TestHybridStateSaveRetriesTheSynchronizationAFailedSaveOwed(t *testing.T) {
 	if err := store.Save(testState(t, testKey(t))); err != nil {
 		t.Fatalf("the retry failed: %v", err)
 	}
+	root := realPath(t, existing)
+	confirmed := confirmedSet(synced)
 	for _, required := range []string{
-		existing,
-		filepath.Join(existing, "state"),
-		filepath.Join(existing, "state", "hybrid"),
+		root,
+		filepath.Join(root, "state"),
+		filepath.Join(root, "state", "hybrid"),
 	} {
-		if !slices.Contains(synced, required) {
+		if !confirmed[required] {
 			t.Errorf("the retry reported success without confirming %q; confirmed %q", required, synced)
 		}
 	}
@@ -534,16 +568,166 @@ func TestHybridStateSaveConfirmsTheAbsoluteChainForARelativePath(t *testing.T) {
 			}
 			// The working directory itself is an ancestor that a relative
 			// walk would never have reached.
-			absoluteWorking, err := filepath.Abs(working)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !slices.Contains(synced, absoluteWorking) {
+			absoluteWorking := realPath(t, working)
+			if !confirmedSet(synced)[absoluteWorking] {
 				t.Errorf("the working directory %q was not confirmed; confirmed %q", absoluteWorking, synced)
 			}
 			if _, err := store.Load(); err != nil {
 				t.Fatalf("the installed state is not readable: %v", err)
 			}
 		})
+	}
+}
+
+// An operator may point hybrid.state_path through a symlink — a relocated
+// data volume usually looks exactly like this. Two chains are owed, and the
+// link and its target are deliberately placed under disjoint roots here: the
+// target's parents hold the directory the state really lives in, while the
+// link's own parent holds the entry that leads to it. Confirming only one of
+// them lets Save report the sole private key durable while a power loss can
+// still remove the other side.
+func TestHybridStateSaveConfirmsBothSidesOfASymlink(t *testing.T) {
+	restore := syncDirectoryFunc
+	delay := directorySyncRetryDelay
+	t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
+	directorySyncRetryDelay = time.Millisecond
+
+	linkRoot, targetRoot := t.TempDir(), t.TempDir()
+	target := filepath.Join(targetRoot, "volume", "hybrid")
+	if err := os.MkdirAll(target, stateDirMode); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(linkRoot, "state")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("this filesystem does not support symlinks: %v", err)
+	}
+
+	var synced []string
+	syncDirectoryFunc = func(path string) error {
+		synced = append(synced, path)
+		return restore(path)
+	}
+	store := Store{Path: filepath.Join(link, "installation.json")}
+	if err := store.Save(testState(t, testKey(t))); err != nil {
+		t.Fatal(err)
+	}
+
+	confirmed := confirmedSet(synced)
+	realTargetRoot, realLinkRoot := realPath(t, targetRoot), realPath(t, linkRoot)
+	for what, required := range map[string]string{
+		"the target's parent":  filepath.Join(realTargetRoot, "volume"),
+		"the target's root":    realTargetRoot,
+		"the symlink's parent": realLinkRoot,
+	} {
+		if !confirmed[required] {
+			t.Errorf("%s, %q, was not confirmed; confirmed %q", what, required, synced)
+		}
+	}
+	if _, err := store.Load(); err != nil {
+		t.Fatalf("the installed state is not readable: %v", err)
+	}
+}
+
+// A path can take more than one hop, and each hop's own ancestry is owed.
+// Modelled on a relocated volume that was itself relocated: config -> volume,
+// and a directory inside the volume -> somewhere else again. The entry that
+// records the intermediate target lives in a directory neither the fully
+// resolved path nor the original spelling passes through.
+func TestHybridStateSaveConfirmsEveryHopOfANestedSymlink(t *testing.T) {
+	restore := syncDirectoryFunc
+	delay := directorySyncRetryDelay
+	t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
+	directorySyncRetryDelay = time.Millisecond
+
+	configRoot, mountRoot, serviceRoot := t.TempDir(), t.TempDir(), t.TempDir()
+
+	// /srv/hybrid — where the state really ends up.
+	final := filepath.Join(serviceRoot, "hybrid")
+	// /mnt/volume — the intermediate target, recorded by /mnt.
+	volume := filepath.Join(mountRoot, "volume")
+	for _, directory := range []string{final, volume} {
+		if err := os.MkdirAll(directory, stateDirMode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(volume, filepath.Join(configRoot, "state")); err != nil {
+		t.Skipf("this filesystem does not support symlinks: %v", err)
+	}
+	if err := os.Symlink(final, filepath.Join(volume, "active")); err != nil {
+		t.Fatal(err)
+	}
+
+	var synced []string
+	syncDirectoryFunc = func(path string) error {
+		synced = append(synced, path)
+		return restore(path)
+	}
+	store := Store{Path: filepath.Join(configRoot, "state", "active", "installation.json")}
+	if err := store.Save(testState(t, testKey(t))); err != nil {
+		t.Fatal(err)
+	}
+
+	confirmed := confirmedSet(synced)
+	for what, required := range map[string]string{
+		"the final target's parent":     realPath(t, serviceRoot),
+		"the intermediate hop's parent": realPath(t, mountRoot),
+		"the link's own parent":         realPath(t, configRoot),
+	} {
+		if !confirmed[required] {
+			t.Errorf("%s, %q, was not confirmed; confirmed %q", what, required, synced)
+		}
+	}
+	if _, err := store.Load(); err != nil {
+		t.Fatalf("the installed state is not readable: %v", err)
+	}
+}
+
+// A symlink target may be relative, and it is interpreted from the link's
+// physical parent — not from the spelling used to reach it. Joining it to the
+// lexical parent invents a path that is unrelated or absent, and the walk then
+// refuses a save whose state is already written.
+func TestHybridStateSaveResolvesARelativeSymlinkTargetFromItsRealParent(t *testing.T) {
+	restore := syncDirectoryFunc
+	delay := directorySyncRetryDelay
+	t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
+	directorySyncRetryDelay = time.Millisecond
+
+	configRoot, mountRoot := t.TempDir(), t.TempDir()
+	volume := filepath.Join(mountRoot, "volume")
+	final := filepath.Join(mountRoot, "hybrid")
+	for _, directory := range []string{volume, final} {
+		if err := os.MkdirAll(directory, stateDirMode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(volume, filepath.Join(configRoot, "state")); err != nil {
+		t.Skipf("this filesystem does not support symlinks: %v", err)
+	}
+	// Relative, and only meaningful from /mnt/volume — not from /config.
+	if err := os.Symlink(filepath.Join("..", "hybrid"), filepath.Join(volume, "active")); err != nil {
+		t.Fatal(err)
+	}
+
+	var synced []string
+	syncDirectoryFunc = func(path string) error {
+		synced = append(synced, path)
+		return restore(path)
+	}
+	store := Store{Path: filepath.Join(configRoot, "state", "active", "installation.json")}
+	if err := store.Save(testState(t, testKey(t))); err != nil {
+		t.Fatalf("a relative symlink target was resolved against the wrong parent: %v", err)
+	}
+
+	confirmed := confirmedSet(synced)
+	for what, required := range map[string]string{
+		"the real target's parent": realPath(t, mountRoot),
+		"the link's own parent":    realPath(t, configRoot),
+	} {
+		if !confirmed[required] {
+			t.Errorf("%s, %q, was not confirmed; confirmed %q", what, required, synced)
+		}
+	}
+	if _, err := store.Load(); err != nil {
+		t.Fatalf("the installed state is not readable: %v", err)
 	}
 }

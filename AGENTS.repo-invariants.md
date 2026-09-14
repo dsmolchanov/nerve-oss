@@ -116,9 +116,12 @@ makes a review loop unable to terminate.
   admission only when it is readable from disk. The confirmed entry is the
   whole chain the state file depends on, not only the destination: each entry
   is recorded by its parent, so `Save` confirms from the state directory up to
-  the filesystem root, resolving a relative `hybrid.state_path` to an absolute
-  one first — a relative walk terminates at `.` and never reaches the working
-  directory's own ancestors. That obligation is discharged on every save rather than
+  the filesystem root, resolving `hybrid.state_path` to an absolute path with
+  confirms every entry the state file is reachable through: each prefix of the
+  absolute path, and for a prefix that is a symlink, its target's ancestry in
+  turn. A relative walk terminates at `.` and never reaches the working
+  directory's ancestors; confirming only the fully resolved path and the
+  original spelling misses the entry recording an intermediate hop. That obligation is discharged on every save rather than
   inferred from which directories already exist — a directory can be left
   behind by an earlier save that created it and could not confirm it, and no
   record of that debt can itself be stored durably, so existence is never proof
@@ -127,6 +130,9 @@ makes a review loop unable to terminate.
   `TestHybridStateSaveSynchronizesEveryDirectoryItCreates`,
   `TestHybridStateSaveConfirmsTheChainEvenWhenNothingIsCreated`,
   `TestHybridStateSaveConfirmsTheAbsoluteChainForARelativePath`,
+  `TestHybridStateSaveConfirmsBothSidesOfASymlink`,
+  `TestHybridStateSaveConfirmsEveryHopOfANestedSymlink`,
+  `TestHybridStateSaveResolvesARelativeSymlinkTargetFromItsRealParent`,
   `TestHybridStateRefusesToClaimUnsupportedSyncIsDurable`,
   `TestHybridTransitionalWritesAreCompletedOnResume`,
   `TestHybridConnectHandlesBothSidesOfAnUncertainSave`,
