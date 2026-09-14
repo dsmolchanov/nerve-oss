@@ -101,7 +101,8 @@ makes a review loop unable to terminate.
   line and the header's own name, never a round number, so a valid identifier
   is discarded only when it genuinely cannot be serialized. Enforced by
   `TestThreadingHeadersNameTheReplyTargetExactlyOnce`,
-  `TestGetThreadReplyTargetDerivesAndSanitizesThreading` and
+  `TestGetThreadReplyTargetDerivesAndSanitizesThreading`,
+  `TestGetThreadReplyTargetRefusesAnotherOrganizationsThread` and
   `TestSMTPThreadingHeadersStayInsideTheLineLimit`.
 
 - Does every hybrid installation-state change either confirm its directory
