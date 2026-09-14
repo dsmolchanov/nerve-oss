@@ -498,26 +498,46 @@ func (s Store) Save(state State) error {
 // synchronized is one whose entry cannot be promised to survive, and saying
 // otherwise is the single thing the caller is relying on this not to do.
 func confirmChain(path string) error {
-	// hybrid.state_path may be relative. Walking a relative chain stops at
-	// "." — filepath.Dir(".") is "." — so it would confirm a couple of
-	// entries and return without ever reaching the working directory's own
-	// ancestors, leaving exactly the gap this walk exists to close.
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return err
 	}
-	// filepath.Abs is lexical: it keeps a symlink in the spelling. Opening
-	// the directory follows the link, so the destination itself is confirmed,
-	// but the walk would then climb the link's parents instead of the real
-	// ones — with /state -> /mnt/new/state, /mnt/new never gets confirmed and
-	// a power loss can still discard the entry holding the key.
+	// filepath.Abs is lexical: it keeps a symlink in the spelling. Opening a
+	// directory follows the link, so the destination is confirmed either way,
+	// but the lexical parents are not the target's real ones — with
+	// /config/state -> /mnt/volume/hybrid, walking only the spelling never
+	// confirms /mnt/volume.
 	resolved, err := filepath.EvalSymlinks(absolute)
 	if err != nil {
 		return err
 	}
-	for current := resolved; ; {
-		if err := confirmDirectory(current); err != nil {
+	// Both chains are owed. The target's parents hold the directory the state
+	// really lives in; the lexical parents hold the symlink entry that leads
+	// to it, and a link whose parent was never confirmed can vanish just as
+	// the target can, leaving the installation unreachable either way.
+	confirmed := make(map[string]bool)
+	for _, start := range [...]string{resolved, absolute} {
+		if err := confirmAncestry(start, confirmed); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// confirmAncestry makes path and each of its parents durable, up to the
+// filesystem root, skipping what an earlier walk already confirmed.
+//
+// A failure is propagated like every other durability failure here, including
+// on an ancestor this process did not create: an ancestor that cannot be
+// synchronized is one whose entry cannot be promised to survive, and saying
+// otherwise is the single thing the caller is relying on this not to do.
+func confirmAncestry(path string, confirmed map[string]bool) error {
+	for current := path; ; {
+		if !confirmed[current] {
+			if err := confirmDirectory(current); err != nil {
+				return err
+			}
+			confirmed[current] = true
 		}
 		parent := filepath.Dir(current)
 		if parent == current {

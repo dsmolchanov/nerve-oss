@@ -561,25 +561,25 @@ func TestHybridStateSaveConfirmsTheAbsoluteChainForARelativePath(t *testing.T) {
 	}
 }
 
-// An operator may point hybrid.state_path through a symlink — a moved data
-// volume usually looks exactly like this. filepath.Abs keeps the link in the
-// spelling, and opening the directory follows it, so the destination is
-// confirmed either way; the real ancestors above the link target are not.
-// Those hold the entry the installation key ultimately depends on.
-func TestHybridStateSaveConfirmsTheRealChainThroughASymlink(t *testing.T) {
+// An operator may point hybrid.state_path through a symlink — a relocated
+// data volume usually looks exactly like this. Two chains are owed, and the
+// link and its target are deliberately placed under disjoint roots here: the
+// target's parents hold the directory the state really lives in, while the
+// link's own parent holds the entry that leads to it. Confirming only one of
+// them lets Save report the sole private key durable while a power loss can
+// still remove the other side.
+func TestHybridStateSaveConfirmsBothSidesOfASymlink(t *testing.T) {
 	restore := syncDirectoryFunc
 	delay := directorySyncRetryDelay
 	t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
 	directorySyncRetryDelay = time.Millisecond
 
-	base := t.TempDir()
-	// The real tree the state actually lives in, and a link pointing at it
-	// from somewhere else entirely.
-	target := filepath.Join(base, "volume", "hybrid")
+	linkRoot, targetRoot := t.TempDir(), t.TempDir()
+	target := filepath.Join(targetRoot, "volume", "hybrid")
 	if err := os.MkdirAll(target, stateDirMode); err != nil {
 		t.Fatal(err)
 	}
-	link := filepath.Join(base, "state")
+	link := filepath.Join(linkRoot, "state")
 	if err := os.Symlink(target, link); err != nil {
 		t.Skipf("this filesystem does not support symlinks: %v", err)
 	}
@@ -594,17 +594,23 @@ func TestHybridStateSaveConfirmsTheRealChainThroughASymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The parent of the link target is the entry a lexical walk skips.
-	resolvedBase, err := filepath.EvalSymlinks(base)
-	if err != nil {
-		t.Fatal(err)
+	// Compare by the directory each entry actually names: one directory can
+	// be reached by more than one spelling, and fsync acts on the inode.
+	confirmed := make(map[string]bool, 2*len(synced))
+	for _, entry := range synced {
+		confirmed[entry] = true
+		if real, err := filepath.EvalSymlinks(entry); err == nil {
+			confirmed[real] = true
+		}
 	}
-	for _, required := range []string{
-		filepath.Join(resolvedBase, "volume"),
-		resolvedBase,
+	realTargetRoot, realLinkRoot := realPath(t, targetRoot), realPath(t, linkRoot)
+	for what, required := range map[string]string{
+		"the target's parent":  filepath.Join(realTargetRoot, "volume"),
+		"the target's root":    realTargetRoot,
+		"the symlink's parent": realLinkRoot,
 	} {
-		if !slices.Contains(synced, required) {
-			t.Errorf("the real ancestor %q was not confirmed; confirmed %q", required, synced)
+		if !confirmed[required] {
+			t.Errorf("%s, %q, was not confirmed; confirmed %q", what, required, synced)
 		}
 	}
 	if _, err := store.Load(); err != nil {
