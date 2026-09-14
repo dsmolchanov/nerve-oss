@@ -442,6 +442,53 @@ func TestHybridStateSaveSynchronizesOnlyTheDestinationWhenNothingIsCreated(t *te
 	}
 }
 
+// A Save that cannot confirm a directory it created must not leave it behind:
+// a later Save would find it, take its existence for durability, skip the
+// synchronization that never happened and report success — after which a
+// power loss can still take the ancestor and the only installation key with
+// it. Existence is only proof of durability because this holds.
+func TestHybridStateSaveRetriesTheSynchronizationAFailedSaveOwed(t *testing.T) {
+	restore := syncDirectoryFunc
+	delay := directorySyncRetryDelay
+	t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
+	directorySyncRetryDelay = time.Millisecond
+
+	existing := t.TempDir()
+	store := Store{Path: filepath.Join(existing, "state", "hybrid", "installation.json")}
+
+	// The first save fails on the very first parent it has to confirm.
+	syncDirectoryFunc = func(string) error { return errors.New("input/output error") }
+	if err := store.Save(testState(t, testKey(t))); err == nil {
+		t.Fatal("an unsynchronized new directory was reported as success")
+	}
+	// Nothing it could not confirm survives it.
+	if _, err := os.Stat(filepath.Join(existing, "state")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("a failed save left an unconfirmed directory behind: %v", err)
+	}
+
+	// The retry therefore owes — and performs — every synchronization.
+	var synced []string
+	syncDirectoryFunc = func(path string) error {
+		synced = append(synced, path)
+		return restore(path)
+	}
+	if err := store.Save(testState(t, testKey(t))); err != nil {
+		t.Fatalf("the retry failed: %v", err)
+	}
+	for _, required := range []string{
+		existing,
+		filepath.Join(existing, "state"),
+		filepath.Join(existing, "state", "hybrid"),
+	} {
+		if !slices.Contains(synced, required) {
+			t.Errorf("the retry reported success without synchronizing %q; synchronized %q", required, synced)
+		}
+	}
+	if _, err := store.Load(); err != nil {
+		t.Fatalf("the installed state is not readable: %v", err)
+	}
+}
+
 // A parent that cannot be made durable is a failure before the rename: the
 // key has not been written, and reporting it as installed-but-unconfirmed
 // would send an operator looking for state that does not exist.

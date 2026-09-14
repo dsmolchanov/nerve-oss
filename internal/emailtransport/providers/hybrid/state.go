@@ -476,16 +476,24 @@ func (s Store) Save(state State) error {
 }
 
 // createStateDirectory creates the state directory and makes every directory
-// entry it had to create durable before the caller writes a key into it.
+// entry it creates durable before the caller writes a key into it.
 //
-// os.MkdirAll can create several levels at once, and a new directory entry
-// only survives a power loss once its *parent* has been synchronized. Syncing
-// the destination alone — which is all the post-rename confirmation does —
-// leaves a first installation on a previously absent path able to report a
-// successful Save and then come back from a crash with no directory at all,
-// and therefore without the sole private key. The runtime would restart
-// unable to prove its identity, orphaning the Cloud installation and stopping
-// mail in both directions.
+// A new directory entry only survives a power loss once its *parent* has been
+// synchronized. Syncing the destination alone — which is all the post-rename
+// confirmation does — would leave a first installation on a previously absent
+// path able to report a successful Save and still come back from a crash with
+// no directory at all, and therefore without the sole private key: the runtime
+// would restart unable to prove its identity, orphaning the Cloud installation
+// and stopping mail in both directions.
+//
+// Each level is created and then confirmed in its parent before the next one
+// is created, and a level that cannot be confirmed is removed again. That is
+// what lets a later Save treat an existing directory as a durable one: an
+// unconfirmed directory is never left behind for it to find. Should even the
+// removal fail, the error is still returned — the caller is never told the
+// write succeeded — but the directory does survive, and a later Save will
+// accept it. That residue is the one case this cannot close from here: there
+// is nowhere durable to record the outstanding obligation.
 //
 // This runs before the rename, so a failure here means nothing was written.
 func createStateDirectory(path string) error {
@@ -493,22 +501,45 @@ func createStateDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(path, stateDirMode); err != nil {
-		return err
-	}
-	// Deepest first, up to and including the first ancestor that already
-	// existed: that ancestor is the one holding the shallowest new entry.
-	for _, created := range absent {
-		if err := confirmDirectory(filepath.Dir(created)); err != nil {
+	// absentAncestors reports deepest first; create in the opposite order so
+	// each parent exists before the level below it is added to it.
+	var created []string
+	for i := len(absent) - 1; i >= 0; i-- {
+		level := absent[i]
+		switch err := os.Mkdir(level, stateDirMode); {
+		case err == nil:
+			created = append(created, level)
+		case errors.Is(err, fs.ErrExist):
+			// Someone else won the race. Its entry is not ours to remove,
+			// but the parent still has to be confirmed before we descend.
+		default:
+			removeUnconfirmed(created)
+			return err
+		}
+		if err := confirmDirectory(filepath.Dir(level)); err != nil {
+			removeUnconfirmed(created)
 			return err
 		}
 	}
 	return nil
 }
 
+// removeUnconfirmed deletes the directories this call created but could not
+// confirm, so that a later Save does not mistake their existence for proof
+// that they are durable. They are empty: nothing is written into the state
+// directory until it has been confirmed. Removal stops at the first entry
+// that will not go, since the ones above it still hold that one.
+func removeUnconfirmed(created []string) {
+	for i := len(created) - 1; i >= 0; i-- {
+		if err := os.Remove(created[i]); err != nil {
+			return
+		}
+	}
+}
+
 // absentAncestors reports path and every ancestor of it that does not exist
 // yet, deepest first. It is called before the directories are created, so the
-// answer is exactly the set of entries MkdirAll is about to add.
+// answer is exactly the set of entries that have to be added.
 func absentAncestors(path string) ([]string, error) {
 	var absent []string
 	for current := path; ; {
