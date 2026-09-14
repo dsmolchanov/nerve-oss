@@ -431,7 +431,7 @@ func (s Store) Save(state State) error {
 		return err
 	}
 	directory := filepath.Dir(s.Path)
-	if err := createStateDirectory(directory); err != nil {
+	if err := os.MkdirAll(directory, stateDirMode); err != nil {
 		return err
 	}
 	raw, err := json.MarshalIndent(state, "", "  ")
@@ -469,91 +469,42 @@ func (s Store) Save(state State) error {
 	// Past this point the new state is what a reader sees. Only its
 	// durability is still in question, so retry the one remaining step
 	// before reporting an outcome the caller cannot undo by itself.
-	if err := confirmDirectory(directory); err != nil {
+	if err := confirmChain(directory); err != nil {
 		return &UnconfirmedError{Op: "write", Err: err}
 	}
 	return nil
 }
 
-// createStateDirectory creates the state directory and makes every directory
-// entry it creates durable before the caller writes a key into it.
+// confirmChain makes path durable along with every entry it depends on, from
+// path itself up to the filesystem root.
 //
-// A new directory entry only survives a power loss once its *parent* has been
-// synchronized. Syncing the destination alone — which is all the post-rename
-// confirmation does — would leave a first installation on a previously absent
-// path able to report a successful Save and still come back from a crash with
-// no directory at all, and therefore without the sole private key: the runtime
+// A directory entry only survives a power loss once its *parent* has been
+// synchronized, and os.MkdirAll can add several levels at once. Confirming
+// only the destination would let a first installation on a previously absent
+// path report a successful Save and still come back from a crash with no
+// directory at all, and therefore without the sole private key: the runtime
 // would restart unable to prove its identity, orphaning the Cloud installation
 // and stopping mail in both directions.
 //
-// Each level is created and then confirmed in its parent before the next one
-// is created, and a level that cannot be confirmed is removed again. That is
-// what lets a later Save treat an existing directory as a durable one: an
-// unconfirmed directory is never left behind for it to find. Should even the
-// removal fail, the error is still returned — the caller is never told the
-// write succeeded — but the directory does survive, and a later Save will
-// accept it. That residue is the one case this cannot close from here: there
-// is nowhere durable to record the outstanding obligation.
+// The whole chain is confirmed on every save rather than only the part that
+// was just created. Existence is not proof of durability: a directory can be
+// left behind by an earlier save that created it and then failed to confirm
+// it, and no record of that debt can itself be stored durably. Re-confirming
+// an already durable ancestor costs an fsync on a clean inode; skipping one
+// that was owed costs the installation.
 //
-// This runs before the rename, so a failure here means nothing was written.
-func createStateDirectory(path string) error {
-	absent, err := absentAncestors(path)
-	if err != nil {
-		return err
-	}
-	// absentAncestors reports deepest first; create in the opposite order so
-	// each parent exists before the level below it is added to it.
-	var created []string
-	for i := len(absent) - 1; i >= 0; i-- {
-		level := absent[i]
-		switch err := os.Mkdir(level, stateDirMode); {
-		case err == nil:
-			created = append(created, level)
-		case errors.Is(err, fs.ErrExist):
-			// Someone else won the race. Its entry is not ours to remove,
-			// but the parent still has to be confirmed before we descend.
-		default:
-			removeUnconfirmed(created)
-			return err
-		}
-		if err := confirmDirectory(filepath.Dir(level)); err != nil {
-			removeUnconfirmed(created)
-			return err
-		}
-	}
-	return nil
-}
-
-// removeUnconfirmed deletes the directories this call created but could not
-// confirm, so that a later Save does not mistake their existence for proof
-// that they are durable. They are empty: nothing is written into the state
-// directory until it has been confirmed. Removal stops at the first entry
-// that will not go, since the ones above it still hold that one.
-func removeUnconfirmed(created []string) {
-	for i := len(created) - 1; i >= 0; i-- {
-		if err := os.Remove(created[i]); err != nil {
-			return
-		}
-	}
-}
-
-// absentAncestors reports path and every ancestor of it that does not exist
-// yet, deepest first. It is called before the directories are created, so the
-// answer is exactly the set of entries that have to be added.
-func absentAncestors(path string) ([]string, error) {
-	var absent []string
+// A failure is propagated like every other durability failure here, including
+// on an ancestor this process did not create: an ancestor that cannot be
+// synchronized is one whose entry cannot be promised to survive, and saying
+// otherwise is the single thing the caller is relying on this not to do.
+func confirmChain(path string) error {
 	for current := path; ; {
-		switch _, err := os.Stat(current); {
-		case err == nil:
-			return absent, nil
-		case !errors.Is(err, fs.ErrNotExist):
-			return nil, err
+		if err := confirmDirectory(current); err != nil {
+			return err
 		}
-		absent = append(absent, current)
 		parent := filepath.Dir(current)
 		if parent == current {
-			// The filesystem root; there is no further entry to record.
-			return absent, nil
+			return nil
 		}
 		current = parent
 	}

@@ -418,9 +418,13 @@ func TestHybridStateSaveSynchronizesEveryDirectoryItCreates(t *testing.T) {
 	}
 }
 
-// A directory that already exists has nothing to record in its parent, so a
-// save into one must not start synchronizing unrelated ancestors.
-func TestHybridStateSaveSynchronizesOnlyTheDestinationWhenNothingIsCreated(t *testing.T) {
+// The obligation is discharged on every save, not only when a directory is
+// missing. A save into a directory that already exists still confirms the
+// whole chain: that directory may have been created by an earlier save which
+// failed to confirm it, and there is nowhere durable to have recorded that.
+// Treating existence as proof would skip the synchronization that was owed
+// and report success over an ancestor that can still disappear.
+func TestHybridStateSaveConfirmsTheChainEvenWhenNothingIsCreated(t *testing.T) {
 	restore := syncDirectoryFunc
 	delay := directorySyncRetryDelay
 	t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
@@ -437,16 +441,18 @@ func TestHybridStateSaveSynchronizesOnlyTheDestinationWhenNothingIsCreated(t *te
 	if err := store.Save(testState(t, testKey(t))); err != nil {
 		t.Fatal(err)
 	}
-	if len(synced) != 1 || synced[0] != directory {
-		t.Fatalf("a save into an existing directory synchronized %q", synced)
+	for _, required := range []string{directory, filepath.Dir(directory), string(filepath.Separator)} {
+		if !slices.Contains(synced, required) {
+			t.Errorf("a save into an existing directory did not confirm %q; confirmed %q", required, synced)
+		}
 	}
 }
 
-// A Save that cannot confirm a directory it created must not leave it behind:
-// a later Save would find it, take its existence for durability, skip the
-// synchronization that never happened and report success — after which a
-// power loss can still take the ancestor and the only installation key with
-// it. Existence is only proof of durability because this holds.
+// A directory an earlier save created but could not confirm is left on disk,
+// and no durable record of that debt can exist. The retry must therefore
+// synchronize every parent again rather than read the directory's existence
+// as proof that it is durable — otherwise it writes the sole installation key
+// and reports success over an ancestor a power loss can still take.
 func TestHybridStateSaveRetriesTheSynchronizationAFailedSaveOwed(t *testing.T) {
 	restore := syncDirectoryFunc
 	delay := directorySyncRetryDelay
@@ -456,17 +462,13 @@ func TestHybridStateSaveRetriesTheSynchronizationAFailedSaveOwed(t *testing.T) {
 	existing := t.TempDir()
 	store := Store{Path: filepath.Join(existing, "state", "hybrid", "installation.json")}
 
-	// The first save fails on the very first parent it has to confirm.
+	// The first save creates the tree and then fails to confirm it.
 	syncDirectoryFunc = func(string) error { return errors.New("input/output error") }
 	if err := store.Save(testState(t, testKey(t))); err == nil {
-		t.Fatal("an unsynchronized new directory was reported as success")
-	}
-	// Nothing it could not confirm survives it.
-	if _, err := os.Stat(filepath.Join(existing, "state")); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("a failed save left an unconfirmed directory behind: %v", err)
+		t.Fatal("an unconfirmed directory chain was reported as success")
 	}
 
-	// The retry therefore owes — and performs — every synchronization.
+	// The directories survive it, so the retry owes every synchronization.
 	var synced []string
 	syncDirectoryFunc = func(path string) error {
 		synced = append(synced, path)
@@ -481,35 +483,10 @@ func TestHybridStateSaveRetriesTheSynchronizationAFailedSaveOwed(t *testing.T) {
 		filepath.Join(existing, "state", "hybrid"),
 	} {
 		if !slices.Contains(synced, required) {
-			t.Errorf("the retry reported success without synchronizing %q; synchronized %q", required, synced)
+			t.Errorf("the retry reported success without confirming %q; confirmed %q", required, synced)
 		}
 	}
 	if _, err := store.Load(); err != nil {
 		t.Fatalf("the installed state is not readable: %v", err)
-	}
-}
-
-// A parent that cannot be made durable is a failure before the rename: the
-// key has not been written, and reporting it as installed-but-unconfirmed
-// would send an operator looking for state that does not exist.
-func TestHybridStateSaveRefusesWhenANewParentCannotBeSynchronized(t *testing.T) {
-	restore := syncDirectoryFunc
-	delay := directorySyncRetryDelay
-	t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
-	directorySyncRetryDelay = time.Millisecond
-
-	existing := t.TempDir()
-	store := Store{Path: filepath.Join(existing, "state", "installation.json")}
-
-	syncDirectoryFunc = func(string) error { return errors.New("input/output error") }
-	err := store.Save(testState(t, testKey(t)))
-	if err == nil {
-		t.Fatal("an unsynchronized new directory was reported as success")
-	}
-	if Unconfirmed(err) {
-		t.Fatalf("a pre-rename failure claimed the state was installed: %v", err)
-	}
-	if _, statErr := os.Stat(store.Path); !errors.Is(statErr, fs.ErrNotExist) {
-		t.Fatalf("a refused save left state behind: %v", statErr)
 	}
 }

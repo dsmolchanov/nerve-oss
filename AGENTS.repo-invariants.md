@@ -113,19 +113,17 @@ makes a review loop unable to terminate.
   succeed, any path that resumes a transitional state — a pairing awaiting
   admission, a prepared rotation, an existing binding — must itself re-write
   that state rather than returning from a fast path, and a key is offered for
-  admission only when it is readable from disk. The confirmed entry is every
-  directory the write creates, not only the destination: each new entry is
-  recorded by its parent, so a first installation on an absent path creates one
-  level at a time and confirms it in its parent before descending, and a
-  failure there is a pre-rename failure that must not be reported as
-  installed-but-unconfirmed. A directory that could not be confirmed is removed
-  again rather than left for a later write to find — existence may be treated
-  as durability only because an unconfirmed directory is never left behind.
-  Enforced by `TestHybridStateSaveReportsHowFarItGot`,
+  admission only when it is readable from disk. The confirmed entry is the
+  whole chain the state file depends on, not only the destination: each entry
+  is recorded by its parent, so `Save` confirms from the state directory up to
+  the filesystem root. That obligation is discharged on every save rather than
+  inferred from which directories already exist — a directory can be left
+  behind by an earlier save that created it and could not confirm it, and no
+  record of that debt can itself be stored durably, so existence is never proof
+  of durability. Enforced by `TestHybridStateSaveReportsHowFarItGot`,
   `TestHybridStateSaveRetriesTheSynchronizationAFailedSaveOwed`,
   `TestHybridStateSaveSynchronizesEveryDirectoryItCreates`,
-  `TestHybridStateSaveSynchronizesOnlyTheDestinationWhenNothingIsCreated`,
-  `TestHybridStateSaveRefusesWhenANewParentCannotBeSynchronized`,
+  `TestHybridStateSaveConfirmsTheChainEvenWhenNothingIsCreated`,
   `TestHybridStateRefusesToClaimUnsupportedSyncIsDurable`,
   `TestHybridTransitionalWritesAreCompletedOnResume`,
   `TestHybridConnectHandlesBothSidesOfAnUncertainSave`,
