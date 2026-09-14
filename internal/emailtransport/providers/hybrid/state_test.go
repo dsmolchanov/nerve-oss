@@ -14,6 +14,19 @@ import (
 	"github.com/google/uuid"
 )
 
+// realPath resolves a path the way confirmChain does, so an expectation is
+// written in the spelling the walk actually confirms. A temporary directory
+// can sit under a symlink — /var is one on macOS — and comparing against the
+// unresolved spelling would test the test, not the walk.
+func realPath(t *testing.T, path string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved
+}
+
 func testKey(t *testing.T) Key {
 	t.Helper()
 	key, err := GenerateKey()
@@ -398,11 +411,12 @@ func TestHybridStateSaveSynchronizesEveryDirectoryItCreates(t *testing.T) {
 
 	// Every new entry is recorded by its parent, and the destination itself
 	// is recorded by the post-rename confirmation.
+	root := realPath(t, existing)
 	for _, required := range []string{
-		existing,
-		filepath.Join(existing, "state"),
-		filepath.Join(existing, "state", "hybrid"),
-		destination,
+		root,
+		filepath.Join(root, "state"),
+		filepath.Join(root, "state", "hybrid"),
+		filepath.Join(root, "state", "hybrid", "installation"),
 	} {
 		if !slices.Contains(synced, required) {
 			t.Errorf("Save did not synchronize %q; synchronized %q", required, synced)
@@ -441,7 +455,8 @@ func TestHybridStateSaveConfirmsTheChainEvenWhenNothingIsCreated(t *testing.T) {
 	if err := store.Save(testState(t, testKey(t))); err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{directory, filepath.Dir(directory), string(filepath.Separator)} {
+	root := realPath(t, directory)
+	for _, required := range []string{root, filepath.Dir(root), string(filepath.Separator)} {
 		if !slices.Contains(synced, required) {
 			t.Errorf("a save into an existing directory did not confirm %q; confirmed %q", required, synced)
 		}
@@ -477,10 +492,11 @@ func TestHybridStateSaveRetriesTheSynchronizationAFailedSaveOwed(t *testing.T) {
 	if err := store.Save(testState(t, testKey(t))); err != nil {
 		t.Fatalf("the retry failed: %v", err)
 	}
+	root := realPath(t, existing)
 	for _, required := range []string{
-		existing,
-		filepath.Join(existing, "state"),
-		filepath.Join(existing, "state", "hybrid"),
+		root,
+		filepath.Join(root, "state"),
+		filepath.Join(root, "state", "hybrid"),
 	} {
 		if !slices.Contains(synced, required) {
 			t.Errorf("the retry reported success without confirming %q; confirmed %q", required, synced)
@@ -534,10 +550,7 @@ func TestHybridStateSaveConfirmsTheAbsoluteChainForARelativePath(t *testing.T) {
 			}
 			// The working directory itself is an ancestor that a relative
 			// walk would never have reached.
-			absoluteWorking, err := filepath.Abs(working)
-			if err != nil {
-				t.Fatal(err)
-			}
+			absoluteWorking := realPath(t, working)
 			if !slices.Contains(synced, absoluteWorking) {
 				t.Errorf("the working directory %q was not confirmed; confirmed %q", absoluteWorking, synced)
 			}
@@ -545,5 +558,56 @@ func TestHybridStateSaveConfirmsTheAbsoluteChainForARelativePath(t *testing.T) {
 				t.Fatalf("the installed state is not readable: %v", err)
 			}
 		})
+	}
+}
+
+// An operator may point hybrid.state_path through a symlink — a moved data
+// volume usually looks exactly like this. filepath.Abs keeps the link in the
+// spelling, and opening the directory follows it, so the destination is
+// confirmed either way; the real ancestors above the link target are not.
+// Those hold the entry the installation key ultimately depends on.
+func TestHybridStateSaveConfirmsTheRealChainThroughASymlink(t *testing.T) {
+	restore := syncDirectoryFunc
+	delay := directorySyncRetryDelay
+	t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
+	directorySyncRetryDelay = time.Millisecond
+
+	base := t.TempDir()
+	// The real tree the state actually lives in, and a link pointing at it
+	// from somewhere else entirely.
+	target := filepath.Join(base, "volume", "hybrid")
+	if err := os.MkdirAll(target, stateDirMode); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "state")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("this filesystem does not support symlinks: %v", err)
+	}
+
+	var synced []string
+	syncDirectoryFunc = func(path string) error {
+		synced = append(synced, path)
+		return restore(path)
+	}
+	store := Store{Path: filepath.Join(link, "installation.json")}
+	if err := store.Save(testState(t, testKey(t))); err != nil {
+		t.Fatal(err)
+	}
+
+	// The parent of the link target is the entry a lexical walk skips.
+	resolvedBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		filepath.Join(resolvedBase, "volume"),
+		resolvedBase,
+	} {
+		if !slices.Contains(synced, required) {
+			t.Errorf("the real ancestor %q was not confirmed; confirmed %q", required, synced)
+		}
+	}
+	if _, err := store.Load(); err != nil {
+		t.Fatalf("the installed state is not readable: %v", err)
 	}
 }

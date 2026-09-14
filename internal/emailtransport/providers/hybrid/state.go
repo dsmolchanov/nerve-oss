@@ -506,7 +506,16 @@ func confirmChain(path string) error {
 	if err != nil {
 		return err
 	}
-	for current := absolute; ; {
+	// filepath.Abs is lexical: it keeps a symlink in the spelling. Opening
+	// the directory follows the link, so the destination itself is confirmed,
+	// but the walk would then climb the link's parents instead of the real
+	// ones — with /state -> /mnt/new/state, /mnt/new never gets confirmed and
+	// a power loss can still discard the entry holding the key.
+	resolved, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return err
+	}
+	for current := resolved; ; {
 		if err := confirmDirectory(current); err != nil {
 			return err
 		}
