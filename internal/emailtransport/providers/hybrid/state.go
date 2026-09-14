@@ -498,7 +498,15 @@ func (s Store) Save(state State) error {
 // synchronized is one whose entry cannot be promised to survive, and saying
 // otherwise is the single thing the caller is relying on this not to do.
 func confirmChain(path string) error {
-	for current := path; ; {
+	// hybrid.state_path may be relative. Walking a relative chain stops at
+	// "." — filepath.Dir(".") is "." — so it would confirm a couple of
+	// entries and return without ever reaching the working directory's own
+	// ancestors, leaving exactly the gap this walk exists to close.
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	for current := absolute; ; {
 		if err := confirmDirectory(current); err != nil {
 			return err
 		}

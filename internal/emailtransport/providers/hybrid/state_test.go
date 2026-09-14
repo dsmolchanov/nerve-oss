@@ -490,3 +490,60 @@ func TestHybridStateSaveRetriesTheSynchronizationAFailedSaveOwed(t *testing.T) {
 		t.Fatalf("the installed state is not readable: %v", err)
 	}
 }
+
+// hybrid.state_path may be given relative to the working directory. A
+// relative walk terminates at "." — filepath.Dir(".") is "." — so it would
+// confirm a step or two and return, never reaching the working directory's
+// own ancestors: the same unconfirmed-ancestor gap the chain exists to close,
+// reached by a different spelling of the same file.
+func TestHybridStateSaveConfirmsTheAbsoluteChainForARelativePath(t *testing.T) {
+	for _, relative := range []string{
+		"installation.json",
+		filepath.Join("state", "hybrid", "installation.json"),
+		filepath.Join("state", "..", "state", "installation.json"),
+	} {
+		t.Run(relative, func(t *testing.T) {
+			restore := syncDirectoryFunc
+			delay := directorySyncRetryDelay
+			t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
+			directorySyncRetryDelay = time.Millisecond
+
+			working := t.TempDir()
+			t.Chdir(working)
+
+			var synced []string
+			syncDirectoryFunc = func(path string) error {
+				synced = append(synced, path)
+				return restore(path)
+			}
+			store := Store{Path: relative}
+			if err := store.Save(testState(t, testKey(t))); err != nil {
+				t.Fatal(err)
+			}
+
+			// Nothing relative is ever confirmed, and the walk runs all the
+			// way out to the filesystem root.
+			for _, entry := range synced {
+				if !filepath.IsAbs(entry) {
+					t.Errorf("confirmed a relative entry %q; confirmed %q", entry, synced)
+				}
+			}
+			root := string(filepath.Separator)
+			if !slices.Contains(synced, root) {
+				t.Errorf("the walk stopped before the filesystem root; confirmed %q", synced)
+			}
+			// The working directory itself is an ancestor that a relative
+			// walk would never have reached.
+			absoluteWorking, err := filepath.Abs(working)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Contains(synced, absoluteWorking) {
+				t.Errorf("the working directory %q was not confirmed; confirmed %q", absoluteWorking, synced)
+			}
+			if _, err := store.Load(); err != nil {
+				t.Fatalf("the installed state is not readable: %v", err)
+			}
+		})
+	}
+}
