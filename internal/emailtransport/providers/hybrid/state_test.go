@@ -681,3 +681,53 @@ func TestHybridStateSaveConfirmsEveryHopOfANestedSymlink(t *testing.T) {
 		t.Fatalf("the installed state is not readable: %v", err)
 	}
 }
+
+// A symlink target may be relative, and it is interpreted from the link's
+// physical parent — not from the spelling used to reach it. Joining it to the
+// lexical parent invents a path that is unrelated or absent, and the walk then
+// refuses a save whose state is already written.
+func TestHybridStateSaveResolvesARelativeSymlinkTargetFromItsRealParent(t *testing.T) {
+	restore := syncDirectoryFunc
+	delay := directorySyncRetryDelay
+	t.Cleanup(func() { syncDirectoryFunc = restore; directorySyncRetryDelay = delay })
+	directorySyncRetryDelay = time.Millisecond
+
+	configRoot, mountRoot := t.TempDir(), t.TempDir()
+	volume := filepath.Join(mountRoot, "volume")
+	final := filepath.Join(mountRoot, "hybrid")
+	for _, directory := range []string{volume, final} {
+		if err := os.MkdirAll(directory, stateDirMode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(volume, filepath.Join(configRoot, "state")); err != nil {
+		t.Skipf("this filesystem does not support symlinks: %v", err)
+	}
+	// Relative, and only meaningful from /mnt/volume — not from /config.
+	if err := os.Symlink(filepath.Join("..", "hybrid"), filepath.Join(volume, "active")); err != nil {
+		t.Fatal(err)
+	}
+
+	var synced []string
+	syncDirectoryFunc = func(path string) error {
+		synced = append(synced, path)
+		return restore(path)
+	}
+	store := Store{Path: filepath.Join(configRoot, "state", "active", "installation.json")}
+	if err := store.Save(testState(t, testKey(t))); err != nil {
+		t.Fatalf("a relative symlink target was resolved against the wrong parent: %v", err)
+	}
+
+	confirmed := confirmedSet(synced)
+	for what, required := range map[string]string{
+		"the real target's parent": realPath(t, mountRoot),
+		"the link's own parent":    realPath(t, configRoot),
+	} {
+		if !confirmed[required] {
+			t.Errorf("%s, %q, was not confirmed; confirmed %q", what, required, synced)
+		}
+	}
+	if _, err := store.Load(); err != nil {
+		t.Fatalf("the installed state is not readable: %v", err)
+	}
+}

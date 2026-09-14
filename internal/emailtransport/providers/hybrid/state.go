@@ -571,7 +571,15 @@ func symlinkTarget(path string) (string, error) {
 		return "", err
 	}
 	if !filepath.IsAbs(target) {
-		target = filepath.Join(filepath.Dir(path), target)
+		// A relative target is interpreted from the link's *physical*
+		// parent. Joining it to the lexical one would invent a path: with
+		// /config/state -> /mnt/volume and /mnt/volume/active -> ../hybrid,
+		// the lexical join yields /config/hybrid instead of /mnt/hybrid.
+		parent, err := filepath.EvalSymlinks(filepath.Dir(path))
+		if err != nil {
+			return "", err
+		}
+		target = filepath.Join(parent, target)
 	}
 	return filepath.Clean(target), nil
 }

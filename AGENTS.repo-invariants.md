@@ -132,6 +132,7 @@ makes a review loop unable to terminate.
   `TestHybridStateSaveConfirmsTheAbsoluteChainForARelativePath`,
   `TestHybridStateSaveConfirmsBothSidesOfASymlink`,
   `TestHybridStateSaveConfirmsEveryHopOfANestedSymlink`,
+  `TestHybridStateSaveResolvesARelativeSymlinkTargetFromItsRealParent`,
   `TestHybridStateRefusesToClaimUnsupportedSyncIsDurable`,
   `TestHybridTransitionalWritesAreCompletedOnResume`,
   `TestHybridConnectHandlesBothSidesOfAnUncertainSave`,
