@@ -262,7 +262,12 @@ type ThreadReplyTarget struct {
 // provider emitted them. The parent is the newest inbound message that has a
 // Message-ID, and References is that message's own chain with its ID appended,
 // which is what RFC 5322 asks for.
-func (s *Store) GetThreadReplyTarget(ctx context.Context, inboxID, threadID string) (ThreadReplyTarget, error) {
+// The organization is a parameter, not an inference from the thread: these
+// are caller-supplied UUIDs, and without the predicate a caller holding one
+// organization's identifiers could read another's Message-ID chain and thread
+// an outbound reply onto it. Cloud's row-level security happens to scope this
+// today; the query must not depend on that being true of every caller.
+func (s *Store) GetThreadReplyTarget(ctx context.Context, orgID, inboxID, threadID string) (ThreadReplyTarget, error) {
 	var target ThreadReplyTarget
 	var messageID, parentInReplyTo, chain string
 	// array_to_string keeps the reference chain out of the driver's array
@@ -271,11 +276,11 @@ func (s *Store) GetThreadReplyTarget(ctx context.Context, inboxID, threadID stri
 		SELECT coalesce(internet_message_id, ''), coalesce(in_reply_to, ''),
 		       coalesce(array_to_string("references", ' '), '')
 		FROM messages
-		WHERE thread_id = $1 AND inbox_id = $2 AND direction = 'inbound'
+		WHERE thread_id = $1 AND inbox_id = $2 AND org_id = $3 AND direction = 'inbound'
 		  AND coalesce(internet_message_id, '') <> ''
 		ORDER BY created_at DESC, id DESC
 		LIMIT 1
-	`, threadID, inboxID).Scan(&messageID, &parentInReplyTo, &chain)
+	`, threadID, inboxID, orgID).Scan(&messageID, &parentInReplyTo, &chain)
 	if errors.Is(err, sql.ErrNoRows) {
 		return target, nil
 	}

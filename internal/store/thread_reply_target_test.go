@@ -62,7 +62,7 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 		t.Run("chain then parent", func(t *testing.T) {
 			threadID := inbound("<third@example.test>", "<second@example.test>",
 				[]string{"<root@example.test>", "<second@example.test>"}, now)
-			target, err := st.GetThreadReplyTarget(ctx, inboxID, threadID)
+			target, err := st.GetThreadReplyTarget(ctx, orgID, inboxID, threadID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -79,7 +79,7 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 
 		t.Run("parent with no chain", func(t *testing.T) {
 			threadID := inbound("<only@example.test>", "<parent@example.test>", nil, now)
-			target, err := st.GetThreadReplyTarget(ctx, inboxID, threadID)
+			target, err := st.GetThreadReplyTarget(ctx, orgID, inboxID, threadID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -90,7 +90,7 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 
 		t.Run("no ancestors at all", func(t *testing.T) {
 			threadID := inbound("<first@example.test>", "", nil, now)
-			target, err := st.GetThreadReplyTarget(ctx, inboxID, threadID)
+			target, err := st.GetThreadReplyTarget(ctx, orgID, inboxID, threadID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -117,7 +117,7 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 				uuid.NewString(), inboxID, orgID, threadID, now.Add(time.Minute), uuid.NewString()); err != nil {
 				t.Fatal(err)
 			}
-			target, err := st.GetThreadReplyTarget(ctx, inboxID, threadID)
+			target, err := st.GetThreadReplyTarget(ctx, orgID, inboxID, threadID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -135,7 +135,7 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 				threadID, inboxID, orgID); err != nil {
 				t.Fatal(err)
 			}
-			target, err := st.GetThreadReplyTarget(ctx, inboxID, threadID)
+			target, err := st.GetThreadReplyTarget(ctx, orgID, inboxID, threadID)
 			if err != nil || target.InReplyTo != "" || target.References != "" {
 				t.Fatalf("target = %+v err=%v", target, err)
 			}
@@ -153,7 +153,7 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 			} {
 				t.Run(name, func(t *testing.T) {
 					threadID := inbound(messageID, "", nil, now)
-					target, err := st.GetThreadReplyTarget(ctx, inboxID, threadID)
+					target, err := st.GetThreadReplyTarget(ctx, orgID, inboxID, threadID)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -168,7 +168,7 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 		t.Run("malformed ancestor dropped", func(t *testing.T) {
 			threadID := inbound("<good@example.test>", "",
 				[]string{"<root@example.test>", "broken", "<second@example.test>"}, now)
-			target, err := st.GetThreadReplyTarget(ctx, inboxID, threadID)
+			target, err := st.GetThreadReplyTarget(ctx, orgID, inboxID, threadID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -187,7 +187,7 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 				ancestors = append(ancestors, "<"+uuid.NewString()+"@example.test>")
 			}
 			threadID := inbound("<newest@example.test>", "", ancestors, now)
-			target, err := st.GetThreadReplyTarget(ctx, inboxID, threadID)
+			target, err := st.GetThreadReplyTarget(ctx, orgID, inboxID, threadID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -219,7 +219,7 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 		t.Run("chain already names the parent", func(t *testing.T) {
 			threadID := inbound("<current@example.test>", "",
 				[]string{"<root@example.test>", "<current@example.test>"}, now)
-			target, err := st.GetThreadReplyTarget(ctx, inboxID, threadID)
+			target, err := st.GetThreadReplyTarget(ctx, orgID, inboxID, threadID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -243,7 +243,7 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 			}
 			ancestors = append(ancestors, repeated)
 			threadID := inbound("<newest@example.test>", "", ancestors, now)
-			target, err := st.GetThreadReplyTarget(ctx, inboxID, threadID)
+			target, err := st.GetThreadReplyTarget(ctx, orgID, inboxID, threadID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -265,7 +265,7 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 		t.Run("identifier size boundary", func(t *testing.T) {
 			for _, size := range []int{3, 100, 513, 700, maxMessageIDBytes} {
 				threadID := inbound("<"+strings.Repeat("a", size-2)+">", "", nil, now)
-				target, err := st.GetThreadReplyTarget(ctx, inboxID, threadID)
+				target, err := st.GetThreadReplyTarget(ctx, orgID, inboxID, threadID)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -279,7 +279,7 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 			// One byte past what a line can carry is refused.
 			over := "<" + strings.Repeat("a", maxMessageIDBytes-1) + ">"
 			threadID := inbound(over, "", nil, now)
-			target, err := st.GetThreadReplyTarget(ctx, inboxID, threadID)
+			target, err := st.GetThreadReplyTarget(ctx, orgID, inboxID, threadID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -293,7 +293,7 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 		t.Run("parent fills the budget", func(t *testing.T) {
 			long := "<" + strings.Repeat("a", maxMessageIDBytes-2) + ">"
 			threadID := inbound(long, "", []string{"<root@example.test>"}, now)
-			target, err := st.GetThreadReplyTarget(ctx, inboxID, threadID)
+			target, err := st.GetThreadReplyTarget(ctx, orgID, inboxID, threadID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -305,5 +305,77 @@ func TestGetThreadReplyTargetDerivesAndSanitizesThreading(t *testing.T) {
 				t.Fatalf("in-reply-to = %q", target.InReplyTo)
 			}
 		})
+	})
+}
+
+// The identifiers reaching this read are caller-supplied. Holding one
+// organization's UUIDs must not return another's Message-ID chain, which an
+// outbound reply would then be threaded onto — leaking that the conversation
+// exists and attaching mail to it. The sibling inbox-provider write is bound
+// to the tenant the same way; this read was not.
+func TestGetThreadReplyTargetRefusesAnotherOrganizationsThread(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+
+		type tenant struct{ org, inbox, thread string }
+		var tenants [2]tenant
+		for i := range tenants {
+			org, inbox, thread := uuid.NewString(), uuid.NewString(), uuid.NewString()
+			if _, err := db.ExecContext(ctx, `INSERT INTO orgs (id, name) VALUES ($1, $2)`, org, "tenant"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.ExecContext(ctx,
+				`INSERT INTO inboxes (id, org_id, address, status) VALUES ($1, $2, $3, 'active')`,
+				inbox, org, uuid.NewString()+"@test.example"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.ExecContext(ctx,
+				`INSERT INTO threads (id, inbox_id, org_id, subject, status, updated_at) VALUES ($1,$2,$3,'s','open',now())`,
+				thread, inbox, org); err != nil {
+				t.Fatal(err)
+			}
+			row := uuid.NewString()
+			if _, err := db.ExecContext(ctx,
+				`INSERT INTO messages (id, inbox_id, org_id, thread_id, direction, subject, text, created_at,
+				 provider_message_id, internet_message_id)
+				 VALUES ($1,$2,$3,$4,'inbound','s','t',now(),$5,$6)`,
+				row, inbox, org, thread, row, "<secret-"+org+"@test.example>"); err != nil {
+				t.Fatal(err)
+			}
+			tenants[i] = tenant{org, inbox, thread}
+		}
+		a, b := tenants[0], tenants[1]
+
+		// Its own thread still threads.
+		own, err := st.GetThreadReplyTarget(ctx, a.org, a.inbox, a.thread)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if own.InReplyTo == "" {
+			t.Fatal("a tenant cannot thread onto its own conversation")
+		}
+
+		// Another organization's identifiers yield nothing, whichever of them
+		// is borrowed.
+		for what, call := range map[string]func() (ThreadReplyTarget, error){
+			"another organization's thread and inbox": func() (ThreadReplyTarget, error) {
+				return st.GetThreadReplyTarget(ctx, a.org, b.inbox, b.thread)
+			},
+			"another organization's thread alone": func() (ThreadReplyTarget, error) {
+				return st.GetThreadReplyTarget(ctx, a.org, a.inbox, b.thread)
+			},
+			"its own thread read as another organization": func() (ThreadReplyTarget, error) {
+				return st.GetThreadReplyTarget(ctx, b.org, a.inbox, a.thread)
+			},
+		} {
+			target, err := call()
+			if err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+			if target.InReplyTo != "" || target.References != "" {
+				t.Errorf("%s returned %+v", what, target)
+			}
+		}
 	})
 }

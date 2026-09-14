@@ -514,7 +514,7 @@ func (s *Service) SendReplyWithAttachments(ctx context.Context, threadID string,
 		// no provider emitted the headers. A thread with no inbound Message-ID
 		// yields an empty target, and a reply then references nothing rather
 		// than inventing a parent.
-		threading, err := st.GetThreadReplyTarget(scopedCtx, inboxID, thread.ID)
+		threading, err := st.GetThreadReplyTarget(scopedCtx, inbox.OrgID, inboxID, thread.ID)
 		if err != nil {
 			return nil, err
 		}
