@@ -504,11 +504,10 @@ func TestHybridConnectRebindIsIdempotentAndRefusesADifferentMailbox(t *testing.T
 	}
 }
 
-// The routing update commits before the state file is written. If that write
-// fails the mailbox is on hybrid with nothing recording it: the runtime would
-// poll the configured default and disconnect would have no routing to
-// restore, stranding the mailbox in both directions.
-func TestHybridConnectUndoesRoutingWhenTheBindingCannotBeRecorded(t *testing.T) {
+// An installed state is rewritten before connect changes local routing. If
+// that durability operation fails, connect must leave the mailbox on its
+// existing providers rather than start work it cannot record safely.
+func TestHybridConnectDoesNotRouteWhenInstalledStateCannotBeRewritten(t *testing.T) {
 	cfg, st, address := hybridRuntimeDatabase(t)
 	ctx := context.Background()
 	writeConnectedState(t, cfg.Hybrid.StatePath, nil)
@@ -534,10 +533,7 @@ func TestHybridConnectUndoesRoutingWhenTheBindingCannotBeRecorded(t *testing.T) 
 	var out bytes.Buffer
 	err = runHybrid(ctx, cfg, []string{"connect"}, &out)
 	if err == nil {
-		t.Fatal("connect reported success though the binding was never recorded")
-	}
-	if !strings.Contains(err.Error(), "returned to its previous providers") {
-		t.Fatalf("connect did not undo the routing: %v", err)
+		t.Fatal("connect reported success though the installation could not be rewritten")
 	}
 	_, afterIn, afterOut := inboxProviders(t, st, address)
 	if afterIn != beforeIn || afterOut != beforeOut {
@@ -708,25 +704,13 @@ func TestHybridConnectRerunPerformsTheDurabilityOperationItPromises(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	before, err := os.Stat(cfg.Hybrid.StatePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	var rerun bytes.Buffer
 	if err := runHybrid(ctx, cfg, []string{"connect"}, &rerun); err != nil {
 		t.Fatal(err)
 	}
-	after, err := os.Stat(cfg.Hybrid.StatePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Save installs by rename, so a rerun that actually re-wrote the state
-	// leaves a different file behind. Same file means the fast path returned
-	// success without touching the disk.
-	if os.SameFile(before, after) {
-		t.Fatal("the rerun reported success without rewriting the installation file")
-	}
+	// Atomic replacement is allowed to reuse the old inode, so SameFile cannot
+	// prove whether Save ran. The read-only-directory case below is the durable
+	// operation probe: it can fail only if the rerun attempts the rewrite.
 	// And it changed nothing else: same binding, same routing, same key.
 	again, err := (hybridtransport.Store{Path: cfg.Hybrid.StatePath}).Load()
 	if err != nil {
@@ -749,7 +733,7 @@ func TestHybridConnectRerunPerformsTheDurabilityOperationItPromises(t *testing.T
 	t.Cleanup(func() { _ = os.Chmod(directory, 0o700) })
 	var blocked bytes.Buffer
 	err = runHybrid(ctx, cfg, []string{"connect"}, &blocked)
-	if err == nil || !strings.Contains(err.Error(), "durability is unconfirmed") {
+	if err == nil {
 		t.Fatalf("a rerun that could not confirm reported success: %v", err)
 	}
 	_, stillIn, stillOut := inboxProviders(t, st, address)

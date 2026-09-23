@@ -2,8 +2,10 @@
 """Image-level smoke for a hybrid installation's durable local state.
 
 A hybrid pairing is the first piece of runtime state that does not live in
-Postgres: it is a private key in a file. That makes three things worth
-proving against the published image rather than in a unit test.
+Postgres: it is a private key in a file. That makes three things worth proving
+at image level rather than in a unit test. CI builds the checkout; the
+protected candidate workflow passes an immutable digest and proves the exact
+published bytes before promotion.
 
   clean start    A host configured for hybrid but not yet paired must serve.
                  Setup is a multi-step, two-person process, and an operator
@@ -26,6 +28,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import socket
 import subprocess
@@ -89,7 +92,8 @@ def free_port():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.parse_args()
+    parser.add_argument('--image', help='immutable published runtime image to test instead of building the checkout')
+    args = parser.parse_args()
     os.chdir(ROOT)
     project = 'nerve-hybrid-smoke-' + secrets.token_hex(4)
     with tempfile.TemporaryDirectory(prefix='nerve-hybrid-selfhost-') as tmp:
@@ -99,8 +103,18 @@ def main():
         for key in list(env):
             if key.startswith(('COMPOSE_', 'NERVE_', 'NM_', 'STALWART_')) or key == 'POSTGRES_PASSWORD':
                 del env[key]
+        compose_files = str(ROOT / 'docker-compose.yml')
+        if args.image:
+            if not re.search(r'@sha256:[0-9a-f]{64}$', args.image):
+                raise ValueError('--image must be an immutable digest reference')
+            override = tmp / 'published-image.json'
+            published = {'build': None, 'image': args.image, 'platform': 'linux/amd64'}
+            override.write_text(json.dumps({'services': {
+                'cortex': published, 'migrate': published,
+            }}))
+            compose_files += os.pathsep + str(override)
         env.update({'COMPOSE_PROJECT_NAME': project,
-                    'COMPOSE_FILE': str(ROOT / 'docker-compose.yml'),
+                    'COMPOSE_FILE': compose_files,
                     'COMPOSE_ENV_FILES': str(tmp / '.env'), 'COMPOSE_DISABLE_ENV_FILE': '1',
                     'NERVE_API_KEY': secrets.token_hex(32),
                     'POSTGRES_PASSWORD': secrets.token_hex(32),
@@ -132,7 +146,12 @@ def main():
             return json.loads(raw)
 
         try:
-            compose('up', '-d', '--build', '--wait', '--wait-timeout', '240')
+            if args.image:
+                run('docker', 'pull', '--platform', 'linux/amd64', args.image)
+            startup = ['up', '-d']
+            startup += ['--pull', 'never', '--no-build'] if args.image else ['--build']
+            startup += ['--wait', '--wait-timeout', '240']
+            compose(*startup)
             wait_for(ready, 'runtime ready with hybrid configured but unpaired')
             if hybrid_state() is not None:
                 raise AssertionError('A fresh image already carries an installation')
@@ -175,11 +194,14 @@ def main():
                 raise AssertionError(f'installation state has mode {mode}, want 600')
             print(f'PASS pairing key {key_id[:12]}… written owner-only inside the image', flush=True)
 
-            # Upgrade: recreate the container from a rebuilt image. The key is
-            # admitted to Cloud by hand, so regenerating it on every upgrade
-            # would mean re-admitting it every time.
-            compose('up', '-d', '--build', '--force-recreate', '--wait', '--wait-timeout', '240')
-            wait_for(ready, 'runtime ready after upgrade')
+            # Recreate the container from the selected image. The key is
+            # admitted to Cloud by hand, so regenerating it on every
+            # replacement would mean re-admitting it every time.
+            recreate = ['up', '-d']
+            recreate += ['--pull', 'never', '--no-build'] if args.image else ['--build']
+            recreate += ['--force-recreate', '--wait', '--wait-timeout', '240']
+            compose(*recreate)
+            wait_for(ready, 'runtime ready after recreation')
             upgraded = hybrid_state()
             if upgraded is None:
                 raise AssertionError('the upgrade destroyed the installation key')
@@ -187,7 +209,7 @@ def main():
                 raise AssertionError('the upgrade regenerated the installation key')
             if upgraded.get('version') != state.get('version'):
                 raise AssertionError('the upgrade rewrote the state version')
-            print('PASS upgrade: container recreated, same installation key', flush=True)
+            print('PASS recreation: container recreated, same installation key', flush=True)
 
             # A database backup does not carry the installation, because the
             # key was never in the database. An operator restoring onto a new

@@ -160,9 +160,9 @@ func resolveReceipt(receipt SendReceipt) (string, error) {
 	case "uncertain":
 		// Retrying would risk a duplicate at the recipient. Wait for Cloud's
 		// reconciliation instead of consuming retry budget.
-		return "", emailtransport.NewTransientError(0, "outcome_unknown", ErrSendUncertain)
+		return "", emailtransport.NewPendingError("outcome_unknown", ErrSendUncertain)
 	case "accepted", "claimed":
-		return "", emailtransport.NewTransientError(0, "provider_pending", ErrSendPending)
+		return "", emailtransport.NewPendingError("provider_pending", ErrSendPending)
 	default:
 		return "", emailtransport.NewTransientError(0, "server_error",
 			fmt.Errorf("%w: unknown send status %q", ErrUnavailable, receipt.Status))

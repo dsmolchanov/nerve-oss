@@ -34,7 +34,7 @@ import (
 // StateVersion is the on-disk format. A file written by a newer runtime is
 // refused rather than reinterpreted: a misread installation would re-pair or
 // sign with the wrong key, and both are worse than refusing to start.
-const StateVersion = 1
+const StateVersion = 2
 
 const (
 	// A 2048-bit modulus is the floor auth.RSAJWKThumbprint accepts. Generate
@@ -99,8 +99,14 @@ type State struct {
 	InstallationID string `json:"installation_id"`
 	InboxID        string `json:"inbox_id"`
 	AuthorityID    string `json:"authority_id"`
-	Key            Key    `json:"key"`
-	PendingKey     *Key   `json:"pending_key,omitempty"`
+	// PairingID and PairingSecret are persisted before completion is attempted.
+	// Cloud completion is replayable with this proof, so a committed Cloud
+	// installation can still be recovered after the local final save fails.
+	// They are cleared atomically when Phase becomes installed.
+	PairingID     string `json:"pairing_id,omitempty"`
+	PairingSecret string `json:"pairing_secret,omitempty"`
+	Key           Key    `json:"key"`
+	PendingKey    *Key   `json:"pending_key,omitempty"`
 	// LocalMailbox is the mailbox in this runtime's own database that the
 	// installation carries, and the routing it had before. The runtime polls
 	// that mailbox rather than the configured default, and disconnect puts
@@ -128,6 +134,7 @@ type LocalMailbox struct {
 // and logs. Nothing that prints a State may print the original.
 func (s State) Redacted() State {
 	s.Key.PrivateKeyPEM = ""
+	s.PairingSecret = ""
 	if s.PendingKey != nil {
 		pending := *s.PendingKey
 		pending.PrivateKeyPEM = ""
@@ -169,11 +176,22 @@ func (s State) Validate() error {
 		if s.OrgID != "" || s.InstallationID != "" {
 			return errors.New("hybrid state is connecting but already names an installation")
 		}
+		if (s.PairingID == "") != (s.PairingSecret == "") {
+			return errors.New("hybrid connecting state must carry both pairing id and secret or neither")
+		}
+		if s.PairingID != "" {
+			if parsed, err := uuid.Parse(s.PairingID); err != nil || parsed.String() != s.PairingID || len(s.PairingSecret) != 43 {
+				return errors.New("hybrid connecting state carries an invalid pairing proof")
+			}
+		}
 	case PhaseInstalled:
 		for name, value := range map[string]string{"org_id": s.OrgID, "installation_id": s.InstallationID} {
 			if parsed, err := uuid.Parse(value); err != nil || parsed.String() != value {
 				return fmt.Errorf("hybrid %s must be a canonical UUID", name)
 			}
+		}
+		if s.PairingID != "" || s.PairingSecret != "" {
+			return errors.New("hybrid installed state still carries a pairing proof")
 		}
 	default:
 		return fmt.Errorf("hybrid state phase %q must be %q or %q", s.Phase, PhaseConnecting, PhaseInstalled)
@@ -344,6 +362,9 @@ func (s State) Installed() bool { return s.Phase == PhaseInstalled }
 // the file holds the private key, so loose permissions are a disclosed key, and
 // continuing would be worse than failing to start.
 func (s Store) Load() (State, error) {
+	if err := refuseFinalSymlink(s.Path); err != nil {
+		return State{}, err
+	}
 	file, err := os.Open(s.Path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return State{}, ErrNotConnected
@@ -385,6 +406,11 @@ func (s Store) Load() (State, error) {
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return State{}, errors.New("hybrid installation state has trailing content")
+	}
+	// Version 1 predates durable pairing proofs. Its installed and pre-pairing
+	// connecting states map exactly to version 2 with empty proof fields.
+	if state.Version == 1 {
+		state.Version = StateVersion
 	}
 	if err := state.Validate(); err != nil {
 		return State{}, err
@@ -430,6 +456,9 @@ func (s Store) Save(state State) error {
 	if err := state.Validate(); err != nil {
 		return err
 	}
+	if err := refuseFinalSymlink(s.Path); err != nil {
+		return err
+	}
 	directory := filepath.Dir(s.Path)
 	if err := os.MkdirAll(directory, stateDirMode); err != nil {
 		return err
@@ -471,6 +500,25 @@ func (s Store) Save(state State) error {
 	// before reporting an outcome the caller cannot undo by itself.
 	if err := confirmChain(directory); err != nil {
 		return &UnconfirmedError{Op: "write", Err: err}
+	}
+	return nil
+}
+
+// refuseFinalSymlink keeps the atomic rename from replacing a symlink instead
+// of updating the state file its operator intended. Symlinked parent
+// directories remain supported and are covered by confirmChain; the final
+// component is rejected because following it safely across a rename would
+// require a platform-specific no-follow directory handle.
+func refuseFinalSymlink(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&fs.ModeSymlink != 0 {
+		return fmt.Errorf("%w: %s is a symbolic link", ErrStateUnsafePermissions, path)
 	}
 	return nil
 }

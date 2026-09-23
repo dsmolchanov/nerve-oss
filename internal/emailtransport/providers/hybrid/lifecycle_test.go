@@ -32,6 +32,9 @@ type pairingCloud struct {
 	pairingID      string
 	secret         string
 	rotatedTo      atomic.Value // string
+	beginCalls     atomic.Int32
+	completeCalls  atomic.Int32
+	onComplete     func()
 	server         *httptest.Server
 	tokens         *httptest.Server
 }
@@ -85,6 +88,7 @@ func newPairingCloud(t *testing.T) *pairingCloud {
 		_ = json.Unmarshal(raw, &input)
 		switch action {
 		case "begin":
+			cloud.beginCalls.Add(1)
 			if input["installation_id"] != "" {
 				c := input["installation_id"]
 				cloud.t.Errorf("begin carried installation id %v", c)
@@ -95,6 +99,7 @@ func newPairingCloud(t *testing.T) *pairingCloud {
 				"pairing": map[string]any{"id": cloud.pairingID}, "secret": cloud.secret,
 			})
 		case "complete":
+			cloud.completeCalls.Add(1)
 			if !cloud.approved.Load() {
 				http.Error(w, "pairing unavailable", http.StatusNotFound)
 				return
@@ -102,6 +107,9 @@ func newPairingCloud(t *testing.T) *pairingCloud {
 			if input["pairing_id"] != cloud.pairingID || input["pairing_secret"] != cloud.secret {
 				http.Error(w, "pairing unavailable", http.StatusNotFound)
 				return
+			}
+			if cloud.onComplete != nil {
+				cloud.onComplete()
 			}
 			writeJSON(w, map[string]any{"id": cloud.installationID, "org_id": cloud.orgID})
 		case "status":
@@ -240,6 +248,49 @@ func TestHybridBeginKeepsAnAlreadyAdmittedKey(t *testing.T) {
 	}
 }
 
+func TestHybridConnectRecoversCloudCompletionAfterLocalSaveFailure(t *testing.T) {
+	cloud := newPairingCloud(t)
+	store := lifecycleStore(t)
+	begun, err := Begin(store, cloud.params())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloud.admit(begun.Key)
+	cloud.approved.Store(true)
+	directory := filepath.Dir(store.Path)
+	cloud.onComplete = func() {
+		if err := os.Chmod(directory, 0o500); err != nil {
+			t.Errorf("make state directory read-only: %v", err)
+		}
+		cloud.onComplete = nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := Connect(ctx, store, nil, io.Discard); err == nil {
+		t.Fatal("completion followed by a failed local save reported success")
+	}
+	if err := os.Chmod(directory, stateDirMode); err != nil {
+		t.Fatal(err)
+	}
+	deferred, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deferred.PairingID != cloud.pairingID || deferred.PairingSecret != cloud.secret || deferred.Installed() {
+		t.Fatalf("recoverable pairing proof was not retained: %+v", deferred.Redacted())
+	}
+	connected, err := Connect(ctx, store, nil, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !connected.Installed() || connected.InstallationID != cloud.installationID {
+		t.Fatalf("replay did not recover installation: %+v", connected.Redacted())
+	}
+	if cloud.beginCalls.Load() != 1 || cloud.completeCalls.Load() != 2 {
+		t.Fatalf("begin=%d complete=%d, want one pairing and one completion replay", cloud.beginCalls.Load(), cloud.completeCalls.Load())
+	}
+}
+
 func connectedStore(t *testing.T) (Store, *pairingCloud) {
 	t.Helper()
 	cloud := newPairingCloud(t)
@@ -269,8 +320,11 @@ func TestHybridRotationSwitchesOnlyAfterCloudAcceptsTheReplacement(t *testing.T)
 	}
 	ctx := context.Background()
 
-	if _, err := CommitRotation(ctx, store, nil); !errors.Is(err, ErrNoPendingKey) {
-		t.Fatalf("committed without preparing: %v", err)
+	// Commit is idempotent when Cloud already accepts the active key. A retry
+	// must rewrite the state because a prior promotion may have been visible
+	// locally without its directory sync being confirmed.
+	if current, err := CommitRotation(ctx, store, nil); err != nil || current.Key.KID != before.Key.KID {
+		t.Fatalf("idempotent commit changed the active key: %+v err=%v", current.Redacted(), err)
 	}
 	record, err := PrepareRotation(store)
 	if err != nil {
@@ -332,8 +386,8 @@ func TestHybridRotationCanBeAbandoned(t *testing.T) {
 	if err != nil || state.PendingKey != nil {
 		t.Fatalf("abandon left a replacement: %+v err=%v", state.Redacted(), err)
 	}
-	if err := AbandonRotation(store); !errors.Is(err, ErrNoPendingKey) {
-		t.Fatalf("abandon with nothing prepared: %v", err)
+	if err := AbandonRotation(store); err != nil {
+		t.Fatalf("repeated abandon did not confirm the visible state: %v", err)
 	}
 }
 

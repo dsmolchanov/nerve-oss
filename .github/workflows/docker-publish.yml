@@ -90,6 +90,7 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/nerve-runtime
             ghcr.io/${{ github.repository_owner }}/neuralmaild
       - uses: docker/build-push-action@v5
+        id: publish-image
         with:
           context: .
           file: deploy/docker/cortex/Dockerfile
@@ -106,6 +107,12 @@ jobs:
             OUTBOUND_POLICY_SHA256=${{ steps.manifest.outputs.outbound_policy_sha256 }}
             BUILD_COMMIT=${{ github.sha }}
             BUILD_TIME=${{ steps.manifest.outputs.build_time }}
+      - name: Prove hybrid self-host lifecycle against published release bytes
+        env:
+          IMAGE_DIGEST: ${{ steps.publish-image.outputs.digest }}
+        run: |
+          python3 scripts/ci/hybrid_selfhost_smoke.py \
+            --image "ghcr.io/${{ github.repository_owner }}/nerve-runtime@${IMAGE_DIGEST}"
       - name: Generate runtime release artifacts
         run: |
           mkdir -p dist/runtime

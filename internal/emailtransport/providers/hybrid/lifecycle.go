@@ -50,7 +50,10 @@ func Begin(store Store, params ConnectParams) (State, error) {
 		if existing.Installed() {
 			return State{}, errors.New("hybrid runtime is already connected; disconnect first")
 		}
-		return existing, nil
+		// A prior save may be readable but unconfirmed. Rewriting on every
+		// successful resume pays that durability debt before the operator relies
+		// on the key or a persisted pairing proof.
+		return existing, store.Save(existing)
 	} else if !errors.Is(err, ErrNotConnected) {
 		return State{}, err
 	}
@@ -120,7 +123,7 @@ func Connect(ctx context.Context, store Store, httpClient *http.Client, progress
 		return State{}, err
 	}
 	if state.Installed() {
-		return state, nil
+		return state, store.Save(state)
 	}
 	client := &Client{
 		HTTPClient: httpClient, BaseURL: state.CloudBaseURL, InboxID: state.InboxID,
@@ -132,22 +135,29 @@ func Connect(ctx context.Context, store Store, httpClient *http.Client, progress
 		} `json:"pairing"`
 		Secret string `json:"secret"`
 	}
-	// begin and complete are the only actions Cloud refuses an installation ID
-	// on. The client sends the empty one it was built with, which is what
-	// Cloud requires before a pairing has named an installation.
-	if err := client.call(ctx, "begin", map[string]any{}, &pairing); err != nil {
-		return State{}, err
+	if state.PairingID == "" {
+		// begin and complete are the only actions Cloud refuses an installation
+		// ID on. Persist the proof before offering it to complete: Cloud may
+		// commit even when the response or the following local save is lost.
+		if err := client.call(ctx, "begin", map[string]any{}, &pairing); err != nil {
+			return State{}, err
+		}
+		if _, err := uuid.Parse(pairing.Pairing.ID); err != nil || pairing.Secret == "" {
+			return State{}, fmt.Errorf("%w: cloud returned an unusable pairing", ErrUnavailable)
+		}
+		state.PairingID = pairing.Pairing.ID
+		state.PairingSecret = pairing.Secret
+		if err := store.Save(state); err != nil {
+			return State{}, err
+		}
 	}
-	if _, err := uuid.Parse(pairing.Pairing.ID); err != nil || pairing.Secret == "" {
-		return State{}, fmt.Errorf("%w: cloud returned an unusable pairing", ErrUnavailable)
-	}
-	writeProgress(progress, "Pairing %s created. Ask the mailbox owner to approve it.\n", pairing.Pairing.ID)
+	writeProgress(progress, "Pairing %s created. Ask the mailbox owner to approve it.\n", state.PairingID)
 
 	var installation struct {
 		ID    string `json:"id"`
 		OrgID string `json:"org_id"`
 	}
-	complete := map[string]any{"pairing_id": pairing.Pairing.ID, "pairing_secret": pairing.Secret}
+	complete := map[string]any{"pairing_id": state.PairingID, "pairing_secret": state.PairingSecret}
 	for {
 		err := client.call(ctx, "complete", complete, &installation)
 		if err == nil {
@@ -161,7 +171,7 @@ func Connect(ctx context.Context, store Store, httpClient *http.Client, progress
 		}
 		select {
 		case <-ctx.Done():
-			return State{}, fmt.Errorf("pairing %s was not approved: %w", pairing.Pairing.ID, ctx.Err())
+			return State{}, fmt.Errorf("pairing %s was not approved: %w", state.PairingID, ctx.Err())
 		case <-time.After(pairingPollInterval):
 		}
 	}
@@ -171,6 +181,8 @@ func Connect(ctx context.Context, store Store, httpClient *http.Client, progress
 	state.Phase = PhaseInstalled
 	state.InstallationID = installation.ID
 	state.OrgID = installation.OrgID
+	state.PairingID = ""
+	state.PairingSecret = ""
 	if err := store.Save(state); err != nil {
 		return State{}, err
 	}
@@ -284,7 +296,14 @@ func CommitRotation(ctx context.Context, store Store, httpClient *http.Client) (
 		return State{}, ErrPairingIncomplete
 	}
 	if state.PendingKey == nil {
-		return State{}, ErrNoPendingKey
+		// A successful promotion can be visible but not confirmed durable. If
+		// Cloud accepts the current key, rewriting the installed state makes a
+		// retry complete the durability operation instead of falsely reporting
+		// that there was nothing to commit.
+		if _, err := newClient(state, state.Key, httpClient).Status(ctx); err != nil {
+			return State{}, ErrNoPendingKey
+		}
+		return state, store.Save(state)
 	}
 	replacement := *state.PendingKey
 	// Reach a real installation-scoped action, not only the token endpoint:
@@ -308,7 +327,8 @@ func AbandonRotation(store Store) error {
 		return err
 	}
 	if state.PendingKey == nil {
-		return ErrNoPendingKey
+		// Abandon is idempotent so a retry can confirm a prior visible write.
+		return store.Save(state)
 	}
 	state.PendingKey = nil
 	return store.Save(state)

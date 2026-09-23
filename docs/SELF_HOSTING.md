@@ -367,8 +367,11 @@ copy of the key. Ask them to revoke it.
 The key is on a volume, so recreating the container keeps it. Do not rebuild a
 deployment by deleting the volume; the replacement key would have to be
 admitted to Cloud by hand again. `scripts/ci/hybrid_selfhost_smoke.py`
-exercises clean start, upgrade and the backup boundary against the built
-image.
+exercises clean start, recreation and the backup boundary against the locally
+built image in ordinary CI. The tag-publish workflow runs the same smoke with
+`--image` against the immutable GHCR digest it just pushed before it creates
+the GitHub Release, so a successful release run is evidence for the
+distributable bytes rather than only for the source checkout.
 
 ## Updating a deployment
 

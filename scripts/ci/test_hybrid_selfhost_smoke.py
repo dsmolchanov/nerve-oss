@@ -6,6 +6,7 @@ import secrets
 import subprocess
 import traceback
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from hybrid_selfhost_smoke import run_command, try_command
@@ -76,9 +77,23 @@ class IsolationTest(unittest.TestCase):
         self.assertIn("'COMPOSE_PROJECT_NAME': project", source)
         self.assertIn("COMPOSE_DISABLE_ENV_FILE", source)
         self.assertIn("startswith(('COMPOSE_', 'NERVE_', 'NM_', 'STALWART_'))", source)
+        self.assertIn("'cortex': published, 'migrate': published", source)
+        self.assertIn("run('docker', 'pull', '--platform', 'linux/amd64', args.image)", source)
+        self.assertIn("['--pull', 'never', '--no-build'] if args.image else ['--build']", source)
+        self.assertIn("r'@sha256:[0-9a-f]{64}$'", source)
         # The teardown must not carry --profile full or a project it did not
         # create, and must remove the volumes it made.
         self.assertIn("'down', '-t', '5', '-v', '--remove-orphans'", source)
+
+    def test_release_publish_proves_the_pushed_digest_before_release(self):
+        workflow = (Path(__file__).parents[2] / '.github/workflows/docker-publish.yml').read_text()
+        publish_job, candidate_job = workflow.split('  candidate:', 1)
+        smoke = 'Prove hybrid self-host lifecycle against published release bytes'
+        self.assertIn('id: publish-image', publish_job)
+        self.assertIn(smoke, publish_job)
+        self.assertIn('steps.publish-image.outputs.digest', publish_job)
+        self.assertLess(publish_job.index(smoke), publish_job.index('gh release create'))
+        self.assertNotIn(smoke, candidate_job)
 
 
 if __name__ == '__main__':
