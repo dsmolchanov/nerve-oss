@@ -48,7 +48,7 @@ func TestLocalOutboundConfiguration(t *testing.T) {
 	}
 }
 
-func TestCloudOutboundConfigurationPreservesLegacyErrors(t *testing.T) {
+func TestCloudOutboundConfigurationKeepsLegacyTextAndSafeCode(t *testing.T) {
 	cfg := config.Default()
 	cfg.Cloud.Mode = true
 	svc := Service{Config: cfg}
@@ -59,5 +59,17 @@ func TestCloudOutboundConfigurationPreservesLegacyErrors(t *testing.T) {
 	var setup *OutboundConfigurationError
 	if errors.As(err, &setup) {
 		t.Fatal("changed cloud error contract")
+	}
+	var cloudSetup *CloudOutboundConfigurationError
+	if !errors.As(err, &cloudSetup) || cloudSetup.Code != "outbound_disabled" {
+		t.Fatalf("missing safe cloud configuration code: %v", err)
+	}
+
+	cfg.Security.AllowOutbound = true
+	svc = Service{Config: cfg, Transport: emailtransport.NewRegistry()}
+	err = svc.checkOutboundConfiguration("a@example.test", "SYNTHETIC_PROVIDER_SECRET")
+	if !errors.As(err, &cloudSetup) || cloudSetup.Code != "outbound_transport_unconfigured" ||
+		err.Error() != "unknown outbound provider: SYNTHETIC_PROVIDER_SECRET" {
+		t.Fatalf("cloud transport error contract changed: %v", err)
 	}
 }

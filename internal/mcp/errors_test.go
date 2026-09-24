@@ -20,6 +20,21 @@ func TestTranslateModernBusinessErrorMapsEnqueuePolicyDenial(t *testing.T) {
 	}
 }
 
+func TestTranslateModernBusinessErrorRedactsCloudOutboundConfiguration(t *testing.T) {
+	for _, code := range []string{"outbound_disabled", "recipient_domain_not_allowed", "outbound_transport_unconfigured"} {
+		t.Run(code, func(t *testing.T) {
+			translated := translateModernBusinessError(&tools.CloudOutboundConfigurationError{Code: code})
+			if translated.Code != code || translated.Remediation != "" || translated.Retryable {
+				t.Fatalf("unsafe or missing cloud configuration result: %+v", translated)
+			}
+		})
+	}
+	unsafe := translateModernBusinessError(&tools.CloudOutboundConfigurationError{Code: "SYNTHETIC_PROVIDER_SECRET"})
+	if unsafe.Code != "tool_failed" || strings.Contains(unsafe.Code, "SYNTHETIC_PROVIDER_SECRET") {
+		t.Fatalf("unrecognized cloud configuration code escaped: %+v", unsafe)
+	}
+}
+
 func TestTranslateModernBusinessErrorMapsOnboardingFailures(t *testing.T) {
 	retryAt := time.Unix(1_723_000_100, 0).UTC()
 	translated := translateModernBusinessError(&OnboardingBusinessError{
