@@ -368,6 +368,11 @@ func TestHybridOutboundResolvesEverySendStatus(t *testing.T) {
 			if id != want.id || !errors.Is(err, want.err) {
 				t.Fatalf("id=%q err=%v, want id=%q err=%v", id, err, want.id, want.err)
 			}
+			classified := emailtransport.ClassifyProviderError(err)
+			wantPending := name == "uncertain" || name == "accepted" || name == "claimed"
+			if err != nil && classified.Pending != wantPending {
+				t.Fatalf("pending=%t, want %t for %s", classified.Pending, wantPending, name)
+			}
 		})
 	}
 }

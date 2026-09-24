@@ -14,6 +14,10 @@ type ProviderError struct {
 	// Permanent indicates the error cannot be recovered by retrying
 	// (e.g. invalid recipient, authentication failure, forbidden).
 	Permanent bool
+	// Pending means the provider durably owns the operation but has not
+	// produced a terminal result yet. Polling the same operation identity must
+	// not consume the delivery retry budget.
+	Pending bool
 
 	// StatusCode is the provider HTTP status code when the error came
 	// from a REST API. Zero for transport errors.
@@ -60,6 +64,13 @@ func NewPermanentError(statusCode int, reason string, cause error) *ProviderErro
 // this for rate limits, server errors, and network failures.
 func NewTransientError(statusCode int, reason string, cause error) *ProviderError {
 	return &ProviderError{Permanent: false, StatusCode: statusCode, Reason: reason, Cause: cause}
+}
+
+// NewPendingError builds an error for a durably accepted operation whose
+// terminal provider result is still pending or uncertain. The outbox worker
+// replays/readbacks the same operation without consuming its retry budget.
+func NewPendingError(reason string, cause error) *ProviderError {
+	return &ProviderError{Pending: true, Reason: reason, Cause: cause}
 }
 
 // ClassifyProviderError unwraps err and returns a ProviderError view of

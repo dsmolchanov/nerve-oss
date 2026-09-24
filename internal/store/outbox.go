@@ -1011,14 +1011,25 @@ func (s *Store) finishClaimedOutbox(ctx context.Context, id, workerID, operation
 }
 
 func (s *Store) RequeueOutboxMessage(ctx context.Context, id string, nextAttemptAt time.Time, lastError string) error {
-	return s.requeueOutboxMessage(ctx, id, "", nextAttemptAt, lastError)
+	return s.requeueOutboxMessage(ctx, id, "", nextAttemptAt, lastError, false)
 }
 
 func (s *Store) RequeueClaimedOutboxMessage(ctx context.Context, id, workerID string, nextAttemptAt time.Time, lastError string) error {
 	if workerID == "" {
 		return errors.New("missing outbox worker id")
 	}
-	return s.requeueOutboxMessage(ctx, id, workerID, nextAttemptAt, lastError)
+	return s.requeueOutboxMessage(ctx, id, workerID, nextAttemptAt, lastError, false)
+}
+
+// RequeueClaimedOutboxPending releases a claim for a provider-owned operation
+// without consuming an application retry. Claiming increments attempt_count;
+// a durable accepted/claimed/uncertain receipt is a readback poll, not another
+// delivery attempt, so this transition refunds that increment.
+func (s *Store) RequeueClaimedOutboxPending(ctx context.Context, id, workerID string, nextAttemptAt time.Time, lastError string) error {
+	if workerID == "" {
+		return errors.New("missing outbox worker id")
+	}
+	return s.requeueOutboxMessage(ctx, id, workerID, nextAttemptAt, lastError, true)
 }
 
 // RequeueClaimedOutboxKnownProviderFailure atomically records a confirmed
@@ -1121,7 +1132,7 @@ func (s *Store) RequeueClaimedOutboxKnownProviderFailure(ctx context.Context, id
 	})
 }
 
-func (s *Store) requeueOutboxMessage(ctx context.Context, id, workerID string, nextAttemptAt time.Time, lastError string) error {
+func (s *Store) requeueOutboxMessage(ctx context.Context, id, workerID string, nextAttemptAt time.Time, lastError string, refundAttempt bool) error {
 	if id == "" {
 		return errors.New("missing id")
 	}
@@ -1194,6 +1205,7 @@ func (s *Store) requeueOutboxMessage(ctx context.Context, id, workerID string, n
 		result, err := scoped.q.ExecContext(ctx, `
 			UPDATE outbox_messages
 			SET status = 'queued',
+			    attempt_count = CASE WHEN $5 THEN greatest(attempt_count - 1, 0) ELSE attempt_count END,
 			    next_attempt_at = $2,
 			    last_error = nullif($3, ''),
 			    locked_at = null,
@@ -1201,7 +1213,7 @@ func (s *Store) requeueOutboxMessage(ctx context.Context, id, workerID string, n
 			    terminal_at = null
 			WHERE id = $1
 			  AND ($4 = '' OR (status = 'sending' AND locked_by = $4))
-		`, id, nextAttemptAt, lastError, workerID)
+		`, id, nextAttemptAt, lastError, workerID, refundAttempt)
 		if err != nil {
 			return err
 		}

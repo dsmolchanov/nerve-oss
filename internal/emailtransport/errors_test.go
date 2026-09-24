@@ -98,3 +98,12 @@ func TestProviderError_Error(t *testing.T) {
 		t.Errorf("Error() with nil cause should return Reason, got %q", pe2.Error())
 	}
 }
+
+func TestPendingProviderErrorSurvivesWrapping(t *testing.T) {
+	cause := errors.New("provider still owns operation")
+	pending := NewPendingError("provider_pending", cause)
+	classified := ClassifyProviderError(fmt.Errorf("send: %w", pending))
+	if classified != pending || !classified.Pending || classified.Permanent || !errors.Is(classified, cause) {
+		t.Fatalf("classified=%+v", classified)
+	}
+}

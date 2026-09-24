@@ -109,6 +109,50 @@ func TestHybridStateRoundTripsAndStaysOwnerOnly(t *testing.T) {
 	}
 }
 
+func TestHybridStateRedactionRemovesEverySecret(t *testing.T) {
+	state := testState(t, testKey(t))
+	state.Phase = PhaseConnecting
+	state.OrgID = ""
+	state.InstallationID = ""
+	state.PairingID = uuid.NewString()
+	state.PairingSecret = strings.Repeat("s", 43)
+	redacted := state.Redacted()
+	if redacted.Key.PrivateKeyPEM != "" || redacted.PairingSecret != "" {
+		t.Fatalf("redaction retained secret material: %+v", redacted)
+	}
+	if redacted.Key.KID == "" || redacted.PairingID == "" {
+		t.Fatal("redaction removed non-secret recovery identifiers")
+	}
+}
+
+func TestHybridStateRefusesFinalComponentSymlinkWithoutReplacingIt(t *testing.T) {
+	directory := t.TempDir()
+	target := filepath.Join(directory, "actual.json")
+	state := testState(t, testKey(t))
+	if err := os.WriteFile(target, []byte("sentinel"), stateFileMode); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(directory, "installation.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("this filesystem does not support symlinks: %v", err)
+	}
+	store := Store{Path: link}
+	if _, err := store.Load(); !errors.Is(err, ErrStateUnsafePermissions) {
+		t.Fatalf("final symlink loaded: %v", err)
+	}
+	if err := store.Save(state); !errors.Is(err, ErrStateUnsafePermissions) {
+		t.Fatalf("final symlink replaced: %v", err)
+	}
+	info, err := os.Lstat(link)
+	if err != nil || info.Mode()&fs.ModeSymlink == 0 {
+		t.Fatalf("save destroyed final symlink: mode=%v err=%v", info.Mode(), err)
+	}
+	raw, err := os.ReadFile(target)
+	if err != nil || string(raw) != "sentinel" {
+		t.Fatalf("save changed symlink target: %q err=%v", raw, err)
+	}
+}
+
 // The file holds the only long-lived secret on this host. Loading it when any
 // other account can read it would quietly keep using a key that must be treated
 // as disclosed, so every loosened mode refuses.
@@ -187,6 +231,23 @@ func TestHybridStateRefusesNewerVersion(t *testing.T) {
 	}
 	if _, err := store.Load(); !errors.Is(err, ErrStateVersion) {
 		t.Fatalf("newer state loaded: %v", err)
+	}
+}
+
+func TestHybridStateLoadsVersionOneForUpgrade(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "installation.json")}
+	state := testState(t, testKey(t))
+	state.Version = 1
+	raw, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.Path, raw, stateFileMode); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load()
+	if err != nil || loaded.Version != StateVersion || loaded.InstallationID != state.InstallationID {
+		t.Fatalf("version one upgrade=%+v err=%v", loaded.Redacted(), err)
 	}
 }
 

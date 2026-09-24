@@ -417,6 +417,15 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 	// immediately without consuming retry budget — an invalid recipient or
 	// bad authentication will not resolve on retry.
 	classified := ClassifyProviderError(err)
+	if classified != nil && classified.Pending {
+		// Cloud (or another asynchronous provider) owns the stable operation
+		// already. Re-read the same identity later without burning the finite
+		// delivery retry budget; no new provider operation will be created.
+		w.incDeliver(msg.Provider, "provider_pending")
+		next := time.Now().UTC().Add(w.backoffForAttempt(max(msg.AttemptCount, 1)))
+		requeueErr := w.Store.RequeueClaimedOutboxPending(outcomeContext(), msg.ID, claimLeaseID, next, err.Error())
+		return errors.Join(err, requeueErr)
+	}
 	if classified != nil && classified.Permanent {
 		slog.WarnContext(ctx, "outbox: permanent provider error, terminating",
 			slog.String("worker_id", w.WorkerID),

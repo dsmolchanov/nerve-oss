@@ -3,6 +3,7 @@ package emailtransport
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -126,6 +127,53 @@ type deadlineOutcomeAdapter struct {
 	calls        int
 	acceptBefore int
 	expire       func()
+}
+
+var errProviderPendingTest = errors.New("provider owns operation")
+
+type pendingOutcomeAdapter struct{ calls int }
+
+func (a *pendingOutcomeAdapter) Name() string { return "capture" }
+func (a *pendingOutcomeAdapter) SendMessage(context.Context, OutboundMessage, string) (string, error) {
+	a.calls++
+	return "", NewPendingError("provider_pending", errProviderPendingTest)
+}
+func (a *pendingOutcomeAdapter) GetDeliveryStatus(context.Context, string) (DeliveryStatus, error) {
+	return DeliveryStatusQueued, nil
+}
+func (a *pendingOutcomeAdapter) SupportsIdempotentReplay() bool { return true }
+func (a *pendingOutcomeAdapter) IdempotentReplayWindow() time.Duration {
+	return 24 * time.Hour
+}
+
+func TestProviderPendingReadbackDoesNotConsumeRetryBudget(t *testing.T) {
+	withOutboxWorkerDatabase(t, func(ctx context.Context, db *sql.DB, st *store.Store) {
+		org, inbox := seedWorkerPolicyFence(t, ctx, db, st, "provider-pending")
+		id := insertWorkerPolicyOutbox(t, ctx, db, org, inbox, 1)
+		adapter := &pendingOutcomeAdapter{}
+		worker := policyFenceWorker(t, st, adapter, "provider-pending")
+		worker.BaseBackoff = time.Millisecond
+		for poll := 0; poll < store.MaxOutboxRetries+3; poll++ {
+			if _, err := db.ExecContext(ctx, `UPDATE outbox_messages SET next_attempt_at=now() WHERE id=$1`, id); err != nil {
+				t.Fatal(err)
+			}
+			claimed := claimWorkerPolicyOutbox(t, ctx, st, id, "provider-pending")
+			if err := worker.deliverOne(ctx, claimed); !errors.Is(err, errProviderPendingTest) {
+				t.Fatalf("pending provider result=%v", err)
+			}
+			var status string
+			var attempts int
+			if err := db.QueryRowContext(ctx, `SELECT status,attempt_count FROM outbox_messages WHERE id=$1`, id).Scan(&status, &attempts); err != nil {
+				t.Fatal(err)
+			}
+			if status != "queued" || attempts != 0 {
+				t.Fatalf("poll=%d status=%q attempts=%d", poll, status, attempts)
+			}
+		}
+		if adapter.calls != store.MaxOutboxRetries+3 {
+			t.Fatalf("provider calls=%d", adapter.calls)
+		}
+	})
 }
 
 func (a *deadlineOutcomeAdapter) Name() string { return "capture" }
