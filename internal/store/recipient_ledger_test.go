@@ -16,7 +16,7 @@ import (
 
 func recipientFixture(t *testing.T, ctx context.Context, db *sql.DB, limit sql.NullInt64) (*Store, RecipientPeriod) {
 	t.Helper()
-	if err := MigrateUpToCore(ctx, db, 30); err != nil {
+	if err := MigrateUpToCore(ctx, db, 31); err != nil {
 		t.Fatal(err)
 	}
 	p := RecipientPeriod{OrgID: uuid.NewString(), PeriodID: uuid.NewString(), StartsAt: time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond), EndsAt: time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond), Limit: limit}
@@ -375,6 +375,9 @@ func TestRecipientLedgerMigrationAndConstraints(t *testing.T) {
 			t.Fatal(err)
 		}
 		s, p := recipientFixture(t, ctx, db, sql.NullInt64{Int64: 10, Valid: true})
+		if err := MigrateDownCore(ctx, db); err != nil {
+			t.Fatal(err)
+		}
 		if err := MigrateDownCore(ctx, db); err == nil || !strings.Contains(err.Error(), "recipient ledger rows exist") {
 			t.Fatalf("down guard %v", err)
 		}

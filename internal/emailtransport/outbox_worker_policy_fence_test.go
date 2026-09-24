@@ -130,6 +130,55 @@ func TestOutboxWorkerQuarantinesAmbiguousNonReplayProvider(t *testing.T) {
 	})
 }
 
+func TestOutboxWorkerQuarantinesAmbiguousMeteredProviderWithoutAutonomousEpoch(t *testing.T) {
+	withOutboxWorkerDatabase(t, func(ctx context.Context, db *sql.DB, st *store.Store) {
+		orgID, inboxID := uuid.NewString(), uuid.NewString()
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs(id,name) VALUES($1,'metered worker')`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO inboxes(id,org_id,address,status)
+  VALUES($1,$2,'metered@local.neuralmail','active')`, inboxID, orgID); err != nil {
+			t.Fatal(err)
+		}
+		period := store.RecipientPeriod{OrgID: orgID, PeriodID: uuid.NewString(),
+			StartsAt: time.Now().UTC().Add(-time.Hour), EndsAt: time.Now().UTC().Add(time.Hour),
+			Limit: sql.NullInt64{Int64: 1, Valid: true}}
+		if err := st.RunInTx(ctx, func(tx *store.Store) error { return tx.InstallRecipientPeriod(ctx, period) }); err != nil {
+			t.Fatal(err)
+		}
+		id, err := st.EnqueueOutboxMessage(ctx, store.OutboxMessage{OrgID: orgID, InboxID: inboxID,
+			Provider: "ambiguous", IdempotencyKey: "metered-ambiguous", To: "recipient@example.test",
+			From: "metered@local.neuralmail", Subject: "metered", TextBody: "body"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		claimed := claimWorkerPolicyOutbox(t, ctx, st, id, "metered-worker")
+		if claimed.AutonomousPolicyEpoch != 0 {
+			t.Fatalf("unexpected autonomous epoch: %d", claimed.AutonomousPolicyEpoch)
+		}
+		adapter := &ambiguousNonReplayAdapter{}
+		worker := policyFenceWorker(t, st, adapter, "metered-worker")
+		if err := worker.deliverOne(ctx, claimed); err == nil {
+			t.Fatal("ambiguous provider call unexpectedly succeeded")
+		}
+		var status string
+		var startedAt, resolvedAt sql.NullTime
+		var reserved, committed int64
+		if err := db.QueryRowContext(ctx, `SELECT status,provider_started_at,provider_resolved_at
+  FROM outbox_messages WHERE org_id=$1 AND id=$2`, orgID, id).Scan(&status, &startedAt, &resolvedAt); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.QueryRowContext(ctx, `SELECT reserved,committed FROM org_recipient_periods
+  WHERE org_id=$1 AND period_id=$2`, orgID, period.PeriodID).Scan(&reserved, &committed); err != nil {
+			t.Fatal(err)
+		}
+		if adapter.calls != 1 || status != "queued" || !startedAt.Valid || resolvedAt.Valid || reserved != 1 || committed != 0 {
+			t.Fatalf("calls=%d status=%q started=%v resolved=%v reserved=%d committed=%d",
+				adapter.calls, status, startedAt.Valid, resolvedAt.Valid, reserved, committed)
+		}
+	})
+}
+
 type transientServerReplayAdapter struct{ calls int }
 
 func (a *transientServerReplayAdapter) Name() string                   { return "server-replay" }

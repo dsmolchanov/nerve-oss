@@ -75,6 +75,54 @@ func TestAtomicReserveNoOvershootUnderConcurrency(t *testing.T) {
 	})
 }
 
+func TestV2RecipientMeterDoesNotChargeLegacyToolUnitsOrRollPeriod(t *testing.T) {
+	withTempStore(t, func(ctx context.Context, st *store.Store) {
+		orgID := uuid.NewString()
+		now := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+		oldStart, oldEnd := now.Add(-48*time.Hour), now.Add(-24*time.Hour)
+		insertEntitlementFixture(t, ctx, st, orgID, oldStart, oldEnd, 0, 100000)
+		period := store.RecipientPeriod{OrgID: orgID, PeriodID: uuid.NewString(),
+			StartsAt: now.Add(-time.Hour), EndsAt: now.Add(time.Hour),
+			Limit: sql.NullInt64{Int64: 0, Valid: true}}
+		if err := st.RunInTx(ctx, func(tx *store.Store) error { return tx.InstallRecipientPeriod(ctx, period) }); err != nil {
+			t.Fatal(err)
+		}
+		svc := NewService(config.Default(), st, nil)
+		svc.Now = func() time.Time { return now }
+		for i, status := range []string{"success", "failed"} {
+			reservation, err := svc.PreAuthorizeTool(ctx, auth.Principal{OrgID: orgID}, "list_threads", fmt.Sprintf("v2-read-%d", i), "")
+			if err != nil {
+				t.Fatalf("v2 read %d: %v", i, err)
+			}
+			if reservation.MeterName != "" || reservation.Quantity != 0 {
+				t.Fatalf("legacy unit reservation on v2 read: %+v", reservation)
+			}
+			if err := svc.FinalizeToolExecution(ctx, *reservation, "list_threads", fmt.Sprintf("v2-read-%d", i), "", status, "", nil); err != nil {
+				t.Fatalf("v2 finalize %d: %v", i, err)
+			}
+		}
+		ent, err := st.GetOrgEntitlement(ctx, orgID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ent.UsagePeriodStart.Equal(oldStart) || !ent.UsagePeriodEnd.Equal(oldEnd) {
+			t.Fatalf("v2 read locally rolled legacy period: %s..%s", ent.UsagePeriodStart, ent.UsagePeriodEnd)
+		}
+		var counters, events int
+		if err := st.DB().QueryRowContext(ctx, `SELECT count(*) FROM org_usage_counters
+  WHERE org_id=$1 AND meter_name='mcp_units'`, orgID).Scan(&counters); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.DB().QueryRowContext(ctx, `SELECT count(*) FROM usage_events
+  WHERE org_id=$1 AND meter_name='mcp_units'`, orgID).Scan(&events); err != nil {
+			t.Fatal(err)
+		}
+		if counters != 0 || events != 0 {
+			t.Fatalf("v2 read charged legacy units: counters=%d events=%d", counters, events)
+		}
+	})
+}
+
 func TestPreAuthorizeToolRollsUsagePeriodForward(t *testing.T) {
 	withTempStore(t, func(ctx context.Context, st *store.Store) {
 		orgID := uuid.NewString()

@@ -178,7 +178,7 @@ func (s *Store) AdvanceOutboundPolicyEpoch(ctx context.Context, orgID string) (e
 		}
 		return 0, 0, err
 	}
-	result, err := s.q.ExecContext(ctx, `
+	rows, err := s.q.QueryContext(ctx, `
 		UPDATE outbox_messages
 		SET status = 'failed',
 		    last_error = 'policy_revoked',
@@ -190,12 +190,33 @@ func (s *Store) AdvanceOutboundPolicyEpoch(ctx context.Context, orgID string) (e
 		  AND autonomous_policy_epoch < $2
 		  AND status IN ('queued', 'sending')
 		  AND NOT (provider_started_at IS NOT NULL AND provider_resolved_at IS NULL)
+		RETURNING id::text
 	`, orgID, epoch)
 	if err != nil {
 		return 0, 0, err
 	}
-	terminalized, err = result.RowsAffected()
-	return epoch, terminalized, err
+	var outboxIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, 0, err
+		}
+		outboxIDs = append(outboxIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, 0, err
+	}
+	for _, id := range outboxIDs {
+		if err := s.resolveOutboxRecipients(ctx, orgID, id, "released"); err != nil {
+			return 0, 0, err
+		}
+	}
+	return epoch, int64(len(outboxIDs)), nil
 }
 
 // explicit false and an absent row.

@@ -93,8 +93,12 @@ func (s *Service) PreAuthorizeTool(ctx context.Context, principal auth.Principal
 			}
 			return err
 		}
+		v2Meter, err := scoped.RecipientMeterEnrolled(ctx, principal.OrgID)
+		if err != nil {
+			return err
+		}
 
-		if now.After(ent.UsagePeriodEnd) {
+		if !v2Meter && now.After(ent.UsagePeriodEnd) {
 			nextStart, nextEnd := rolloverWindow(ent.UsagePeriodStart, ent.UsagePeriodEnd, now)
 			if err := scoped.UpdateOrgEntitlementUsagePeriod(ctx, principal.OrgID, nextStart, nextEnd); err != nil {
 				return err
@@ -147,6 +151,17 @@ func (s *Service) PreAuthorizeTool(ctx context.Context, principal auth.Principal
 				_ = scoped.MarkToolIdempotencyFailed(ctx, principal.OrgID, toolName, idempotencyKey, now)
 			}
 			return &RateLimitError{RetryAfterSeconds: retryAfter}
+		}
+		if v2Meter {
+			// Reads, search, DNS and billing retain RPM/idempotency fences but
+			// never consume the legacy mcp_units meter. Sends reserve the v2
+			// recipient ledger atomically with their shared outbox enqueue.
+			s.Observer.RecordAllow(principal.OrgID, "authorized", 0, 0)
+			reservation = &Reservation{
+				OrgID: principal.OrgID, Subscription: ent.SubscriptionStatus,
+				Features: ent.Features, LegacyOutboundReplay: legacyOutboundReplay,
+			}
+			return nil
 		}
 
 		if err := scoped.EnsureOrgUsageCounter(ctx, principal.OrgID, meterMCPUnits, ent.UsagePeriodStart, ent.UsagePeriodEnd); err != nil {
@@ -276,8 +291,10 @@ func (s *Service) FinalizeToolExecution(ctx context.Context, reservation Reserva
 	return s.Store.RunAsOrg(ctx, reservation.OrgID, func(scoped *store.Store) error {
 		now := s.Now()
 		if normalizedStatus != "success" {
-			if err := scoped.ReleaseOrgUsageUnits(ctx, reservation.OrgID, reservation.MeterName, reservation.PeriodStart, reservation.Quantity); err != nil {
-				return err
+			if reservation.MeterName != "" {
+				if err := scoped.ReleaseOrgUsageUnits(ctx, reservation.OrgID, reservation.MeterName, reservation.PeriodStart, reservation.Quantity); err != nil {
+					return err
+				}
 			}
 			s.Observer.RecordDeny(reservation.OrgID, "tool_execution_failed")
 		}
@@ -307,7 +324,10 @@ func (s *Service) FinalizeToolExecution(ctx context.Context, reservation Reserva
 				}
 			}
 		}
-		return scoped.RecordUsageEvent(ctx, reservation.OrgID, reservation.MeterName, reservation.Quantity, toolName, replayID, auditID, normalizedStatus)
+		if reservation.MeterName != "" {
+			return scoped.RecordUsageEvent(ctx, reservation.OrgID, reservation.MeterName, reservation.Quantity, toolName, replayID, auditID, normalizedStatus)
+		}
+		return nil
 	})
 }
 
