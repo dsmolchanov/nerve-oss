@@ -34,7 +34,7 @@ type pairingCloud struct {
 	rotatedTo      atomic.Value // string
 	beginCalls     atomic.Int32
 	completeCalls  atomic.Int32
-	expiredPairing atomic.Value // string
+	expireNext     atomic.Int32
 	onComplete     func()
 	server         *httptest.Server
 	tokens         *httptest.Server
@@ -105,7 +105,7 @@ func newPairingCloud(t *testing.T) *pairingCloud {
 			})
 		case "complete":
 			cloud.completeCalls.Add(1)
-			if expired, _ := cloud.expiredPairing.Load().(string); expired != "" && input["pairing_id"] == expired {
+			if cloud.expireNext.Load() > 0 && cloud.expireNext.Add(-1) >= 0 {
 				http.Error(w, "pairing expired", http.StatusGone)
 				return
 			}
@@ -323,12 +323,13 @@ func TestHybridConnectReissuesExpiredUnapprovedPairingWithoutRotatingKey(t *test
 		t.Fatalf("unapproved pairing proof was not retained: %+v", deferred.Redacted())
 	}
 	oldPairingID := deferred.PairingID
-	cloud.expiredPairing.Store(oldPairingID)
+	cloud.expireNext.Store(1)
 	cloud.approved.Store(true)
 
 	secondContext, cancelSecond := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancelSecond()
-	connected, err := Connect(secondContext, store, nil, io.Discard)
+	var progress strings.Builder
+	connected, err := Connect(secondContext, store, nil, &progress)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,6 +341,42 @@ func TestHybridConnectReissuesExpiredUnapprovedPairingWithoutRotatingKey(t *test
 	}
 	if cloud.pairingID == oldPairingID {
 		t.Fatal("expired pairing proof was reused")
+	}
+	if strings.Count(progress.String(), oldPairingID) != 1 || strings.Count(progress.String(), cloud.pairingID) != 1 {
+		t.Fatalf("pairing notices were not emitted once per proof: %q", progress.String())
+	}
+}
+
+func TestHybridConnectBoundsAutomaticPairingRenewal(t *testing.T) {
+	cloud := newPairingCloud(t)
+	store := lifecycleStore(t)
+	begun, err := Begin(store, cloud.params())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloud.admit(begun.Key)
+	cloud.approved.Store(true)
+	cloud.expireNext.Store(2)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var progress strings.Builder
+	_, err = Connect(ctx, store, nil, &progress)
+	if !errors.Is(err, ErrPairingExpired) || !strings.Contains(err.Error(), "rerun connect") {
+		t.Fatalf("repeated expiry returned %v", err)
+	}
+	deferred, loadErr := store.Load()
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if deferred.Key.KID != begun.Key.KID || deferred.PairingID == "" || deferred.PairingSecret == "" {
+		t.Fatalf("bounded renewal lost the admitted key or replacement proof: %+v", deferred.Redacted())
+	}
+	if cloud.beginCalls.Load() != 2 || cloud.completeCalls.Load() != 2 {
+		t.Fatalf("begin=%d complete=%d, want one automatic renewal", cloud.beginCalls.Load(), cloud.completeCalls.Load())
+	}
+	if strings.Count(progress.String(), "Pairing ") != 2 {
+		t.Fatalf("pairing notices=%q, want one per proof", progress.String())
 	}
 }
 

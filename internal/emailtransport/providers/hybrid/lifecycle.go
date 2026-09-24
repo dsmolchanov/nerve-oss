@@ -159,14 +159,19 @@ func Connect(ctx context.Context, store Store, httpClient *http.Client, progress
 		ID    string `json:"id"`
 		OrgID string `json:"org_id"`
 	}
+	writeProgress(progress, "Pairing %s created. Ask the mailbox owner to approve it.\n", state.PairingID)
+	automaticRenewals := 0
 	for {
-		writeProgress(progress, "Pairing %s created. Ask the mailbox owner to approve it.\n", state.PairingID)
 		complete := map[string]any{"pairing_id": state.PairingID, "pairing_secret": state.PairingSecret}
 		err := client.call(ctx, "complete", complete, &installation)
 		if err == nil {
 			break
 		}
 		if errors.Is(err, ErrPairingExpired) {
+			if automaticRenewals >= 1 {
+				return State{}, fmt.Errorf("%w: replacement pairing also expired; rerun connect to create another proof", ErrPairingExpired)
+			}
+			automaticRenewals++
 			// Cloud has proved this pairing never completed, so it is safe to
 			// replace only the short-lived proof. The admitted key and mailbox
 			// binding remain unchanged. Clear the obsolete bearer secret before
@@ -179,6 +184,7 @@ func Connect(ctx context.Context, store Store, httpClient *http.Client, progress
 			if err := beginPairing(); err != nil {
 				return State{}, err
 			}
+			writeProgress(progress, "Pairing %s created. Ask the mailbox owner to approve it.\n", state.PairingID)
 			continue
 		}
 		// Cloud reports an unapproved pairing the same way it reports one that
