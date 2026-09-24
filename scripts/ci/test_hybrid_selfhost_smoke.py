@@ -82,7 +82,8 @@ class IsolationTest(unittest.TestCase):
         self.assertIn("startswith(('COMPOSE_', 'NERVE_', 'NM_', 'STALWART_'))", source)
         self.assertIn("{'services': {'cortex': published}}", source)
         self.assertIn("run('docker', 'pull', '--platform', 'linux/amd64', args.image)", source)
-        self.assertIn("['--pull', 'never', '--no-build'] if args.image else ['--build']", source)
+        self.assertIn("startup += ['--pull', 'always', '--no-build'] if args.image else ['--build']", source)
+        self.assertIn("recreate += ['--pull', 'never', '--no-build'] if args.image else ['--build']", source)
         self.assertIn("r'@sha256:[0-9a-f]{64}$'", source)
         # The teardown must not carry --profile full or a project it did not
         # create, and must remove the volumes it made.

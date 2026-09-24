@@ -147,7 +147,12 @@ def main():
             if args.image:
                 run('docker', 'pull', '--platform', 'linux/amd64', args.image)
             startup = ['up', '-d']
-            startup += ['--pull', 'never', '--no-build'] if args.image else ['--build']
+            # GitHub-hosted runners do not guarantee that the Compose support
+            # images are cached. Pull every service on the first start; the
+            # cortex reference is an immutable digest, so this cannot change
+            # the runtime bytes under test. Recreation below stays offline and
+            # proves that those exact local bytes keep the installation key.
+            startup += ['--pull', 'always', '--no-build'] if args.image else ['--build']
             startup += ['--wait', '--wait-timeout', '240']
             compose(*startup)
             wait_for(ready, 'runtime ready with hybrid configured but unpaired')
