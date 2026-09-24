@@ -34,6 +34,7 @@ type pairingCloud struct {
 	rotatedTo      atomic.Value // string
 	beginCalls     atomic.Int32
 	completeCalls  atomic.Int32
+	expiredPairing atomic.Value // string
 	onComplete     func()
 	server         *httptest.Server
 	tokens         *httptest.Server
@@ -88,7 +89,11 @@ func newPairingCloud(t *testing.T) *pairingCloud {
 		_ = json.Unmarshal(raw, &input)
 		switch action {
 		case "begin":
-			cloud.beginCalls.Add(1)
+			call := cloud.beginCalls.Add(1)
+			if call > 1 {
+				cloud.pairingID = uuid.NewString()
+				cloud.secret = strings.Repeat("y", 43)
+			}
 			if input["installation_id"] != "" {
 				c := input["installation_id"]
 				cloud.t.Errorf("begin carried installation id %v", c)
@@ -100,6 +105,10 @@ func newPairingCloud(t *testing.T) *pairingCloud {
 			})
 		case "complete":
 			cloud.completeCalls.Add(1)
+			if expired, _ := cloud.expiredPairing.Load().(string); expired != "" && input["pairing_id"] == expired {
+				http.Error(w, "pairing expired", http.StatusGone)
+				return
+			}
 			if !cloud.approved.Load() {
 				http.Error(w, "pairing unavailable", http.StatusNotFound)
 				return
@@ -288,6 +297,49 @@ func TestHybridConnectRecoversCloudCompletionAfterLocalSaveFailure(t *testing.T)
 	}
 	if cloud.beginCalls.Load() != 1 || cloud.completeCalls.Load() != 2 {
 		t.Fatalf("begin=%d complete=%d, want one pairing and one completion replay", cloud.beginCalls.Load(), cloud.completeCalls.Load())
+	}
+}
+
+func TestHybridConnectReissuesExpiredUnapprovedPairingWithoutRotatingKey(t *testing.T) {
+	cloud := newPairingCloud(t)
+	store := lifecycleStore(t)
+	begun, err := Begin(store, cloud.params())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloud.admit(begun.Key)
+
+	firstContext, cancelFirst := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	_, firstErr := Connect(firstContext, store, nil, io.Discard)
+	cancelFirst()
+	if !errors.Is(firstErr, context.DeadlineExceeded) {
+		t.Fatalf("unapproved pairing returned %v, want deadline", firstErr)
+	}
+	deferred, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deferred.PairingID == "" || deferred.PairingSecret == "" {
+		t.Fatalf("unapproved pairing proof was not retained: %+v", deferred.Redacted())
+	}
+	oldPairingID := deferred.PairingID
+	cloud.expiredPairing.Store(oldPairingID)
+	cloud.approved.Store(true)
+
+	secondContext, cancelSecond := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelSecond()
+	connected, err := Connect(secondContext, store, nil, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !connected.Installed() || connected.Key.KID != begun.Key.KID {
+		t.Fatalf("expired proof recovery changed the admitted key or did not install: %+v", connected.Redacted())
+	}
+	if cloud.beginCalls.Load() != 2 || cloud.completeCalls.Load() < 3 {
+		t.Fatalf("begin=%d complete=%d, want one replacement under the same key", cloud.beginCalls.Load(), cloud.completeCalls.Load())
+	}
+	if cloud.pairingID == oldPairingID {
+		t.Fatal("expired pairing proof was reused")
 	}
 }
 

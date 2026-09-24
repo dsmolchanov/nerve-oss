@@ -2,8 +2,11 @@
 """Guards for the hybrid image smoke: credential safety and its own isolation."""
 import contextlib
 import io
+import json
+import os
 import secrets
 import subprocess
+import tempfile
 import traceback
 import unittest
 from pathlib import Path
@@ -77,13 +80,36 @@ class IsolationTest(unittest.TestCase):
         self.assertIn("'COMPOSE_PROJECT_NAME': project", source)
         self.assertIn("COMPOSE_DISABLE_ENV_FILE", source)
         self.assertIn("startswith(('COMPOSE_', 'NERVE_', 'NM_', 'STALWART_'))", source)
-        self.assertIn("'cortex': published, 'migrate': published", source)
+        self.assertIn("{'services': {'cortex': published}}", source)
         self.assertIn("run('docker', 'pull', '--platform', 'linux/amd64', args.image)", source)
         self.assertIn("['--pull', 'never', '--no-build'] if args.image else ['--build']", source)
         self.assertIn("r'@sha256:[0-9a-f]{64}$'", source)
         # The teardown must not carry --profile full or a project it did not
         # create, and must remove the volumes it made.
         self.assertIn("'down', '-t', '5', '-v', '--remove-orphans'", source)
+
+    def test_published_image_override_does_not_introduce_services(self):
+        root = Path(__file__).parents[2]
+        image = 'ghcr.io/example/runtime@sha256:' + 'a' * 64
+        override_body = {'services': {'cortex': {
+            'build': None, 'image': image, 'platform': 'linux/amd64',
+        }}}
+        env = os.environ.copy()
+        env.update({
+            'NERVE_API_KEY': secrets.token_hex(32),
+            'POSTGRES_PASSWORD': secrets.token_hex(32),
+            'STALWART_PASSWORD': secrets.token_hex(32),
+        })
+        with tempfile.TemporaryDirectory(prefix='hybrid-compose-model-') as directory:
+            override = Path(directory) / 'published-image.json'
+            override.write_text(json.dumps(override_body))
+            command = ['docker', 'compose', '--env-file', '/dev/null',
+                       '-f', str(root / 'docker-compose.yml'),
+                       '-f', str(override), 'config', '--services']
+            rendered = subprocess.run(command, cwd=root, env=env, check=True,
+                                      text=True, stdout=subprocess.PIPE).stdout.splitlines()
+        self.assertNotIn('migrate', rendered)
+        self.assertEqual(set(rendered), {'cortex', 'postgres', 'redis', 'mailpit'})
 
     def test_release_publish_proves_the_pushed_digest_before_release(self):
         workflow = (Path(__file__).parents[2] / '.github/workflows/docker-publish.yml').read_text()

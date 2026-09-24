@@ -43,6 +43,12 @@ var (
 	// ErrMissing is a delivery or receipt Cloud does not have. For a lease it
 	// usually means the lease expired and the delivery went back to the queue.
 	ErrMissing = errors.New("hybrid delivery or receipt unavailable")
+
+	// ErrPairingExpired means an unconsumed pairing proof reached its deadline.
+	// A completed pairing is replayable even after that deadline, so Cloud only
+	// returns this for a proof that is safe to replace under the same admitted
+	// key.
+	ErrPairingExpired = errors.New("hybrid pairing expired")
 )
 
 // Delivery is one inbound message Cloud is holding for this installation.
@@ -391,6 +397,8 @@ func statusError(action string, status int) error {
 		return transient("rate_limited", ErrSendLimit)
 	case http.StatusNotFound:
 		return permanent("not_found", ErrMissing)
+	case http.StatusGone:
+		return permanent("pairing_expired", ErrPairingExpired)
 	case http.StatusBadRequest, http.StatusRequestEntityTooLarge:
 		// Cloud rejected the request as formed. Resending it unchanged cannot
 		// succeed, so this is terminal for this message, not an outage.

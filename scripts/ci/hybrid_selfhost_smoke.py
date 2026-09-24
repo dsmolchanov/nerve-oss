@@ -109,9 +109,7 @@ def main():
                 raise ValueError('--image must be an immutable digest reference')
             override = tmp / 'published-image.json'
             published = {'build': None, 'image': args.image, 'platform': 'linux/amd64'}
-            override.write_text(json.dumps({'services': {
-                'cortex': published, 'migrate': published,
-            }}))
+            override.write_text(json.dumps({'services': {'cortex': published}}))
             compose_files += os.pathsep + str(override)
         env.update({'COMPOSE_PROJECT_NAME': project,
                     'COMPOSE_FILE': compose_files,

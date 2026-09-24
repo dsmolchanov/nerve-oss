@@ -135,33 +135,51 @@ func Connect(ctx context.Context, store Store, httpClient *http.Client, progress
 		} `json:"pairing"`
 		Secret string `json:"secret"`
 	}
-	if state.PairingID == "" {
+	beginPairing := func() error {
 		// begin and complete are the only actions Cloud refuses an installation
 		// ID on. Persist the proof before offering it to complete: Cloud may
 		// commit even when the response or the following local save is lost.
 		if err := client.call(ctx, "begin", map[string]any{}, &pairing); err != nil {
-			return State{}, err
+			return err
 		}
 		if _, err := uuid.Parse(pairing.Pairing.ID); err != nil || pairing.Secret == "" {
-			return State{}, fmt.Errorf("%w: cloud returned an unusable pairing", ErrUnavailable)
+			return fmt.Errorf("%w: cloud returned an unusable pairing", ErrUnavailable)
 		}
 		state.PairingID = pairing.Pairing.ID
 		state.PairingSecret = pairing.Secret
-		if err := store.Save(state); err != nil {
+		return store.Save(state)
+	}
+	if state.PairingID == "" {
+		if err := beginPairing(); err != nil {
 			return State{}, err
 		}
 	}
-	writeProgress(progress, "Pairing %s created. Ask the mailbox owner to approve it.\n", state.PairingID)
 
 	var installation struct {
 		ID    string `json:"id"`
 		OrgID string `json:"org_id"`
 	}
-	complete := map[string]any{"pairing_id": state.PairingID, "pairing_secret": state.PairingSecret}
 	for {
+		writeProgress(progress, "Pairing %s created. Ask the mailbox owner to approve it.\n", state.PairingID)
+		complete := map[string]any{"pairing_id": state.PairingID, "pairing_secret": state.PairingSecret}
 		err := client.call(ctx, "complete", complete, &installation)
 		if err == nil {
 			break
+		}
+		if errors.Is(err, ErrPairingExpired) {
+			// Cloud has proved this pairing never completed, so it is safe to
+			// replace only the short-lived proof. The admitted key and mailbox
+			// binding remain unchanged. Clear the obsolete bearer secret before
+			// requesting another so a failed save can only retry this decision.
+			state.PairingID = ""
+			state.PairingSecret = ""
+			if err := store.Save(state); err != nil {
+				return State{}, err
+			}
+			if err := beginPairing(); err != nil {
+				return State{}, err
+			}
+			continue
 		}
 		// Cloud reports an unapproved pairing the same way it reports one that
 		// expired or never existed. Keep offering the proof until the context
