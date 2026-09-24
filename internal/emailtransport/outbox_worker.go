@@ -273,7 +273,7 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		}
 	}
 
-	if msg.AutonomousPolicyEpoch > 0 && msg.ProviderStartedAt.Valid && !msg.ProviderResolvedAt.Valid {
+	if msg.ProviderStartedAt.Valid && !msg.ProviderResolvedAt.Valid {
 		// A stale claim proves a prior worker may already have completed the
 		// provider call. Replay is safe only inside the adapter's bounded
 		// idempotency window. Quarantine before loading attachments or touching
