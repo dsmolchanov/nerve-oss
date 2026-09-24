@@ -273,7 +273,7 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		}
 	}
 
-	if msg.AutonomousPolicyEpoch > 0 && msg.ProviderStartedAt.Valid && !msg.ProviderResolvedAt.Valid {
+	if msg.ProviderStartedAt.Valid && !msg.ProviderResolvedAt.Valid {
 		// A stale claim proves a prior worker may already have completed the
 		// provider call. Replay is safe only inside the adapter's bounded
 		// idempotency window. Quarantine before loading attachments or touching
@@ -389,6 +389,10 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 			w.incDeliver(msg.Provider, "policy_revoked")
 			return err
 		}
+		if errors.Is(err, store.ErrRecipientLimit) {
+			w.incDeliver(msg.Provider, "recipient_period_closed")
+			return err
+		}
 		if errors.Is(err, store.ErrOutboxClaimLost) {
 			return err
 		}
@@ -450,7 +454,7 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 	// logical operation before failing the request, so only idempotent
 	// replay/readback may resolve it. Transport errors are ambiguous too.
 	knownOutcome := classified != nil && classified.StatusCode >= 400 && classified.StatusCode < 500
-	if msg.AutonomousPolicyEpoch > 0 && !knownOutcome && !adapterSupportsIdempotentReplay(adapter) {
+	if operationID != "" && !knownOutcome && !adapterSupportsIdempotentReplay(adapter) {
 		// Replaying an ambiguous operation through SMTP or another adapter that
 		// cannot honor the stable operation identity can duplicate a delivery.
 		// Quarantine immediately; the unresolved fence keeps lifecycle cleanup
@@ -463,7 +467,7 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 	}
 
 	if msg.AttemptCount >= store.MaxOutboxRetries {
-		if msg.AutonomousPolicyEpoch > 0 && !knownOutcome && adapterSupportsIdempotentReplay(adapter) {
+		if operationID != "" && !knownOutcome && adapterSupportsIdempotentReplay(adapter) {
 			// Unknown autonomous outcomes cannot be declared failed: retrying the
 			// same provider idempotency identity is the recovery/readback path.
 			next := time.Now().UTC().Add(w.MaxBackoff)

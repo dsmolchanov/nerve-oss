@@ -16,7 +16,7 @@ import (
 
 func recipientFixture(t *testing.T, ctx context.Context, db *sql.DB, limit sql.NullInt64) (*Store, RecipientPeriod) {
 	t.Helper()
-	if err := MigrateUpToCore(ctx, db, 30); err != nil {
+	if err := MigrateUpToCore(ctx, db, 31); err != nil {
 		t.Fatal(err)
 	}
 	p := RecipientPeriod{OrgID: uuid.NewString(), PeriodID: uuid.NewString(), StartsAt: time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond), EndsAt: time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond), Limit: limit}
@@ -56,6 +56,48 @@ func assertRecipientCounters(t *testing.T, ctx context.Context, db *sql.DB, p Re
 	if ledgerReserved != reserved || ledgerCommitted != committed {
 		t.Fatalf("ledger drift: %d/%d vs counters %d/%d", ledgerReserved, ledgerCommitted, reserved, committed)
 	}
+}
+
+func TestRecipientAdmissionPeriodNeverFallsBackAfterEnrollment(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		s, p := recipientFixture(t, ctx, db, sql.NullInt64{Int64: 10, Valid: true})
+		legacyOrg := uuid.NewString()
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs(id,name) VALUES($1,'legacy recipient fixture')`, legacyOrg); err != nil {
+			t.Fatal(err)
+		}
+		check := func(org, wantPeriod string, wantEnrolled bool, wantErr error) {
+			t.Helper()
+			err := s.RunInTx(ctx, func(tx *Store) error {
+				period, enrolled, lookupErr := tx.RecipientAdmissionPeriod(ctx, org)
+				if period != wantPeriod || enrolled != wantEnrolled || !errors.Is(lookupErr, wantErr) {
+					t.Errorf("period=%q enrolled=%v err=%v; want %q %v %v", period, enrolled, lookupErr, wantPeriod, wantEnrolled, wantErr)
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		check(legacyOrg, "", false, nil)
+		check(p.OrgID, p.PeriodID, true, nil)
+		if _, _, err := s.RecipientAdmissionPeriod(ctx, p.OrgID); err == nil {
+			t.Fatal("period selection outside transaction succeeded")
+		}
+		if _, err := db.ExecContext(ctx, `UPDATE org_recipient_periods SET admission_closed=true WHERE org_id=$1 AND period_id=$2`, p.OrgID, p.PeriodID); err != nil {
+			t.Fatal(err)
+		}
+		check(p.OrgID, "", true, ErrRecipientLimit)
+		other := p
+		other.PeriodID = uuid.NewString()
+		if err := s.RunInTx(ctx, func(tx *Store) error { return tx.InstallRecipientPeriod(ctx, other) }); err != nil {
+			t.Fatal(err)
+		}
+		check(p.OrgID, other.PeriodID, true, nil)
+		if _, err := db.ExecContext(ctx, `UPDATE org_recipient_periods SET admission_closed=false WHERE org_id=$1 AND period_id=$2`, p.OrgID, p.PeriodID); err != nil {
+			t.Fatal(err)
+		}
+		check(p.OrgID, "", true, ErrRecipientLedgerConflict)
+	})
 }
 func TestRecipientLedgerConcurrency(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
@@ -333,6 +375,9 @@ func TestRecipientLedgerMigrationAndConstraints(t *testing.T) {
 			t.Fatal(err)
 		}
 		s, p := recipientFixture(t, ctx, db, sql.NullInt64{Int64: 10, Valid: true})
+		if err := MigrateDownCore(ctx, db); err != nil {
+			t.Fatal(err)
+		}
 		if err := MigrateDownCore(ctx, db); err == nil || !strings.Contains(err.Error(), "recipient ledger rows exist") {
 			t.Fatalf("down guard %v", err)
 		}

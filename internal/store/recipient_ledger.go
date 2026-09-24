@@ -10,8 +10,9 @@ import (
 )
 
 var (
-	ErrRecipientLedgerConflict = errors.New("recipient ledger replay conflicts with stored contract")
-	ErrRecipientLimit          = errors.New("recipient allowance exhausted or period closed")
+	ErrRecipientLedgerConflict           = errors.New("recipient ledger replay conflicts with stored contract")
+	ErrRecipientLimit                    = errors.New("recipient allowance exhausted or period closed")
+	ErrRecipientReplayRequiresNewMessage = errors.New("enrolled recipient meter requires a new outbox message for replay")
 )
 
 // RecipientPeriod is supplied by an authoritative billing projection. A null
@@ -32,6 +33,54 @@ func recipientIDs(org, id string) error {
 		}
 	}
 	return nil
+}
+
+// recipientLedgerAvailable is checked through the caller's transaction. Core
+// 28/29 continue serving legacy outbox rows, while an applied Core 30 must use
+// the ledger table. A missing migration history is an error, never evidence
+// that an enrolled organization can use the legacy meter.
+func (s *Store) recipientLedgerAvailable(ctx context.Context) (bool, error) {
+	if err := s.requireTx(); err != nil {
+		return false, err
+	}
+	var applied bool
+	err := s.q.QueryRowContext(ctx, `SELECT is_applied FROM schema_migrations_core
+  WHERE version_id=30 ORDER BY id DESC LIMIT 1`).Scan(&applied)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return applied, err
+}
+
+func (s *Store) recipientOutboxFenceAvailable(ctx context.Context) (bool, error) {
+	if err := s.requireTx(); err != nil {
+		return false, err
+	}
+	var applied bool
+	err := s.q.QueryRowContext(ctx, `SELECT is_applied FROM schema_migrations_core
+  WHERE version_id=31 ORDER BY id DESC LIMIT 1`).Scan(&applied)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return applied, err
+}
+
+// RecipientMeterEnrolled persists across a closed or expired period. It lets
+// runtime authorization keep legacy tool units isolated from the v2 contract
+// even when the v2 send allowance is currently zero.
+func (s *Store) RecipientMeterEnrolled(ctx context.Context, org string) (bool, error) {
+	available, err := s.recipientLedgerAvailable(ctx)
+	if err != nil || !available {
+		return false, err
+	}
+	if err := recipientIDs(org, org); err != nil {
+		return false, err
+	}
+	var enrolled bool
+	err = s.q.QueryRowContext(ctx, `SELECT EXISTS(
+  SELECT 1 FROM org_recipient_periods WHERE org_id=$1::uuid
+)`, org).Scan(&enrolled)
+	return enrolled, err
 }
 
 // InstallRecipientPeriod must share its caller's projection transaction. Exact
@@ -65,8 +114,58 @@ func (s *Store) InstallRecipientPeriod(ctx context.Context, p RecipientPeriod) e
 	return nil
 }
 
-// ReserveRecipients is an opt-in primitive, with no production callsites yet.
-// Its caller must establish outbox ownership and all live lifecycle/policy
+// RecipientAdmissionPeriod identifies the single live period for an enrolled
+// organization. An organization with no period rows still uses its legacy
+// meter; once enrolled, an expired or closed period never falls back to it.
+// Callers must hold their billing/lifecycle authority lock and reserve in the
+// same transaction. ReserveRecipients rechecks the period after locking it.
+func (s *Store) RecipientAdmissionPeriod(ctx context.Context, org string) (period string, enrolled bool, err error) {
+	if err := s.requireTx(); err != nil {
+		return "", false, err
+	}
+	if err := recipientIDs(org, org); err != nil {
+		return "", false, err
+	}
+	rows, err := s.q.QueryContext(ctx, `SELECT period_id::text FROM org_recipient_periods
+  WHERE org_id=$1 AND NOT admission_closed
+    AND starts_at <= clock_timestamp() AND ends_at > clock_timestamp()
+  LIMIT 2`, org)
+	if err != nil {
+		return "", false, err
+	}
+	var active []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return "", false, err
+		}
+		active = append(active, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return "", false, err
+	}
+	if err := rows.Close(); err != nil {
+		return "", false, err
+	}
+	if len(active) > 1 {
+		return "", true, ErrRecipientLedgerConflict
+	}
+	if len(active) == 1 {
+		return active[0], true, nil
+	}
+	if err := s.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM org_recipient_periods WHERE org_id=$1)`, org).Scan(&enrolled); err != nil {
+		return "", false, err
+	}
+	if enrolled {
+		return "", true, ErrRecipientLimit
+	}
+	return "", false, nil
+}
+
+// ReserveRecipients is an opt-in primitive. Its caller must establish outbox
+// ownership and all live lifecycle/policy
 // fences and insert the outbox row in this same transaction. The org-period row
 // serializes accounting; callers must propagate errors to roll back the whole
 // transaction. Replays retain their original terminal state and never re-charge.
@@ -178,4 +277,69 @@ func (s *Store) ResolveRecipients(ctx context.Context, org, period, outbox, stat
 	}
 	_, err := s.q.ExecContext(ctx, `UPDATE recipient_reservations SET state=$4,resolved_at=clock_timestamp() WHERE org_id=$1 AND period_id=$2 AND outbox_id=$3`, org, period, outbox, state)
 	return err
+}
+
+// resolveOutboxRecipients must run in the same transaction as a definitive
+// outbox transition. Outbox rows without a reservation predate enrollment and
+// retain their legacy accounting. Unknown outcomes never call this helper.
+func (s *Store) resolveOutboxRecipients(ctx context.Context, org, outbox, state string) error {
+	available, err := s.recipientLedgerAvailable(ctx)
+	if err != nil || !available {
+		return err
+	}
+	var period string
+	err = s.q.QueryRowContext(ctx, `SELECT period_id::text FROM recipient_reservations
+  WHERE org_id=$1::uuid AND outbox_id=$2::uuid`, org, outbox).Scan(&period)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return s.ResolveRecipients(ctx, org, period, outbox, state)
+}
+
+func (s *Store) recipientOutboxPeriod(ctx context.Context, org, outbox string) (string, bool, error) {
+	available, err := s.recipientLedgerAvailable(ctx)
+	if err != nil || !available {
+		return "", false, err
+	}
+	var period string
+	var state string
+	err = s.q.QueryRowContext(ctx, `SELECT period_id::text,state FROM recipient_reservations
+  WHERE org_id=$1::uuid AND outbox_id=$2::uuid`, org, outbox).Scan(&period, &state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err == nil && state != "reserved" {
+		return "", false, ErrOutboxClaimLost
+	}
+	if err != nil {
+		return "", false, err
+	}
+	fenced, err := s.recipientOutboxFenceAvailable(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	if !fenced {
+		return "", false, &UnsupportedSchemaError{Operation: "recipient provider operation", RequiresCore: 31}
+	}
+	var meterVersion sql.NullInt64
+	err = s.q.QueryRowContext(ctx, `SELECT recipient_meter_version FROM outbox_messages
+  WHERE org_id=$1::uuid AND id=$2::uuid`, org, outbox).Scan(&meterVersion)
+	if err != nil {
+		return "", false, err
+	}
+	if !meterVersion.Valid || meterVersion.Int64 != 2 {
+		return "", false, ErrRecipientLedgerConflict
+	}
+	return period, err == nil, err
+}
+
+func (s *Store) recipientPeriodAllowsDispatch(ctx context.Context, org, period string) (bool, error) {
+	var allowed bool
+	err := s.q.QueryRowContext(ctx, `SELECT NOT admission_closed
+    AND starts_at <= clock_timestamp() AND ends_at > clock_timestamp()
+  FROM org_recipient_periods WHERE org_id=$1::uuid AND period_id=$2::uuid FOR UPDATE`, org, period).Scan(&allowed)
+	return allowed, err
 }

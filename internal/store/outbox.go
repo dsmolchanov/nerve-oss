@@ -299,10 +299,18 @@ func (s *Store) enqueueOutboxMessage(ctx context.Context, msg OutboxMessage, aft
 	hash := contentHash(msg.To, msg.Subject, msg.TextBody, msg.HTMLBody, msg.Attachments)
 	var outID string
 	err = s.withTx(ctx, func(scoped *Store) error {
-		if msg.AutonomousLimits != nil {
+		ledgerAvailable, err := scoped.recipientLedgerAvailable(ctx)
+		if err != nil {
+			return err
+		}
+		if msg.AutonomousLimits != nil || ledgerAvailable {
+			// Billing projection and policy transitions take the same org
+			// lock. An enqueue cannot cross period activation or closure.
 			if err := scoped.LockOrgPolicy(ctx, msg.OrgID); err != nil {
 				return err
 			}
+		}
+		if msg.AutonomousLimits != nil {
 			epoch, err := scoped.CurrentOutboundPolicyEpoch(ctx, msg.OrgID)
 			if err != nil {
 				return err
@@ -325,6 +333,28 @@ func (s *Store) enqueueOutboxMessage(ctx context.Context, msg OutboxMessage, aft
 		outID = resolvedID
 		if !inserted {
 			return nil
+		}
+		if ledgerAvailable && !suppressed {
+			period, enrolled, err := scoped.RecipientAdmissionPeriod(ctx, msg.OrgID)
+			if err != nil {
+				return err
+			}
+			if enrolled {
+				fenced, err := scoped.recipientOutboxFenceAvailable(ctx)
+				if err != nil {
+					return err
+				}
+				if !fenced {
+					return &UnsupportedSchemaError{Operation: "EnqueueOutboxMessage recipient meter", RequiresCore: 31}
+				}
+				if _, err := scoped.ReserveRecipients(ctx, msg.OrgID, period, outID, 1); err != nil {
+					return err
+				}
+				if _, err := scoped.q.ExecContext(ctx, `UPDATE outbox_messages
+  SET recipient_meter_version=2 WHERE org_id=$1::uuid AND id=$2::uuid`, msg.OrgID, outID); err != nil {
+					return err
+				}
+			}
 		}
 		if msg.AutonomousLimits != nil {
 			limits := *msg.AutonomousLimits
@@ -671,21 +701,30 @@ func (s *Store) BeginOutboxProviderOperationState(ctx context.Context, msg Outbo
 	if msg.ID == "" || msg.OrgID == "" || !msg.LockedBy.Valid || msg.LockedBy.String == "" {
 		return OutboxProviderOperation{}, errors.New("missing claimed outbox identity")
 	}
-	// The legacy fast path must come first. The worker calls this for every
-	// claimed message, and on Core 28 every row is legacy, so guarding ahead of
-	// this return would refuse each one and requeue it without ever reaching the
-	// provider -- Artifact B could not deliver mail on the Core 28 half of its
-	// window. Only a genuinely fenced row needs the fence.
-	if msg.AutonomousPolicyEpoch <= 0 {
+	// Core 28 cannot have a recipient reservation or provider-start fence.
+	if msg.AutonomousPolicyEpoch <= 0 && !s.OutboundFenceEnabled() {
 		return OutboxProviderOperation{}, nil
-	}
-	if err := s.requireOutboundFence(ctx, "BeginOutboxProviderOperationState"); err != nil {
-		return OutboxProviderOperation{}, err
 	}
 	operationID := "outbox:" + msg.ID
 	var operationStartedAt time.Time
 	policyRevoked := false
-	err := s.FenceOrgPolicy(ctx, msg.OrgID, func(scoped *Store) error {
+	periodClosed := false
+	legacy := false
+	err := s.withTx(ctx, func(scoped *Store) error {
+		period, metered, err := scoped.recipientOutboxPeriod(ctx, msg.OrgID, msg.ID)
+		if err != nil {
+			return err
+		}
+		if msg.AutonomousPolicyEpoch <= 0 && !metered {
+			legacy = true
+			return nil
+		}
+		if err := scoped.requireOutboundFence(ctx, "BeginOutboxProviderOperationState"); err != nil {
+			return err
+		}
+		if err := scoped.LockOrgPolicy(ctx, msg.OrgID); err != nil {
+			return err
+		}
 		var (
 			status     string
 			lockedBy   sql.NullString
@@ -713,8 +752,13 @@ func (s *Store) BeginOutboxProviderOperationState(ctx context.Context, msg Outbo
 			policyRevoked = true
 			return nil
 		}
+		if status == "failed" && lastError.Valid && lastError.String == "recipient_period_closed" && metered {
+			periodClosed = true
+			return nil
+		}
 		if status != "sending" || !lockedBy.Valid || lockedBy.String != msg.LockedBy.String ||
-			!savedEpoch.Valid || savedEpoch.Int64 != msg.AutonomousPolicyEpoch {
+			savedEpoch.Valid != (msg.AutonomousPolicyEpoch > 0) ||
+			(savedEpoch.Valid && savedEpoch.Int64 != msg.AutonomousPolicyEpoch) {
 			return ErrOutboxClaimLost
 		}
 		if storedOpID.Valid && storedOpID.String != operationID {
@@ -728,16 +772,17 @@ func (s *Store) BeginOutboxProviderOperationState(ctx context.Context, msg Outbo
 			return nil
 		}
 
-		currentEpoch, err := scoped.CurrentOutboundPolicyEpoch(ctx, msg.OrgID)
-		if err != nil {
-			return err
-		}
-		allowed, err := scoped.outboundPolicyFlagsAllowSend(ctx, msg.OrgID)
-		if err != nil {
-			return err
-		}
-		if currentEpoch != msg.AutonomousPolicyEpoch || !allowed {
-			result, err := scoped.q.ExecContext(ctx, `
+		if savedEpoch.Valid {
+			currentEpoch, err := scoped.CurrentOutboundPolicyEpoch(ctx, msg.OrgID)
+			if err != nil {
+				return err
+			}
+			allowed, err := scoped.outboundPolicyFlagsAllowSend(ctx, msg.OrgID)
+			if err != nil {
+				return err
+			}
+			if currentEpoch != msg.AutonomousPolicyEpoch || !allowed {
+				result, err := scoped.q.ExecContext(ctx, `
 				UPDATE outbox_messages
 				SET status = 'failed',
 				    last_error = 'policy_revoked',
@@ -746,20 +791,52 @@ func (s *Store) BeginOutboxProviderOperationState(ctx context.Context, msg Outbo
 				    terminal_at = now()
 				WHERE id = $1 AND status = 'sending' AND locked_by = $2
 			`, msg.ID, msg.LockedBy.String)
+				if err != nil {
+					return err
+				}
+				rows, err := result.RowsAffected()
+				if err != nil {
+					return err
+				}
+				if rows != 1 {
+					return ErrOutboxClaimLost
+				}
+				if err := scoped.resolveOutboxRecipients(ctx, msg.OrgID, msg.ID, "released"); err != nil {
+					return err
+				}
+				// Returning the sentinel from the transaction callback would roll
+				// back the terminalization. Commit first, then report revocation.
+				policyRevoked = true
+				return nil
+			}
+		}
+		if metered {
+			allowed, err := scoped.recipientPeriodAllowsDispatch(ctx, msg.OrgID, period)
 			if err != nil {
 				return err
 			}
-			rows, err := result.RowsAffected()
-			if err != nil {
-				return err
+			if !allowed {
+				result, err := scoped.q.ExecContext(ctx, `UPDATE outbox_messages
+  SET status='failed',last_error='recipient_period_closed',locked_at=NULL,
+      locked_by=NULL,terminal_at=now()
+  WHERE org_id=$1::uuid AND id=$2::uuid AND status='sending' AND locked_by=$3`,
+					msg.OrgID, msg.ID, msg.LockedBy.String)
+				if err != nil {
+					return err
+				}
+				rows, err := result.RowsAffected()
+				if err != nil {
+					return err
+				}
+				if rows != 1 {
+					return ErrOutboxClaimLost
+				}
+				if err := scoped.resolveOutboxRecipients(ctx, msg.OrgID, msg.ID, "released"); err != nil {
+					return err
+				}
+				periodClosed = true
+				return nil
 			}
-			if rows != 1 {
-				return ErrOutboxClaimLost
-			}
-			// Returning the sentinel from the transaction callback would roll
-			// back the terminalization. Commit first, then report revocation.
-			policyRevoked = true
-			return nil
 		}
 		err = scoped.q.QueryRowContext(ctx, `
 			UPDATE outbox_messages
@@ -779,6 +856,12 @@ func (s *Store) BeginOutboxProviderOperationState(ctx context.Context, msg Outbo
 	}
 	if policyRevoked {
 		return OutboxProviderOperation{}, ErrOutboxPolicyRevoked
+	}
+	if periodClosed {
+		return OutboxProviderOperation{}, ErrRecipientLimit
+	}
+	if legacy {
+		return OutboxProviderOperation{}, nil
 	}
 	return OutboxProviderOperation{ID: operationID, StartedAt: operationStartedAt}, nil
 }
@@ -853,8 +936,10 @@ func (s *Store) MarkOutboxMessageSent(ctx context.Context, id string, providerMe
 	if id == "" {
 		return errors.New("missing id")
 	}
-	fence := s.resolveOutboundFence(ctx)
-	_, err := s.q.ExecContext(ctx, adaptOutboxSQL(fence, `
+	return s.noteOutboxSchemaError(s.withTx(ctx, func(scoped *Store) error {
+		fence := scoped.resolveOutboundFence(ctx)
+		var orgID string
+		err := scoped.q.QueryRowContext(ctx, adaptOutboxSQL(fence, `
 		UPDATE outbox_messages
 		SET status = 'sent',
 		    provider_message_id = nullif($2, ''),
@@ -864,8 +949,16 @@ func (s *Store) MarkOutboxMessageSent(ctx context.Context, id string, providerMe
 		    terminal_at = now(),
 		    provider_resolved_at = CASE WHEN provider_started_at IS NOT NULL THEN now() ELSE provider_resolved_at END
 		WHERE id = $1
-	`), id, providerMessageID)
-	return s.noteOutboxSchemaError(err)
+		RETURNING org_id::text
+	`), id, providerMessageID).Scan(&orgID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return scoped.resolveOutboxRecipients(ctx, orgID, id, "committed")
+	}))
 }
 
 func (s *Store) MarkClaimedOutboxMessageSent(ctx context.Context, id, workerID, operationID, providerMessageID string) error {
@@ -875,7 +968,7 @@ func (s *Store) MarkClaimedOutboxMessageSent(ctx context.Context, id, workerID, 
 // MigrateOutboxProviderToResend switches unsent outbox messages from smtp to resend
 // and resets them for immediate retry. Called at startup when Resend is the configured provider.
 func (s *Store) MigrateOutboxProviderToResend(ctx context.Context) (int64, error) {
-	result, err := s.q.ExecContext(ctx, `
+	query := `
 		UPDATE outbox_messages
 		SET provider = 'resend',
 		    status = 'queued',
@@ -884,7 +977,16 @@ func (s *Store) MigrateOutboxProviderToResend(ctx context.Context) (int64, error
 		    locked_by = null
 		WHERE provider = 'smtp'
 		  AND status IN ('queued', 'sending')
-	`)
+	`
+	if s.OutboundFenceEnabled() {
+		if err := s.requireOutboundFence(ctx, "MigrateOutboxProviderToResend"); err != nil {
+			return 0, err
+		}
+		// An unresolved SMTP attempt may already have been accepted. Changing
+		// providers would turn recovery into a second logical delivery.
+		query += ` AND NOT (provider_started_at IS NOT NULL AND provider_resolved_at IS NULL)`
+	}
+	result, err := s.q.ExecContext(ctx, query)
 	if err != nil {
 		return 0, err
 	}
@@ -896,8 +998,10 @@ func (s *Store) MarkOutboxMessageFailed(ctx context.Context, id string, lastErro
 	if id == "" {
 		return errors.New("missing id")
 	}
-	fence := s.resolveOutboundFence(ctx)
-	_, err := s.q.ExecContext(ctx, adaptOutboxSQL(fence, `
+	return s.noteOutboxSchemaError(s.withTx(ctx, func(scoped *Store) error {
+		fence := scoped.resolveOutboundFence(ctx)
+		var orgID string
+		err := scoped.q.QueryRowContext(ctx, adaptOutboxSQL(fence, `
 		UPDATE outbox_messages
 		SET status = 'failed',
 		    last_error = nullif($2, ''),
@@ -905,8 +1009,16 @@ func (s *Store) MarkOutboxMessageFailed(ctx context.Context, id string, lastErro
 		    locked_by = null,
 		    terminal_at = now()
 		WHERE id = $1
-	`), id, lastError)
-	return s.noteOutboxSchemaError(err)
+		RETURNING org_id::text
+	`), id, lastError).Scan(&orgID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return scoped.resolveOutboxRecipients(ctx, orgID, id, "released")
+	}))
 }
 
 // MarkClaimedOutboxMessageFailed terminalizes a pre-provider failure only
@@ -921,8 +1033,10 @@ func (s *Store) MarkOutboxProviderFailure(ctx context.Context, id string, lastEr
 	if id == "" {
 		return errors.New("missing id")
 	}
-	fence := s.resolveOutboundFence(ctx)
-	_, err := s.q.ExecContext(ctx, adaptOutboxSQL(fence, `
+	return s.noteOutboxSchemaError(s.withTx(ctx, func(scoped *Store) error {
+		fence := scoped.resolveOutboundFence(ctx)
+		var orgID string
+		err := scoped.q.QueryRowContext(ctx, adaptOutboxSQL(fence, `
 		UPDATE outbox_messages
 		SET status = 'failed',
 		    last_error = nullif($2, ''),
@@ -931,8 +1045,16 @@ func (s *Store) MarkOutboxProviderFailure(ctx context.Context, id string, lastEr
 		    terminal_at = now(),
 		    provider_resolved_at = CASE WHEN provider_started_at IS NOT NULL THEN now() ELSE provider_resolved_at END
 		WHERE id = $1
-	`), id, lastError)
-	return s.noteOutboxSchemaError(err)
+		RETURNING org_id::text
+	`), id, lastError).Scan(&orgID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return scoped.resolveOutboxRecipients(ctx, orgID, id, "released")
+	}))
 }
 
 func (s *Store) MarkClaimedOutboxProviderFailure(ctx context.Context, id, workerID, operationID, lastError string) error {
@@ -982,8 +1104,10 @@ func (s *Store) finishClaimedOutbox(ctx context.Context, id, workerID, operation
 	if id == "" || workerID == "" {
 		return errors.New("missing claimed outbox identity")
 	}
-	fence := s.resolveOutboundFence(ctx)
-	result, err := s.q.ExecContext(ctx, adaptOutboxSQL(fence, `
+	return s.noteOutboxSchemaError(s.withTx(ctx, func(scoped *Store) error {
+		fence := scoped.resolveOutboundFence(ctx)
+		var orgID string
+		err := scoped.q.QueryRowContext(ctx, adaptOutboxSQL(fence, `
 		UPDATE outbox_messages
 		SET status = $4,
 		    provider_message_id = nullif($6, ''),
@@ -996,18 +1120,20 @@ func (s *Store) finishClaimedOutbox(ctx context.Context, id, workerID, operation
 		  AND status = 'sending'
 		  AND locked_by = $2
 		  AND (($3 = '' AND provider_operation_id IS NULL) OR provider_operation_id = $3)
-	`), trimOutboxArgs(fence, id, workerID, operationID, status, lastError, providerMessageID, resolve)...)
-	if err != nil {
-		return s.noteOutboxSchemaError(err)
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows != 1 {
-		return ErrOutboxClaimLost
-	}
-	return nil
+		RETURNING org_id::text
+	`), trimOutboxArgs(fence, id, workerID, operationID, status, lastError, providerMessageID, resolve)...).Scan(&orgID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrOutboxClaimLost
+		}
+		if err != nil {
+			return err
+		}
+		state := "released"
+		if status == "sent" {
+			state = "committed"
+		}
+		return scoped.resolveOutboxRecipients(ctx, orgID, id, state)
+	}))
 }
 
 func (s *Store) RequeueOutboxMessage(ctx context.Context, id string, nextAttemptAt time.Time, lastError string) error {
@@ -1059,7 +1185,7 @@ func (s *Store) RequeueClaimedOutboxKnownProviderFailure(ctx context.Context, id
 		if err := scoped.LockOrgPolicy(ctx, orgID); err != nil {
 			return err
 		}
-		var savedEpoch int64
+		var savedEpoch sql.NullInt64
 		if err := scoped.q.QueryRowContext(ctx, `
 			SELECT autonomous_policy_epoch
 			FROM outbox_messages
@@ -1076,25 +1202,47 @@ func (s *Store) RequeueClaimedOutboxKnownProviderFailure(ctx context.Context, id
 			}
 			return err
 		}
-		currentEpoch, err := scoped.CurrentOutboundPolicyEpoch(ctx, orgID)
+		period, metered, err := scoped.recipientOutboxPeriod(ctx, orgID, id)
 		if err != nil {
 			return err
 		}
-		allowed, err := scoped.outboundPolicyFlagsAllowSend(ctx, orgID)
-		if err != nil {
-			return err
+		if !savedEpoch.Valid && !metered {
+			return ErrOutboxClaimLost
 		}
-		if currentEpoch != savedEpoch || !allowed {
+		terminalReason := ""
+		if savedEpoch.Valid {
+			currentEpoch, err := scoped.CurrentOutboundPolicyEpoch(ctx, orgID)
+			if err != nil {
+				return err
+			}
+			allowed, err := scoped.outboundPolicyFlagsAllowSend(ctx, orgID)
+			if err != nil {
+				return err
+			}
+			if currentEpoch != savedEpoch.Int64 || !allowed {
+				terminalReason = "policy_revoked"
+			}
+		}
+		if metered && terminalReason == "" {
+			allowed, err := scoped.recipientPeriodAllowsDispatch(ctx, orgID, period)
+			if err != nil {
+				return err
+			}
+			if !allowed {
+				terminalReason = "recipient_period_closed"
+			}
+		}
+		if terminalReason != "" {
 			result, err := scoped.q.ExecContext(ctx, `
 				UPDATE outbox_messages
 				SET status = 'failed',
-				    last_error = 'policy_revoked',
+				    last_error = $3,
 				    provider_resolved_at = now(),
 				    locked_at = NULL,
 				    locked_by = NULL,
 				    terminal_at = now()
 				WHERE id = $1 AND status = 'sending' AND locked_by = $2
-			`, id, claimLeaseID)
+			`, id, claimLeaseID, terminalReason)
 			if err != nil {
 				return err
 			}
@@ -1105,7 +1253,7 @@ func (s *Store) RequeueClaimedOutboxKnownProviderFailure(ctx context.Context, id
 			if rows != 1 {
 				return ErrOutboxClaimLost
 			}
-			return nil
+			return scoped.resolveOutboxRecipients(ctx, orgID, id, "released")
 		}
 		result, err := scoped.q.ExecContext(ctx, `
 			UPDATE outbox_messages
@@ -1159,7 +1307,11 @@ func (s *Store) requeueOutboxMessage(ctx context.Context, id, workerID string, n
 			}
 			return err
 		}
-		if savedEpoch.Valid {
+		period, metered, err := scoped.recipientOutboxPeriod(ctx, orgID, id)
+		if err != nil {
+			return err
+		}
+		if savedEpoch.Valid || metered {
 			if err := scoped.LockOrgPolicy(ctx, orgID); err != nil {
 				return err
 			}
@@ -1190,7 +1342,7 @@ func (s *Store) requeueOutboxMessage(ctx context.Context, id, workerID string, n
 				return err
 			}
 			if currentEpoch != savedEpoch.Int64 || !allowed {
-				_, err := scoped.q.ExecContext(ctx, `
+				result, err := scoped.q.ExecContext(ctx, `
 					UPDATE outbox_messages
 					SET status = 'failed',
 					    last_error = 'policy_revoked',
@@ -1199,7 +1351,40 @@ func (s *Store) requeueOutboxMessage(ctx context.Context, id, workerID string, n
 					    terminal_at = now()
 					WHERE id = $1
 				`, id)
+				if err != nil {
+					return err
+				}
+				rows, err := result.RowsAffected()
+				if err != nil {
+					return err
+				}
+				if rows != 1 {
+					return ErrOutboxClaimLost
+				}
+				return scoped.resolveOutboxRecipients(ctx, orgID, id, "released")
+			}
+		}
+		if metered && !(startedAt.Valid && !resolvedAt.Valid) {
+			allowed, err := scoped.recipientPeriodAllowsDispatch(ctx, orgID, period)
+			if err != nil {
 				return err
+			}
+			if !allowed {
+				result, err := scoped.q.ExecContext(ctx, `UPDATE outbox_messages
+  SET status='failed',last_error='recipient_period_closed',locked_at=NULL,
+      locked_by=NULL,terminal_at=now()
+  WHERE org_id=$1::uuid AND id=$2::uuid`, orgID, id)
+				if err != nil {
+					return err
+				}
+				rows, err := result.RowsAffected()
+				if err != nil {
+					return err
+				}
+				if rows != 1 {
+					return ErrOutboxClaimLost
+				}
+				return scoped.resolveOutboxRecipients(ctx, orgID, id, "released")
 			}
 		}
 		result, err := scoped.q.ExecContext(ctx, `
@@ -1735,6 +1920,24 @@ func (s *Store) ReplayOutboxMessage(ctx context.Context, orgID, id string) (bool
 	}
 	var replayed bool
 	err := s.withTx(ctx, func(scoped *Store) error {
+		ledgerAvailable, err := scoped.recipientLedgerAvailable(ctx)
+		if err != nil {
+			return err
+		}
+		if ledgerAvailable {
+			if err := scoped.LockOrgPolicy(ctx, orgID); err != nil {
+				return err
+			}
+			var enrolled bool
+			if err := scoped.q.QueryRowContext(ctx, `SELECT EXISTS(
+			  SELECT 1 FROM org_recipient_periods WHERE org_id=$1::uuid
+			)`, orgID).Scan(&enrolled); err != nil {
+				return err
+			}
+			if enrolled {
+				return ErrRecipientReplayRequiresNewMessage
+			}
+		}
 		var status string
 		var releasedDigests string
 		if err := scoped.q.QueryRowContext(ctx, `
