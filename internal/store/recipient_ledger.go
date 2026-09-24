@@ -65,6 +65,56 @@ func (s *Store) InstallRecipientPeriod(ctx context.Context, p RecipientPeriod) e
 	return nil
 }
 
+// RecipientAdmissionPeriod identifies the single live period for an enrolled
+// organization. An organization with no period rows still uses its legacy
+// meter; once enrolled, an expired or closed period never falls back to it.
+// Callers must hold their billing/lifecycle authority lock and reserve in the
+// same transaction. ReserveRecipients rechecks the period after locking it.
+func (s *Store) RecipientAdmissionPeriod(ctx context.Context, org string) (period string, enrolled bool, err error) {
+	if err := s.requireTx(); err != nil {
+		return "", false, err
+	}
+	if err := recipientIDs(org, org); err != nil {
+		return "", false, err
+	}
+	rows, err := s.q.QueryContext(ctx, `SELECT period_id::text FROM org_recipient_periods
+  WHERE org_id=$1 AND NOT admission_closed
+    AND starts_at <= clock_timestamp() AND ends_at > clock_timestamp()
+  LIMIT 2`, org)
+	if err != nil {
+		return "", false, err
+	}
+	var active []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return "", false, err
+		}
+		active = append(active, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return "", false, err
+	}
+	if err := rows.Close(); err != nil {
+		return "", false, err
+	}
+	if len(active) > 1 {
+		return "", true, ErrRecipientLedgerConflict
+	}
+	if len(active) == 1 {
+		return active[0], true, nil
+	}
+	if err := s.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM org_recipient_periods WHERE org_id=$1)`, org).Scan(&enrolled); err != nil {
+		return "", false, err
+	}
+	if enrolled {
+		return "", true, ErrRecipientLimit
+	}
+	return "", false, nil
+}
+
 // ReserveRecipients is an opt-in primitive, with no production callsites yet.
 // Its caller must establish outbox ownership and all live lifecycle/policy
 // fences and insert the outbox row in this same transaction. The org-period row
