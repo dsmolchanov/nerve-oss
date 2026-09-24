@@ -2,7 +2,6 @@ package tools
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 
@@ -18,9 +17,20 @@ type OutboundConfigurationError struct {
 
 func (err *OutboundConfigurationError) Error() string { return err.Code }
 
+// CloudOutboundConfigurationError keeps the existing legacy MCP error text,
+// while the modern MCP boundary can expose only a repository-authored code.
+// The underlying text can include a provider name and must not enter a modern
+// response or protected canary log.
+type CloudOutboundConfigurationError struct {
+	Code   string
+	legacy string
+}
+
+func (err *CloudOutboundConfigurationError) Error() string { return err.legacy }
+
 func (s *Service) outboundConfigError(code, legacy string) error {
 	if s.Config.Cloud.Mode {
-		return errors.New(legacy)
+		return &CloudOutboundConfigurationError{Code: code, legacy: legacy}
 	}
 	return &OutboundConfigurationError{Code: code, Remediation: "docs/SELF_HOSTING.md#outbound-configuration"}
 }

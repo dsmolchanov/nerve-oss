@@ -19,6 +19,7 @@ type modernBusinessError struct {
 func translateModernBusinessError(err error) modernBusinessError {
 	translated := modernBusinessError{Code: "tool_failed"}
 	var configurationErr *tools.OutboundConfigurationError
+	var cloudConfigurationErr *tools.CloudOutboundConfigurationError
 	var attachmentErr *tools.AttachmentInputError
 	var policyErr *outboundPolicyError
 	// The enqueue-time recheck raises the tools-layer type; without this the
@@ -35,6 +36,13 @@ func translateModernBusinessError(err error) modernBusinessError {
 	case errors.As(err, &configurationErr):
 		translated.Code = configurationErr.Code
 		translated.Remediation = configurationErr.Remediation
+	case errors.As(err, &cloudConfigurationErr):
+		// A provider name may be embedded in the legacy message. Admit only
+		// these fixed local codes to the modern response.
+		switch cloudConfigurationErr.Code {
+		case "outbound_disabled", "recipient_domain_not_allowed", "outbound_transport_unconfigured":
+			translated.Code = cloudConfigurationErr.Code
+		}
 	case errors.As(err, &billingErr):
 		if !validBillingBusinessError(billingErr) {
 			return translated
