@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/mail"
 	"neuralmail/configs"
 	"path/filepath"
@@ -616,7 +617,7 @@ func (s *Service) ComposeEmail(ctx context.Context, inboxID, toAddress, subject,
 
 func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddress, subject, body string, bodyHTML string, idempotencyKey string, options ComposeEmailOptions) (any, error) {
 	if err := s.CheckLocalAccess(ctx, "inbox", inboxID); err != nil {
-		return nil, err
+		return nil, logComposeFailure("local_access", err)
 	}
 	if subject == "" {
 		return nil, errors.New("missing subject")
@@ -637,25 +638,30 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 	}
 	fromName, err := normalizeFromName(options.FromName)
 	if err != nil {
-		return nil, err
+		return nil, logComposeFailure("from_name", err)
 	}
 
-	return s.withOutboundStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
+	logged := false
+	fail := func(stage string, cause error) error {
+		logged = true
+		return logComposeFailure(stage, cause)
+	}
+	result, err := s.withOutboundStore(ctx, func(scopedCtx context.Context, st *store.Store, principal auth.Principal) (any, error) {
 		if principal.OrgID != "" {
 			if err := s.ensureInboxBelongsToOrg(scopedCtx, st, principal.OrgID, inboxID); err != nil {
-				return nil, err
+				return nil, fail("ownership", err)
 			}
 		}
 
 		if err := s.reevaluateOutboundPolicy(scopedCtx, st, principal, OutboundPolicyInput{
 			Tool: "compose_email", InboxID: inboxID,
 		}); err != nil {
-			return nil, err
+			return nil, fail("policy", err)
 		}
 
 		inbox, err := s.activeInboxRecord(scopedCtx, st, principal, inboxID)
 		if err != nil {
-			return nil, err
+			return nil, fail("active_inbox", err)
 		}
 		fromAddress := strings.TrimSpace(inbox.Address)
 		if fromAddress == "" {
@@ -666,12 +672,12 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 		} else {
 			fromAddress, err = canonicalOutboundInboxAddress(inbox.Address)
 			if err != nil {
-				return nil, err
+				return nil, fail("sender_address", err)
 			}
 		}
 		fromMailbox, senderAddress, err := formatSenderMailbox(fromAddress, fromName)
 		if err != nil {
-			return nil, err
+			return nil, fail("sender_address", err)
 		}
 
 		if idempotencyKey == "" {
@@ -683,7 +689,7 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 			provider = "smtp"
 		}
 		if err := s.checkOutboundConfiguration(toAddress, provider); err != nil {
-			return nil, err
+			return nil, fail("transport_config", err)
 		}
 
 		outboxID, err := st.EnqueueOutboxMessage(scopedCtx, store.OutboxMessage{
@@ -703,7 +709,7 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 			),
 		})
 		if err != nil {
-			return nil, translateOutboundLimitError(err)
+			return nil, fail("enqueue", translateOutboundLimitError(err))
 		}
 
 		if existing, err := st.GetMessage(scopedCtx, outboxID); err == nil {
@@ -713,7 +719,7 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 				"status":     "queued",
 			}, nil
 		} else if !errors.Is(err, sql.ErrNoRows) {
-			return nil, err
+			return nil, fail("message_read", err)
 		}
 
 		msg := store.Message{
@@ -730,7 +736,7 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 		providerThreadID := "compose-" + outboxID
 		threadID, msgID, err := st.InsertMessageWithThread(scopedCtx, inboxID, providerThreadID, msg)
 		if err != nil {
-			return nil, err
+			return nil, fail("message_write", err)
 		}
 		return map[string]any{
 			"thread_id":  threadID,
@@ -738,6 +744,37 @@ func (s *Service) ComposeEmailWithOptions(ctx context.Context, inboxID, toAddres
 			"status":     "queued",
 		}, nil
 	})
+	if err != nil && !logged {
+		return nil, logComposeFailure("scoped_store", err)
+	}
+	return result, err
+}
+
+func logComposeFailure(stage string, err error) error {
+	if err == nil {
+		return nil
+	}
+	code := "other"
+	switch stage {
+	case "local_access", "from_name", "ownership", "policy", "active_inbox",
+		"sender_address", "transport_config", "message_read", "message_write", "scoped_store":
+		code = stage
+	case "enqueue":
+		switch {
+		case errors.Is(err, store.ErrDomainNotVerified):
+			code = "enqueue_domain_unverified"
+		case errors.Is(err, store.ErrOutboxPolicyRevoked):
+			code = "enqueue_policy_revoked"
+		case errors.Is(err, store.ErrOutboxIdempotencyConflict):
+			code = "enqueue_idempotency_conflict"
+		default:
+			code = "enqueue_other"
+		}
+	}
+	// Never log the wrapped error: it can include an address, key, SQL value,
+	// or provider payload. The stage is a repository-authored literal only.
+	log.Printf("compose_email failure stage=%s", code)
+	return err
 }
 
 func autonomousLimitInput(
