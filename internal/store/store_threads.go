@@ -173,7 +173,7 @@ func (s *Store) UpsertThread(ctx context.Context, thread Thread) (string, error)
 			sentiment_score = EXCLUDED.sentiment_score,
 			priority_level = EXCLUDED.priority_level,
 			provider_thread_id = EXCLUDED.provider_thread_id`,
-		thread.ID, thread.InboxID, thread.Subject, thread.Status, participantsJSON, thread.UpdatedAt, thread.SentimentScore, thread.PriorityLevel, thread.ProviderThreadID)
+		thread.ID, thread.InboxID, thread.Subject, thread.Status, string(participantsJSON), thread.UpdatedAt, thread.SentimentScore, thread.PriorityLevel, thread.ProviderThreadID)
 	if err != nil {
 		return "", err
 	}
@@ -200,7 +200,7 @@ func (s *Store) InsertMessage(ctx context.Context, msg Message) (string, error) 
 		VALUES ($1,$2,(SELECT org_id FROM inboxes WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,nullif($14,''),$15,nullif($16,''))
 		ON CONFLICT (inbox_id, provider_message_id) DO UPDATE SET thread_id = EXCLUDED.thread_id
 		RETURNING id`,
-		msg.ID, msg.InboxID, msg.ThreadID, msg.Direction, msg.Subject, msg.Text, msg.HTML, msg.CreatedAt, msg.ProviderMessageID, msg.InternetMessageID, fromJSON, toJSON, ccJSON, msg.InReplyTo, refs, msg.ReceivedEmailID)
+		msg.ID, msg.InboxID, msg.ThreadID, msg.Direction, msg.Subject, msg.Text, msg.HTML, msg.CreatedAt, msg.ProviderMessageID, msg.InternetMessageID, string(fromJSON), string(toJSON), string(ccJSON), msg.InReplyTo, refs, msg.ReceivedEmailID)
 	var id string
 	if err := row.Scan(&id); err != nil {
 		return "", err
@@ -230,7 +230,7 @@ func (s *Store) EnsureThread(ctx context.Context, inboxID string, providerThread
 		VALUES ($1,$2,(SELECT org_id FROM inboxes WHERE id = $2),$3,$4,$5,$6,$7)
 		ON CONFLICT (inbox_id, provider_thread_id) DO UPDATE SET subject = EXCLUDED.subject, updated_at = EXCLUDED.updated_at
 		RETURNING id`,
-		thread.ID, thread.InboxID, thread.Subject, thread.Status, participantsJSON, thread.UpdatedAt, thread.ProviderThreadID)
+		thread.ID, thread.InboxID, thread.Subject, thread.Status, string(participantsJSON), thread.UpdatedAt, thread.ProviderThreadID)
 	var id string
 	if err := row.Scan(&id); err != nil {
 		return "", err

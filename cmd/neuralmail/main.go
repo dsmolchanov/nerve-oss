@@ -20,8 +20,6 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
-
 	"neuralmail/internal/config"
 	"neuralmail/internal/mcp"
 	"neuralmail/internal/startup"
@@ -116,7 +114,7 @@ func runMigrations(cfg config.Config, migrate func(context.Context, *sql.DB) err
 	if err := startup.CheckEmbeddedMigration(); err != nil {
 		log.Fatalf("migration policy: %v", err)
 	}
-	db, err := sql.Open("pgx", cfg.Database.DSN)
+	db, err := store.OpenDB(cfg.Database.DSN)
 	if err != nil {
 		log.Fatalf("open database: %v", err)
 	}
@@ -471,7 +469,7 @@ func pingHTTP(url string) error {
 }
 
 func pingDatabase(ctx context.Context, dsn string) error {
-	db, err := sql.Open("pgx", dsn)
+	db, err := store.OpenDB(dsn)
 	if err != nil {
 		return err
 	}

@@ -848,7 +848,7 @@ func (s *Store) applyLegacyDomainProviderResultLocked(
 
 	dnsRecords := any(nil)
 	if result.Outcome == LegacyDomainProviderObserved && len(result.DNSRecords) != 0 {
-		dnsRecords = []byte(result.DNSRecords)
+		dnsRecords = jsonTextArg(result.DNSRecords)
 	}
 	mxVerified := result.MXVerified
 	spfVerified := result.SPFVerified
@@ -981,7 +981,7 @@ func (s *Store) captureStaleLegacyDomainCreateLocked(
 	}
 	dnsRecords := any(nil)
 	if result.Outcome == LegacyDomainProviderObserved && len(result.DNSRecords) != 0 {
-		dnsRecords = []byte(result.DNSRecords)
+		dnsRecords = jsonTextArg(result.DNSRecords)
 	}
 
 	claimResult, err := s.q.ExecContext(ctx, `

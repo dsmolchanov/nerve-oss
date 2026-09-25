@@ -1095,7 +1095,10 @@ func withTempDatabase(t *testing.T, run func(ctx context.Context, db *sql.DB)) {
 	if err != nil {
 		t.Fatalf("build test dsn: %v", err)
 	}
-	db, err := sql.Open("pgx", testDSN)
+	// Exercise the same pgx execution mode as every runtime and maintenance
+	// caller. This makes the full PostgreSQL store suite a regression test for
+	// parameter encodings that QueryExecModeExec must infer without Describe.
+	db, err := OpenDB(testDSN)
 	if err != nil {
 		t.Fatalf("open temp database: %v", err)
 	}

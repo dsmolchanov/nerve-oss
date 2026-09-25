@@ -8,7 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 type Store struct {
@@ -176,17 +177,55 @@ var ErrOwnershipMismatch = errors.New("resource does not belong to org")
 // Core store lifecycle
 
 func Open(dsn string) (*Store, error) {
-	if dsn == "" {
-		return nil, errors.New("missing database dsn")
-	}
-	db, err := sql.Open("pgx", dsn)
+	db, err := OpenDB(dsn)
 	if err != nil {
 		return nil, err
 	}
+	return &Store{db: db, q: db, fence: newEnabledFence(), drift: new(atomic.Bool)}, nil
+}
+
+// OpenDB creates the shared database/sql pool used by runtime and maintenance
+// commands. Exec mode deliberately avoids connection-scoped prepared
+// statements and sends Parse/Bind/Execute in one protocol exchange: transaction
+// poolers can move successive exchanges between server sessions, where a named
+// statement can collide with another client and a two-exchange unnamed
+// statement can disappear between Describe and Execute. The extended protocol
+// remains safe for direct PostgreSQL connections as well.
+func OpenDB(dsn string) (*sql.DB, error) {
+	config, err := poolerSafePGXConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	db := stdlib.OpenDB(*config)
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(30 * time.Minute)
-	return &Store{db: db, q: db, fence: newEnabledFence(), drift: new(atomic.Bool)}, nil
+	return db, nil
+}
+
+func poolerSafePGXConfig(dsn string) (*pgx.ConnConfig, error) {
+	if dsn == "" {
+		return nil, errors.New("missing database dsn")
+	}
+	config, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	config.DefaultQueryExecMode = pgx.QueryExecModeExec
+	config.StatementCacheCapacity = 0
+	config.DescriptionCacheCapacity = 0
+	return config, nil
+}
+
+// jsonTextArg keeps JSON parameters untyped until PostgreSQL applies the
+// destination column (or an explicit ::jsonb cast). QueryExecModeExec cannot
+// describe parameter types before sending them, so []byte/json.RawMessage
+// would otherwise be encoded as bytea. Preserve nil as SQL NULL.
+func jsonTextArg(raw []byte) any {
+	if raw == nil {
+		return nil
+	}
+	return string(raw)
 }
 
 func (s *Store) DB() *sql.DB {
