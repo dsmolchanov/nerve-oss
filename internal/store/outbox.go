@@ -1454,7 +1454,7 @@ func (s *Store) InsertOutboxEventReturningID(ctx context.Context, evt OutboxEven
 			INSERT INTO outbox_events (org_id, outbox_message_id, provider_message_id, event_type, raw_payload, reason)
 			VALUES ($1, $2, nullif($3, ''), $4, $5, nullif($6, ''))
 			RETURNING id::text
-		`, evt.OrgID, evt.OutboxMessageID, evt.ProviderMessageID, evt.EventType, evt.RawPayload, evt.Reason)
+		`, evt.OrgID, evt.OutboxMessageID, evt.ProviderMessageID, evt.EventType, jsonTextArg(evt.RawPayload), evt.Reason)
 		if err := row.Scan(&id); err != nil {
 			return "", err
 		}
@@ -1470,7 +1470,7 @@ func (s *Store) InsertOutboxEventReturningID(ctx context.Context, evt OutboxEven
 		SELECT $1, om.id, $2, $3, $4, $5
 		FROM outbox_messages om WHERE om.provider_message_id = $2
 		RETURNING id::text
-	`, evt.OrgID, evt.ProviderMessageID, evt.EventType, evt.RawPayload, evt.Reason)
+	`, evt.OrgID, evt.ProviderMessageID, evt.EventType, jsonTextArg(evt.RawPayload), evt.Reason)
 	if err := row.Scan(&id); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", nil

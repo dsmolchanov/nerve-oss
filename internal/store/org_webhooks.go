@@ -329,7 +329,7 @@ func (s *Store) enqueueWebhookDelivery(ctx context.Context, orgID, webhookID, ou
 		VALUES ($1, $2, nullif($3, '')::uuid, nullif($4, '')::uuid, $5, $6)
 		ON CONFLICT DO NOTHING
 		RETURNING id::text
-	`, orgID, webhookID, outboxEventID, orgEventID, eventType, []byte(payload))
+	`, orgID, webhookID, outboxEventID, orgEventID, eventType, jsonTextArg(payload))
 	if err := row.Scan(&id); err == nil {
 		return id, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {

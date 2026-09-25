@@ -755,7 +755,7 @@ func (s *Store) UpdateOrgDomainResend(ctx context.Context, id, resendDomainID, r
 			    resend_dns_records = coalesce($4::jsonb, resend_dns_records),
 			    updated_at = now()
 			WHERE id = $1
-		`, id, resendDomainID, resendStatus, dnsRecords)
+		`, id, resendDomainID, resendStatus, jsonTextArg(dnsRecords))
 		return err
 	})
 }

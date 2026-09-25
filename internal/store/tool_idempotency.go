@@ -138,7 +138,7 @@ func (s *Store) MarkToolIdempotencySucceeded(ctx context.Context, orgID string, 
 			status = 'succeeded',
 			cached_response = EXCLUDED.cached_response,
 			updated_at = EXCLUDED.updated_at
-	`, orgID, toolName, idempotencyKey, cachedResponse, now)
+	`, orgID, toolName, idempotencyKey, jsonTextArg(cachedResponse), now)
 	return err
 }
 

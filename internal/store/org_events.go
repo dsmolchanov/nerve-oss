@@ -60,7 +60,7 @@ func (s *Store) InsertOrgEventAndFanOut(
 			VALUES ($1, $2, $3, $4, $5)
 			ON CONFLICT (org_id, event_type, ref_kind, ref_id) DO NOTHING
 			RETURNING id::text
-		`, orgID, eventType, refKind, refID, []byte(payload)).Scan(&insertedID)
+		`, orgID, eventType, refKind, refID, jsonTextArg(payload)).Scan(&insertedID)
 		if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
 			return scanErr
 		}
@@ -144,7 +144,7 @@ func (s *Store) enqueueOrgWebhookDelivery(
 		ON CONFLICT (webhook_id, org_event_id) WHERE org_event_id IS NOT NULL
 		DO UPDATE SET webhook_id = org_webhook_deliveries.webhook_id
 		RETURNING id::text
-	`, orgID, webhookID, orgEventID, eventType, []byte(payload)).Scan(&id)
+	`, orgID, webhookID, orgEventID, eventType, jsonTextArg(payload)).Scan(&id)
 	return id, err
 }
 
