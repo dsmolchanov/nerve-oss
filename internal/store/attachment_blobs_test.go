@@ -59,6 +59,35 @@ func TestStoreAttachmentBlobConcurrentDifferentContentHonorsQuota(t *testing.T) 
 	})
 }
 
+func TestStoreAttachmentBlobMapsDatabaseStorageCapToQuota(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		migrateToLatest(t, ctx, db)
+		st := &Store{db: db, q: db}
+		orgID, err := st.CreateOrg(ctx, "storage-cap")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			CREATE FUNCTION reject_attachment_storage_cap() RETURNS trigger
+			LANGUAGE plpgsql AS $$
+			BEGIN
+			  RAISE EXCEPTION USING ERRCODE = 'PNT07', MESSAGE = 'organization storage limit exceeded';
+			END;
+			$$;
+			CREATE TRIGGER reject_attachment_storage_cap
+			BEFORE INSERT ON attachment_blobs
+			FOR EACH ROW EXECUTE FUNCTION reject_attachment_storage_cap();
+		`); err != nil {
+			t.Fatal(err)
+		}
+		_, inserted, err := st.StoreAttachmentBlob(ctx, orgID, "text/plain", []byte("x"))
+		if !errors.Is(err, ErrAttachmentQuotaExceeded) || inserted {
+			t.Fatalf("inserted=%v err=%v, want quota error without insertion", inserted, err)
+		}
+		assertAttachmentUsage(t, ctx, db, orgID, 0, 0)
+	})
+}
+
 func TestStoreAttachmentBlobConcurrentUploadsCannotExceedQuota(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		migrateToLatest(t, ctx, db)

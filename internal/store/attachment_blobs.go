@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 var ErrAttachmentQuotaExceeded = errors.New("attachment storage quota exceeded")
@@ -94,6 +96,10 @@ func (s *Store) StoreAttachmentBlob(
 			return nil
 		}
 		if insertErr != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(insertErr, &pgErr) && pgErr.Code == "PNT07" {
+				return fmt.Errorf("%w: %v", ErrAttachmentQuotaExceeded, insertErr)
+			}
 			return insertErr
 		}
 		if storedSize != size {
