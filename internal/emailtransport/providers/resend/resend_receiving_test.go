@@ -3,8 +3,10 @@ package resend
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -22,6 +24,18 @@ func TestReceivingClientClassifiesRetentionNotFound(t *testing.T) {
 	}
 	if _, err := client.GetAttachment(context.Background(), "received-1", "attachment-1"); !errors.Is(err, ErrAttachmentNotFound) {
 		t.Fatalf("attachment error=%v, want typed not-found", err)
+	}
+}
+
+func TestReceivingClientBoundsProviderBody(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(w, strings.NewReader(strings.Repeat("x", maxReceivedEmailResponseBytes+1)))
+	}))
+	defer server.Close()
+	client := NewReceivingClient(Config{BaseURL: server.URL, HTTPClient: server.Client()})
+	if _, err := client.GetReceivedEmail(context.Background(), "received-oversized"); !errors.Is(err, ErrReceivedEmailTooLarge) {
+		t.Fatalf("oversized provider response error=%v", err)
 	}
 }
 
