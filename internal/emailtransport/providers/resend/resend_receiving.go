@@ -13,8 +13,12 @@ import (
 
 var (
 	ErrReceivedEmailNotFound = errors.New("resend received email not found")
+	ErrReceivedEmailTooLarge = errors.New("resend received email exceeds the bounded fetch size")
 	ErrAttachmentNotFound    = errors.New("resend attachment not found")
 )
+
+const maxReceivedEmailResponseBytes = 40 << 20
+const maxReceivingErrorResponseBytes = 64 << 10
 
 // ReceivedEmail is the response from GET /emails/receiving/{id}
 type ReceivedEmail struct {
@@ -82,7 +86,17 @@ func (c *ReceivingClient) GetReceivedEmail(ctx context.Context, emailID string) 
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	limit := int64(maxReceivedEmailResponseBytes)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		limit = maxReceivingErrorResponseBytes
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("resend receiving: read response: %w", err)
+	}
+	if int64(len(body)) > limit {
+		return nil, ErrReceivedEmailTooLarge
+	}
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, fmt.Errorf("%w (retention may have expired): %s", ErrReceivedEmailNotFound, strings.TrimSpace(string(body)))
