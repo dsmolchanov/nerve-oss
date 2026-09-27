@@ -15,6 +15,7 @@ import (
 )
 
 const billingUpgradeToolName = "nerve_billing_upgrade"
+const billingStatusToolName = "nerve_billing_status"
 const starterOfferID = "starter_2026_09_v2"
 
 // HostedBillingProvisioner delegates a human-confirmed purchase invitation to
@@ -22,6 +23,67 @@ const starterOfferID = "starter_2026_09_v2"
 // from the tool caller.
 type HostedBillingProvisioner interface {
 	Upgrade(context.Context, BillingCaller, BillingUpgradeInput) (BillingUpgradeResult, error)
+	BillingStatus(context.Context, BillingCaller) (BillingStatusResult, error)
+}
+
+type BillingStatusResult struct {
+	ResultType    string `json:"resultType"`
+	HostedState   string `json:"hosted_state"`
+	StarterActive bool   `json:"starter_active"`
+}
+
+func billingStatusToolDescriptor() toolDescriptor {
+	return toolDescriptor{
+		Name:        billingStatusToolName,
+		Description: "Read the authenticated organization's durable hosted Starter billing state",
+		InputSchema: inputObject(map[string]any{}),
+		OutputShape: outputObject(map[string]any{
+			"resultType": map[string]any{"type": "string", "const": "complete"},
+			"hosted_state": map[string]any{"type": "string", "enum": []string{
+				"none", "awaiting_owner", "session_prepared", "session_open", "provider_unknown",
+				"quarantined", "active", "cleanup_required", "terminal",
+			}},
+			"starter_active": map[string]any{"type": "boolean"},
+		}, "resultType", "hosted_state", "starter_active"),
+		ErrorCodes: billingBusinessErrorCodes(),
+	}
+}
+
+func billingStatusToolAvailable(server *Server, principal auth.Principal) bool {
+	return server != nil && server.HostedBilling != nil && server.Config.Cloud.Mode &&
+		server.Auth != nil && isActiveBillingPrincipalForTool(principal) &&
+		server.Auth.ValidateScopes(principal, "nerve:billing.subscribe") == nil
+}
+
+func invokeBillingStatusTool(ctx context.Context, provisioner HostedBillingProvisioner,
+	caller BillingCaller, arguments json.RawMessage) (BillingStatusResult, error) {
+	if provisioner == nil {
+		return BillingStatusResult{}, billingTemporarilyUnavailable()
+	}
+	if !isActiveBillingPrincipalForTool(caller.Principal) {
+		return BillingStatusResult{}, billingInvalidState()
+	}
+	if !bytes.Equal(bytes.TrimSpace(arguments), []byte("{}")) {
+		return BillingStatusResult{}, billingInvalidRequest()
+	}
+	result, err := provisioner.BillingStatus(ctx, caller)
+	if err != nil {
+		return BillingStatusResult{}, sanitizeBillingProvisionerError(err)
+	}
+	if result.ResultType != "complete" || !validHostedStatusState(result.HostedState) {
+		return BillingStatusResult{}, billingTemporarilyUnavailable()
+	}
+	return result, nil
+}
+
+func validHostedStatusState(state string) bool {
+	switch state {
+	case "none", "awaiting_owner", "session_prepared", "session_open", "provider_unknown",
+		"quarantined", "active", "cleanup_required", "terminal":
+		return true
+	default:
+		return false
+	}
 }
 
 type BillingUpgradeInput struct {

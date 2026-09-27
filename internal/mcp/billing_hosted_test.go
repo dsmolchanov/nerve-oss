@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"neuralmail/internal/auth"
+	"neuralmail/internal/localauth"
 )
 
 const hostedTestIntent = "11111111-1111-4111-8111-111111111111"
@@ -27,6 +28,12 @@ func (stub *recordingHostedBilling) Upgrade(_ context.Context, caller BillingCal
 	stub.caller, stub.input = caller, input
 	stub.calls++
 	return stub.result, stub.err
+}
+
+func (stub *recordingHostedBilling) BillingStatus(_ context.Context, caller BillingCaller) (BillingStatusResult, error) {
+	stub.caller = caller
+	stub.calls++
+	return BillingStatusResult{ResultType: "complete", HostedState: "none"}, stub.err
 }
 
 func hostedBillingResult() BillingUpgradeResult {
@@ -114,6 +121,66 @@ func TestHostedUpgradeRejectsCallerAuthorityAndUntrustedResult(t *testing.T) {
 		if !errors.As(err, &business) || business.Code != BillingErrorTemporarilyUnavailable ||
 			strings.Contains(err.Error(), target) {
 			t.Fatalf("unsafe provider URL escaped or was accepted: %q err=%v", target, err)
+		}
+	}
+}
+
+func TestHostedStatusIsScopedAndRejectsCallerAuthority(t *testing.T) {
+	cfg := hostedRouterConfig()
+	cfg.Cloud.DashboardBaseURL = "https://nerve.example"
+	runtime := NewServer(cfg, nil, auth.NewService(cfg, nil), nil)
+	stub := &recordingHostedBilling{}
+	runtime.HostedBilling = stub
+	principal := activeBillingPrincipal("nerve:billing.subscribe")
+	if !billingStatusToolAvailable(runtime, principal) ||
+		billingStatusToolAvailable(runtime, activeBillingPrincipal("nerve:email.read")) {
+		t.Fatal("hosted status ignored principal scope")
+	}
+	for _, arguments := range []string{`{"org_id":"foreign"}`, `{"generation":8}`,
+		`{"customer_id":"cus_other"}`, `{} {}`} {
+		_, err := invokeBillingStatusTool(context.Background(), stub,
+			BillingCaller{Principal: principal}, json.RawMessage(arguments))
+		var business *BillingBusinessError
+		if !errors.As(err, &business) || business.Code != BillingErrorInvalidRequest || stub.calls != 0 {
+			t.Fatalf("caller authority reached status provider: %q err=%v calls=%d", arguments, err, stub.calls)
+		}
+	}
+	handler := NewSDKHandler(runtime, true)
+	call := httptest.NewRecorder()
+	handler.ServeHTTP(call, billingModernRequest(t, principal, "tools/call", map[string]any{
+		"_meta": modernOAuthMeta(), "name": billingStatusToolName,
+		"arguments": map[string]any{},
+	}, billingStatusToolName))
+	if call.Code != http.StatusOK || !strings.Contains(call.Body.String(), `"starter_active":false`) ||
+		stub.calls != 1 || stub.caller.Principal.OrgID != principal.OrgID {
+		t.Fatalf("hosted status call=%d %s; stub=%+v", call.Code, call.Body.String(), stub)
+	}
+}
+
+func TestHostedBillingModernCallsRejectLocalIdentity(t *testing.T) {
+	cfg := hostedRouterConfig()
+	cfg.Cloud.DashboardBaseURL = "https://nerve.example"
+	runtime := NewServer(cfg, nil, auth.NewService(cfg, nil), nil)
+	stub := &recordingHostedBilling{result: hostedBillingResult()}
+	runtime.HostedBilling = stub
+	handler := NewSDKHandler(runtime, true)
+	principal := activeBillingPrincipal("nerve:billing.subscribe")
+	for _, item := range []struct {
+		name string
+		args map[string]any
+	}{
+		{billingUpgradeToolName, map[string]any{"idempotency_key": "once"}},
+		{billingStatusToolName, map[string]any{}},
+	} {
+		request := billingModernRequest(t, principal, "tools/call", map[string]any{
+			"_meta": modernOAuthMeta(), "name": item.name, "arguments": item.args,
+		}, item.name)
+		request = request.WithContext(localauth.WithIdentity(request.Context(), localauth.Identity{}))
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		if stub.calls != 0 || !strings.Contains(recorder.Body.String(), `"isError":true`) {
+			t.Fatalf("local identity reached %s: calls=%d status=%d body=%s", item.name,
+				stub.calls, recorder.Code, recorder.Body.String())
 		}
 	}
 }

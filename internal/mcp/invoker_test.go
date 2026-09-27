@@ -25,6 +25,7 @@ func TestRequiredToolScopePreservesLegacyAndSplitsM2M(t *testing.T) {
 		{m2m, "send_reply", "nerve:email.reply"},
 		{m2m, "compose_email", "nerve:email.compose"},
 		{m2m, billingSubscribeToolName, "nerve:billing.subscribe"},
+		{m2m, billingStatusToolName, "nerve:billing.subscribe"},
 		{m2m, "get_thread", "nerve:email.read"},
 	} {
 		if got := requiredToolScope(test.principal, test.tool); got != test.want {
