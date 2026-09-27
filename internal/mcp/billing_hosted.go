@@ -43,8 +43,10 @@ func billingUpgradeToolDescriptor() toolDescriptor {
 			"idempotency_key": boundedStringProperty(1, 128),
 		}, "idempotency_key"),
 		OutputShape: outputObject(map[string]any{
-			"resultType":  map[string]any{"type": "string", "const": "complete"},
-			"state":       map[string]any{"type": "string", "const": "awaiting_owner"},
+			"resultType": map[string]any{"type": "string", "const": "complete"},
+			"state": map[string]any{"type": "string", "enum": []string{
+				"awaiting_owner", "session_prepared", "session_open", "provider_unknown",
+			}},
 			"offer_id":    map[string]any{"type": "string", "const": starterOfferID},
 			"upgrade_url": map[string]any{"type": "string", "format": "uri", "maxLength": 2048},
 		}, "resultType", "state", "offer_id", "upgrade_url"),
@@ -113,7 +115,7 @@ func decodeBillingUpgradeArguments(arguments json.RawMessage, target *BillingUpg
 }
 
 func validateBillingUpgradeResult(result BillingUpgradeResult, dashboardBaseURL string) error {
-	if result.ResultType != "complete" || result.State != "awaiting_owner" ||
+	if result.ResultType != "complete" || !validBillingUpgradeState(result.State) ||
 		result.OfferID != starterOfferID || len(result.UpgradeURL) > 2048 {
 		return errors.New("invalid billing upgrade result")
 	}
@@ -139,6 +141,15 @@ func validateBillingUpgradeResult(result BillingUpgradeResult, dashboardBaseURL 
 		return errors.New("invalid billing upgrade intent")
 	}
 	return nil
+}
+
+func validBillingUpgradeState(state string) bool {
+	switch state {
+	case "awaiting_owner", "session_prepared", "session_open", "provider_unknown":
+		return true
+	default:
+		return false
+	}
 }
 
 func validBillingDashboardOrigin(value string) bool {

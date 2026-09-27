@@ -62,6 +62,7 @@ type ClientConfig struct {
 
 var _ mcp.OnboardingProvisioner = (*Client)(nil)
 var _ mcp.BillingProvisioner = (*Client)(nil)
+var _ mcp.HostedBillingProvisioner = (*Client)(nil)
 
 type delegationPrincipal struct {
 	Kind       auth.PrincipalKind `json:"kind"`

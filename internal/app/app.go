@@ -58,9 +58,11 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	}
 	var onboardingProvisioner mcp.OnboardingProvisioner
 	var billingProvisioner mcp.BillingProvisioner
+	var hostedBillingProvisioner mcp.HostedBillingProvisioner
 	if delegationClient != nil {
 		onboardingProvisioner = delegationClient
 		billingProvisioner = delegationClient
+		hostedBillingProvisioner = delegationClient
 	}
 	st, err := store.Open(cfg.Database.DSN)
 	if err != nil {
@@ -127,6 +129,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		featureflags.New(cfg.Cloud.Mode, st), onboardingProvisioner,
 	)
 	mcpServer.Billing = billingProvisioner
+	mcpServer.HostedBilling = hostedBillingProvisioner
 	mcpRouter := mcp.NewRouter(cfg, authSvc, mcp.NewLegacyHandler(mcpServer), mcp.NewSDKHandler(mcpServer, true))
 
 	return &App{
