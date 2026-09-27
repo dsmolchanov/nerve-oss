@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -243,9 +244,37 @@ func (s *Store) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
 }
 
+var ErrTenantScopeRestoreFailed = errors.New("tenant scope restoration failed")
+
 func (s *Store) RunAsOrg(ctx context.Context, orgID string, fn func(scoped *Store) error) error {
 	if orgID == "" {
 		return errors.New("missing org id")
+	}
+	// A webhook has already locked its event in a transaction. Keep tenant
+	// policy and the processed marker in that same transaction.
+	if s.inTx {
+		var previousMode, previousOrg string
+		if err := s.q.QueryRowContext(ctx, `SELECT coalesce(current_setting('app.cloud_mode', true), ''),
+  coalesce(current_setting('app.current_org_id', true), '')`).Scan(&previousMode, &previousOrg); err != nil {
+			return err
+		}
+		if _, err := s.q.ExecContext(ctx, `SELECT set_config('app.cloud_mode', 'true', true)`); err != nil {
+			return err
+		}
+		if _, err := s.q.ExecContext(ctx, `SELECT set_config('app.current_org_id', $1, true)`, orgID); err != nil {
+			return err
+		}
+		callbackErr := fn(s)
+		_, orgRestoreErr := s.q.ExecContext(ctx, `SELECT set_config('app.current_org_id', $1, true)`, previousOrg)
+		_, modeRestoreErr := s.q.ExecContext(ctx, `SELECT set_config('app.cloud_mode', $1, true)`, previousMode)
+		if orgRestoreErr != nil || modeRestoreErr != nil {
+			// Never expose callbackErr here: callers may intentionally handle that
+			// business error and commit the surrounding transaction. Restoration
+			// failure means the tenant context is unknown and must abort it.
+			return fmt.Errorf("%w: org=%v mode=%v", ErrTenantScopeRestoreFailed,
+				orgRestoreErr, modeRestoreErr)
+		}
+		return callbackErr
 	}
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
