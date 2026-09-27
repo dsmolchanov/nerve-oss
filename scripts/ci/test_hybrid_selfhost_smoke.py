@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import subprocess
+import sys
 import tempfile
 import traceback
 import unittest
@@ -71,6 +72,15 @@ class ProcessDiagnosticsTest(unittest.TestCase):
 
 
 class IsolationTest(unittest.TestCase):
+    def test_successor_setup_requires_predecessor_cloud_bootstrap(self):
+        script = Path(__file__).with_name('hybrid_selfhost_smoke.py')
+        image = 'ghcr.io/example/runtime@sha256:' + 'a' * 64
+        result = subprocess.run([sys.executable, str(script), '--image', image,
+                                 '--successor-core-head', '31'],
+                                text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('requires --predecessor-migration-image', result.stderr)
+
     # The smoke must never adopt or tear down a developer's running sandbox.
     # It builds its own project name and clears inherited Compose and Nerve
     # variables before doing anything.

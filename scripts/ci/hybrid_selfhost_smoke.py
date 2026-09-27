@@ -100,6 +100,8 @@ def main():
     args = parser.parse_args()
     if args.successor_core_head is not None and (not args.image or args.successor_core_head < 1):
         parser.error('--successor-core-head requires --image and a positive Core head')
+    if args.successor_core_head is not None and not args.predecessor_migration_image:
+        parser.error('--successor-core-head requires --predecessor-migration-image to prepare Cloud 3')
     if args.predecessor_migration_image and args.successor_core_head is None:
         parser.error('--predecessor-migration-image requires --successor-core-head')
     os.chdir(ROOT)
