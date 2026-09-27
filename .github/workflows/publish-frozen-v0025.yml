@@ -77,8 +77,7 @@ jobs:
           jq -e --arg digest "$(jq -r .candidate_linux_amd64_digest deploy/release/frozen-v0.0.25.json)" '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64" and .digest == $digest)] | length == 1' <<<"$raw" >/dev/null
       - name: Prove self-host lifecycle against exact candidate bytes
         run: |
-          cd source
-          python3 scripts/ci/hybrid_selfhost_smoke.py --image "ghcr.io/dsmolchanov/nerve-runtime@$INDEX_DIGEST"
+          python3 scripts/ci/hybrid_selfhost_smoke.py --image "ghcr.io/dsmolchanov/nerve-runtime@$INDEX_DIGEST" --successor-core-head 31 --predecessor-migration-image ghcr.io/dsmolchanov/nerve-runtime@sha256:db82532b5fa3f21dcecc9646a6ece6cde3e65a96b9440eca2bd9c8f459b24810
       - name: Build release assets from the exact candidate source
         run: |
           set -euo pipefail

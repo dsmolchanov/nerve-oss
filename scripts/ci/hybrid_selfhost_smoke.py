@@ -93,7 +93,15 @@ def free_port():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--image', help='immutable published runtime image to test instead of building the checkout')
+    parser.add_argument('--successor-core-head', type=int,
+                        help='prepare an isolated Core schema with the image migrator before starting a successor service')
+    parser.add_argument('--predecessor-migration-image',
+                        help='immutable released predecessor image for isolated Core/Cloud schema upgrade setup')
     args = parser.parse_args()
+    if args.successor_core_head is not None and (not args.image or args.successor_core_head < 1):
+        parser.error('--successor-core-head requires --image and a positive Core head')
+    if args.predecessor_migration_image and args.successor_core_head is None:
+        parser.error('--predecessor-migration-image requires --successor-core-head')
     os.chdir(ROOT)
     project = 'nerve-hybrid-smoke-' + secrets.token_hex(4)
     with tempfile.TemporaryDirectory(prefix='nerve-hybrid-selfhost-') as tmp:
@@ -109,8 +117,20 @@ def main():
                 raise ValueError('--image must be an immutable digest reference')
             override = tmp / 'published-image.json'
             published = {'build': None, 'image': args.image, 'platform': 'linux/amd64'}
+            if args.successor_core_head is not None:
+                # The successor service verifies its already-applied window.
+                # Only the separate migrator is allowed to write it.
+                published['environment'] = {'NM_MIGRATE_ON_START': 'verify'}
             override.write_text(json.dumps({'services': {'cortex': published}}))
             compose_files += os.pathsep + str(override)
+        predecessor_files = None
+        if args.predecessor_migration_image:
+            if not re.search(r'@sha256:[0-9a-f]{64}$', args.predecessor_migration_image):
+                raise ValueError('--predecessor-migration-image must be an immutable digest reference')
+            predecessor_override = tmp / 'predecessor-image.json'
+            predecessor_override.write_text(json.dumps({'services': {'cortex': {
+                'build': None, 'image': args.predecessor_migration_image, 'platform': 'linux/amd64'}}}))
+            predecessor_files = str(ROOT / 'docker-compose.yml') + os.pathsep + str(predecessor_override)
         env.update({'COMPOSE_PROJECT_NAME': project,
                     'COMPOSE_FILE': compose_files,
                     'COMPOSE_ENV_FILES': str(tmp / '.env'), 'COMPOSE_DISABLE_ENV_FILE': '1',
@@ -146,6 +166,21 @@ def main():
         try:
             if args.image:
                 run('docker', 'pull', '--platform', 'linux/amd64', args.image)
+            if args.successor_core_head is not None:
+                compose('up', '-d', '--pull', 'always', '--wait', '--wait-timeout', '240',
+                        'postgres', 'redis', 'mailpit')
+                if predecessor_files:
+                    run('docker', 'pull', '--platform', 'linux/amd64', args.predecessor_migration_image)
+                    env['COMPOSE_FILE'] = predecessor_files
+                    try:
+                        for scope, head in (('core', 29), ('cloud', 3)):
+                            compose('run', '--rm', '--no-deps', '-T', '--entrypoint',
+                                    '/app/nerve-migrate', 'cortex', 'up', '--scope', scope,
+                                    '--to', str(head))
+                    finally:
+                        env['COMPOSE_FILE'] = compose_files
+                compose('run', '--rm', '--no-deps', '-T', '--entrypoint', '/app/nerve-migrate',
+                        'cortex', 'up', '--scope', 'core', '--to', str(args.successor_core_head))
             startup = ['up', '-d']
             # GitHub-hosted runners do not guarantee that the Compose support
             # images are cached. Pull every service on the first start; the
