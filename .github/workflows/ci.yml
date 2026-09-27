@@ -103,6 +103,8 @@ jobs:
         run: python3 scripts/ci/test_selfhost_smoke.py
       - name: Hybrid smoke process diagnostics regression
         run: python3 scripts/ci/test_hybrid_selfhost_smoke.py
+      - name: Frozen runtime promotion contract regression
+        run: python3 scripts/ci/test_verify_frozen_runtime.py
       - name: Compose SMTP/JMAP, persistence and restore
         run: python3 scripts/ci/selfhost_smoke.py
       - name: Hybrid installation clean start, upgrade and backup boundary
