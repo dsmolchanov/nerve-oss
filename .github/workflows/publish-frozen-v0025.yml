@@ -136,5 +136,14 @@ jobs:
           # Docker Publish job, whose older source would rebuild:
           # https://docs.github.com/en/actions/concepts/security/github_token
           gh release create "$VERSION" dist/runtime/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "$VERSION" --notes-file dist/runtime/RELEASE-NOTES.md
-          [[ "$(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)" == "$VERSION" ]] || exit 1
+          gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,assets | jq -e --arg version "$VERSION" '
+            .tagName == $version and .isDraft == false and
+            ([.assets[].name] | sort) == ([
+              "MCP_Contract.md", "RELEASE-NOTES.md", "autonomous-outbound-v1.sha256",
+              "autonomous-outbound-v1.yaml", "core-migrations.sha256",
+              "core-migrations.tar.gz", "mcp-contract.sha256",
+              "runtime-manifest.json", "runtime-manifest.sha256",
+              "runtime-successor-candidate.json", "runtime-successor-candidate.sha256"
+            ] | sort)
+          ' >/dev/null
           trap - EXIT
