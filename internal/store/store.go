@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -243,6 +244,8 @@ func (s *Store) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
 }
 
+var ErrTenantScopeRestoreFailed = errors.New("tenant scope restoration failed")
+
 func (s *Store) RunAsOrg(ctx context.Context, orgID string, fn func(scoped *Store) error) error {
 	if orgID == "" {
 		return errors.New("missing org id")
@@ -264,7 +267,14 @@ func (s *Store) RunAsOrg(ctx context.Context, orgID string, fn func(scoped *Stor
 		callbackErr := fn(s)
 		_, orgRestoreErr := s.q.ExecContext(ctx, `SELECT set_config('app.current_org_id', $1, true)`, previousOrg)
 		_, modeRestoreErr := s.q.ExecContext(ctx, `SELECT set_config('app.cloud_mode', $1, true)`, previousMode)
-		return errors.Join(callbackErr, orgRestoreErr, modeRestoreErr)
+		if orgRestoreErr != nil || modeRestoreErr != nil {
+			// Never expose callbackErr here: callers may intentionally handle that
+			// business error and commit the surrounding transaction. Restoration
+			// failure means the tenant context is unknown and must abort it.
+			return fmt.Errorf("%w: org=%v mode=%v", ErrTenantScopeRestoreFailed,
+				orgRestoreErr, modeRestoreErr)
+		}
+		return callbackErr
 	}
 	conn, err := s.db.Conn(ctx)
 	if err != nil {

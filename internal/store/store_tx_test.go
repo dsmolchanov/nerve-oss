@@ -145,6 +145,39 @@ func TestRunAsOrgInsideTransactionRestoresScopeAfterHandledError(t *testing.T) {
 	})
 }
 
+func TestRunAsOrgRestorationFailureCannotBeHandledAsBusinessError(t *testing.T) {
+	withTempDatabase(t, func(parent context.Context, db *sql.DB) {
+		db.SetMaxOpenConns(1)
+		if _, err := db.ExecContext(parent, `CREATE TABLE tenant_restore_probe(value text PRIMARY KEY)`); err != nil {
+			t.Fatal(err)
+		}
+		st := &Store{db: db, q: db}
+		sentinel := errors.New("handled business error")
+		err := st.RunInTx(parent, func(tx *Store) error {
+			if _, err := tx.q.ExecContext(parent, `INSERT INTO tenant_restore_probe(value) VALUES('must roll back')`); err != nil {
+				return err
+			}
+			child, cancel := context.WithCancel(parent)
+			defer cancel()
+			innerErr := tx.RunAsOrg(child, "00000000-0000-0000-0000-000000000002", func(*Store) error {
+				cancel()
+				return sentinel
+			})
+			if errors.Is(innerErr, sentinel) {
+				return nil // The caller would incorrectly commit on a handled error.
+			}
+			return innerErr
+		})
+		if !errors.Is(err, ErrTenantScopeRestoreFailed) || errors.Is(err, sentinel) {
+			t.Fatalf("restoration failure was handleable as business error: %v", err)
+		}
+		var count int
+		if err := db.QueryRowContext(parent, `SELECT count(*) FROM tenant_restore_probe`).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("outer transaction committed with leaked scope: count=%d err=%v", count, err)
+		}
+	})
+}
+
 func TestWithTxInsideRunAsOrgUsesCallerTransaction(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		if _, err := db.ExecContext(ctx, `CREATE TABLE tx_probe (value text PRIMARY KEY)`); err != nil {
