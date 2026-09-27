@@ -56,9 +56,8 @@ jobs:
           artifact="mcp2026-runtime-successor-C-$SOURCE_SHA-$CANDIDATE_RUN"
           gh run download "$CANDIDATE_RUN" --repo "$GITHUB_REPOSITORY" --name "$artifact" --dir candidate
           [[ "$(find candidate -type f | wc -l | tr -d ' ')" == 2 ]] || exit 1
-          python3 scripts/release/verify_frozen_runtime.py +            deploy/release/frozen-v0.0.25.json +            candidate/runtime-successor-candidate.json candidate/runtime-manifest.json
+          python3 scripts/release/verify_frozen_runtime.py deploy/release/frozen-v0.0.25.json candidate/runtime-successor-candidate.json candidate/runtime-manifest.json
           [[ "$(git -C source rev-parse HEAD)" == "$SOURCE_SHA" ]] || exit 1
-          [[ "$(sha256sum source/scripts/ci/hybrid_selfhost_smoke.py | cut -d' ' -f1)" != "" ]] || exit 1
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -71,11 +70,11 @@ jobs:
         run: |
           set -euo pipefail
           image="ghcr.io/dsmolchanov/nerve-runtime@$INDEX_DIGEST"
-          cosign verify +            --certificate-identity "https://github.com/dsmolchanov/nerve-oss/.github/workflows/docker-publish.yml@refs/heads/main" +            --certificate-oidc-issuer https://token.actions.githubusercontent.com "$image" >/dev/null
+          cosign verify --certificate-identity "https://github.com/dsmolchanov/nerve-oss/.github/workflows/docker-publish.yml@refs/heads/main" --certificate-oidc-issuer https://token.actions.githubusercontent.com "$image" >/dev/null
           python3 source/scripts/ci/test_runtime_image_manifest.py "$image" candidate/runtime-manifest.json
           raw="$(docker buildx imagetools inspect --raw "$image")"
           [[ "sha256:$(printf '%s' "$raw" | sha256sum | cut -d' ' -f1)" == "$INDEX_DIGEST" ]] || exit 1
-          jq -e --arg digest "$(jq -r .candidate_linux_amd64_digest deploy/release/frozen-v0.0.25.json)" +            '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64" and .digest == $digest)] | length == 1' <<<"$raw" >/dev/null
+          jq -e --arg digest "$(jq -r .candidate_linux_amd64_digest deploy/release/frozen-v0.0.25.json)" '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64" and .digest == $digest)] | length == 1' <<<"$raw" >/dev/null
       - name: Prove self-host lifecycle against exact candidate bytes
         run: |
           cd source
@@ -89,9 +88,11 @@ jobs:
           cp source/docs/MCP_Contract.md dist/runtime/MCP_Contract.md
           cp source/configs/policy/autonomous-outbound-v1.yaml dist/runtime/autonomous-outbound-v1.yaml
           tar -czf dist/runtime/core-migrations.tar.gz -C source/internal/store/migrations core
-          for name in runtime-manifest.json runtime-successor-candidate.json MCP_Contract.md autonomous-outbound-v1.yaml core-migrations.tar.gz; do
-            sha256sum "dist/runtime/$name" | cut -d' ' -f1 > "dist/runtime/$name.sha256"
-          done
+          sha256sum dist/runtime/runtime-manifest.json | cut -d' ' -f1 > dist/runtime/runtime-manifest.sha256
+          sha256sum dist/runtime/runtime-successor-candidate.json | cut -d' ' -f1 > dist/runtime/runtime-successor-candidate.sha256
+          sha256sum dist/runtime/MCP_Contract.md | cut -d' ' -f1 > dist/runtime/mcp-contract.sha256
+          sha256sum dist/runtime/autonomous-outbound-v1.yaml | cut -d' ' -f1 > dist/runtime/autonomous-outbound-v1.sha256
+          sha256sum dist/runtime/core-migrations.tar.gz | cut -d' ' -f1 > dist/runtime/core-migrations.sha256
           cat > dist/runtime/RELEASE-NOTES.md <<EOF
           Frozen runtime $VERSION
 
@@ -126,14 +127,14 @@ jobs:
             raw="$(docker buildx imagetools inspect --raw "$tag")"
             [[ "sha256:$(printf '%s' "$raw" | sha256sum | cut -d' ' -f1)" == "$INDEX_DIGEST" ]] || exit 1
           done
-          tag_object="$(gh api -X POST "repos/$GITHUB_REPOSITORY/git/tags" +            -f tag="$VERSION" -f message="Frozen runtime $VERSION from $CANDIDATE_RUN ($INDEX_DIGEST)" +            -f object="$SOURCE_SHA" -f type=commit --jq .sha)"
+          tag_object="$(gh api -X POST "repos/$GITHUB_REPOSITORY/git/tags" -f tag="$VERSION" -f message="Frozen runtime $VERSION from $CANDIDATE_RUN ($INDEX_DIGEST)" -f object="$SOURCE_SHA" -f type=commit --jq .sha)"
           [[ "$tag_object" =~ ^[0-9a-f]{40}$ ]] || exit 1
-          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" +            -f ref="refs/tags/$VERSION" -f sha="$tag_object" >/dev/null
-          jq -e --arg tag "$tag_object" '.object.type == "tag" and .object.sha == $tag' +            <(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$VERSION") >/dev/null
-          jq -e --arg source "$SOURCE_SHA" '.object.type == "commit" and .object.sha == $source' +            <(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object") >/dev/null
+          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$VERSION" -f sha="$tag_object" >/dev/null
+          jq -e --arg tag "$tag_object" '.object.type == "tag" and .object.sha == $tag' <(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$VERSION") >/dev/null
+          jq -e --arg source "$SOURCE_SHA" '.object.type == "commit" and .object.sha == $source' <(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object") >/dev/null
           # GITHUB_TOKEN-created refs do not trigger the legacy tag-push
           # Docker Publish job, whose older source would rebuild:
           # https://docs.github.com/en/actions/concepts/security/github_token
-          gh release create "$VERSION" dist/runtime/* +            --repo "$GITHUB_REPOSITORY" --verify-tag --title "$VERSION" +            --notes-file dist/runtime/RELEASE-NOTES.md
+          gh release create "$VERSION" dist/runtime/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "$VERSION" --notes-file dist/runtime/RELEASE-NOTES.md
           [[ "$(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)" == "$VERSION" ]] || exit 1
           trap - EXIT
