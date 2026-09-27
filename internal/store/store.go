@@ -261,14 +261,10 @@ func (s *Store) RunAsOrg(ctx context.Context, orgID string, fn func(scoped *Stor
 		if _, err := s.q.ExecContext(ctx, `SELECT set_config('app.current_org_id', $1, true)`, orgID); err != nil {
 			return err
 		}
-		if err := fn(s); err != nil {
-			return err
-		}
-		if _, err := s.q.ExecContext(ctx, `SELECT set_config('app.current_org_id', $1, true)`, previousOrg); err != nil {
-			return err
-		}
-		_, err := s.q.ExecContext(ctx, `SELECT set_config('app.cloud_mode', $1, true)`, previousMode)
-		return err
+		callbackErr := fn(s)
+		_, orgRestoreErr := s.q.ExecContext(ctx, `SELECT set_config('app.current_org_id', $1, true)`, previousOrg)
+		_, modeRestoreErr := s.q.ExecContext(ctx, `SELECT set_config('app.cloud_mode', $1, true)`, previousMode)
+		return errors.Join(callbackErr, orgRestoreErr, modeRestoreErr)
 	}
 	conn, err := s.db.Conn(ctx)
 	if err != nil {

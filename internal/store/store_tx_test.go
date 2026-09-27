@@ -103,6 +103,48 @@ func TestRunAsOrgInsideTransactionKeepsTenantScopeAndCallerRollback(t *testing.T
 	})
 }
 
+func TestRunAsOrgInsideTransactionRestoresScopeAfterHandledError(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		db.SetMaxOpenConns(1)
+		st := &Store{db: db, q: db}
+		orgA := "00000000-0000-0000-0000-000000000001"
+		orgB := "00000000-0000-0000-0000-000000000002"
+		sentinel := errors.New("handled business error")
+		err := st.RunInTx(ctx, func(tx *Store) error {
+			if _, err := tx.q.ExecContext(ctx, `SELECT set_config('app.cloud_mode','false',true)`); err != nil {
+				return err
+			}
+			if _, err := tx.q.ExecContext(ctx, `SELECT set_config('app.current_org_id',$1,true)`, orgA); err != nil {
+				return err
+			}
+			if err := tx.RunAsOrg(ctx, orgB, func(scoped *Store) error {
+				var actualOrg string
+				if err := scoped.q.QueryRowContext(ctx, `SELECT current_setting('app.current_org_id',true)`).Scan(&actualOrg); err != nil {
+					return err
+				}
+				if actualOrg != orgB {
+					t.Fatalf("nested org=%q, want %q", actualOrg, orgB)
+				}
+				return sentinel
+			}); !errors.Is(err, sentinel) {
+				return err
+			}
+			var mode, actualOrg string
+			if err := tx.q.QueryRowContext(ctx, `SELECT current_setting('app.cloud_mode',true),
+				current_setting('app.current_org_id',true)`).Scan(&mode, &actualOrg); err != nil {
+				return err
+			}
+			if mode != "false" || actualOrg != orgA {
+				t.Fatalf("handled error leaked tenant scope: mode=%q org=%q", mode, actualOrg)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("outer transaction could not commit after handled error: %v", err)
+		}
+	})
+}
+
 func TestWithTxInsideRunAsOrgUsesCallerTransaction(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		if _, err := db.ExecContext(ctx, `CREATE TABLE tx_probe (value text PRIMARY KEY)`); err != nil {
