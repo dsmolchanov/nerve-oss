@@ -1,0 +1,9 @@
+{
+  "version": "v0.0.25",
+  "source_revision": "7b95eae7ca89c3b99decd989d04d18a40fa2b9a1",
+  "candidate_run_id": 36104220018,
+  "candidate_index_digest": "sha256:5893458682809de17c4ba0c757e3f3e499d336fb5ca48cf448713404a386dcb8",
+  "candidate_linux_amd64_digest": "sha256:14beea5c75f85df19f22ea377cc274d76aeb89c40e500656d3cadcc596cb8bcd",
+  "candidate_manifest_sha256": "ccaf3ca1102f2c5b8e5bb672d37cdfa88fa3e5274787d511978fa5539d414715",
+  "cloud_release_set": "36104390910:7033bc5e29c04202f3990bc67f122264472d61b384e3864ab2c550cae9ac0af2"
+}

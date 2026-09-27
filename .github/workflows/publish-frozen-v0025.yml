@@ -1,0 +1,139 @@
+name: Publish frozen v0.0.25
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type PUBLISH-FROZEN-V0.0.25.
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+  packages: write
+
+concurrency:
+  group: publish-frozen-v0.0.25
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: cloud-production
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VERSION: v0.0.25
+      SOURCE_SHA: 7b95eae7ca89c3b99decd989d04d18a40fa2b9a1
+      CANDIDATE_RUN: '36104220018'
+      INDEX_DIGEST: sha256:5893458682809de17c4ba0c757e3f3e499d336fb5ca48cf448713404a386dcb8
+    steps:
+      - name: Require exact protected invocation
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          [[ "$CONFIRM" == PUBLISH-FROZEN-V0.0.25 ]] || exit 1
+          [[ "$GITHUB_REPOSITORY" == dsmolchanov/nerve-oss && "$GITHUB_REF" == refs/heads/main ]] || exit 1
+      - uses: actions/checkout@v4
+      - name: Check out the exact candidate source for release assets and smoke
+        uses: actions/checkout@v4
+        with:
+          ref: 7b95eae7ca89c3b99decd989d04d18a40fa2b9a1
+          path: source
+          persist-credentials: false
+      - name: Authenticate the frozen candidate run and artifact
+        run: |
+          set -euo pipefail
+          jq -e --argjson run "$CANDIDATE_RUN" --arg source "$SOURCE_SHA" '
+            .id == $run and .status == "completed" and .conclusion == "success" and
+            .event == "workflow_dispatch" and .head_branch == "main" and
+            .head_sha == $source and .path == ".github/workflows/docker-publish.yml" and
+            .repository.full_name == "dsmolchanov/nerve-oss" and
+            .head_repository.full_name == "dsmolchanov/nerve-oss"
+          ' <(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN") >/dev/null
+          artifact="mcp2026-runtime-successor-C-$SOURCE_SHA-$CANDIDATE_RUN"
+          gh run download "$CANDIDATE_RUN" --repo "$GITHUB_REPOSITORY" --name "$artifact" --dir candidate
+          [[ "$(find candidate -type f | wc -l | tr -d ' ')" == 2 ]] || exit 1
+          python3 scripts/release/verify_frozen_runtime.py +            deploy/release/frozen-v0.0.25.json +            candidate/runtime-successor-candidate.json candidate/runtime-manifest.json
+          [[ "$(git -C source rev-parse HEAD)" == "$SOURCE_SHA" ]] || exit 1
+          [[ "$(sha256sum source/scripts/ci/hybrid_selfhost_smoke.py | cut -d' ' -f1)" != "" ]] || exit 1
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Install pinned cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Verify the signed immutable image and embedded manifest
+        run: |
+          set -euo pipefail
+          image="ghcr.io/dsmolchanov/nerve-runtime@$INDEX_DIGEST"
+          cosign verify +            --certificate-identity "https://github.com/dsmolchanov/nerve-oss/.github/workflows/docker-publish.yml@refs/heads/main" +            --certificate-oidc-issuer https://token.actions.githubusercontent.com "$image" >/dev/null
+          python3 source/scripts/ci/test_runtime_image_manifest.py "$image" candidate/runtime-manifest.json
+          raw="$(docker buildx imagetools inspect --raw "$image")"
+          [[ "sha256:$(printf '%s' "$raw" | sha256sum | cut -d' ' -f1)" == "$INDEX_DIGEST" ]] || exit 1
+          jq -e --arg digest "$(jq -r .candidate_linux_amd64_digest deploy/release/frozen-v0.0.25.json)" +            '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64" and .digest == $digest)] | length == 1' <<<"$raw" >/dev/null
+      - name: Prove self-host lifecycle against exact candidate bytes
+        run: |
+          cd source
+          python3 scripts/ci/hybrid_selfhost_smoke.py --image "ghcr.io/dsmolchanov/nerve-runtime@$INDEX_DIGEST"
+      - name: Build release assets from the exact candidate source
+        run: |
+          set -euo pipefail
+          mkdir -p dist/runtime
+          cp candidate/runtime-manifest.json dist/runtime/runtime-manifest.json
+          cp candidate/runtime-successor-candidate.json dist/runtime/runtime-successor-candidate.json
+          cp source/docs/MCP_Contract.md dist/runtime/MCP_Contract.md
+          cp source/configs/policy/autonomous-outbound-v1.yaml dist/runtime/autonomous-outbound-v1.yaml
+          tar -czf dist/runtime/core-migrations.tar.gz -C source/internal/store/migrations core
+          for name in runtime-manifest.json runtime-successor-candidate.json MCP_Contract.md autonomous-outbound-v1.yaml core-migrations.tar.gz; do
+            sha256sum "dist/runtime/$name" | cut -d' ' -f1 > "dist/runtime/$name.sha256"
+          done
+          cat > dist/runtime/RELEASE-NOTES.md <<EOF
+          Frozen runtime $VERSION
+
+          Source: $SOURCE_SHA
+          Candidate run: $CANDIDATE_RUN
+          Immutable index: $INDEX_DIGEST
+          Cloud release set: 36104390910:7033bc5e29c04202f3990bc67f122264472d61b384e3864ab2c550cae9ac0af2
+
+          The already-reviewed candidate image was promoted without rebuilding.
+          EOF
+      - name: Prove the version is unused immediately before publication
+        run: |
+          set -euo pipefail
+          ./scripts/release/prove_candidate_version_unused.sh "$GITHUB_REPOSITORY" "$GITHUB_REPOSITORY_OWNER" "$VERSION" promotion
+      - name: Publish exact OCI index, annotated source tag and GitHub Release
+        run: |
+          set -euo pipefail
+          started=0
+          partial() {
+            if [[ "$started" == 1 ]]; then
+              echo "::error::Partial v0.0.25 publication; inspect all four identities and assets. Never retry or overwrite automatically."
+            fi
+          }
+          trap partial EXIT
+          source="ghcr.io/dsmolchanov/nerve-runtime@$INDEX_DIGEST"
+          for package in nerve-runtime neuralmaild; do
+            tag="ghcr.io/dsmolchanov/$package:$VERSION"
+            # The complete absence proof above covers both repositories; do
+            # not re-enter this workflow after any side effect.
+            started=1
+            docker buildx imagetools create -t "$tag" "$source"
+            raw="$(docker buildx imagetools inspect --raw "$tag")"
+            [[ "sha256:$(printf '%s' "$raw" | sha256sum | cut -d' ' -f1)" == "$INDEX_DIGEST" ]] || exit 1
+          done
+          tag_object="$(gh api -X POST "repos/$GITHUB_REPOSITORY/git/tags" +            -f tag="$VERSION" -f message="Frozen runtime $VERSION from $CANDIDATE_RUN ($INDEX_DIGEST)" +            -f object="$SOURCE_SHA" -f type=commit --jq .sha)"
+          [[ "$tag_object" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" +            -f ref="refs/tags/$VERSION" -f sha="$tag_object" >/dev/null
+          jq -e --arg tag "$tag_object" '.object.type == "tag" and .object.sha == $tag' +            <(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$VERSION") >/dev/null
+          jq -e --arg source "$SOURCE_SHA" '.object.type == "commit" and .object.sha == $source' +            <(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object") >/dev/null
+          # GITHUB_TOKEN-created refs do not trigger the legacy tag-push
+          # Docker Publish job, whose older source would rebuild:
+          # https://docs.github.com/en/actions/concepts/security/github_token
+          gh release create "$VERSION" dist/runtime/* +            --repo "$GITHUB_REPOSITORY" --verify-tag --title "$VERSION" +            --notes-file dist/runtime/RELEASE-NOTES.md
+          [[ "$(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)" == "$VERSION" ]] || exit 1
+          trap - EXIT
