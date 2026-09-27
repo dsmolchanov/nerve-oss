@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestWithTxBareStoreCommitsAndRollsBack(t *testing.T) {
@@ -50,6 +51,54 @@ func TestWithTxBareStoreCommitsAndRollsBack(t *testing.T) {
 		}
 		if len(values) != 1 || values[0] != "committed" {
 			t.Fatalf("unexpected committed rows: %v", values)
+		}
+	})
+}
+
+func TestRunAsOrgInsideTransactionKeepsTenantScopeAndCallerRollback(t *testing.T) {
+	withTempDatabase(t, func(parent context.Context, db *sql.DB) {
+		ctx, cancel := context.WithTimeout(parent, 3*time.Second)
+		defer cancel()
+		db.SetMaxOpenConns(1)
+		if _, err := db.ExecContext(ctx, `CREATE TABLE tenant_scope_probe(value text PRIMARY KEY)`); err != nil {
+			t.Fatal(err)
+		}
+		st := &Store{db: db, q: db}
+		orgID := "00000000-0000-0000-0000-000000000001"
+		rollback := errors.New("outer rollback")
+		err := st.RunInTx(ctx, func(tx *Store) error {
+			if err := tx.RunAsOrg(ctx, orgID, func(scoped *Store) error {
+				if scoped != tx {
+					t.Fatal("tenant scope left the webhook transaction")
+				}
+				var mode, scopedOrg string
+				if err := scoped.q.QueryRowContext(ctx, `SELECT current_setting('app.cloud_mode', true),
+					current_setting('app.current_org_id', true)`).Scan(&mode, &scopedOrg); err != nil {
+					return err
+				}
+				if mode != "true" || scopedOrg != orgID {
+					t.Fatalf("tenant scope mode=%q org=%q", mode, scopedOrg)
+				}
+				_, err := scoped.q.ExecContext(ctx, `INSERT INTO tenant_scope_probe(value) VALUES('scoped')`)
+				return err
+			}); err != nil {
+				return err
+			}
+			var restoredOrg string
+			if err := tx.q.QueryRowContext(ctx, `SELECT coalesce(current_setting('app.current_org_id', true),'')`).Scan(&restoredOrg); err != nil {
+				return err
+			}
+			if restoredOrg != "" {
+				t.Fatalf("tenant scope leaked after callback: %q", restoredOrg)
+			}
+			return rollback
+		})
+		if !errors.Is(err, rollback) {
+			t.Fatalf("outer rollback=%v", err)
+		}
+		var count int
+		if err := db.QueryRowContext(parent, `SELECT count(*) FROM tenant_scope_probe`).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("tenant-scoped write escaped rollback: count=%d err=%v", count, err)
 		}
 	})
 }

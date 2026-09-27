@@ -247,6 +247,29 @@ func (s *Store) RunAsOrg(ctx context.Context, orgID string, fn func(scoped *Stor
 	if orgID == "" {
 		return errors.New("missing org id")
 	}
+	// A webhook has already locked its event in a transaction. Keep tenant
+	// policy and the processed marker in that same transaction.
+	if s.inTx {
+		var previousMode, previousOrg string
+		if err := s.q.QueryRowContext(ctx, `SELECT coalesce(current_setting('app.cloud_mode', true), ''),
+  coalesce(current_setting('app.current_org_id', true), '')`).Scan(&previousMode, &previousOrg); err != nil {
+			return err
+		}
+		if _, err := s.q.ExecContext(ctx, `SELECT set_config('app.cloud_mode', 'true', true)`); err != nil {
+			return err
+		}
+		if _, err := s.q.ExecContext(ctx, `SELECT set_config('app.current_org_id', $1, true)`, orgID); err != nil {
+			return err
+		}
+		if err := fn(s); err != nil {
+			return err
+		}
+		if _, err := s.q.ExecContext(ctx, `SELECT set_config('app.current_org_id', $1, true)`, previousOrg); err != nil {
+			return err
+		}
+		_, err := s.q.ExecContext(ctx, `SELECT set_config('app.cloud_mode', $1, true)`, previousMode)
+		return err
+	}
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return err
