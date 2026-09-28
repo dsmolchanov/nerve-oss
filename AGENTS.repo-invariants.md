@@ -27,6 +27,13 @@ makes a review loop unable to terminate.
 
 ## Invariants
 
+- When nested `RunAsOrg` cannot set or restore either transaction-local tenant
+  setting, does it abort the enclosing transaction even if its caller handles
+  the returned error? Enforced by
+  `TestRunAsOrgSetupFailureCannotCommitPreviousTenantScope` and
+  `TestRunAsOrgRestorationFailureAbortsEvenWhenCallerIgnoresError` in
+  `internal/store/store_tx_test.go`.
+
 <!-- Add entries below. Example shape:
 
 - No handler under `apps/api/routes/` may be registered without a
