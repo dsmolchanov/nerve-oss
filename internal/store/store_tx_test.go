@@ -4,9 +4,29 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
+
+type tenantScopeInjectedFailure struct {
+	*sql.Tx
+	failQuery string
+	failAt    int
+	seen      *int
+}
+
+func (q tenantScopeInjectedFailure) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if strings.Contains(query, q.failQuery) {
+		if q.seen != nil {
+			*q.seen++
+		}
+		if q.failAt == 0 || q.seen != nil && *q.seen == q.failAt {
+			return nil, errors.New("injected tenant scope failure")
+		}
+	}
+	return q.Tx.ExecContext(ctx, query, args...)
+}
 
 func TestWithTxBareStoreCommitsAndRollsBack(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
@@ -174,6 +194,75 @@ func TestRunAsOrgRestorationFailureCannotBeHandledAsBusinessError(t *testing.T) 
 		var count int
 		if err := db.QueryRowContext(parent, `SELECT count(*) FROM tenant_restore_probe`).Scan(&count); err != nil || count != 0 {
 			t.Fatalf("outer transaction committed with leaked scope: count=%d err=%v", count, err)
+		}
+	})
+}
+
+func TestRunAsOrgSetupFailureCannotCommitPreviousTenantScope(t *testing.T) {
+	for _, failQuery := range []string{"set_config('app.cloud_mode'", "set_config('app.current_org_id'"} {
+		t.Run(failQuery, func(t *testing.T) {
+			withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+				if _, err := db.ExecContext(ctx, `CREATE TABLE tenant_setup_probe(value text PRIMARY KEY)`); err != nil {
+					t.Fatal(err)
+				}
+				st := &Store{db: db, q: db}
+				err := st.RunInTx(ctx, func(tx *Store) error {
+					if _, err := tx.q.ExecContext(ctx, `INSERT INTO tenant_setup_probe(value) VALUES('must roll back')`); err != nil {
+						return err
+					}
+					underlying := tx.q.(*sql.Tx)
+					if _, err := underlying.ExecContext(ctx, `SELECT set_config('app.cloud_mode','false',true)`); err != nil {
+						return err
+					}
+					if _, err := underlying.ExecContext(ctx, `SELECT set_config('app.current_org_id','00000000-0000-0000-0000-000000000001',true)`); err != nil {
+						return err
+					}
+					tx.q = tenantScopeInjectedFailure{Tx: underlying, failQuery: failQuery}
+					innerErr := tx.RunAsOrg(ctx, "00000000-0000-0000-0000-000000000002", func(*Store) error {
+						t.Fatal("callback ran after scope setup failed")
+						return nil
+					})
+					if !errors.Is(innerErr, ErrTenantScopeRestoreFailed) {
+						t.Fatalf("setup error was handleable: %v", innerErr)
+					}
+					return nil // Simulate a caller that handles and ignores the error.
+				})
+				if !errors.Is(err, sql.ErrTxDone) {
+					t.Fatalf("outer transaction committed after setup failure: %v", err)
+				}
+				var count int
+				if err := db.QueryRowContext(ctx, `SELECT count(*) FROM tenant_setup_probe`).Scan(&count); err != nil || count != 0 {
+					t.Fatalf("stale tenant transaction committed: count=%d err=%v", count, err)
+				}
+			})
+		})
+	}
+}
+
+func TestRunAsOrgRestorationFailureAbortsEvenWhenCallerIgnoresError(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if _, err := db.ExecContext(ctx, `CREATE TABLE tenant_restore_ignored(value text PRIMARY KEY)`); err != nil {
+			t.Fatal(err)
+		}
+		st := &Store{db: db, q: db}
+		err := st.RunInTx(ctx, func(tx *Store) error {
+			if _, err := tx.q.ExecContext(ctx, `INSERT INTO tenant_restore_ignored(value) VALUES('must roll back')`); err != nil {
+				return err
+			}
+			seen := 0
+			tx.q = tenantScopeInjectedFailure{Tx: tx.q.(*sql.Tx), failQuery: "set_config('app.current_org_id', $1, true)", failAt: 2, seen: &seen}
+			_ = tx.RunAsOrg(ctx, "00000000-0000-0000-0000-000000000002", func(*Store) error { return nil })
+			if seen != 2 {
+				t.Fatalf("injection did not reach restoration: %d", seen)
+			}
+			return nil
+		})
+		if !errors.Is(err, sql.ErrTxDone) {
+			t.Fatalf("caller ignored scope error and committed: %v", err)
+		}
+		var count int
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM tenant_restore_ignored`).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("scope failure committed: count=%d err=%v", count, err)
 		}
 	})
 }

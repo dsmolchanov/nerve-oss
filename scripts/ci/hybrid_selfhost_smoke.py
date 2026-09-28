@@ -229,6 +229,13 @@ def main():
                 raise AssertionError(f'unexpected state after connect: {state.get("phase")}')
             key_id = state['key']['kid']
 
+            local_status = json.loads(cortex('/app/neuralmail', 'hybrid', 'status'))
+            if local_status.get('phase') != 'connecting' or local_status.get('key_id') != key_id:
+                raise AssertionError('hybrid status did not report the exact pending local key')
+            if local_status.get('installation_id'):
+                raise AssertionError('an unapproved local key was reported as installed')
+            print('PASS local status: pending key visible without claiming Cloud approval', flush=True)
+
             mode = cortex('stat', '-c', '%a', STATE_PATH).strip()
             if mode != '600':
                 raise AssertionError(f'installation state has mode {mode}, want 600')
@@ -275,6 +282,28 @@ def main():
                 raise AssertionError(f'a restored host did not say it is unpaired: {message[-500:]}')
             print('PASS backup/restore: a database dump carries no installation, '
                   'and a restored host reports itself unpaired', flush=True)
+
+            # Disconnect is local until the human owner revokes the Cloud
+            # installation. Exercise that distinction on the published image:
+            # the command must remove the key and tell the operator it has not
+            # performed a remote revocation. It must run while the daemon is
+            # stopped so the daemon cannot keep signing with an in-memory key.
+            compose('stop', 'cortex')
+            disconnected = compose('run', '--rm', '--no-deps', '-T',
+                                   '--entrypoint', '/app/neuralmail', 'cortex',
+                                   'hybrid', 'disconnect')
+            if 'did not revoke anything' not in disconnected:
+                raise AssertionError('local disconnect concealed the required Cloud owner revocation')
+            after_disconnect = try_command(['docker', 'compose', 'run', '--rm', '--no-deps', '-T',
+                                            '--entrypoint', '/app/neuralmail', 'cortex',
+                                            'hybrid', 'status'], env)
+            if after_disconnect.returncode == 0 or b'not connected' not in after_disconnect.stderr:
+                raise AssertionError('hybrid status did not report local disconnection')
+            compose('start', 'cortex')
+            wait_for(ready, 'runtime ready after local disconnect')
+            if hybrid_state() is not None:
+                raise AssertionError('local disconnect retained the installation private key')
+            print('PASS local disconnect: key removed, Cloud revocation still required', flush=True)
         except Exception as error:
             print(f'FAIL {error}', flush=True)
             raise

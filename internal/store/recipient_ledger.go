@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -12,6 +13,8 @@ import (
 var (
 	ErrRecipientLedgerConflict           = errors.New("recipient ledger replay conflicts with stored contract")
 	ErrRecipientLimit                    = errors.New("recipient allowance exhausted or period closed")
+	ErrRecipientPeriodUnavailable        = fmt.Errorf("%w: no active recipient period", ErrRecipientLimit)
+	ErrRecipientAllowanceExhausted       = fmt.Errorf("%w: recipient allowance exhausted", ErrRecipientLimit)
 	ErrRecipientReplayRequiresNewMessage = errors.New("enrolled recipient meter requires a new outbox message for replay")
 )
 
@@ -159,7 +162,7 @@ func (s *Store) RecipientAdmissionPeriod(ctx context.Context, org string) (perio
 		return "", false, err
 	}
 	if enrolled {
-		return "", true, ErrRecipientLimit
+		return "", true, ErrRecipientPeriodUnavailable
 	}
 	return "", false, nil
 }
@@ -201,7 +204,7 @@ func (s *Store) ReserveRecipients(ctx context.Context, org, period, outbox strin
 		return "", err
 	}
 	if !active {
-		return "", ErrRecipientLimit
+		return "", ErrRecipientPeriodUnavailable
 	}
 	// Insert first: concurrent attempts to bind one outbox to different periods
 	// cannot modify counters unless they won the unique reservation identity.
@@ -232,7 +235,19 @@ func (s *Store) ReserveRecipients(ctx context.Context, org, period, outbox strin
 		return "", err
 	}
 	if n != 1 {
-		return "", ErrRecipientLimit
+		// The row remains locked until this transaction ends. Distinguish a
+		// closed/expired period from an exhausted allowance without guessing
+		// from the earlier pre-update read, which may precede a lock wait.
+		var open bool
+		if err := s.q.QueryRowContext(ctx, `SELECT NOT admission_closed
+  AND starts_at <= clock_timestamp() AND ends_at > clock_timestamp()
+  FROM org_recipient_periods WHERE org_id=$1 AND period_id=$2`, org, period).Scan(&open); err != nil {
+			return "", err
+		}
+		if !open {
+			return "", ErrRecipientPeriodUnavailable
+		}
+		return "", ErrRecipientAllowanceExhausted
 	}
 	return "reserved", nil
 }

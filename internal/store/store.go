@@ -253,16 +253,28 @@ func (s *Store) RunAsOrg(ctx context.Context, orgID string, fn func(scoped *Stor
 	// A webhook has already locked its event in a transaction. Keep tenant
 	// policy and the processed marker in that same transaction.
 	if s.inTx {
+		// A failed scope change cannot be returned as an ordinary error: the
+		// caller may handle it and commit the surrounding transaction. Keep a
+		// rollback handle before changing either transaction-local setting.
+		rollback, ok := s.q.(interface{ Rollback() error })
+		if !ok {
+			return ErrTenantScopeRestoreFailed
+		}
+		abortScope := func(stage string, cause error) error {
+			rollbackErr := rollback.Rollback()
+			return fmt.Errorf("%w: %s: %v (rollback: %v)",
+				ErrTenantScopeRestoreFailed, stage, cause, rollbackErr)
+		}
 		var previousMode, previousOrg string
 		if err := s.q.QueryRowContext(ctx, `SELECT coalesce(current_setting('app.cloud_mode', true), ''),
   coalesce(current_setting('app.current_org_id', true), '')`).Scan(&previousMode, &previousOrg); err != nil {
 			return err
 		}
 		if _, err := s.q.ExecContext(ctx, `SELECT set_config('app.cloud_mode', 'true', true)`); err != nil {
-			return err
+			return abortScope("set cloud mode", err)
 		}
 		if _, err := s.q.ExecContext(ctx, `SELECT set_config('app.current_org_id', $1, true)`, orgID); err != nil {
-			return err
+			return abortScope("set organization", err)
 		}
 		callbackErr := fn(s)
 		_, orgRestoreErr := s.q.ExecContext(ctx, `SELECT set_config('app.current_org_id', $1, true)`, previousOrg)
@@ -271,8 +283,8 @@ func (s *Store) RunAsOrg(ctx context.Context, orgID string, fn func(scoped *Stor
 			// Never expose callbackErr here: callers may intentionally handle that
 			// business error and commit the surrounding transaction. Restoration
 			// failure means the tenant context is unknown and must abort it.
-			return fmt.Errorf("%w: org=%v mode=%v", ErrTenantScopeRestoreFailed,
-				orgRestoreErr, modeRestoreErr)
+			return abortScope("restore tenant scope", fmt.Errorf("org=%v mode=%v",
+				orgRestoreErr, modeRestoreErr))
 		}
 		return callbackErr
 	}
