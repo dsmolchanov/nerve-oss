@@ -16,11 +16,51 @@ from pathlib import Path
 import secrets
 import subprocess
 import tempfile
+import time
 import urllib.request
 import uuid
 
 FIXTURE_PORT = 18089
 STATE_PATH = '/var/lib/nerve/hybrid-installation.json'
+
+
+def complete_sends(path):
+    """Return complete JSONL events, never a file still being written."""
+    if not path.exists():
+        return None
+    raw = path.read_text()
+    if not raw or not raw.endswith('\n'):
+        return None
+    try:
+        return [json.loads(line) for line in raw.splitlines()]
+    except ValueError:
+        return None
+
+
+def observe_single_send(read_events, terminal, quiet_seconds=6, timeout=120,
+                        now=time.monotonic, pause=time.sleep):
+    """Require one complete event and a terminal outbox throughout a quiet window.
+
+    Waiting for a file to exist can race its writer. Checking the first line
+    alone can miss a second provider call after the worker retries. The outbox
+    terminal state closes that retry path; the quiet window also observes a
+    delayed duplicate in the fixture before teardown.
+    """
+    deadline = now() + timeout
+    stable_since = None
+    while now() < deadline:
+        events = read_events()
+        if events is not None and len(events) > 1:
+            raise AssertionError('synthetic reply reached Cloud more than once')
+        if events is not None and len(events) == 1 and terminal():
+            if stable_since is None:
+                stable_since = now()
+            if now() - stable_since >= quiet_seconds:
+                return events[0]
+        else:
+            stable_since = None
+        pause(0.1)
+    raise RuntimeError('synthetic reply never reached one complete, settled send')
 
 
 def fixture(state_dir):
@@ -240,10 +280,12 @@ def smoke(image, successor_core_head, predecessor_migration_image):
             client.tool('send_reply', {'thread_id': threads[0]['ID'],
                                        'body_or_draft_id': 'Synthetic hybrid reply',
                                        'idempotency_key': 'hybrid-active-smoke-reply'})
-            wait_for(lambda: (tmp / 'sends.jsonl').exists(), 'synthetic reply reached local Cloud fixture')
-            sends = [json.loads(line) for line in (tmp / 'sends.jsonl').read_text().splitlines()]
-            if len(sends) != 1 or sends[0].get('body') != 'Synthetic hybrid reply':
-                raise AssertionError('reply was missing or duplicated at the fixture')
+            sent = observe_single_send(
+                lambda: complete_sends(tmp / 'sends.jsonl'),
+                lambda: sql('SELECT count(*) FROM outbox_messages') == '1' and
+                        sql("SELECT count(*) FROM outbox_messages WHERE status='sent'") == '1')
+            if sent.get('body') != 'Synthetic hybrid reply':
+                raise AssertionError('reply body differed at the fixture')
             print('PASS image pairing, active inbound, durable ACK and one synthetic reply', flush=True)
         finally:
             subprocess.run(['docker', 'compose', 'down', '-t', '5', '-v', '--remove-orphans'],
