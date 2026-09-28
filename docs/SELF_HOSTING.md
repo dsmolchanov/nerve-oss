@@ -294,6 +294,11 @@ startup, so the change would not take effect until a restart while the command
 reported success. Stop the runtime, run the command with `docker compose run`,
 then start it again. `-allow-running` overrides the check for an operator who
 will restart immediately.
+The guard accepts only a refused local `/readyz` connection as proof the
+daemon is stopped. A reachable daemon that is starting or unhealthy, a timed-out
+probe, or an unverifiable non-local address blocks the change; stop the runtime
+and any separate worker before proceeding. The readiness probe cannot replace
+that operational stop when another process may start concurrently.
 
 ```sh
 docker compose stop cortex
