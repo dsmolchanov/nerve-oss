@@ -174,7 +174,7 @@ func TestMeteredEnqueueReplayAndSuppressionCannotBypassAllowance(t *testing.T) {
 		if err != nil || replayed != first {
 			t.Fatalf("idempotent replay=%q first=%q err=%v", replayed, first, err)
 		}
-		if _, err := s.EnqueueOutboxMessage(ctx, message("second", "second@example.test")); !errors.Is(err, ErrRecipientLimit) {
+		if _, err := s.EnqueueOutboxMessage(ctx, message("second", "second@example.test")); !errors.Is(err, ErrRecipientAllowanceExhausted) {
 			t.Fatalf("over allowance enqueue: %v", err)
 		}
 		if err := s.AddSuppression(ctx, period.OrgID, "blocked@example.test", "hard_bounce", "bounce"); err != nil {
@@ -333,7 +333,7 @@ func TestRecipientPeriodFencePreservesUnknownAndReleasesUnstarted(t *testing.T) 
 				}
 				switch scenario {
 				case "before_start":
-					if _, err := s.BeginOutboxProviderOperationState(ctx, msg); !errors.Is(err, ErrRecipientLimit) {
+					if _, err := s.BeginOutboxProviderOperationState(ctx, msg); !errors.Is(err, ErrRecipientPeriodUnavailable) {
 						t.Fatalf("closed period first start: %v", err)
 					}
 					assertRecipientCounters(t, ctx, db, period, 0, 0)

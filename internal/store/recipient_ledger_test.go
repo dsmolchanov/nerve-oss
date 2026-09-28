@@ -86,7 +86,7 @@ func TestRecipientAdmissionPeriodNeverFallsBackAfterEnrollment(t *testing.T) {
 		if _, err := db.ExecContext(ctx, `UPDATE org_recipient_periods SET admission_closed=true WHERE org_id=$1 AND period_id=$2`, p.OrgID, p.PeriodID); err != nil {
 			t.Fatal(err)
 		}
-		check(p.OrgID, "", true, ErrRecipientLimit)
+		check(p.OrgID, "", true, ErrRecipientPeriodUnavailable)
 		other := p
 		other.PeriodID = uuid.NewString()
 		if err := s.RunInTx(ctx, func(tx *Store) error { return tx.InstallRecipientPeriod(ctx, other) }); err != nil {
@@ -115,7 +115,7 @@ func TestRecipientLedgerConcurrency(t *testing.T) {
 				_, err := recipientReserve(ctx, s, p, uuid.NewString(), 1)
 				if err == nil {
 					accepted.Add(1)
-				} else if !errors.Is(err, ErrRecipientLimit) {
+				} else if !errors.Is(err, ErrRecipientAllowanceExhausted) {
 					errs <- err
 				}
 			}()
@@ -202,7 +202,7 @@ func TestRecipientLedgerUnknownPastPeriodAndClose(t *testing.T) {
 		if _, err := db.ExecContext(ctx, `UPDATE org_recipient_periods SET ends_at=clock_timestamp()-interval '1 second',admission_closed=true WHERE org_id=$1 AND period_id=$2`, p.OrgID, p.PeriodID); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := recipientReserve(ctx, s, p, uuid.NewString(), 1); !errors.Is(err, ErrRecipientLimit) {
+		if _, err := recipientReserve(ctx, s, p, uuid.NewString(), 1); !errors.Is(err, ErrRecipientPeriodUnavailable) {
 			t.Fatal(err)
 		}
 		assertRecipientCounters(t, ctx, db, p, 4, 0)
@@ -297,7 +297,7 @@ func TestRecipientLedgerLimitAndPeriodContract(t *testing.T) {
 			s, p := recipientFixture(t, ctx, db, limit)
 			_, err := recipientReserve(ctx, s, p, uuid.NewString(), 1)
 			if limit.Valid {
-				if !errors.Is(err, ErrRecipientLimit) {
+				if !errors.Is(err, ErrRecipientAllowanceExhausted) {
 					t.Fatal(err)
 				}
 				assertRecipientCounters(t, ctx, db, p, 0, 0)
@@ -523,7 +523,7 @@ func TestRecipientLedgerLockWaitCannotAdmitAfterExpiry(t *testing.T) {
 		}
 		select {
 		case err := <-result:
-			if !errors.Is(err, ErrRecipientLimit) {
+			if !errors.Is(err, ErrRecipientPeriodUnavailable) {
 				t.Fatalf("post-expiry reservation: %v", err)
 			}
 		case <-time.After(5 * time.Second):

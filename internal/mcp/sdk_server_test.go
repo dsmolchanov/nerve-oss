@@ -18,6 +18,7 @@ import (
 	"neuralmail/internal/auth"
 	"neuralmail/internal/config"
 	"neuralmail/internal/entitlements"
+	"neuralmail/internal/store"
 	"neuralmail/internal/tools"
 )
 
@@ -89,6 +90,9 @@ func TestSDKServerTranslatesBusinessFailureAsCallToolResult(t *testing.T) {
 	}{
 		{name: "local setup", err: &tools.OutboundConfigurationError{Code: "smtp_unconfigured", Remediation: "docs/SELF_HOSTING.md#outbound-configuration"}, wantCode: "smtp_unconfigured"},
 		{name: "quota", err: entitlements.ErrQuotaExceeded, wantCode: "quota_exceeded"},
+		{name: "recipient quota", err: store.ErrRecipientAllowanceExhausted, wantCode: "recipient_quota_exceeded"},
+		{name: "recipient period", err: store.ErrRecipientPeriodUnavailable, wantCode: "recipient_period_unavailable"},
+		{name: "storage quota", err: store.ErrAttachmentQuotaExceeded, wantCode: "storage_quota_exceeded"},
 		{name: "subscription", err: entitlements.ErrSubscriptionInactive, wantCode: "subscription_inactive"},
 		{name: "rate", err: &entitlements.RateLimitError{RetryAfterSeconds: 12}, wantCode: "rate_limited", wantRetryable: true},
 		{name: "idempotency", err: &entitlements.IdempotencyInProgressError{RetryAfterSeconds: 3}, wantCode: "idempotency_in_progress", wantRetryable: true},

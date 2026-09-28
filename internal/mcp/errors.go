@@ -6,6 +6,7 @@ import (
 
 	"neuralmail/internal/entitlements"
 	"neuralmail/internal/llm"
+	"neuralmail/internal/store"
 	"neuralmail/internal/tools"
 )
 
@@ -70,6 +71,14 @@ func translateModernBusinessError(err error) modernBusinessError {
 		translated.Code = enqueuePolicyErr.Code
 	case errors.As(err, &attachmentErr):
 		translated.Code = attachmentErr.Code
+	case errors.Is(err, store.ErrRecipientPeriodUnavailable):
+		translated.Code = "recipient_period_unavailable"
+	case errors.Is(err, store.ErrRecipientAllowanceExhausted):
+		translated.Code = "recipient_quota_exceeded"
+	case errors.Is(err, store.ErrRecipientLimit):
+		translated.Code = "recipient_admission_unavailable"
+	case errors.Is(err, store.ErrAttachmentQuotaExceeded):
+		translated.Code = "storage_quota_exceeded"
 	case errors.Is(err, entitlements.ErrQuotaExceeded):
 		translated.Code = "quota_exceeded"
 	case errors.Is(err, entitlements.ErrSubscriptionInactive):
