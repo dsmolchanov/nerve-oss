@@ -38,21 +38,26 @@ def complete_sends(path):
 
 
 def observe_single_send(read_events, terminal, quiet_seconds=6, timeout=120,
+                        polled=lambda: True, inbound_count=None,
                         now=time.monotonic, pause=time.sleep):
     """Require one complete event and a terminal outbox throughout a quiet window.
 
     Waiting for a file to exist can race its writer. Checking the first line
     alone can miss a second provider call after the worker retries. The outbox
     terminal state closes that retry path; the quiet window also observes a
-    delayed duplicate in the fixture before teardown.
+    delayed duplicate in the fixture before teardown. After restart, an
+    observed inbound poll gates the window and the local inbound count stays
+    checked for its full duration.
     """
     deadline = now() + timeout
     stable_since = None
     while now() < deadline:
+        if inbound_count is not None and inbound_count() != 1:
+            raise AssertionError('acknowledged inbound was replayed after restart')
         events = read_events()
         if events is not None and len(events) > 1:
             raise AssertionError('synthetic reply reached Cloud more than once')
-        if events is not None and len(events) == 1 and terminal():
+        if events is not None and len(events) == 1 and terminal() and polled():
             if stable_since is None:
                 stable_since = now()
             if now() - stable_since >= quiet_seconds:
@@ -123,6 +128,8 @@ def fixture(state_dir):
             if action == 'status':
                 return self.answer(200, {'installation_id': admission['installation_id'], 'state': 'active'})
             if action == 'poll':
+                if (state_dir / 'watch-post-restart').exists():
+                    (state_dir / 'polled-after-restart').write_text('yes')
                 if (state_dir / 'acked').exists():
                     return self.answer(200, {'delivery': None})
                 return self.answer(200, {'delivery': {
@@ -204,8 +211,8 @@ def smoke(image, successor_core_head, predecessor_migration_image):
         def compose(*command):
             return run('docker', 'compose', *command)
 
-        def sql(query):
-            return compose('exec', '-T', 'postgres', 'psql', '-U', 'neuralmail', '-d', 'neuralmail',
+        def sql(query, database='neuralmail'):
+            return compose('exec', '-T', 'postgres', 'psql', '-U', 'neuralmail', '-d', database,
                            '-X', '-A', '-t', '-v', 'ON_ERROR_STOP=1', '-c', query).strip()
 
         def ready():
@@ -287,6 +294,48 @@ def smoke(image, successor_core_head, predecessor_migration_image):
             if sent.get('body') != 'Synthetic hybrid reply':
                 raise AssertionError('reply body differed at the fixture')
             print('PASS image pairing, active inbound, durable ACK and one synthetic reply', flush=True)
+
+            # A coordinated database backup after active traffic must recover
+            # both the inbound message and the settled reply. It deliberately
+            # does not recover the installation key: that lives in the host's
+            # owner-only state volume, outside PostgreSQL.
+            compose('stop', 'cloud-fixture', 'cortex')
+            dump = tmp / 'active-backup.dump'
+            run('bash', 'scripts/selfhost/backup.sh', str(dump))
+            restored_db = 'restore_hybrid_active'
+            run('bash', 'scripts/selfhost/restore.sh', str(dump), restored_db)
+            if sql("SELECT count(*) FROM messages WHERE internet_message_id='<fixture-inbound@example.invalid>'",
+                   restored_db) != '1':
+                raise AssertionError('restored database lost the acknowledged inbound message')
+            if sql("SELECT count(*) FROM outbox_messages WHERE status='sent'", restored_db) != '1':
+                raise AssertionError('restored database lost the settled synthetic reply')
+            if sql("SELECT inbound_provider || '/' || outbound_provider FROM inboxes WHERE address='dev@local.nerve.email'",
+                   restored_db) != 'hybrid/hybrid':
+                raise AssertionError('restored database lost the hybrid mailbox route')
+            restored_env = env.copy()
+            restored_env['NERVE_DB_DSN'] = ('postgres://neuralmail:' + env['POSTGRES_PASSWORD'] +
+                                             '@postgres:5432/' + restored_db + '?sslmode=disable')
+            restored = try_command(['docker', 'compose', 'run', '--rm', '--no-deps', '-T',
+                                    '-e', 'NERVE_DB_DSN', '-v', '/var/lib/nerve',
+                                    '--entrypoint', '/app/neuralmail', 'cortex', 'hybrid', 'status'], restored_env)
+            if restored.returncode == 0 or b'not connected' not in restored.stderr:
+                raise AssertionError('database-only restore did not refuse an absent installation key')
+
+            # Restart the original host with its preserved state volume. The
+            # durable ACK and sent outbox row must not cause another delivery.
+            (tmp / 'watch-post-restart').write_text('yes')
+            compose('start', 'cortex')
+            wait_for(ready, 'paired runtime ready after backup')
+            compose('up', '-d', '--force-recreate', 'cloud-fixture')
+            wait_for(lambda: compose('exec', '-T', 'cortex', 'wget', '-q', '-O', '/dev/null',
+                                     f'http://127.0.0.1:{FIXTURE_PORT}/health') == '',
+                     'local Cloud fixture ready after backup')
+            observe_single_send(lambda: complete_sends(tmp / 'sends.jsonl'),
+                                lambda: sql("SELECT count(*) FROM outbox_messages WHERE status='sent'") == '1',
+                                polled=lambda: (tmp / 'polled-after-restart').exists(),
+                                inbound_count=lambda: int(sql(
+                                    "SELECT count(*) FROM messages WHERE internet_message_id='<fixture-inbound@example.invalid>'")))
+            print('PASS active backup/restore: recovered mail, absent installation key and no replay', flush=True)
         finally:
             subprocess.run(['docker', 'compose', 'down', '-t', '5', '-v', '--remove-orphans'],
                            env=env, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
