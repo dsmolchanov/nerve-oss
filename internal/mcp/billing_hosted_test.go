@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"neuralmail/internal/auth"
+	"neuralmail/internal/entitlements"
 	"neuralmail/internal/localauth"
 )
 
@@ -46,6 +47,8 @@ func TestHostedUpgradeRequiresPrincipalScopeAndExactServerOrigin(t *testing.T) {
 	cfg := hostedRouterConfig()
 	cfg.Cloud.DashboardBaseURL = "https://nerve.example"
 	runtime := NewServer(cfg, nil, auth.NewService(cfg, nil), nil)
+	quotaGate := &fakeEntitlementGate{preAuthErr: entitlements.ErrQuotaExceeded}
+	runtime.Entitlements = quotaGate
 	stub := &recordingHostedBilling{result: hostedBillingResult()}
 	runtime.HostedBilling = stub
 	principal := activeBillingPrincipal("nerve:billing.subscribe")
@@ -82,7 +85,7 @@ func TestHostedUpgradeRequiresPrincipalScopeAndExactServerOrigin(t *testing.T) {
 	}, billingUpgradeToolName))
 	if call.Code != http.StatusOK || !strings.Contains(call.Body.String(), hostedTestIntent) ||
 		stub.calls != 1 || stub.input.IdempotencyKey != "upgrade-once" ||
-		stub.caller.Principal.OrgID != principal.OrgID {
+		stub.caller.Principal.OrgID != principal.OrgID || quotaGate.preAuthCalls != 0 {
 		t.Fatalf("hosted call=%d %s; stub=%+v", call.Code, call.Body.String(), stub)
 	}
 }
@@ -129,6 +132,8 @@ func TestHostedStatusIsScopedAndRejectsCallerAuthority(t *testing.T) {
 	cfg := hostedRouterConfig()
 	cfg.Cloud.DashboardBaseURL = "https://nerve.example"
 	runtime := NewServer(cfg, nil, auth.NewService(cfg, nil), nil)
+	quotaGate := &fakeEntitlementGate{preAuthErr: entitlements.ErrQuotaExceeded}
+	runtime.Entitlements = quotaGate
 	stub := &recordingHostedBilling{}
 	runtime.HostedBilling = stub
 	principal := activeBillingPrincipal("nerve:billing.subscribe")
@@ -152,7 +157,7 @@ func TestHostedStatusIsScopedAndRejectsCallerAuthority(t *testing.T) {
 		"arguments": map[string]any{},
 	}, billingStatusToolName))
 	if call.Code != http.StatusOK || !strings.Contains(call.Body.String(), `"starter_active":false`) ||
-		stub.calls != 1 || stub.caller.Principal.OrgID != principal.OrgID {
+		stub.calls != 1 || stub.caller.Principal.OrgID != principal.OrgID || quotaGate.preAuthCalls != 0 {
 		t.Fatalf("hosted status call=%d %s; stub=%+v", call.Code, call.Body.String(), stub)
 	}
 }
