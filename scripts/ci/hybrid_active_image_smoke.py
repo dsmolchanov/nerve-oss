@@ -326,6 +326,8 @@ def smoke(image, successor_core_head, predecessor_migration_image):
                 raise AssertionError('original host replayed acknowledged inbound after backup')
             observe_single_send(lambda: complete_sends(tmp / 'sends.jsonl'),
                                 lambda: sql("SELECT count(*) FROM outbox_messages WHERE status='sent'") == '1')
+            if sql("SELECT count(*) FROM messages WHERE internet_message_id='<fixture-inbound@example.invalid>'") != '1':
+                raise AssertionError('original host replayed acknowledged inbound after restart')
             print('PASS active backup/restore: recovered mail, absent installation key and no replay', flush=True)
         finally:
             subprocess.run(['docker', 'compose', 'down', '-t', '5', '-v', '--remove-orphans'],
