@@ -858,7 +858,7 @@ func (s *Store) BeginOutboxProviderOperationState(ctx context.Context, msg Outbo
 		return OutboxProviderOperation{}, ErrOutboxPolicyRevoked
 	}
 	if periodClosed {
-		return OutboxProviderOperation{}, ErrRecipientLimit
+		return OutboxProviderOperation{}, ErrRecipientPeriodUnavailable
 	}
 	if legacy {
 		return OutboxProviderOperation{}, nil

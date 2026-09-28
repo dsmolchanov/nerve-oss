@@ -1,12 +1,35 @@
 package mcp
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"neuralmail/internal/store"
 	"neuralmail/internal/tools"
 )
+
+func TestTranslateModernBusinessErrorSeparatesRecipientQuotaAndPeriodClosure(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		code string
+	}{
+		{"recipient allowance", store.ErrRecipientAllowanceExhausted, "recipient_quota_exceeded"},
+		{"recipient period", store.ErrRecipientPeriodUnavailable, "recipient_period_unavailable"},
+		{"generic recipient denial", store.ErrRecipientLimit, "recipient_admission_unavailable"},
+		{"storage", store.ErrAttachmentQuotaExceeded, "storage_quota_exceeded"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			translated := translateModernBusinessError(fmt.Errorf("enqueue: %w", test.err))
+			if translated.Code != test.code || translated.Retryable || translated.Remediation != "" {
+				t.Fatalf("translated error=%+v want code=%q", translated, test.code)
+			}
+		})
+	}
+}
 
 func TestTranslateModernBusinessErrorMapsEnqueuePolicyDenial(t *testing.T) {
 	// The enqueue-time recheck raises the tools-layer type; a caller must see
