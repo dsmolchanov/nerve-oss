@@ -75,7 +75,7 @@ func TestAtomicReserveNoOvershootUnderConcurrency(t *testing.T) {
 	})
 }
 
-func TestV2RecipientMeterDoesNotChargeLegacyToolUnitsOrRollPeriod(t *testing.T) {
+func TestV2RecipientMeterKeepsReadAndBillingToolsAvailableAtZero(t *testing.T) {
 	withTempStore(t, func(ctx context.Context, st *store.Store) {
 		orgID := uuid.NewString()
 		now := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
@@ -89,15 +89,20 @@ func TestV2RecipientMeterDoesNotChargeLegacyToolUnitsOrRollPeriod(t *testing.T) 
 		}
 		svc := NewService(config.Default(), st, nil)
 		svc.Now = func() time.Time { return now }
-		for i, status := range []string{"success", "failed"} {
-			reservation, err := svc.PreAuthorizeTool(ctx, auth.Principal{OrgID: orgID}, "list_threads", fmt.Sprintf("v2-read-%d", i), "")
+		for i, test := range []struct{ tool, status string }{
+			{"list_threads", "success"},
+			{"nerve_billing_status", "success"},
+			{"nerve_billing_upgrade", "success"},
+			{"nerve_billing_upgrade", "failed"},
+		} {
+			reservation, err := svc.PreAuthorizeTool(ctx, auth.Principal{OrgID: orgID}, test.tool, fmt.Sprintf("v2-tool-%d", i), "")
 			if err != nil {
-				t.Fatalf("v2 read %d: %v", i, err)
+				t.Fatalf("v2 tool %q: %v", test.tool, err)
 			}
 			if reservation.MeterName != "" || reservation.Quantity != 0 {
-				t.Fatalf("legacy unit reservation on v2 read: %+v", reservation)
+				t.Fatalf("legacy unit reservation on v2 tool %q: %+v", test.tool, reservation)
 			}
-			if err := svc.FinalizeToolExecution(ctx, *reservation, "list_threads", fmt.Sprintf("v2-read-%d", i), "", status, "", nil); err != nil {
+			if err := svc.FinalizeToolExecution(ctx, *reservation, test.tool, fmt.Sprintf("v2-tool-%d", i), "", test.status, "", nil); err != nil {
 				t.Fatalf("v2 finalize %d: %v", i, err)
 			}
 		}
