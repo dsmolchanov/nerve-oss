@@ -3,8 +3,11 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"net/mail"
 	"strconv"
 	"strings"
@@ -26,7 +29,15 @@ const (
 	limitFirstRecipientsPerDay = int64(25)
 	limitHardBounceAttempts    = int64(20)
 	limitHardBounceBasisPoints = int64(500)
+	outboundPolicyV2           = "autonomous-outbound-v2"
 )
+
+var ErrOutboundPolicyVersionUnavailable = errors.New("outbound policy version unavailable")
+
+type outboundDailyCaps struct {
+	sends           int64
+	firstRecipients int64
+}
 
 type OutboundLimitInput struct {
 	ToolName       string
@@ -70,7 +81,11 @@ func (s *Store) ReserveOutboundLimits(
 	recipientHash := outboundRecipientHash(canonicalRecipient)
 
 	if input.ComposeEnabled {
-		if err := s.reserveOutboundBucket(ctx, orgID, input, meterOutboundSendDay, "", reservationClock, limitSendPerDay); err != nil {
+		caps, err := s.outboundComposeCaps(ctx, orgID, reservationClock)
+		if err != nil {
+			return err
+		}
+		if err := s.reserveOutboundBucket(ctx, orgID, input, meterOutboundSendDay, "", reservationClock, caps.sends); err != nil {
 			return err
 		}
 		first, err := s.firstOutboundRecipient(ctx, orgID, outboxID, canonicalRecipient, recipientHash)
@@ -78,7 +93,7 @@ func (s *Store) ReserveOutboundLimits(
 			return err
 		}
 		if first {
-			if err := s.reserveOutboundBucket(ctx, orgID, input, meterOutboundFirstRecipientDay, "", reservationClock, limitFirstRecipientsPerDay); err != nil {
+			if err := s.reserveOutboundBucket(ctx, orgID, input, meterOutboundFirstRecipientDay, "", reservationClock, caps.firstRecipients); err != nil {
 				return err
 			}
 			seenMeter := meterOutboundRecipientSeen + ":" + recipientHash
@@ -98,6 +113,82 @@ func (s *Store) ReserveOutboundLimits(
 		ctx, orgID, input, meterOutboundReplyRecipient, recipientHash,
 		reservationClock, limitReplyPerRecipientDay,
 	)
+}
+
+// The policy marker is projected from an immutable purchased offer. Existing
+// subscriptions without it keep v1, even if their legacy tier label matches a
+// new tier. The org lock held by ReserveOutboundLimits serializes this read
+// with entitlement projection and with the first accepted compose event.
+func (s *Store) outboundComposeCaps(ctx context.Context, orgID string, clock outboundLimitClock) (outboundDailyCaps, error) {
+	v1 := outboundDailyCaps{sends: limitSendPerDay, firstRecipients: limitFirstRecipientsPerDay}
+	ent, err := s.GetOrgEntitlement(ctx, orgID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return v1, nil
+	}
+	if err != nil {
+		return outboundDailyCaps{}, err
+	}
+	var features struct {
+		OutboundPolicyVersion string `json:"outbound_policy_version"`
+	}
+	if err := json.Unmarshal(ent.Features, &features); err != nil {
+		return outboundDailyCaps{}, ErrOutboundPolicyVersionUnavailable
+	}
+	if features.OutboundPolicyVersion == "" {
+		return v1, nil
+	}
+	if features.OutboundPolicyVersion != outboundPolicyV2 {
+		return outboundDailyCaps{}, ErrOutboundPolicyVersionUnavailable
+	}
+	enrolled, err := s.RecipientMeterEnrolled(ctx, orgID)
+	if err != nil {
+		return outboundDailyCaps{}, err
+	}
+	if !enrolled {
+		// A projected tier marker without its monthly recipient ledger is a
+		// partial billing transition, not permission to use higher daily caps.
+		return outboundDailyCaps{}, ErrOutboundPolicyVersionUnavailable
+	}
+	var first sql.NullTime
+	if err := s.q.QueryRowContext(ctx, `SELECT min(created_at) FROM usage_events
+  WHERE org_id=$1 AND meter_name=$2 AND status='success'`, orgID, meterOutboundSendDay).Scan(&first); err != nil {
+		return outboundDailyCaps{}, err
+	}
+	origin := clock.acceptedAt
+	if first.Valid {
+		origin = first.Time
+	}
+	return effectiveOutboundV2Caps(ent.PlanCode, origin, clock.acceptedAt)
+}
+
+func effectiveOutboundV2Caps(tier string, firstCompose, now time.Time) (outboundDailyCaps, error) {
+	var tierCaps outboundDailyCaps
+	switch tier {
+	case "starter":
+		tierCaps = outboundDailyCaps{100, 25}
+	case "growth":
+		tierCaps = outboundDailyCaps{500, 125}
+	case "scale":
+		tierCaps = outboundDailyCaps{1500, 375}
+	default:
+		return outboundDailyCaps{}, ErrOutboundPolicyVersionUnavailable
+	}
+	firstDay := firstCompose.UTC().Truncate(24 * time.Hour)
+	currentDay := now.UTC().Truncate(24 * time.Hour)
+	if currentDay.Before(firstDay) {
+		return outboundDailyCaps{}, ErrOutboundPolicyVersionUnavailable
+	}
+	days := int(currentDay.Sub(firstDay) / (24 * time.Hour))
+	warmup := outboundDailyCaps{100, 25}
+	if days >= 3 && days < 7 {
+		warmup = outboundDailyCaps{500, 125}
+	} else if days >= 7 {
+		warmup = tierCaps
+	}
+	return outboundDailyCaps{
+		sends:           min(tierCaps.sends, warmup.sends),
+		firstRecipients: min(tierCaps.firstRecipients, warmup.firstRecipients),
+	}, nil
 }
 
 func (s *Store) readOutboundLimitClock(ctx context.Context) (outboundLimitClock, error) {
