@@ -38,21 +38,26 @@ def complete_sends(path):
 
 
 def observe_single_send(read_events, terminal, quiet_seconds=6, timeout=120,
+                        polled=lambda: True, inbound_count=None,
                         now=time.monotonic, pause=time.sleep):
     """Require one complete event and a terminal outbox throughout a quiet window.
 
     Waiting for a file to exist can race its writer. Checking the first line
     alone can miss a second provider call after the worker retries. The outbox
     terminal state closes that retry path; the quiet window also observes a
-    delayed duplicate in the fixture before teardown.
+    delayed duplicate in the fixture before teardown. After restart, an
+    observed inbound poll gates the window and the local inbound count stays
+    checked for its full duration.
     """
     deadline = now() + timeout
     stable_since = None
     while now() < deadline:
+        if inbound_count is not None and inbound_count() != 1:
+            raise AssertionError('acknowledged inbound was replayed after restart')
         events = read_events()
         if events is not None and len(events) > 1:
             raise AssertionError('synthetic reply reached Cloud more than once')
-        if events is not None and len(events) == 1 and terminal():
+        if events is not None and len(events) == 1 and terminal() and polled():
             if stable_since is None:
                 stable_since = now()
             if now() - stable_since >= quiet_seconds:
@@ -123,6 +128,8 @@ def fixture(state_dir):
             if action == 'status':
                 return self.answer(200, {'installation_id': admission['installation_id'], 'state': 'active'})
             if action == 'poll':
+                if (state_dir / 'watch-post-restart').exists():
+                    (state_dir / 'polled-after-restart').write_text('yes')
                 if (state_dir / 'acked').exists():
                     return self.answer(200, {'delivery': None})
                 return self.answer(200, {'delivery': {
@@ -316,18 +323,18 @@ def smoke(image, successor_core_head, predecessor_migration_image):
 
             # Restart the original host with its preserved state volume. The
             # durable ACK and sent outbox row must not cause another delivery.
+            (tmp / 'watch-post-restart').write_text('yes')
             compose('start', 'cortex')
             wait_for(ready, 'paired runtime ready after backup')
             compose('up', '-d', '--force-recreate', 'cloud-fixture')
             wait_for(lambda: compose('exec', '-T', 'cortex', 'wget', '-q', '-O', '/dev/null',
                                      f'http://127.0.0.1:{FIXTURE_PORT}/health') == '',
                      'local Cloud fixture ready after backup')
-            if sql("SELECT count(*) FROM messages WHERE internet_message_id='<fixture-inbound@example.invalid>'") != '1':
-                raise AssertionError('original host replayed acknowledged inbound after backup')
             observe_single_send(lambda: complete_sends(tmp / 'sends.jsonl'),
-                                lambda: sql("SELECT count(*) FROM outbox_messages WHERE status='sent'") == '1')
-            if sql("SELECT count(*) FROM messages WHERE internet_message_id='<fixture-inbound@example.invalid>'") != '1':
-                raise AssertionError('original host replayed acknowledged inbound after restart')
+                                lambda: sql("SELECT count(*) FROM outbox_messages WHERE status='sent'") == '1',
+                                polled=lambda: (tmp / 'polled-after-restart').exists(),
+                                inbound_count=lambda: int(sql(
+                                    "SELECT count(*) FROM messages WHERE internet_message_id='<fixture-inbound@example.invalid>'")))
             print('PASS active backup/restore: recovered mail, absent installation key and no replay', flush=True)
         finally:
             subprocess.run(['docker', 'compose', 'down', '-t', '5', '-v', '--remove-orphans'],

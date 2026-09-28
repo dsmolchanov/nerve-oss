@@ -54,6 +54,32 @@ class ObserveSingleSendTest(unittest.TestCase):
             observe_single_send(events, lambda: True, quiet_seconds=0.5,
                                 timeout=2, now=lambda: clock[0], pause=pause)
 
+    def test_restart_quiet_window_starts_only_after_a_new_poll(self):
+        clock = [0.0]
+
+        def pause(duration):
+            clock[0] += duration
+
+        observe_single_send(lambda: [{'body': 'synthetic'}], lambda: True,
+                            quiet_seconds=0.3, timeout=2,
+                            polled=lambda: clock[0] >= 0.4,
+                            inbound_count=lambda: 1,
+                            now=lambda: clock[0], pause=pause)
+        self.assertGreaterEqual(clock[0], 0.7)
+
+    def test_rejects_inbound_replay_during_post_poll_quiet_window(self):
+        clock = [0.0]
+
+        def pause(duration):
+            clock[0] += duration
+
+        with self.assertRaisesRegex(AssertionError, 'inbound was replayed'):
+            observe_single_send(lambda: [{'body': 'synthetic'}], lambda: True,
+                                quiet_seconds=0.5, timeout=2,
+                                polled=lambda: clock[0] >= 0.1,
+                                inbound_count=lambda: 1 if clock[0] < 0.4 else 2,
+                                now=lambda: clock[0], pause=pause)
+
 
 if __name__ == '__main__':
     unittest.main()
