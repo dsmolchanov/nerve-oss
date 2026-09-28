@@ -541,6 +541,11 @@ func TestOutboundV2RequiresExplicitEntitlementAndPreservesWarmupHistory(t *testi
 			if err != nil {
 				return err
 			}
+			if _, err := tx.q.ExecContext(ctx, `INSERT INTO usage_events
+  (org_id,meter_name,quantity,tool_name,status,created_at)
+  VALUES($1,$2,100,'compose_email','success',$3)`, orgID, meterOutboundSendDay, clock.acceptedAt); err != nil {
+				return err
+			}
 			if err := tx.EnsureOrgUsageCounter(ctx, orgID, meterOutboundSendDay, clock.dayStart, clock.dayEnd); err != nil {
 				return err
 			}
