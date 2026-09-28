@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -503,7 +504,7 @@ func TestOutboundV2RequiresExplicitEntitlementAndPreservesWarmupHistory(t *testi
 				if err != nil {
 					return err
 				}
-				got, err = tx.outboundComposeCaps(ctx, orgID, clock)
+				got, _, err = tx.outboundComposeCaps(ctx, orgID, clock)
 				return err
 			})
 			return got, err
@@ -530,6 +531,11 @@ func TestOutboundV2RequiresExplicitEntitlementAndPreservesWarmupHistory(t *testi
 		if got, err := readCaps(); err != nil || got != (outboundDailyCaps{100, 25}) {
 			t.Fatalf("new Scale skipped warmup: %+v, %v", got, err)
 		}
+		var stored sql.NullTime
+		if err := st.q.QueryRowContext(ctx, `SELECT first_compose_accepted_at
+  FROM org_outbound_policy_state WHERE org_id=$1`, orgID).Scan(&stored); err != nil || stored.Valid {
+			t.Fatalf("policy read started warmup without admission: %+v, %v", stored, err)
+		}
 		if err := st.RunInTx(ctx, func(tx *Store) error {
 			clock, err := tx.readOutboundLimitClock(ctx)
 			if err != nil {
@@ -553,10 +559,15 @@ func TestOutboundV2RequiresExplicitEntitlementAndPreservesWarmupHistory(t *testi
 				t.Fatalf("first-day Scale denial=%v", err)
 			}
 		}
+		if err := st.q.QueryRowContext(ctx, `SELECT first_compose_accepted_at
+  FROM org_outbound_policy_state WHERE org_id=$1`, orgID).Scan(&stored); err != nil || stored.Valid {
+			t.Fatalf("denied compose started warmup: %+v, %v", stored, err)
+		}
+		historical := now.Add(-8 * 24 * time.Hour).Truncate(time.Microsecond)
 		if _, err := st.q.ExecContext(ctx, `INSERT INTO usage_events
   (org_id,meter_name,quantity,tool_name,status,created_at)
   VALUES ($1,$2,1,'compose_email','success',$3)`, orgID, meterOutboundSendDay,
-			now.Add(-8*24*time.Hour)); err != nil {
+			historical); err != nil {
 			t.Fatal(err)
 		}
 		if got, err := readCaps(); err != nil || got != (outboundDailyCaps{1500, 375}) {
@@ -566,11 +577,66 @@ func TestOutboundV2RequiresExplicitEntitlementAndPreservesWarmupHistory(t *testi
 			"post-warmup", "new@example.test", true)); err != nil {
 			t.Fatalf("post-warmup Scale send: %v", err)
 		}
+		if err := st.q.QueryRowContext(ctx, `SELECT first_compose_accepted_at
+  FROM org_outbound_policy_state WHERE org_id=$1`, orgID).Scan(&stored); err != nil ||
+			!stored.Valid || !stored.Time.Equal(historical) {
+			t.Fatalf("accepted compose did not preserve historical origin: %+v, %v", stored, err)
+		}
+		if _, err := st.q.ExecContext(ctx, `UPDATE org_entitlements SET plan_code='growth' WHERE org_id=$1`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := readCaps(); err != nil || got != (outboundDailyCaps{500, 125}) {
+			t.Fatalf("tier change reset durable warmup history: %+v, %v", got, err)
+		}
 		if _, err := st.q.ExecContext(ctx, `UPDATE org_entitlements SET plan_code='unknown' WHERE org_id=$1`, orgID); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := readCaps(); !errors.Is(err, ErrOutboundPolicyVersionUnavailable) {
 			t.Fatalf("unknown v2 tier did not fail closed: %v", err)
+		}
+	})
+}
+
+func TestCore32WarmupOriginMigrationAndRollbackGuard(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 31); err != nil {
+			t.Fatal(err)
+		}
+		orgID := uuid.NewString()
+		historical := time.Now().UTC().Add(-8 * 24 * time.Hour).Truncate(time.Microsecond)
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs(id,name) VALUES($1,'warmup migration')`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO org_outbound_policy_state(org_id) VALUES($1)`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO usage_events
+  (org_id,meter_name,quantity,tool_name,status,created_at)
+  VALUES($1,$2,1,'compose_email','success',$3)`, orgID, meterOutboundSendDay, historical); err != nil {
+			t.Fatal(err)
+		}
+		if err := MigrateUpToCore(ctx, db, 32); err != nil {
+			t.Fatal(err)
+		}
+		var index sql.NullString
+		if err := db.QueryRowContext(ctx, `SELECT to_regclass('public.idx_usage_events_first_compose')::text`).Scan(&index); err != nil || !index.Valid {
+			t.Fatalf("bounded historical lookup index missing: %+v, %v", index, err)
+		}
+		st := &Store{db: db, q: db}
+		if err := st.RunInTx(ctx, func(tx *Store) error {
+			if err := tx.LockOrgPolicy(ctx, orgID); err != nil {
+				return err
+			}
+			origin, err := tx.outboundWarmupOrigin(ctx, orgID, time.Now().UTC())
+			if err != nil || !origin.Equal(historical) {
+				return fmt.Errorf("historical origin=%s, want %s: %v", origin, historical, err)
+			}
+			return tx.persistOutboundWarmupOrigin(ctx, orgID, origin)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := MigrateDownCore(ctx, db); err == nil || !strings.Contains(err.Error(), "warmup origin evidence exists") {
+			t.Fatalf("Core32 down discarded warmup history: %v", err)
 		}
 	})
 }

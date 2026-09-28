@@ -81,7 +81,7 @@ func (s *Store) ReserveOutboundLimits(
 	recipientHash := outboundRecipientHash(canonicalRecipient)
 
 	if input.ComposeEnabled {
-		caps, err := s.outboundComposeCaps(ctx, orgID, reservationClock)
+		caps, warmupOrigin, err := s.outboundComposeCaps(ctx, orgID, reservationClock)
 		if err != nil {
 			return err
 		}
@@ -103,6 +103,11 @@ func (s *Store) ReserveOutboundLimits(
 				return err
 			}
 		}
+		if !warmupOrigin.IsZero() {
+			if err := s.persistOutboundWarmupOrigin(ctx, orgID, warmupOrigin); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 
@@ -119,46 +124,96 @@ func (s *Store) ReserveOutboundLimits(
 // subscriptions without it keep v1, even if their legacy tier label matches a
 // new tier. The org lock held by ReserveOutboundLimits serializes this read
 // with entitlement projection and with the first accepted compose event.
-func (s *Store) outboundComposeCaps(ctx context.Context, orgID string, clock outboundLimitClock) (outboundDailyCaps, error) {
+func (s *Store) outboundComposeCaps(ctx context.Context, orgID string, clock outboundLimitClock) (outboundDailyCaps, time.Time, error) {
 	v1 := outboundDailyCaps{sends: limitSendPerDay, firstRecipients: limitFirstRecipientsPerDay}
 	ent, err := s.GetOrgEntitlement(ctx, orgID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return v1, nil
+		return v1, time.Time{}, nil
 	}
 	if err != nil {
-		return outboundDailyCaps{}, err
+		return outboundDailyCaps{}, time.Time{}, err
 	}
 	var features struct {
 		OutboundPolicyVersion string `json:"outbound_policy_version"`
 	}
 	if err := json.Unmarshal(ent.Features, &features); err != nil {
-		return outboundDailyCaps{}, ErrOutboundPolicyVersionUnavailable
+		return outboundDailyCaps{}, time.Time{}, ErrOutboundPolicyVersionUnavailable
 	}
 	if features.OutboundPolicyVersion == "" {
-		return v1, nil
+		return v1, time.Time{}, nil
 	}
 	if features.OutboundPolicyVersion != outboundPolicyV2 {
-		return outboundDailyCaps{}, ErrOutboundPolicyVersionUnavailable
+		return outboundDailyCaps{}, time.Time{}, ErrOutboundPolicyVersionUnavailable
 	}
 	enrolled, err := s.RecipientMeterEnrolled(ctx, orgID)
 	if err != nil {
-		return outboundDailyCaps{}, err
+		return outboundDailyCaps{}, time.Time{}, err
 	}
 	if !enrolled {
 		// A projected tier marker without its monthly recipient ledger is a
 		// partial billing transition, not permission to use higher daily caps.
-		return outboundDailyCaps{}, ErrOutboundPolicyVersionUnavailable
+		return outboundDailyCaps{}, time.Time{}, ErrOutboundPolicyVersionUnavailable
 	}
-	var first sql.NullTime
-	if err := s.q.QueryRowContext(ctx, `SELECT min(created_at) FROM usage_events
-  WHERE org_id=$1 AND meter_name=$2 AND status='success'`, orgID, meterOutboundSendDay).Scan(&first); err != nil {
-		return outboundDailyCaps{}, err
+	origin, err := s.outboundWarmupOrigin(ctx, orgID, clock.acceptedAt)
+	if err != nil {
+		return outboundDailyCaps{}, time.Time{}, err
 	}
-	origin := clock.acceptedAt
-	if first.Valid {
-		origin = first.Time
+	caps, err := effectiveOutboundV2Caps(ent.PlanCode, origin, clock.acceptedAt)
+	if err != nil {
+		return outboundDailyCaps{}, time.Time{}, err
 	}
-	return effectiveOutboundV2Caps(ent.PlanCode, origin, clock.acceptedAt)
+	return caps, origin, nil
+}
+
+// The org policy lock and transaction cover both this read and the eventual
+// enqueue. The historical lookup runs only until a successful v2 admission
+// persists the origin; a denied or rolled-back send cannot start warmup.
+func (s *Store) outboundWarmupOrigin(ctx context.Context, orgID string, acceptedAt time.Time) (time.Time, error) {
+	var origin sql.NullTime
+	err := s.q.QueryRowContext(ctx, `SELECT first_compose_accepted_at
+  FROM org_outbound_policy_state WHERE org_id=$1::uuid FOR UPDATE`, orgID).Scan(&origin)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, ErrOutboundPolicyStateMissing
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	if origin.Valid {
+		return origin.Time, nil
+	}
+	err = s.q.QueryRowContext(ctx, `SELECT created_at FROM usage_events
+  WHERE org_id=$1::uuid AND meter_name='autonomous_outbound_send_day' AND status='success'
+  ORDER BY created_at LIMIT 1`, orgID).Scan(&origin)
+	if errors.Is(err, sql.ErrNoRows) {
+		return acceptedAt, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	return origin.Time, nil
+}
+
+func (s *Store) persistOutboundWarmupOrigin(ctx context.Context, orgID string, origin time.Time) error {
+	result, err := s.q.ExecContext(ctx, `UPDATE org_outbound_policy_state
+  SET first_compose_accepted_at=$2 WHERE org_id=$1::uuid AND first_compose_accepted_at IS NULL`, orgID, origin)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		var stored time.Time
+		if err := s.q.QueryRowContext(ctx, `SELECT first_compose_accepted_at
+  FROM org_outbound_policy_state WHERE org_id=$1::uuid`, orgID).Scan(&stored); err != nil {
+			return err
+		}
+		if !stored.Equal(origin) {
+			return ErrOutboundPolicyVersionUnavailable
+		}
+	}
+	return nil
 }
 
 func effectiveOutboundV2Caps(tier string, firstCompose, now time.Time) (outboundDailyCaps, error) {
