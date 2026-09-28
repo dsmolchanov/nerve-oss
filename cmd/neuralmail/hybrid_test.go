@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -320,6 +322,60 @@ func TestHybridMutationsRefuseWhileTheRuntimeIsServing(t *testing.T) {
 	err = runHybrid(context.Background(), stopped, []string{"rotate", "-commit"}, &quiet)
 	if err == nil || strings.Contains(err.Error(), "still serving") {
 		t.Fatalf("a stopped runtime was treated as serving: %v", err)
+	}
+}
+
+func TestHybridMutationProbeFailsClosedBeforeReadiness(t *testing.T) {
+	for _, status := range []int{http.StatusServiceUnavailable, http.StatusNotFound, http.StatusFound} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+			cfg := hybridTestConfig(t)
+			cfg.HTTP.Addr = strings.TrimPrefix(server.URL, "http://")
+			for _, operation := range []string{"connecting", "rotating", "disconnecting"} {
+				if err := requireStoppedRuntime(context.Background(), cfg, false, operation); err == nil || !strings.Contains(err.Error(), "still serving") {
+					t.Fatalf("%s accepted reachable unready daemon (%d): %v", operation, status, err)
+				}
+			}
+		})
+	}
+	for _, addr := range []string{"", "198.51.100.1:8088", "not-an-address"} {
+		cfg := hybridTestConfig(t)
+		cfg.HTTP.Addr = addr
+		if err := requireStoppedRuntime(context.Background(), cfg, false, "disconnecting"); err == nil || !strings.Contains(err.Error(), "cannot prove") {
+			t.Fatalf("unverifiable readiness address %q permitted mutation: %v", addr, err)
+		}
+	}
+
+	// A hostless listener may use either IP family. Reaching its IPv4 side
+	// must still block the CLI even if IPv6 is not listening.
+	wildcard := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer wildcard.Close()
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(wildcard.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfgWildcard := hybridTestConfig(t)
+	cfgWildcard.HTTP.Addr = ":" + port
+	if err := requireStoppedRuntime(context.Background(), cfgWildcard, false, "disconnecting"); err == nil || !strings.Contains(err.Error(), "still serving") {
+		t.Fatalf("hostless readiness address permitted mutation: %v", err)
+	}
+
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slow.Close()
+	cfg := hybridTestConfig(t)
+	cfg.HTTP.Addr = strings.TrimPrefix(slow.URL, "http://")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := requireStoppedRuntime(ctx, cfg, false, "disconnecting"); err == nil || !strings.Contains(err.Error(), "cannot prove") {
+		t.Fatalf("timed-out readiness probe was treated as stopped: %v", err)
 	}
 }
 
