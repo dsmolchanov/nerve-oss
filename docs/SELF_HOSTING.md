@@ -378,6 +378,15 @@ built image in ordinary CI. The tag-publish workflow runs the same smoke with
 the GitHub Release, so a successful release run is evidence for the
 distributable bytes rather than only for the source checkout.
 
+`scripts/ci/hybrid_active_image_smoke.py` adds an isolated active-path check.
+It pairs the image with a loopback-only synthetic Cloud fixture, restarts the
+runtime, verifies one inbound message is stored and acknowledged, and submits
+one reply to the fixture. It accepts an immutable `--image` digest; successor
+images that require a prepared schema also need `--successor-core-head` and an
+immutable `--predecessor-migration-image`. The fixture sends no mail and does
+not prove production Cloud admission, provider delivery, or the production
+data boundary.
+
 ## Updating a deployment
 
 Choose a reviewed commit or release compatible with your current schema and
