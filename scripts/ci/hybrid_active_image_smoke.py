@@ -37,6 +37,20 @@ def complete_sends(path):
         return None
 
 
+def fixture_key_state(admission, kid):
+    """Model admission separately from the owner's installation-key switch."""
+    admitted = admission.get('admitted_kids', [admission.get('kid')])
+    is_admitted = bool(kid) and kid in admitted
+    return is_admitted, is_admitted and kid == admission.get('active_kid', admission.get('kid'))
+
+
+def write_admission(directory, admission):
+    """Publish a whole fixture revision while its HTTP worker is reading it."""
+    staged = directory / 'admission.next.json'
+    staged.write_text(json.dumps(admission))
+    staged.replace(directory / 'admission.json')
+
+
 def observe_single_send(read_events, terminal, quiet_seconds=6, timeout=120,
                         polled=lambda: True, inbound_count=None,
                         now=time.monotonic, pause=time.sleep):
@@ -105,12 +119,18 @@ def fixture(state_dir):
                     header = json.loads(base64.urlsafe_b64decode(assertion.split('.')[0] + '==='))
                 except (ValueError, IndexError):
                     return self.answer(401, {'error': 'invalid_client'})
-                if header.get('kid') != admission.get('kid'):
+                kid = header.get('kid')
+                admitted, _ = fixture_key_state(admission, kid)
+                if not admitted:
                     return self.answer(401, {'error': 'invalid_client'})
-                return self.answer(200, {'access_token': 'fixture-token', 'token_type': 'Bearer',
+                return self.answer(200, {'access_token': 'fixture-token.' + kid, 'token_type': 'Bearer',
                                          'expires_in': 900, 'scope': 'nerve:email.read nerve:email.reply'})
-            if self.headers.get('Authorization') != 'Bearer fixture-token':
+            bearer = self.headers.get('Authorization', '')
+            if not bearer.startswith('Bearer fixture-token.'):
                 return self.answer(401, {})
+            admitted, active = fixture_key_state(admission, bearer.removeprefix('Bearer fixture-token.'))
+            if not admitted or not active:
+                return self.answer(403, {})
             try:
                 request = json.loads(raw)
             except ValueError:
@@ -128,6 +148,8 @@ def fixture(state_dir):
             if action == 'status':
                 return self.answer(200, {'installation_id': admission['installation_id'], 'state': 'active'})
             if action == 'poll':
+                if (state_dir / 'watch-post-rotation').exists():
+                    (state_dir / 'polled-after-rotation').write_text('yes')
                 if (state_dir / 'watch-post-restart').exists():
                     (state_dir / 'polled-after-restart').write_text('yes')
                 if (state_dir / 'acked').exists():
@@ -253,7 +275,7 @@ def smoke(image, successor_core_head, predecessor_migration_image):
                          'pairing_secret': secrets.token_urlsafe(32), 'installation_id': str(uuid.uuid4()),
                          'org_id': str(uuid.uuid4()), 'inbox_id': inbox_id,
                          'delivery_id': str(uuid.uuid4()), 'lease_token': str(uuid.uuid4())}
-            (tmp / 'admission.json').write_text(json.dumps(admission))
+            write_admission(tmp, admission)
             connect = ['docker', 'compose', 'exec', '-T', 'cortex', '/app/neuralmail', 'hybrid',
                        'connect', '-allow-running', '-cloud-url', f'http://127.0.0.1:{FIXTURE_PORT}',
                        '-token-endpoint', f'http://127.0.0.1:{FIXTURE_PORT}/oauth/token',
@@ -268,7 +290,7 @@ def smoke(image, successor_core_head, predecessor_migration_image):
                 raise AssertionError('failed first connect did not preserve pending state')
             admission['kid'] = state['key']['kid']
             admission['approved'] = True
-            (tmp / 'admission.json').write_text(json.dumps(admission))
+            write_admission(tmp, admission)
             compose('exec', '-T', 'cortex', '/app/neuralmail', 'hybrid', 'connect', '-allow-running')
             state = json.loads(compose('exec', '-T', 'cortex', 'cat', STATE_PATH))
             if state.get('phase') != 'installed' or state.get('installation_id') != admission['installation_id']:
@@ -294,6 +316,51 @@ def smoke(image, successor_core_head, predecessor_migration_image):
             if sent.get('body') != 'Synthetic hybrid reply':
                 raise AssertionError('reply body differed at the fixture')
             print('PASS image pairing, active inbound, durable ACK and one synthetic reply', flush=True)
+
+            # The published binary must keep the old key until Cloud has both
+            # admitted the replacement and switched this installation onto it.
+            # -allow-running is limited to this isolated fixture; restart the
+            # daemon immediately after the synthetic owner switch.
+            old_kid = state['key']['kid']
+            compose('exec', '-T', 'cortex', '/app/neuralmail', 'hybrid', 'rotate')
+            prepared = json.loads(compose('exec', '-T', 'cortex', 'cat', STATE_PATH))
+            pending_kid = prepared.get('pending_key', {}).get('kid')
+            if not pending_kid or pending_kid == old_kid or prepared['key']['kid'] != old_kid:
+                raise AssertionError('rotation preparation replaced the active key')
+            commit = ['docker', 'compose', 'exec', '-T', 'cortex', '/app/neuralmail',
+                      'hybrid', 'rotate', '-commit', '-allow-running']
+
+            def refused_commit():
+                refusal = try_command(commit, env)
+                if refusal.returncode == 0:
+                    raise AssertionError('rotation committed before the owner switched keys')
+                if b'cloud does not yet accept the replacement key' not in refusal.stderr:
+                    raise AssertionError('rotation refused for an unrelated command failure')
+                held = json.loads(compose('exec', '-T', 'cortex', 'cat', STATE_PATH))
+                if held['key']['kid'] != old_kid or held.get('pending_key', {}).get('kid') != pending_kid:
+                    raise AssertionError('refused rotation changed the active or prepared key')
+
+            refused_commit()
+            admission['admitted_kids'] = [old_kid, pending_kid]
+            admission['active_kid'] = old_kid
+            write_admission(tmp, admission)
+            refused_commit()  # Admission alone must not stand in for owner rotation.
+            admission['active_kid'] = pending_kid
+            write_admission(tmp, admission)
+            compose('exec', '-T', 'cortex', '/app/neuralmail', 'hybrid',
+                    'rotate', '-commit', '-allow-running')
+            rotated = json.loads(compose('exec', '-T', 'cortex', 'cat', STATE_PATH))
+            if rotated['key']['kid'] != pending_kid or rotated.get('pending_key'):
+                raise AssertionError('rotation did not promote exactly the owner-switched key')
+            (tmp / 'watch-post-rotation').write_text('yes')
+            compose('restart', 'cortex')
+            wait_for(ready, 'rotated runtime ready')
+            observe_single_send(lambda: complete_sends(tmp / 'sends.jsonl'),
+                                lambda: sql("SELECT count(*) FROM outbox_messages WHERE status='sent'") == '1',
+                                polled=lambda: (tmp / 'polled-after-rotation').exists(),
+                                inbound_count=lambda: int(sql(
+                                    "SELECT count(*) FROM messages WHERE internet_message_id='<fixture-inbound@example.invalid>'")))
+            print('PASS image rotation: admission, owner switch, restart and no replay', flush=True)
 
             # A coordinated database backup after active traffic must recover
             # both the inbound message and the settled reply. It deliberately

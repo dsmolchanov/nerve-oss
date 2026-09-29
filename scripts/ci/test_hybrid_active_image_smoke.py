@@ -2,10 +2,36 @@
 """Deterministic guards for the active-image synthetic send observation."""
 
 from pathlib import Path
+import json
 import tempfile
 import unittest
 
-from hybrid_active_image_smoke import complete_sends, observe_single_send
+from hybrid_active_image_smoke import complete_sends, fixture_key_state, observe_single_send, write_admission
+
+
+class FixtureKeyStateTest(unittest.TestCase):
+    def test_admission_does_not_imply_owner_switch(self):
+        state = {'kid': 'old', 'admitted_kids': ['old', 'new'], 'active_kid': 'old'}
+        self.assertEqual(fixture_key_state(state, 'old'), (True, True))
+        self.assertEqual(fixture_key_state(state, 'new'), (True, False))
+        self.assertEqual(fixture_key_state(state, 'unknown'), (False, False))
+        self.assertEqual(fixture_key_state(state, ''), (False, False))
+        state['active_kid'] = 'new'
+        self.assertEqual(fixture_key_state(state, 'old'), (True, False))
+        self.assertEqual(fixture_key_state(state, 'new'), (True, True))
+
+    def test_initial_pairing_defaults_to_single_key(self):
+        self.assertEqual(fixture_key_state({'kid': 'first'}, 'first'), (True, True))
+        self.assertEqual(fixture_key_state({'kid': 'first'}, 'other'), (False, False))
+
+    def test_fixture_revision_replaces_one_complete_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_admission(root, {'kid': 'old'})
+            write_admission(root, {'kid': 'old', 'admitted_kids': ['old', 'new']})
+            self.assertEqual(json.loads((root / 'admission.json').read_text()),
+                             {'kid': 'old', 'admitted_kids': ['old', 'new']})
+            self.assertFalse((root / 'admission.next.json').exists())
 
 
 class CompleteSendsTest(unittest.TestCase):
