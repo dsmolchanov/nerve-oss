@@ -381,8 +381,12 @@ distributable bytes rather than only for the source checkout.
 `scripts/ci/hybrid_active_image_smoke.py` adds an isolated active-path check.
 It pairs the image with a loopback-only synthetic Cloud fixture, restarts the
 runtime, verifies one inbound message is stored and acknowledged, and submits
-one reply to the fixture. With writers stopped, it then backs up the active
-database, restores into a separate database, verifies the inbound and settled
+one reply to the fixture. It then prepares a replacement key and proves that
+neither preparation nor admission alone switches the installation. Once the
+synthetic owner switches, the image commits the replacement, restarts, polls
+with the new key and does not replay the settled mail. With writers stopped,
+it backs up the active database, restores into a separate database, verifies
+the inbound and settled
 reply survived, and confirms a restored host without the state volume is
 unpaired. Restarting the original host must not replay either message. It
 accepts an immutable `--image` digest; successor images that require a prepared
