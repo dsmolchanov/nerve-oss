@@ -117,6 +117,64 @@ func (s *Store) InstallRecipientPeriod(ctx context.Context, p RecipientPeriod) e
 	return nil
 }
 
+// IncreaseRecipientPeriodLimit is the narrow in-period billing transition for
+// an already enrolled Starter organization. The caller must have verified a
+// paid Starter-to-Growth/Scale change in the same transaction. The existing
+// period ID, boundaries, reservations and committed usage remain untouched;
+// an unpaid pending update must never call this method.
+func (s *Store) IncreaseRecipientPeriodLimit(ctx context.Context, orgID, periodID string,
+	oldLimit, newLimit int64) error {
+	if err := s.requireTx(); err != nil {
+		return err
+	}
+	if err := recipientIDs(orgID, periodID); err != nil {
+		return err
+	}
+	if oldLimit != 3000 || (newLimit != 10000 && newLimit != 30000) {
+		return ErrRecipientLedgerConflict
+	}
+	available, err := s.recipientLedgerAvailable(ctx)
+	if err != nil {
+		return err
+	}
+	if !available {
+		return ErrRecipientPeriodUnavailable
+	}
+	var storedLimit sql.NullInt64
+	var active bool
+	err = s.q.QueryRowContext(ctx, `SELECT recipient_limit,
+  starts_at<=clock_timestamp() AND ends_at>clock_timestamp() AND NOT admission_closed
+  FROM org_recipient_periods
+  WHERE org_id=$1::uuid AND period_id=$2::uuid AND meter_version=2
+  FOR UPDATE`, orgID, periodID).Scan(&storedLimit, &active)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrRecipientPeriodUnavailable
+	}
+	if err != nil {
+		return err
+	}
+	if !active || !storedLimit.Valid ||
+		(storedLimit.Int64 != oldLimit && storedLimit.Int64 != newLimit) {
+		return ErrRecipientLedgerConflict
+	}
+	if storedLimit.Int64 == newLimit {
+		return nil
+	}
+	result, err := s.q.ExecContext(ctx, `UPDATE org_recipient_periods
+  SET recipient_limit=$4
+  WHERE org_id=$1::uuid AND period_id=$2::uuid AND meter_version=2
+    AND recipient_limit=$3 AND NOT admission_closed
+    AND starts_at<=clock_timestamp() AND ends_at>clock_timestamp()`,
+		orgID, periodID, oldLimit, newLimit)
+	if err != nil {
+		return err
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return ErrRecipientLedgerConflict
+	}
+	return nil
+}
+
 // RecipientAdmissionPeriod identifies the single live period for an enrolled
 // organization. An organization with no period rows still uses its legacy
 // meter; once enrolled, an expired or closed period never falls back to it.

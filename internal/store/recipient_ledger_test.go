@@ -58,6 +58,66 @@ func assertRecipientCounters(t *testing.T, ctx context.Context, db *sql.DB, p Re
 	}
 }
 
+func TestRecipientPeriodInPlacePaidUpgradePreservesCounters(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		s, period := recipientFixture(t, ctx, db, sql.NullInt64{Int64: 3000, Valid: true})
+		committedID, pendingID := uuid.NewString(), uuid.NewString()
+		if _, err := recipientReserve(ctx, s, period, committedID, 100); err != nil {
+			t.Fatal(err)
+		}
+		if err := recipientResolve(ctx, s, period, committedID, "committed"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := recipientReserve(ctx, s, period, pendingID, 50); err != nil {
+			t.Fatal(err)
+		}
+		change := func(orgID string, oldLimit, newLimit int64) error {
+			return s.RunInTx(ctx, func(tx *Store) error {
+				return tx.IncreaseRecipientPeriodLimit(ctx, orgID, period.PeriodID,
+					oldLimit, newLimit)
+			})
+		}
+		if err := change(period.OrgID, 3000, 30000); err != nil {
+			t.Fatalf("paid Scale transition: %v", err)
+		}
+		if err := change(period.OrgID, 3000, 30000); err != nil {
+			t.Fatalf("exact paid replay: %v", err)
+		}
+		for _, bad := range []struct {
+			orgID              string
+			oldLimit, newLimit int64
+		}{
+			{period.OrgID, 3000, 10000},
+			{period.OrgID, 10000, 30000},
+			{period.OrgID, 30000, 3000},
+			{uuid.NewString(), 3000, 30000},
+		} {
+			if err := change(bad.orgID, bad.oldLimit, bad.newLimit); err == nil {
+				t.Fatalf("unbound recipient allowance transition accepted: %+v", bad)
+			}
+		}
+		var limit, reserved, committed int64
+		if err := db.QueryRowContext(ctx, `SELECT recipient_limit,reserved,committed
+  FROM org_recipient_periods WHERE org_id=$1 AND period_id=$2`,
+			period.OrgID, period.PeriodID).Scan(&limit, &reserved, &committed); err != nil {
+			t.Fatal(err)
+		}
+		if limit != 30000 || reserved != 50 || committed != 100 {
+			t.Fatalf("paid transition reset usage: limit=%d reserved=%d committed=%d",
+				limit, reserved, committed)
+		}
+		assertRecipientCounters(t, ctx, db, period, 50, 100)
+		if _, err := db.ExecContext(ctx, `UPDATE org_recipient_periods
+  SET admission_closed=true WHERE org_id=$1 AND period_id=$2`,
+			period.OrgID, period.PeriodID); err != nil {
+			t.Fatal(err)
+		}
+		if err := change(period.OrgID, 3000, 30000); err == nil {
+			t.Fatal("closed period replay reopened paid allowance")
+		}
+	})
+}
+
 func TestRecipientAdmissionPeriodNeverFallsBackAfterEnrollment(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		s, p := recipientFixture(t, ctx, db, sql.NullInt64{Int64: 10, Valid: true})
