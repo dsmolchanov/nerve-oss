@@ -73,6 +73,17 @@ func (s *Store) ReserveOutboundLimits(
 	if err := s.LockOrgPolicy(ctx, orgID); err != nil {
 		return err
 	}
+	// Enrolled sources closed for handover cannot mutate abuse counters
+	// through a direct Store caller after the monthly outbox fence closes.
+	ledgerAvailable, err := s.recipientLedgerAvailable(ctx)
+	if err != nil {
+		return err
+	}
+	if ledgerAvailable {
+		if _, _, err := s.RecipientAdmissionPeriod(ctx, orgID); err != nil {
+			return err
+		}
+	}
 	reservationClock, err := s.readOutboundLimitClock(ctx)
 	if err != nil {
 		return err
