@@ -326,6 +326,11 @@ func newSDKServer(requestContext context.Context, runtime *Server) *sdkmcp.Serve
 				result, err = invokeBillingUpgradeTool(ctx, runtime.HostedBilling, BillingCaller{
 					Principal: principal, Authorization: billingAuthorizationFromContext(requestContext),
 				}, request.Params.Arguments, runtime.Config.Cloud.DashboardBaseURL)
+			} else if request.Params.Name == billingPairingConfirmToolName {
+				if _, restricted := localauth.FromContext(ctx); restricted {
+					return nil, nil, localauth.ErrForbidden
+				}
+				result, err = invokeBillingPairingConfirmTool(ctx, runtime.HostedBilling, BillingCaller{Principal: principal, Authorization: billingAuthorizationFromContext(requestContext)}, request.Params.Arguments, runtime.Config.Cloud.DashboardBaseURL)
 			} else if request.Params.Name == billingStatusToolName {
 				if _, restricted := localauth.FromContext(ctx); restricted {
 					return nil, nil, localauth.ErrForbidden

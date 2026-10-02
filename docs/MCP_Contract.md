@@ -599,3 +599,34 @@ All tools should return errors in a consistent shape when possible.
   "required": ["code", "message"]
 }
 ```
+
+### Human owner pairing (pricing v2 candidate)
+
+`nerve_billing_pairing_confirm` is a modern MCP billing operation for an active
+`m2m_org` bearer with `nerve:billing.subscribe`. Local identities, onboarding-only
+principals and callers without that scope cannot use it. The candidate stays
+closed until the coordinated Cloud/browser pairing release is admitted; adding
+this contract does not publish an offer or activate Free or a paid entitlement.
+
+The owner opens an opaque invitation in the dashboard, signs in and explicitly
+confirms the pinned Starter terms. That browser receives a short-lived challenge
+and its session digest. The original live agent confirms exactly three fields:
+`pairing_id` (canonical nonzero UUID), `browser_session_sha256` (64 lower-case hex
+characters), and `challenge` (canonical unpadded base64url for 32 bytes). No org,
+owner identity, machine generation, Stripe object or offer may be supplied in
+the arguments. The runtime delegates the exact operation/body with the original
+billing bearer; Cloud verifies the machine key, generation and consumed nonce.
+
+Success returns only `resultType=complete`, `state=completed`,
+`offer_id=starter_2026_09_v2`, and a configured-dashboard
+`/billing/pairing?pairing_id=<opaque UUID>` URL. The URL contains no challenge,
+identity, session digest or organization. The native tool verifies both the
+configured origin and the exact input invitation. Completed pairing binds the
+owner and an immutable hosted purchase invitation atomically; it does not pay
+or grant quota. Only the same verified browser can subsequently confirm the
+exact terms and open hosted Checkout. Browser consent alone cannot create that
+purchase invitation, and agent confirmation alone cannot bind an owner.
+
+This operation remains available at zero mail allowance and never reserves or
+resets recipients. It uses the existing typed billing business errors; provider
+response text and browser proof material are never error messages or audit logs.

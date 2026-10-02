@@ -62,7 +62,7 @@ func (invoker *Invoker) Invoke(ctx context.Context, invocation ToolInvocation) (
 			}
 		}
 	}
-	if invocation.Name == billingSubscribeToolName || invocation.Name == billingUpgradeToolName || invocation.Name == billingStatusToolName {
+	if invocation.Name == billingSubscribeToolName || invocation.Name == billingUpgradeToolName || invocation.Name == billingStatusToolName || invocation.Name == billingPairingConfirmToolName {
 		// Billing is intentionally modern-only and is dispatched by the SDK
 		// adapter through BillingProvisioner after the same scope precheck.
 		return nil, errors.New("billing tool requires the modern MCP protocol")
@@ -199,7 +199,7 @@ func requiredToolScope(principal auth.Principal, toolName string) string {
 			return "nerve:email.compose"
 		}
 		return "nerve:email.send"
-	case billingSubscribeToolName, billingUpgradeToolName, billingStatusToolName:
+	case billingSubscribeToolName, billingUpgradeToolName, billingStatusToolName, billingPairingConfirmToolName:
 		return "nerve:billing.subscribe"
 	default:
 		return "nerve:email.read"

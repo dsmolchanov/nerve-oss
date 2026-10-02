@@ -176,6 +176,7 @@ func TestHostedBillingModernCallsRejectLocalIdentity(t *testing.T) {
 	}{
 		{billingUpgradeToolName, map[string]any{"idempotency_key": "once"}},
 		{billingStatusToolName, map[string]any{}},
+		{billingPairingConfirmToolName, map[string]any{"pairing_id": hostedTestIntent, "browser_session_sha256": strings.Repeat("a", 64), "challenge": strings.Repeat("x", 43)}},
 	} {
 		request := billingModernRequest(t, principal, "tools/call", map[string]any{
 			"_meta": modernOAuthMeta(), "name": item.name, "arguments": item.args,
@@ -240,4 +241,10 @@ func TestHostedStatusNativeAndDescriptorRequireConsistentPaidTier(t *testing.T) 
 	if !strings.Contains(string(descriptor), `"active_tier"`) {
 		t.Fatalf("descriptor omitted paid tier %s", descriptor)
 	}
+}
+
+func (stub *recordingHostedBilling) ConfirmBillingPairing(_ context.Context, caller BillingCaller, input BillingPairingConfirmInput) (BillingPairingConfirmResult, error) {
+	stub.caller = caller
+	stub.calls++
+	return BillingPairingConfirmResult{ResultType: "complete", State: "completed", OfferID: starterOfferID, UpgradeURL: "https://nerve.example/billing/pairing?pairing_id=" + input.PairingID}, stub.err
 }

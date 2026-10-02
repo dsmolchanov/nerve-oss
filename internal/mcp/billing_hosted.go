@@ -24,6 +24,7 @@ const starterOfferID = "starter_2026_09_v2"
 type HostedBillingProvisioner interface {
 	Upgrade(context.Context, BillingCaller, BillingUpgradeInput) (BillingUpgradeResult, error)
 	BillingStatus(context.Context, BillingCaller) (BillingStatusResult, error)
+	ConfirmBillingPairing(context.Context, BillingCaller, BillingPairingConfirmInput) (BillingPairingConfirmResult, error)
 }
 
 type BillingStatusResult struct {
