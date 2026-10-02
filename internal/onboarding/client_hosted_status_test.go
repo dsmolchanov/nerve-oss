@@ -46,7 +46,7 @@ func TestClientDelegatesHostedStatusWithOriginalBearerAndTuple(t *testing.T) {
 			t.Fatalf("invalid hosted status headers: %v", request.Header)
 		}
 		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"result":{"resultType":"complete","hosted_state":"session_open","starter_active":false}}`))
+		_, _ = writer.Write([]byte(`{"result":{"resultType":"complete","hosted_state":"session_open","starter_active":false,"active_tier":""}}`))
 	}))
 	defer server.Close()
 	client := newTestClient(t, server.URL, server.Client(), now)
@@ -58,11 +58,15 @@ func TestClientDelegatesHostedStatusWithOriginalBearerAndTuple(t *testing.T) {
 
 func TestClientHostedStatusRejectsMalformedEnvelope(t *testing.T) {
 	for _, body := range []string{
-		`{"result":{"resultType":"complete","hosted_state":"active"}}`,
-		`{"result":{"resultType":"complete","hosted_state":"active","starter_active":true,"customer_id":"cus_other"}}`,
-		`{"result":{"resultType":"complete","hosted_state":"active","hosted_state":"terminal","starter_active":true}}`,
-		`{"result":{"resultType":"complete","hosted_state":"unknown","starter_active":false}}`,
-		`{"result":{"resultType":"complete","hosted_state":"active","starter_active":true},"error":{"code":"billing_invalid_state","retryable":false}}`,
+		`{"result":{"resultType":"complete","hosted_state":"active","active_tier":"starter"}}`,
+		`{"result":{"resultType":"complete","hosted_state":"active","starter_active":true,"active_tier":"starter","customer_id":"cus_other"}}`,
+		`{"result":{"resultType":"complete","hosted_state":"active","hosted_state":"terminal","starter_active":true,"active_tier":"starter"}}`,
+		`{"result":{"resultType":"complete","hosted_state":"unknown","starter_active":false,"active_tier":""}}`,
+		`{"result":{"resultType":"complete","hosted_state":"active","starter_active":false}}`,
+		`{"result":{"resultType":"complete","hosted_state":"active","starter_active":true,"active_tier":"growth"}}`,
+		`{"result":{"resultType":"complete","hosted_state":"session_open","starter_active":false,"active_tier":"scale"}}`,
+		`{"result":{"resultType":"complete","hosted_state":"active","starter_active":false,"active_tier":"legacy"}}`,
+		`{"result":{"resultType":"complete","hosted_state":"active","starter_active":true,"active_tier":"starter"},"error":{"code":"billing_invalid_state","retryable":false}}`,
 	} {
 		t.Run(body, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
@@ -77,5 +81,22 @@ func TestClientHostedStatusRejectsMalformedEnvelope(t *testing.T) {
 				t.Fatalf("malformed status accepted: err=%v", err)
 			}
 		})
+	}
+}
+
+func TestHostedStatusDecodesOnlyConsistentPaidTier(t *testing.T) {
+	for _, tier := range []string{"", "starter", "growth", "scale"} {
+		state := "active"
+		if tier == "" {
+			state = "terminal"
+		}
+		body, err := json.Marshal(map[string]any{"result": map[string]any{"resultType": "complete", "hosted_state": state, "starter_active": tier == "starter", "active_tier": tier}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		value, business, err := decodeHostedStatusResponse(body)
+		if err != nil || business != nil || value.ActiveTier != tier || value.StarterActive != (tier == "starter") {
+			t.Fatalf("tier=%q result=%+v business=%v err=%v", tier, value, business, err)
+		}
 	}
 }

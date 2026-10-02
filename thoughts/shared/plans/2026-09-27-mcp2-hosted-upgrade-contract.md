@@ -2,7 +2,7 @@
 date: 2026-09-27
 repository: nerve-oss
 status: in_progress
-topic: MCP 2.0 hosted Starter upgrade and status contract
+topic: MCP 2.0 hosted upgrade and committed paid tier status contract
 parent_plan: nerve-cloud/thoughts/shared/plans/2026-09-08-mcp2-pricing-v2.md
 ---
 
@@ -58,3 +58,9 @@ profile, policy, quota or paid entitlement changes are in this OSS slice.
 This document does not mark pricing v2 Gate A or manual Stripe/tenant checks
 complete. Its source and release pin advance only through the parent release
 process.
+
+## Coordinated paid tier status (parent Slice B)
+
+The strict status result additionally requires `active_tier`, one of empty string, `starter`, `growth`, or `scale`. Empty denotes no currently proved active hosted paid tier; the original intent lifecycle alone does not prove payment. `starter_active` is true exactly for `active_tier=starter`. Any nonempty active tier requires `hosted_state=active`. Native provisioner results and signed delegation share the same consistency validator; no caller may select a tier through the read-only tool. Cloud Starter #389 must emit its proved Starter/empty result, and Cloud B #400 must emit its immutable effective tier, before deploying this mandatory coordinated contract. Neither a mutable legacy plan label nor a redirect authorizes an active result. No compatibility fallback or purchase scope expansion is introduced.
+
+The exact OSS mirror/source and release pins require the combined policy + hosted contract source before a B release. This draft contract remains unexposed until matching Cloud endpoints, current-head checks/review and parent manual release gates pass.

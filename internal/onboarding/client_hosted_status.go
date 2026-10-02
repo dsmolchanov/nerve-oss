@@ -96,11 +96,12 @@ func decodeHostedStatusResponse(body []byte) (*mcp.BillingStatusResult, *mcp.Bil
 			ResultType    *string `json:"resultType"`
 			HostedState   *string `json:"hosted_state"`
 			StarterActive *bool   `json:"starter_active"`
+			ActiveTier    *string `json:"active_tier"`
 		} `json:"result"`
 		Error *billingErrorWire `json:"error"`
 	}
 	if raw, ok := top["result"]; ok {
-		if _, err := decodeExactJSONObject(raw, "hosted status result", "resultType", "hosted_state", "starter_active"); err != nil {
+		if _, err := decodeExactJSONObject(raw, "hosted status result", "resultType", "hosted_state", "starter_active", "active_tier"); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -121,12 +122,15 @@ func decodeHostedStatusResponse(body []byte) (*mcp.BillingStatusResult, *mcp.Bil
 	var businessErr *mcp.BillingBusinessError
 	if wire.Result != nil {
 		if wire.Result.ResultType == nil || *wire.Result.ResultType != "complete" ||
-			wire.Result.HostedState == nil || !validHostedStatusState(*wire.Result.HostedState) ||
-			wire.Result.StarterActive == nil {
+			wire.Result.HostedState == nil ||
+			wire.Result.StarterActive == nil || wire.Result.ActiveTier == nil {
 			return nil, nil, errors.New("invalid hosted status result")
 		}
 		result = &mcp.BillingStatusResult{ResultType: *wire.Result.ResultType,
-			HostedState: *wire.Result.HostedState, StarterActive: *wire.Result.StarterActive}
+			HostedState: *wire.Result.HostedState, StarterActive: *wire.Result.StarterActive, ActiveTier: *wire.Result.ActiveTier}
+		if !mcp.ValidHostedBillingStatus(*result) {
+			return nil, nil, errors.New("contradictory hosted paid tier status")
+		}
 	}
 	if wire.Error != nil {
 		if wire.Error.Code == nil || wire.Error.Retryable == nil {
@@ -139,14 +143,4 @@ func decodeHostedStatusResponse(body []byte) (*mcp.BillingStatusResult, *mcp.Bil
 		return nil, nil, errors.New("hosted status response requires one outcome")
 	}
 	return result, businessErr, nil
-}
-
-func validHostedStatusState(state string) bool {
-	switch state {
-	case "none", "awaiting_owner", "session_prepared", "session_open", "provider_unknown",
-		"quarantined", "active", "cleanup_required", "terminal":
-		return true
-	default:
-		return false
-	}
 }

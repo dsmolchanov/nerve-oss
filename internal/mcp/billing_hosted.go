@@ -30,12 +30,13 @@ type BillingStatusResult struct {
 	ResultType    string `json:"resultType"`
 	HostedState   string `json:"hosted_state"`
 	StarterActive bool   `json:"starter_active"`
+	ActiveTier    string `json:"active_tier"`
 }
 
 func billingStatusToolDescriptor() toolDescriptor {
 	return toolDescriptor{
 		Name:        billingStatusToolName,
-		Description: "Read the authenticated organization's durable hosted Starter billing state",
+		Description: "Read the authenticated organization's durable hosted paid tier billing state",
 		InputSchema: inputObject(map[string]any{}),
 		OutputShape: outputObject(map[string]any{
 			"resultType": map[string]any{"type": "string", "const": "complete"},
@@ -44,7 +45,8 @@ func billingStatusToolDescriptor() toolDescriptor {
 				"quarantined", "active", "cleanup_required", "terminal",
 			}},
 			"starter_active": map[string]any{"type": "boolean"},
-		}, "resultType", "hosted_state", "starter_active"),
+			"active_tier":    map[string]any{"type": "string", "enum": []string{"", "starter", "growth", "scale"}},
+		}, "resultType", "hosted_state", "starter_active", "active_tier"),
 		ErrorCodes: billingBusinessErrorCodes(),
 	}
 }
@@ -70,10 +72,25 @@ func invokeBillingStatusTool(ctx context.Context, provisioner HostedBillingProvi
 	if err != nil {
 		return BillingStatusResult{}, sanitizeBillingProvisionerError(err)
 	}
-	if result.ResultType != "complete" || !validHostedStatusState(result.HostedState) {
+	if !ValidHostedBillingStatus(result) {
 		return BillingStatusResult{}, billingTemporarilyUnavailable()
 	}
 	return result, nil
+}
+
+// ValidHostedBillingStatus is shared by native tools and signed delegation.
+// An active tier requires committed active hosted state; StarterActive remains
+// true only for Starter, never as a generic flag for another paid tier.
+func ValidHostedBillingStatus(result BillingStatusResult) bool {
+	if result.ResultType != "complete" || !validHostedStatusState(result.HostedState) {
+		return false
+	}
+	switch result.ActiveTier {
+	case "", "starter", "growth", "scale":
+	default:
+		return false
+	}
+	return result.StarterActive == (result.ActiveTier == "starter") && (result.ActiveTier == "" || result.HostedState == "active")
 }
 
 func validHostedStatusState(state string) bool {

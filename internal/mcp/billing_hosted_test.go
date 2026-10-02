@@ -189,3 +189,55 @@ func TestHostedBillingModernCallsRejectLocalIdentity(t *testing.T) {
 		}
 	}
 }
+
+type hostedStatusResultStub struct {
+	recordingHostedBilling
+	statusResult BillingStatusResult
+}
+
+func (s *hostedStatusResultStub) BillingStatus(_ context.Context, caller BillingCaller) (BillingStatusResult, error) {
+	s.caller = caller
+	s.calls++
+	return s.statusResult, nil
+}
+func TestHostedStatusNativeAndDescriptorRequireConsistentPaidTier(t *testing.T) {
+	for _, test := range []struct {
+		name, state, tier string
+		starter, valid    bool
+	}{
+		{"unpaid", "session_open", "", false, true},
+		{"expired paid period", "active", "", false, true},
+		{"Starter", "active", "starter", true, true},
+		{"Growth", "active", "growth", false, true},
+		{"Scale", "active", "scale", false, true},
+		{"unproved Starter", "active", "", true, false},
+		{"wrong Starter flag", "active", "growth", true, false},
+		{"missing Starter flag", "active", "starter", false, false},
+		{"unpaid Growth", "session_open", "growth", false, false},
+		{"closed Scale", "terminal", "scale", false, false},
+		{"unknown tier", "active", "legacy", false, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stub := &hostedStatusResultStub{statusResult: BillingStatusResult{ResultType: "complete", HostedState: test.state, StarterActive: test.starter, ActiveTier: test.tier}}
+			got, err := invokeBillingStatusTool(context.Background(), stub, BillingCaller{Principal: activeBillingPrincipal("nerve:billing.subscribe")}, json.RawMessage(`{}`))
+			if (err == nil) != test.valid || stub.calls != 1 {
+				t.Fatalf("result=%+v err=%v calls=%d", got, err, stub.calls)
+			}
+			if test.valid {
+				encoded, err := json.Marshal(got)
+				if err != nil || !strings.Contains(string(encoded), `"active_tier":`) {
+					t.Fatalf("missing mandatory paid tier: %s %v", encoded, err)
+				}
+			} else {
+				var business *BillingBusinessError
+				if !errors.As(err, &business) || business.Code != BillingErrorTemporarilyUnavailable {
+					t.Fatalf("invalid result escaped business boundary: %v", err)
+				}
+			}
+		})
+	}
+	descriptor, _ := json.Marshal(billingStatusToolDescriptor())
+	if !strings.Contains(string(descriptor), `"active_tier"`) {
+		t.Fatalf("descriptor omitted paid tier %s", descriptor)
+	}
+}
