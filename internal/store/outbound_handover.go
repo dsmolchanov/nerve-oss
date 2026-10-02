@@ -364,7 +364,7 @@ func (s *Store) exportOutboundHandoverHashes(ctx context.Context, org, cursor st
 	// The fallback hashes the same lower/btrim bytes firstOutboundRecipient
 	// compares; display-address parsing must not silently broaden its history.
 	rows, err := s.q.QueryContext(ctx, `WITH hashes AS (
- SELECT substring(meter_name FROM $3) AS hash FROM usage_events WHERE org_id=$1::uuid AND status='success' AND meter_name LIKE $4||':%'
+ SELECT substring(meter_name FROM $3::integer) AS hash FROM usage_events WHERE org_id=$1::uuid AND status='success' AND meter_name LIKE $4||':%'
  UNION SELECT encode(digest(lower(btrim("to")),'sha256'),'hex') FROM outbox_messages WHERE org_id=$1::uuid)
  SELECT hash FROM hashes WHERE hash>$2 ORDER BY hash LIMIT $5`, org, cursor, len(meterOutboundRecipientSeen)+2, meterOutboundRecipientSeen, outboundHandoverPageSize)
 	if err != nil {
