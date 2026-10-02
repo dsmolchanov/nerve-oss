@@ -309,7 +309,10 @@ func TestHybridConnectReissuesExpiredUnapprovedPairingWithoutRotatingKey(t *test
 	}
 	cloud.admit(begun.Key)
 
-	firstContext, cancelFirst := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	// This timeout includes durable state writes and token minting. Give those
+	// setup operations enough time to reach the unapproved complete request;
+	// cancellation during each network phase has its own deterministic matrix.
+	firstContext, cancelFirst := context.WithTimeout(context.Background(), 5*time.Second)
 	_, firstErr := Connect(firstContext, store, nil, io.Discard)
 	cancelFirst()
 	if !errors.Is(firstErr, context.DeadlineExceeded) {

@@ -67,33 +67,53 @@ func requireStoppedRuntime(ctx context.Context, cfg config.Config, allowRunning 
 	}
 	addr := strings.TrimSpace(cfg.HTTP.Addr)
 	if addr == "" {
-		return nil
+		return fmt.Errorf("cannot prove the runtime is stopped before %s: no local readiness address is configured", operation)
 	}
-	if host, port, err := net.SplitHostPort(addr); err == nil {
-		// A daemon bound to every interface answers on loopback, which is the
-		// only address this command can reach from inside the same host.
-		if host == "" || host == "0.0.0.0" || host == "::" {
-			host = "127.0.0.1"
-		}
-		addr = net.JoinHostPort(host, port)
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("cannot prove the runtime is stopped before %s: invalid local readiness address", operation)
+	}
+	// A wildcard listener answers on loopback. The unspecified host can be
+	// either IP family, so both must refuse before a mutation is safe.
+	hosts := []string{host}
+	switch host {
+	case "", "localhost":
+		hosts = []string{"127.0.0.1", "::1"}
+	case "0.0.0.0":
+		hosts = []string{"127.0.0.1"}
+	case "::":
+		hosts = []string{"::1"}
+	}
+	if ip := net.ParseIP(hosts[0]); ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("cannot prove the runtime is stopped before %s: readiness address is not loopback", operation)
 	}
 	probe, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	request, err := http.NewRequestWithContext(probe, http.MethodGet, "http://"+addr+"/readyz", nil)
-	if err != nil {
-		return nil
+	// A proxy or redirect is not evidence about this host. Probe it directly,
+	// and accept only a refused local connection as proof it is stopped.
+	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	for _, localHost := range hosts {
+		localAddr := net.JoinHostPort(localHost, port)
+		request, err := http.NewRequestWithContext(probe, http.MethodGet, "http://"+localAddr+"/readyz", nil)
+		if err != nil {
+			return fmt.Errorf("cannot prove the runtime at %s is stopped before %s: invalid readiness address", addr, operation)
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			if errors.Is(err, syscall.ECONNREFUSED) {
+				continue
+			}
+			return fmt.Errorf("cannot prove the runtime at %s is stopped before %s; stop it first or pass -allow-running and restart immediately", addr, operation)
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+		_ = response.Body.Close()
+		// A process answering even with 503 (starting, unhealthy, or draining)
+		// may have loaded the previous installation.
+		return fmt.Errorf("the runtime at %s is still serving; %s would leave it using the previous "+
+			"installation until it restarts. Stop it first, or pass -allow-running and restart immediately", addr, operation)
 	}
-	response, err := (&http.Client{Timeout: 2 * time.Second}).Do(request)
-	if err != nil {
-		return nil
-	}
-	defer response.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
-	if response.StatusCode != http.StatusOK {
-		return nil
-	}
-	return fmt.Errorf("the runtime at %s is still serving; %s would leave it using the previous "+
-		"installation until it restarts. Stop it first, or pass -allow-running and restart immediately", addr, operation)
+	return nil
 }
 
 func hybridConnect(ctx context.Context, cfg config.Config, stateStore hybridtransport.Store, client *http.Client, args []string, out io.Writer) error {
