@@ -5,7 +5,9 @@ The protocol details below describe hosted mode; local bearer keys and network
 binding are documented in [SELF_HOSTING.md](SELF_HOSTING.md).
 
 The hosted `/mcp` endpoint validates `Origin` before authentication, authenticates
-exactly once, and routes only an exact `MCP-Protocol-Version`. Browser callers
+exactly once, and routes only an exact `MCP-Protocol-Version`; a request without
+that header (such as the initial `initialize`) is routed to the legacy
+`2025-11-25` adapter, as the MCP spec prescribes. Browser callers
 must use an allowlisted HTTPS origin. Native clients may omit `Origin` only when
 their typed credential is allowed by the runtime policy; a hostile or malformed
 origin is rejected even when credentials are otherwise valid.
