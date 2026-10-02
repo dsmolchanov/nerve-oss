@@ -246,6 +246,99 @@ func effectiveOutboundV2Caps(tier string, firstCompose, now time.Time) (outbound
 	}, nil
 }
 
+// OutboundPolicyUsage describes the current UTC compose buckets, not an
+// authorization to compose. Dispatch still applies owner, generation, abuse
+// and suspension fences. Reading this snapshot never starts warmup.
+type OutboundPolicyUsage struct {
+	Version                 string     `json:"version"`
+	DayStart                time.Time  `json:"day_start"`
+	DayEnd                  time.Time  `json:"day_end"`
+	ComposeSendLimit        int64      `json:"compose_send_limit"`
+	ComposeSendUsed         int64      `json:"compose_send_used"`
+	ComposeSendRemaining    int64      `json:"compose_send_remaining"`
+	FirstRecipientLimit     int64      `json:"first_recipient_limit"`
+	FirstRecipientUsed      int64      `json:"first_recipient_used"`
+	FirstRecipientRemaining int64      `json:"first_recipient_remaining"`
+	WarmupStartedAt         *time.Time `json:"warmup_started_at"`
+	NextCapChangeAt         *time.Time `json:"next_cap_change_at"`
+}
+
+func (s *Store) ReadOutboundPolicyUsage(ctx context.Context, orgID string) (OutboundPolicyUsage, error) {
+	var result OutboundPolicyUsage
+	if err := s.requireTx(); err != nil {
+		return result, err
+	}
+	if err := s.LockOrgPolicy(ctx, orgID); err != nil {
+		return result, err
+	}
+	clock, err := s.readOutboundLimitClock(ctx)
+	if err != nil {
+		return result, err
+	}
+	caps, origin, err := s.outboundComposeCaps(ctx, orgID, clock)
+	if err != nil {
+		return result, err
+	}
+	result.Version = "autonomous-outbound-v1"
+	result.DayStart, result.DayEnd = clock.dayStart, clock.dayEnd
+	result.ComposeSendLimit, result.FirstRecipientLimit = caps.sends, caps.firstRecipients
+	for _, bucket := range []struct {
+		meter string
+		used  *int64
+	}{
+		{meterOutboundSendDay, &result.ComposeSendUsed},
+		{meterOutboundFirstRecipientDay, &result.FirstRecipientUsed},
+	} {
+		used, err := s.GetOrgUsageCounterUsed(ctx, orgID, bucket.meter, clock.dayStart)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return OutboundPolicyUsage{}, err
+		}
+		*bucket.used = used
+	}
+	result.ComposeSendRemaining = max(int64(0), caps.sends-result.ComposeSendUsed)
+	result.FirstRecipientRemaining = max(int64(0), caps.firstRecipients-result.FirstRecipientUsed)
+	if origin.IsZero() {
+		return result, nil
+	}
+	result.Version = outboundPolicyV2
+	// outboundComposeCaps uses today's clock for a first prospective send.
+	// Only durable state or an actual successful historical compose may be
+	// shown as a started warmup; no read writes that first-send evidence.
+	var started sql.NullTime
+	err = s.q.QueryRowContext(ctx, `SELECT coalesce(first_compose_accepted_at,
+  (SELECT created_at FROM usage_events WHERE org_id=$1::uuid
+    AND meter_name='autonomous_outbound_send_day' AND status='success'
+    ORDER BY created_at LIMIT 1))
+  FROM org_outbound_policy_state WHERE org_id=$1::uuid`, orgID).Scan(&started)
+	if err != nil {
+		return OutboundPolicyUsage{}, err
+	}
+	if started.Valid {
+		at := started.Time.UTC()
+		result.WarmupStartedAt = &at
+		ent, err := s.GetOrgEntitlement(ctx, orgID)
+		if err != nil {
+			return OutboundPolicyUsage{}, err
+		}
+		result.NextCapChangeAt = nextOutboundCapChange(ent.PlanCode, at, clock.acceptedAt)
+	}
+	return result, nil
+}
+
+func nextOutboundCapChange(tier string, firstCompose, now time.Time) *time.Time {
+	day := firstCompose.UTC().Truncate(24 * time.Hour)
+	var next time.Time
+	if (tier == "growth" || tier == "scale") && now.Before(day.Add(3*24*time.Hour)) {
+		next = day.Add(3 * 24 * time.Hour)
+	} else if tier == "scale" && now.Before(day.Add(7*24*time.Hour)) {
+		next = day.Add(7 * 24 * time.Hour)
+	}
+	if next.IsZero() {
+		return nil
+	}
+	return &next
+}
+
 func (s *Store) readOutboundLimitClock(ctx context.Context) (outboundLimitClock, error) {
 	var result outboundLimitClock
 	err := s.q.QueryRowContext(ctx, `

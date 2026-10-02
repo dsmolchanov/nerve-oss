@@ -602,6 +602,95 @@ func TestOutboundV2RequiresExplicitEntitlementAndPreservesWarmupHistory(t *testi
 	})
 }
 
+func TestOutboundPolicyUsageReadDoesNotStartWarmupOrCreateBuckets(t *testing.T) {
+	withOutboundLimitStore(t, func(ctx context.Context, st *Store, orgID, inboxID string) {
+		now := time.Now().UTC()
+		if _, err := st.q.ExecContext(ctx, `INSERT INTO org_entitlements
+ (org_id,plan_code,subscription_status,mcp_rpm,monthly_units,max_inboxes,max_domains,
+ features,usage_period_start,usage_period_end)
+ VALUES($1,'scale','active',500,0,0,250,'{"outbound_policy_version":"autonomous-outbound-v2"}',$2,$3)`,
+			orgID, now.Add(-time.Hour), now.Add(30*24*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.RunInTx(ctx, func(tx *Store) error {
+			return tx.InstallRecipientPeriod(ctx, RecipientPeriod{OrgID: orgID, PeriodID: uuid.NewString(),
+				StartsAt: now.Add(-time.Hour), EndsAt: now.Add(30 * 24 * time.Hour), Limit: sql.NullInt64{Int64: 30000, Valid: true}})
+		}); err != nil {
+			t.Fatal(err)
+		}
+		read := func() OutboundPolicyUsage {
+			var got OutboundPolicyUsage
+			if err := st.RunInTx(ctx, func(tx *Store) error { var err error; got, err = tx.ReadOutboundPolicyUsage(ctx, orgID); return err }); err != nil {
+				t.Fatal(err)
+			}
+			return got
+		}
+		for replay := 0; replay < 2; replay++ {
+			got := read()
+			if got.Version != outboundPolicyV2 || got.ComposeSendLimit != 100 || got.FirstRecipientLimit != 25 ||
+				got.ComposeSendUsed != 0 || got.ComposeSendRemaining != 100 || got.WarmupStartedAt != nil || got.NextCapChangeAt != nil {
+				t.Fatalf("prospective Scale status fabricated warmup or usage: %+v", got)
+			}
+		}
+		var buckets int
+		var origin sql.NullTime
+		if err := st.q.QueryRowContext(ctx, `SELECT count(*) FROM org_usage_counters WHERE org_id=$1`, orgID).Scan(&buckets); err != nil || buckets != 0 {
+			t.Fatalf("read created buckets: %d %v", buckets, err)
+		}
+		if err := st.q.QueryRowContext(ctx, `SELECT first_compose_accepted_at FROM org_outbound_policy_state WHERE org_id=$1`, orgID).Scan(&origin); err != nil || origin.Valid {
+			t.Fatalf("read persisted warmup: %v %v", origin, err)
+		}
+		historical := now.Add(-8 * 24 * time.Hour).Truncate(time.Microsecond)
+		if _, err := st.q.ExecContext(ctx, `INSERT INTO usage_events(org_id,meter_name,quantity,tool_name,status,created_at)
+ VALUES($1,$2,1,'compose_email','success',$3)`, orgID, meterOutboundSendDay, historical); err != nil {
+			t.Fatal(err)
+		}
+		got := read()
+		if got.ComposeSendLimit != 1500 || got.FirstRecipientLimit != 375 || got.WarmupStartedAt == nil ||
+			!got.WarmupStartedAt.Equal(historical) || got.NextCapChangeAt != nil {
+			t.Fatalf("historical warmup missing: %+v", got)
+		}
+		if _, err := st.EnqueueOutboxMessage(ctx, outboundLimitMessage(orgID, inboxID, "status-admission", "new@example.test", true)); err != nil {
+			t.Fatal(err)
+		}
+		got = read()
+		if got.ComposeSendUsed != 1 || got.ComposeSendRemaining != 1499 || got.FirstRecipientUsed != 1 || got.FirstRecipientRemaining != 374 {
+			t.Fatalf("status differs from admission: %+v", got)
+		}
+		if _, err := st.q.ExecContext(ctx, `UPDATE org_entitlements SET features='{}',plan_code='scale' WHERE org_id=$1`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		got = read()
+		if got.Version != "autonomous-outbound-v1" || got.ComposeSendLimit != 100 || got.WarmupStartedAt != nil {
+			t.Fatalf("legacy label inferred higher allowance: %+v", got)
+		}
+	})
+}
+
+func TestNextOutboundCapChangeUsesUTCDateAndTier(t *testing.T) {
+	first := time.Date(2026, 3, 28, 23, 45, 0, 0, time.FixedZone("east", 2*3600))
+	day := first.UTC().Truncate(24 * time.Hour)
+	for _, test := range []struct {
+		tier     string
+		days     int
+		nextDays int
+	}{
+		{"starter", 0, 0}, {"growth", 0, 3}, {"growth", 3, 0}, {"scale", 0, 3}, {"scale", 3, 7}, {"scale", 7, 0},
+	} {
+		got := nextOutboundCapChange(test.tier, first, day.Add(time.Duration(test.days)*24*time.Hour))
+		if test.nextDays == 0 {
+			if got != nil {
+				t.Fatalf("%+v: unexpected transition %v", test, got)
+			}
+			continue
+		}
+		want := day.Add(time.Duration(test.nextDays) * 24 * time.Hour)
+		if got == nil || !got.Equal(want) || got.Location() != time.UTC {
+			t.Fatalf("%+v: got %v want %v", test, got, want)
+		}
+	}
+}
+
 func TestCore32WarmupOriginMigrationAndRollbackGuard(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		if err := MigrateUpToCore(ctx, db, 31); err != nil {
