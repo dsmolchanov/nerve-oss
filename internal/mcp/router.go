@@ -35,8 +35,22 @@ type Router struct {
 
 type routedProtocolVersionKey struct{}
 
+type inferredProtocolVersionKey struct{}
+
 func withRoutedProtocolVersion(ctx context.Context, version string) context.Context {
 	return context.WithValue(ctx, routedProtocolVersionKey{}, version)
+}
+
+// withInferredProtocolVersion marks a version the router assumed because the
+// client sent no MCP-Protocol-Version header. It pins the response version but,
+// unlike an explicit header, must not constrain initialize negotiation.
+func withInferredProtocolVersion(ctx context.Context, version string) context.Context {
+	return context.WithValue(withRoutedProtocolVersion(ctx, version), inferredProtocolVersionKey{}, true)
+}
+
+func protocolVersionInferred(ctx context.Context) bool {
+	inferred, _ := ctx.Value(inferredProtocolVersionKey{}).(bool)
+	return inferred
 }
 
 func routedProtocolVersion(ctx context.Context) (string, bool) {
@@ -103,13 +117,15 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// spec says to treat those as legacy, which the sessionful adapter handles.
 	// Mcp-Method/Mcp-Name only exist in the modern protocol, so a headerless
 	// request carrying them is a malformed modern request, not a legacy one.
-	requestedVersion := LegacyProtocolVersion
-	if len(versions) == 1 {
-		requestedVersion = versions[0]
-	} else if len(r.Header.Values("Mcp-Method")) > 0 || len(r.Header.Values("Mcp-Name")) > 0 {
-		writeHeaderMismatch(w, nil, "MCP-Protocol-Version header is required")
+	if len(versions) == 0 {
+		if len(r.Header.Values("Mcp-Method")) > 0 || len(r.Header.Values("Mcp-Name")) > 0 {
+			writeHeaderMismatch(w, nil, "MCP-Protocol-Version header is required")
+			return
+		}
+		router.serveAdapter(w, request.WithContext(withInferredProtocolVersion(request.Context(), LegacyProtocolVersion)), router.legacy)
 		return
 	}
+	requestedVersion := versions[0]
 	switch requestedVersion {
 	case LegacyProtocolVersion:
 		router.serveAdapter(w, request.WithContext(withRoutedProtocolVersion(request.Context(), LegacyProtocolVersion)), router.legacy)
