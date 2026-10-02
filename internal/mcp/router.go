@@ -94,11 +94,22 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	request := r.WithContext(ctx)
 	versions := r.Header.Values("MCP-Protocol-Version")
-	if len(versions) != 1 {
-		writeHeaderMismatch(w, nil, "MCP-Protocol-Version header is required exactly once")
+	if len(versions) > 1 {
+		writeHeaderMismatch(w, nil, "MCP-Protocol-Version header must not be repeated")
 		return
 	}
-	requestedVersion := versions[0]
+	// Clients send MCP-Protocol-Version only after version negotiation, so the
+	// initialize request (and pre-2025-06-18 clients) arrive without it. The
+	// spec says to treat those as legacy, which the sessionful adapter handles.
+	// Mcp-Method/Mcp-Name only exist in the modern protocol, so a headerless
+	// request carrying them is a malformed modern request, not a legacy one.
+	requestedVersion := LegacyProtocolVersion
+	if len(versions) == 1 {
+		requestedVersion = versions[0]
+	} else if len(r.Header.Values("Mcp-Method")) > 0 || len(r.Header.Values("Mcp-Name")) > 0 {
+		writeHeaderMismatch(w, nil, "MCP-Protocol-Version header is required")
+		return
+	}
 	switch requestedVersion {
 	case LegacyProtocolVersion:
 		router.serveAdapter(w, request.WithContext(withRoutedProtocolVersion(request.Context(), LegacyProtocolVersion)), router.legacy)

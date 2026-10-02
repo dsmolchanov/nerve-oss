@@ -228,29 +228,37 @@ func TestRouterRoutesExactProtocolVersions(t *testing.T) {
 	}
 }
 
-func TestRouterRejectsMissingAndDuplicateProtocolHeaders(t *testing.T) {
+func TestRouterRoutesMissingProtocolHeaderToLegacy(t *testing.T) {
+	var routedVersion string
+	router := NewRouter(config.Default(), nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		routedVersion, _ = routedProtocolVersion(r.Context())
+		w.WriteHeader(http.StatusNoContent)
+	}), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("headerless request reached modern adapter")
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}`))
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("expected legacy adapter response, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if routedVersion != LegacyProtocolVersion {
+		t.Fatalf("routed protocol version = %q", routedVersion)
+	}
+}
+
+func TestRouterRejectsDuplicateProtocolHeaders(t *testing.T) {
 	router := NewRouter(config.Default(), nil, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("ambiguous protocol request reached adapter")
 	}), nil)
-	for _, test := range []struct {
-		name     string
-		versions []string
-	}{
-		{name: "missing"},
-		{name: "duplicate", versions: []string{LegacyProtocolVersion, ModernProtocolVersion}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
-			for _, version := range test.versions {
-				req.Header.Add("MCP-Protocol-Version", version)
-			}
-			recorder := httptest.NewRecorder()
-			router.ServeHTTP(recorder, req)
-			assertRouterProtocolError(t, recorder, sdkmcp.CodeHeaderMismatch)
-			if recorder.Header().Get("MCP-Supported-Protocol-Versions") != "" {
-				t.Fatal("header mismatch unexpectedly advertised supported versions")
-			}
-		})
+	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	req.Header.Add("MCP-Protocol-Version", LegacyProtocolVersion)
+	req.Header.Add("MCP-Protocol-Version", ModernProtocolVersion)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	assertRouterProtocolError(t, recorder, sdkmcp.CodeHeaderMismatch)
+	if recorder.Header().Get("MCP-Supported-Protocol-Versions") != "" {
+		t.Fatal("header mismatch unexpectedly advertised supported versions")
 	}
 }
 
