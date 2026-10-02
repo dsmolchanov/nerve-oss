@@ -143,7 +143,7 @@ func TestOutboundHandoverCopiesEnforcedHistoryAndPreservesReplay(t *testing.T) {
 		}); !errors.Is(err, ErrRecipientPeriodUnavailable) {
 			t.Fatalf("source daily write=%v", err)
 		}
-		if err := s.AddSuppression(ctx, source, "suppressed@example.test", "hard_bounce", "test"); err != nil {
+		if err := s.AddSuppression(ctx, source, "suppressed@example.test", "hard_bounce", "bounce"); err != nil {
 			t.Fatal(err)
 		}
 		msg := outboundLimitMessage(source, inbox, "suppressed-after-freeze", "suppressed@example.test", true)
