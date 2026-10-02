@@ -330,8 +330,14 @@ func (c *Client) call(ctx context.Context, action string, input map[string]any, 
 }
 
 func (c *Client) attempt(ctx context.Context, action string, raw []byte) (int, []byte, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, nil, err
+	}
 	token, err := c.Tokens.Token(ctx)
 	if err != nil {
+		if err := ctx.Err(); err != nil {
+			return 0, nil, err
+		}
 		// A denial the authorization server will keep making is terminal for
 		// this message; anything else is worth another attempt.
 		if errors.Is(err, ErrTokenDenied) {
@@ -351,12 +357,18 @@ func (c *Client) attempt(ctx context.Context, action string, raw []byte) (int, [
 	request.Header.Set("Accept", "application/json")
 	response, err := c.httpClient().Do(request)
 	if err != nil {
+		if err := ctx.Err(); err != nil {
+			return 0, nil, err
+		}
 		return 0, nil, emailtransport.NewTransientError(0, "network_error",
 			fmt.Errorf("%w: %s", ErrUnavailable, action))
 	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes))
 	if err != nil {
+		if err := ctx.Err(); err != nil {
+			return 0, nil, err
+		}
 		return 0, nil, emailtransport.NewTransientError(0, "network_error",
 			fmt.Errorf("%w: %s response body", ErrUnavailable, action))
 	}
