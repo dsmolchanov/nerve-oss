@@ -49,6 +49,7 @@ type Server struct {
 	OutboundPolicy OutboundPolicyGate
 	Onboarding     OnboardingProvisioner
 	Billing        BillingProvisioner
+	HostedBilling  HostedBillingProvisioner
 	Invoker        *Invoker
 	mu             sync.Mutex
 	sessions       map[string]time.Time
