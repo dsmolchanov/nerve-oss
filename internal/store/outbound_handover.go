@@ -216,7 +216,7 @@ func (s *Store) freezeOutboundHandover(ctx context.Context, org, transfer string
 	snapshot.DayStart = snapshot.FrozenAt.Truncate(24 * time.Hour)
 	// The timestamp is actual accepted history, including v1, never the time
 	// a new grant was issued. An absent compose history starts no warmup.
-	if err = s.q.QueryRowContext(ctx, `SELECT least(first_compose_accepted_at,(SELECT min(created_at) FROM usage_events WHERE org_id=$1::uuid AND meter_name=$2 AND status='success')) FROM org_outbound_policy_state WHERE org_id=$1::uuid`, org, meterOutboundSendDay).Scan(&snapshot.WarmupOrigin); err != nil {
+	if err = s.q.QueryRowContext(ctx, `SELECT coalesce(first_compose_accepted_at,(SELECT min(created_at) FROM usage_events WHERE org_id=$1::uuid AND meter_name=$2 AND status='success')) FROM org_outbound_policy_state WHERE org_id=$1::uuid`, org, meterOutboundSendDay).Scan(&snapshot.WarmupOrigin); err != nil {
 		return snapshot, err
 	}
 	if snapshot.WarmupOrigin.Valid {

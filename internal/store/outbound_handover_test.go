@@ -151,6 +151,30 @@ func TestOutboundHandoverCopiesEnforcedHistoryAndPreservesReplay(t *testing.T) {
 		if _, err := s.EnqueueOutboxMessage(ctx, msg); !errors.Is(err, ErrRecipientPeriodUnavailable) {
 			t.Fatalf("closed suppressed source=%v", err)
 		}
+
+		// A successor may itself become the source of the next handover.
+		// Aggregated imported day journals must not replace the original
+		// accepted instant with the synthetic UTC bucket-start timestamp.
+		next, _ := insertOutboundLimitTenant(t, ctx, s, "handover-next")
+		zero := RecipientPeriod{OrgID: next, PeriodID: uuid.NewString(), StartsAt: result.FrozenAt, EndsAt: result.FrozenAt.Add(time.Hour), Limit: sql.NullInt64{Int64: 0, Valid: true}}
+		if err := s.RunInTx(ctx, func(tx *Store) error {
+			if err := tx.InstallRecipientPeriod(ctx, zero); err != nil {
+				return err
+			}
+			if _, err := tx.q.ExecContext(ctx, `UPDATE org_recipient_periods SET admission_closed=true WHERE org_id=$1 AND period_id=$2`, next, zero.PeriodID); err != nil {
+				return err
+			}
+			_, err := tx.TransferOutboundPolicyHistory(ctx, target, next, uuid.NewString())
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var nextOrigin time.Time
+		if err := s.q.QueryRowContext(ctx, `SELECT first_compose_accepted_at FROM org_outbound_policy_state WHERE org_id=$1`, next).Scan(&nextOrigin); err != nil || !nextOrigin.Equal(sourceOrigin) {
+			t.Fatalf("successive transfer changed accepted origin original=%v next=%v err=%v", sourceOrigin, nextOrigin, err)
+		}
+		assertUsageCounterMatchesEvents(t, ctx, s, next, meterOutboundSendDay, 4)
+		assertUsageCounterMatchesEvents(t, ctx, s, next, meterOutboundFirstRecipientDay, 1)
 	})
 }
 
