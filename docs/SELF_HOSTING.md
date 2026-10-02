@@ -294,6 +294,11 @@ startup, so the change would not take effect until a restart while the command
 reported success. Stop the runtime, run the command with `docker compose run`,
 then start it again. `-allow-running` overrides the check for an operator who
 will restart immediately.
+The guard accepts only a refused local `/readyz` connection as proof the
+daemon is stopped. A reachable daemon that is starting or unhealthy, a timed-out
+probe, or an unverifiable non-local address blocks the change; stop the runtime
+and any separate worker before proceeding. The readiness probe cannot replace
+that operational stop when another process may start concurrently.
 
 ```sh
 docker compose stop cortex
@@ -372,6 +377,23 @@ built image in ordinary CI. The tag-publish workflow runs the same smoke with
 `--image` against the immutable GHCR digest it just pushed before it creates
 the GitHub Release, so a successful release run is evidence for the
 distributable bytes rather than only for the source checkout.
+
+`scripts/ci/hybrid_active_image_smoke.py` adds an isolated active-path check.
+It pairs the image with a loopback-only synthetic Cloud fixture, restarts the
+runtime, verifies one inbound message is stored and acknowledged, and submits
+one reply to the fixture. It then prepares a replacement key and proves that
+neither preparation nor admission alone switches the installation. Once the
+synthetic owner switches, the image commits the replacement, restarts, polls
+with the new key and does not replay the settled mail. With writers stopped,
+it backs up the active database, restores into a separate database, verifies
+the inbound and settled
+reply survived, and confirms a restored host without the state volume is
+unpaired. Restarting the original host must not replay either message. It
+accepts an immutable `--image` digest; successor images that require a prepared
+schema also need `--successor-core-head` and an
+immutable `--predecessor-migration-image`. The fixture sends no mail and does
+not prove production Cloud admission, provider delivery, or the production
+data boundary.
 
 ## Updating a deployment
 

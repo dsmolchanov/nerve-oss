@@ -257,7 +257,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, routed bool)
 
 func validateRoutedProtocolVersion(ctx context.Context, req Request) error {
 	trusted, routed := routedProtocolVersion(ctx)
-	if !routed || req.Method != "initialize" {
+	if !routed || req.Method != "initialize" || protocolVersionInferred(ctx) {
 		return nil
 	}
 	var params InitializeParams
