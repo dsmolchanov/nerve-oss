@@ -264,3 +264,81 @@ func TestOutboundHandoverRetainsUnknownProviderReservation(t *testing.T) {
 		assertRecipientCounters(t, ctx, s.db, old, 0, 1)
 	})
 }
+
+func TestOutboundHandoverDoesNotInvertOutcomeLockOrder(t *testing.T) {
+	withOutboundLimitStore(t, func(ctx context.Context, s *Store, source, inbox string) {
+		target, _ := insertOutboundLimitTenant(t, ctx, s, "handover-lock-order")
+		old, _ := handoverPeriods(t, ctx, s, source, target)
+		id, err := s.EnqueueOutboxMessage(ctx, outboundLimitMessage(source, inbox, "locked-outcome", "locked@example.test", true))
+		if err != nil {
+			t.Fatal(err)
+		}
+		holder, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer holder.Rollback()
+		var holderPID int
+		if err := holder.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&holderPID); err != nil {
+			t.Fatal(err)
+		}
+		var heldID string
+		if err := holder.QueryRowContext(ctx, `SELECT id::text FROM outbox_messages WHERE org_id=$1 AND id=$2 FOR UPDATE`, source, id).Scan(&heldID); err != nil {
+			t.Fatal(err)
+		}
+		finished := make(chan error, 1)
+		workerPID := make(chan int, 1)
+		transfer := uuid.NewString()
+		go func() {
+			finished <- s.RunInTx(ctx, func(tx *Store) error {
+				var pid int
+				if err := tx.q.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+					return err
+				}
+				workerPID <- pid
+				_, err := tx.TransferOutboundPolicyHistory(ctx, source, target, transfer)
+				return err
+			})
+		}()
+		var pid int
+		select {
+		case pid = <-workerPID:
+		case <-time.After(5 * time.Second):
+			t.Fatal("handover worker did not begin")
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			var blocked bool
+			if err := s.q.QueryRowContext(ctx, `SELECT $2::int=ANY(pg_blocking_pids($1::int))`, pid, holderPID).Scan(&blocked); err != nil {
+				t.Fatal(err)
+			}
+			if blocked {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("handover did not reach the held outbox")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		// An in-flight definitive outcome must still be able to take its period
+		// lock while handover waits on the outbox. Acquiring period first in the
+		// handover would form a cycle here and abort one transaction.
+		periodCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		var periodID string
+		if err := holder.QueryRowContext(periodCtx, `SELECT period_id::text FROM org_recipient_periods WHERE org_id=$1 AND period_id=$2 FOR UPDATE`, source, old.PeriodID).Scan(&periodID); err != nil {
+			t.Fatalf("outcome lock cycle: %v", err)
+		}
+		if err := holder.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-finished:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("handover did not finish after outcome released")
+		}
+	})
+}

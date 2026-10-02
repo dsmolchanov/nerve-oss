@@ -158,9 +158,6 @@ func (s *Store) freezeOutboundHandover(ctx context.Context, org, transfer string
 		if _, err = s.CurrentOutboundPolicyEpoch(ctx, org); err != nil {
 			return snapshot, err
 		}
-		if _, err = s.q.ExecContext(ctx, `UPDATE org_recipient_periods SET admission_closed=true WHERE org_id=$1::uuid AND NOT admission_closed`, org); err != nil {
-			return snapshot, err
-		}
 		changed, flagErr := s.SetFeatureFlag(ctx, &org, "email_outbound_suspended", true, "policy-handover")
 		if flagErr != nil {
 			return snapshot, flagErr
@@ -169,6 +166,13 @@ func (s *Store) freezeOutboundHandover(ctx context.Context, org, transfer string
 			if _, _, err = s.AdvanceOutboundPolicyEpoch(ctx, org); err != nil {
 				return snapshot, err
 			}
+		}
+		// Definitive completions lock the outbox before the recipient period.
+		// Epoch terminalization must follow that order too: closing periods
+		// first could deadlock with an outcome already holding an outbox row.
+		// The shared policy lock already blocks enqueue and first dispatch.
+		if _, err = s.q.ExecContext(ctx, `UPDATE org_recipient_periods SET admission_closed=true WHERE org_id=$1::uuid AND NOT admission_closed`, org); err != nil {
+			return snapshot, err
 		}
 		if snapshot.Epoch, err = s.CurrentOutboundPolicyEpoch(ctx, org); err != nil {
 			return snapshot, err
