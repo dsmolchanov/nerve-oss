@@ -96,6 +96,9 @@ func (t *TokenSource) client() *http.Client {
 // Token returns a valid access token, minting one when the cached token is
 // missing or close enough to expiry that a caller could not finish with it.
 func (t *TokenSource) Token(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	t.mu.Lock()
 	if t.cached != "" && t.now().Add(tokenRenewalMargin).Before(t.expires) {
 		token := t.cached
@@ -160,6 +163,9 @@ func (t *TokenSource) mint(ctx context.Context) (string, time.Time, error) {
 	request.Header.Set("Accept", "application/json")
 	response, err := t.client().Do(request)
 	if err != nil {
+		if err := ctx.Err(); err != nil {
+			return "", time.Time{}, err
+		}
 		return "", time.Time{}, fmt.Errorf("%w: %v", ErrTokenUnavailable, err)
 	}
 	defer func() {
@@ -168,6 +174,9 @@ func (t *TokenSource) mint(ctx context.Context) (string, time.Time, error) {
 	}()
 	raw, err := io.ReadAll(io.LimitReader(response.Body, maxTokenResponseBytes))
 	if err != nil {
+		if err := ctx.Err(); err != nil {
+			return "", time.Time{}, err
+		}
 		return "", time.Time{}, fmt.Errorf("%w: %v", ErrTokenUnavailable, err)
 	}
 	if response.StatusCode != http.StatusOK {
