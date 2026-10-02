@@ -155,3 +155,10 @@ makes a review loop unable to terminate.
   Enforced by TestOutboxTimeoutPersistsEveryProviderOutcome,
   TestOutboxBatchTimeoutRequeuesUnstartedClaimsAndCanContinue and
   TestTenClaimedRowsShareOneDrainDeadlineWhenRequeueBlocks.
+
+- After a published hybrid image restarts, does its synthetic qualification
+  observe a new inbound poll before starting the no-replay quiet window, and
+  check both inbound and outbound duplicate counts throughout that window?
+  Enforced by `test_restart_quiet_window_starts_only_after_a_new_poll` and
+  `test_rejects_inbound_replay_during_post_poll_quiet_window` in
+  `scripts/ci/test_hybrid_active_image_smoke.py`.
