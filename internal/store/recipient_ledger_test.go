@@ -595,3 +595,72 @@ func TestRecipientLedgerLockWaitCannotAdmitAfterExpiry(t *testing.T) {
 		assertRecipientCounters(t, ctx, db, p, 0, 0)
 	})
 }
+
+// Result faults wrap actual PostgreSQL writes so rollback and error provenance
+// are tested independently from a deterministic zero-row CAS refusal.
+type paidQuotaResultFault struct {
+	sql.Result
+	failure error
+	zero    bool
+}
+
+func (r paidQuotaResultFault) RowsAffected() (int64, error) {
+	if r.failure != nil {
+		return 0, r.failure
+	}
+	if r.zero {
+		return 0, nil
+	}
+	return r.Result.RowsAffected()
+}
+
+type paidQuotaResultQueryer struct {
+	queryer
+	marker  string
+	failure error
+	zero    bool
+}
+
+func (q paidQuotaResultQueryer) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	result, err := q.queryer.ExecContext(ctx, query, args...)
+	if err == nil && strings.Contains(query, q.marker) {
+		return paidQuotaResultFault{Result: result, failure: q.failure, zero: q.zero}, nil
+	}
+	return result, err
+}
+func TestPaidRecipientUpgradeResultErrorsAreNotStateFences(t *testing.T) {
+	for _, limit := range []int64{10000, 30000} {
+		for _, zero := range []bool{false, true} {
+			t.Run(fmt.Sprintf("limit_%d_zero_%t", limit, zero), func(t *testing.T) {
+				withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+					st, period := recipientFixture(t, ctx, db, sql.NullInt64{Int64: 3000, Valid: true})
+					injected := errors.New("result metadata unavailable")
+					err := st.RunInTx(ctx, func(tx *Store) error {
+						fault := paidQuotaResultQueryer{queryer: tx.q, marker: "UPDATE org_recipient_periods", zero: zero}
+						if !zero {
+							fault.failure = injected
+						}
+						tx.q = fault
+						return tx.IncreaseRecipientPeriodLimit(ctx, period.OrgID, period.PeriodID, 3000, limit)
+					})
+					if zero {
+						if !errors.Is(err, ErrRecipientLedgerConflict) {
+							t.Fatalf("zero-row CAS=%v", err)
+						}
+					} else if !errors.Is(err, injected) || errors.Is(err, ErrRecipientLedgerConflict) {
+						t.Fatalf("driver result error became state fence: %v", err)
+					}
+					var remaining int64
+					if err := db.QueryRowContext(ctx, `SELECT recipient_limit FROM org_recipient_periods WHERE org_id=$1 AND period_id=$2`, period.OrgID, period.PeriodID).Scan(&remaining); err != nil || remaining != 3000 {
+						t.Fatalf("result failure committed quota: %d %v", remaining, err)
+					}
+					if err := st.RunInTx(ctx, func(tx *Store) error {
+						return tx.IncreaseRecipientPeriodLimit(ctx, period.OrgID, period.PeriodID, 3000, limit)
+					}); err != nil {
+						t.Fatalf("normal exact retry: %v", err)
+					}
+				})
+			})
+		}
+	}
+}

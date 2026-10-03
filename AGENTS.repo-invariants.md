@@ -187,3 +187,8 @@ makes a review loop unable to terminate.
   attachment reopening count, and never on usage or receipt-list results?
   Enforced by `TestInboundAttachmentRetryStateIsClosedAndMaterializedOnly`
   and `TestClientInboundAttachmentRetryStateClosedResponse`.
+- In-period paid recipient cap changes must return sql.Result.RowsAffected
+  failures as driver errors, never as deterministic ledger conflicts. Only a
+  successfully read non-one row count is a state refusal. PostgreSQL-backed
+  TestPaidRecipientUpgradeResultErrorsAreNotStateFences checks both tiers,
+  rollback, zero-row refusal and successful exact retry.
