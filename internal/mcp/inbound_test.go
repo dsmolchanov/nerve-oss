@@ -252,3 +252,28 @@ func TestInboundAttachmentRetryStateIsClosedAndMaterializedOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestInboundNativeRecoveryErrorsAreMutationOnly(t *testing.T) {
+	for _, tc := range []struct{ name, input string }{{InboundUsageTool, `{}`}, {InboundReceiptsTool, `{"limit":1}`}, {InboundRecoverTool, `{"receipt_id":"` + inboundTestID + `"}`}} {
+		for _, business := range []*InboundBusinessError{
+			{Code: "recovery_in_progress_or_changed", Retryable: true},
+			{Code: "recovery_response_exceeds_limit"},
+			{Code: "recovery_provider_or_save_unavailable", Retryable: true},
+			{Code: "inbound_outcome_unknown", Retryable: true},
+		} {
+			t.Run(tc.name+"/"+business.Code, func(t *testing.T) {
+				stub := &inboundStub{err: business}
+				_, err := invokeInboundTool(context.Background(), stub, inboundCaller(), tc.name, json.RawMessage(tc.input))
+				want, retryable := business.Code, business.Retryable
+				if tc.name != InboundRecoverTool {
+					want = "inbound_retry_later"
+					retryable = true
+				}
+				var actual *InboundBusinessError
+				if stub.calls != 1 || !errors.As(err, &actual) || actual.Code != want || actual.Retryable != retryable {
+					t.Fatalf("err=%v calls=%d want=%s/%v", err, stub.calls, want, retryable)
+				}
+			})
+		}
+	}
+}

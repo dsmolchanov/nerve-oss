@@ -166,9 +166,14 @@ makes a review loop unable to terminate.
 - After inbound recovery may have committed, does every semantically invalid
   success at the native provisioner or signed delegation boundary return
   retryable `inbound_outcome_unknown`, while read-only usage/receipts retain
-  retryable `inbound_retry_later`? No automatic recovery retry is permitted.
+  retryable `inbound_retry_later`? Recovery-only errors (`recovery_*` and
+  `inbound_outcome_unknown`) must never be returned by usage/receipts, including
+  delegated HTTP 409/502 and native provisioner errors; those reads return
+  retryable `inbound_retry_later`. No automatic recovery retry is permitted.
   Enforced by `TestInboundNativeInvalidSuccessIsUnknownOnlyForRecovery` and
-  `TestClientInboundRecoveryInvalidPostCommitResponsesAreUnknown`.
+  `TestClientInboundRecoveryInvalidPostCommitResponsesAreUnknown`,
+  `TestClientInboundHTTPErrorMappingIsOperationAware`, and
+  `TestInboundNativeRecoveryErrorsAreMutationOnly`.
 - Does optional `attachment_retry_state` accept only `evaluated` or
   `retry_later` on a materialized recovery result, independently of the
   attachment reopening count, and never on usage or receipt-list results?

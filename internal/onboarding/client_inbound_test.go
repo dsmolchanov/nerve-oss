@@ -125,3 +125,58 @@ func TestClientInboundAttachmentRetryStateClosedResponse(t *testing.T) {
 		})
 	}
 }
+
+func TestClientInboundHTTPErrorMappingIsOperationAware(t *testing.T) {
+	for _, operation := range []string{"usage", "receipts", "recover"} {
+		for _, tc := range []struct {
+			name       string
+			status     int
+			body, code string
+			retryable  bool
+		}{
+			{"bad-request", 400, `{"error":"private"}`, "inbound_invalid_request", false},
+			{"unauthorized", 401, `{"error":"private"}`, "inbound_unavailable", false},
+			{"forbidden", 403, `{"error":"private"}`, "inbound_unavailable", false},
+			{"not-found", 404, `{"error":"private"}`, "inbound_unavailable", false},
+			{"unavailable", 409, `{"error":"inbound_unavailable"}`, "inbound_unavailable", false},
+			{"progress", 409, `{"error":"recovery_in_progress_or_changed"}`, "recovery_in_progress_or_changed", true},
+			{"limit", 409, `{"error":"recovery_response_exceeds_limit"}`, "recovery_response_exceeds_limit", false},
+			{"unknown-recovery", 409, `{"error":"recovery_private_code"}`, "inbound_outcome_unknown", true},
+			{"extra-field", 409, `{"error":"recovery_in_progress_or_changed","provider_id":"private"}`, "inbound_outcome_unknown", true},
+			{"duplicate", 409, `{"error":"inbound_unavailable","error":"recovery_in_progress_or_changed"}`, "inbound_outcome_unknown", true},
+			{"null", 409, `{"error":null}`, "inbound_outcome_unknown", true},
+			{"malformed", 409, `{`, "inbound_outcome_unknown", true},
+			{"gateway", 502, `{"error":"private"}`, "recovery_provider_or_save_unavailable", true},
+			{"unexpected", 503, `{"error":"private"}`, "inbound_outcome_unknown", true},
+		} {
+			t.Run(operation+"/"+tc.name, func(t *testing.T) {
+				input := mcp.InboundInput{}
+				if operation == "receipts" {
+					input.Limit = 1
+				}
+				if operation == "recover" {
+					input.ReceiptID = "11111111-1111-4111-8111-111111111111"
+				}
+				calls := 0
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(tc.status)
+					io.WriteString(w, tc.body)
+				}))
+				defer server.Close()
+				client := newTestClient(t, server.URL, server.Client(), time.Now())
+				result, err := client.Inbound(context.Background(), inboundTestCaller(), operation, input)
+				code, retryable := tc.code, tc.retryable
+				if operation != "recover" && (strings.HasPrefix(code, "recovery_") || code == "inbound_outcome_unknown") {
+					code = "inbound_retry_later"
+					retryable = true
+				}
+				var business *mcp.InboundBusinessError
+				if result != nil || calls != 1 || !errors.As(err, &business) || business.Code != code || business.Retryable != retryable || strings.Contains(err.Error(), "private") {
+					t.Fatalf("result=%s err=%v calls=%d want=%s/%v", result, err, calls, code, retryable)
+				}
+			})
+		}
+	}
+}
