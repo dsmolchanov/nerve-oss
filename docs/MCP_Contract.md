@@ -630,3 +630,14 @@ purchase invitation, and agent confirmation alone cannot bind an owner.
 This operation remains available at zero mail allowance and never reserves or
 resets recipients. It uses the existing typed billing business errors; provider
 response text and browser proof material are never error messages or audit logs.
+
+For an existing active machine generation without any owner link, the pricing
+v2 candidate `nerve_billing_upgrade` returns the same exact response fields with
+`state=needs_owner` and only a configured-origin
+`/billing/pairing?pairing_id=<opaque UUID>` URL. The signed request pins the
+original live machine key and generation. This is a pre-billing invitation: no
+owner, purchase admission, hosted purchase intent, Stripe object or quota is
+created until both confirmations complete. An existing or revoked owner link
+cannot be replaced through this fallback. Other upgrade states continue to
+require exactly `/billing/upgrade?intent=<opaque UUID>`; the two URL contracts
+cannot be interchanged.
