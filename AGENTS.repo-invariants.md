@@ -55,7 +55,12 @@ makes a review loop unable to terminate.
   `TestClientTransportDisconnectReturnsOutcomeUnknownForEveryOperation`,
   `TestClientInvalidPostCommitResponseReturnsOutcomeUnknownForEveryMutation`,
   and `TestClientRejectsSemanticallyInvalidEnvelopesForEveryOperation` tests in
-  `internal/onboarding/client_test.go`.
+  `internal/onboarding/client_test.go`. The same mutation/read distinction
+  applies to Free setup/verify/close/resume at the native MCP provisioner
+  boundary, enforced by
+  `TestFreeSetupNativeInvalidSuccessIsUnknownForEveryMutation` in
+  `internal/mcp/free_setup_test.go` and the Free delegated-response matrix in
+  `internal/onboarding/client_free_setup_test.go`.
 - Do all inbox address lookup, receiving resolution, create, ensure, and
   reactivate paths use the one canonical-equivalence rule, prefer a single
   active row before disabled history where replay is supported, fail closed on
@@ -163,6 +168,25 @@ makes a review loop unable to terminate.
   `test_rejects_inbound_replay_during_post_poll_quiet_window` in
   `scripts/ci/test_hybrid_active_image_smoke.py`.
 
+- After inbound recovery may have committed, does every semantically invalid
+  success at the native provisioner or signed delegation boundary return
+  retryable `inbound_outcome_unknown`, while read-only usage/receipts retain
+  retryable `inbound_retry_later`? Recovery-only errors (`recovery_*` and
+  `inbound_outcome_unknown`) must never be returned by usage/receipts, including
+  delegated HTTP 409/502 and native provisioner errors; those reads return
+  retryable `inbound_retry_later`. Native `tools/list` error enums must advertise
+  this same distinction for all three tools. No automatic recovery retry is
+  permitted.
+  Enforced by `TestInboundNativeInvalidSuccessIsUnknownOnlyForRecovery` and
+  `TestClientInboundRecoveryInvalidPostCommitResponsesAreUnknown`,
+  `TestClientInboundHTTPErrorMappingIsOperationAware`, and
+  `TestInboundNativeRecoveryErrorsAreMutationOnly`, and
+  `TestInboundNativeCatalogErrorsMatchReadAndMutationContracts`.
+- Does optional `attachment_retry_state` accept only `evaluated` or
+  `retry_later` on a materialized recovery result, independently of the
+  attachment reopening count, and never on usage or receipt-list results?
+  Enforced by `TestInboundAttachmentRetryStateIsClosedAndMaterializedOnly`
+  and `TestClientInboundAttachmentRetryStateClosedResponse`.
 - In-period paid recipient cap changes must return sql.Result.RowsAffected
   failures as driver errors, never as deterministic ledger conflicts. Only a
   successfully read non-one row count is a state refusal. PostgreSQL-backed

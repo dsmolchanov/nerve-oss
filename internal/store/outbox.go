@@ -334,12 +334,12 @@ func (s *Store) enqueueOutboxMessage(ctx context.Context, msg OutboxMessage, aft
 		if !inserted {
 			return nil
 		}
-		if ledgerAvailable && !suppressed {
+		if ledgerAvailable {
 			period, enrolled, err := scoped.RecipientAdmissionPeriod(ctx, msg.OrgID)
 			if err != nil {
 				return err
 			}
-			if enrolled {
+			if enrolled && !suppressed {
 				fenced, err := scoped.recipientOutboxFenceAvailable(ctx)
 				if err != nil {
 					return err

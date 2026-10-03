@@ -27,7 +27,11 @@ func modernToolCatalog(ctx context.Context, server *Server, principal auth.Princ
 		if server.Config.Cloud.Mode && (server.Auth == nil || server.Auth.ValidateScopes(principal, "nerve:onboarding") != nil) {
 			return nil
 		}
-		return onboardingToolDescriptors()
+		tools := onboardingToolDescriptors()
+		if freeSetupToolsAvailable(server, principal) {
+			tools = append(tools, freeSetupToolDescriptors()...)
+		}
+		return tools
 	}
 	tools := modernToolDescriptors(ctx, server, principal)
 	if !server.Config.Cloud.Mode || server.Auth == nil {
@@ -83,10 +87,13 @@ func modernToolDescriptors(ctx context.Context, server *Server, principal auth.P
 		tools = append(tools, billingToolDescriptor())
 	}
 	if billingUpgradeToolAvailable(server, principal) {
-		tools = append(tools, billingUpgradeToolDescriptor())
+		tools = append(tools, billingUpgradeToolDescriptor(), billingPairingConfirmToolDescriptor())
 	}
 	if billingStatusToolAvailable(server, principal) {
 		tools = append(tools, billingStatusToolDescriptor())
+	}
+	if inboundToolsAvailable(server, principal) {
+		tools = append(tools, inboundToolDescriptors()...)
 	}
 	return tools
 }

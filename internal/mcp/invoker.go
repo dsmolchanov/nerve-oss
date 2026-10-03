@@ -62,7 +62,7 @@ func (invoker *Invoker) Invoke(ctx context.Context, invocation ToolInvocation) (
 			}
 		}
 	}
-	if invocation.Name == billingSubscribeToolName || invocation.Name == billingUpgradeToolName || invocation.Name == billingStatusToolName {
+	if invocation.Name == billingSubscribeToolName || invocation.Name == billingUpgradeToolName || invocation.Name == billingStatusToolName || invocation.Name == billingPairingConfirmToolName {
 		// Billing is intentionally modern-only and is dispatched by the SDK
 		// adapter through BillingProvisioner after the same scope precheck.
 		return nil, errors.New("billing tool requires the modern MCP protocol")
@@ -181,7 +181,7 @@ func (gate *storeOutboundPolicyGate) Authorize(ctx context.Context, principal au
 
 func requiredToolScope(principal auth.Principal, toolName string) string {
 	switch toolName {
-	case "nerve_onboarding_start", "nerve_onboarding_status", "nerve_onboarding_verify_domain", "nerve_onboarding_close":
+	case "nerve_free_resume", "nerve_free_setup", "nerve_free_status", "nerve_free_verify_domain", "nerve_free_close", "nerve_onboarding_start", "nerve_onboarding_status", "nerve_onboarding_verify_domain", "nerve_onboarding_close":
 		return "nerve:onboarding"
 	case "list_threads", "get_thread":
 		return "nerve:email.read"
@@ -199,7 +199,7 @@ func requiredToolScope(principal auth.Principal, toolName string) string {
 			return "nerve:email.compose"
 		}
 		return "nerve:email.send"
-	case billingSubscribeToolName, billingUpgradeToolName, billingStatusToolName:
+	case billingSubscribeToolName, billingUpgradeToolName, billingStatusToolName, billingPairingConfirmToolName:
 		return "nerve:billing.subscribe"
 	default:
 		return "nerve:email.read"

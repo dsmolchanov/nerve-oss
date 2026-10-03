@@ -24,6 +24,7 @@ const starterOfferID = "starter_2026_09_v2"
 type HostedBillingProvisioner interface {
 	Upgrade(context.Context, BillingCaller, BillingUpgradeInput) (BillingUpgradeResult, error)
 	BillingStatus(context.Context, BillingCaller) (BillingStatusResult, error)
+	ConfirmBillingPairing(context.Context, BillingCaller, BillingPairingConfirmInput) (BillingPairingConfirmResult, error)
 }
 
 type BillingStatusResult struct {
@@ -43,7 +44,7 @@ func billingStatusToolDescriptor() toolDescriptor {
 		OutputShape: outputObject(map[string]any{
 			"resultType": map[string]any{"type": "string", "const": "complete"},
 			"hosted_state": map[string]any{"type": "string", "enum": []string{
-				"none", "awaiting_owner", "session_prepared", "session_open", "provider_unknown",
+				"none", "needs_owner", "awaiting_owner", "session_prepared", "session_open", "provider_unknown",
 				"quarantined", "active", "cleanup_required", "terminal",
 			}},
 			"starter_active":       map[string]any{"type": "boolean"},
@@ -235,9 +236,13 @@ func validateBillingUpgradeResult(result BillingUpgradeResult, dashboardBaseURL 
 	if err != nil || !validBillingDashboardOrigin(dashboardBaseURL) {
 		return errors.New("invalid dashboard origin")
 	}
+	path, parameter := "/billing/upgrade", "intent"
+	if result.State == "needs_owner" {
+		path, parameter = "/billing/pairing", "pairing_id"
+	}
 	target, err := url.Parse(result.UpgradeURL)
 	if err != nil || target.Scheme != base.Scheme || target.Host != base.Host ||
-		target.User != nil || target.Fragment != "" || target.Path != "/billing/upgrade" ||
+		target.User != nil || target.Fragment != "" || target.Path != path ||
 		target.RawPath != "" || target.Opaque != "" {
 		return errors.New("invalid billing upgrade URL")
 	}
@@ -245,11 +250,11 @@ func validateBillingUpgradeResult(result BillingUpgradeResult, dashboardBaseURL 
 	if err != nil {
 		return errors.New("invalid billing upgrade query")
 	}
-	if len(query) != 1 || len(query["intent"]) != 1 {
+	if len(query) != 1 || len(query[parameter]) != 1 {
 		return errors.New("invalid billing upgrade intent")
 	}
-	intent, err := uuid.Parse(query.Get("intent"))
-	if err != nil || intent == uuid.Nil || intent.String() != query.Get("intent") {
+	intent, err := uuid.Parse(query.Get(parameter))
+	if err != nil || intent == uuid.Nil || intent.String() != query.Get(parameter) {
 		return errors.New("invalid billing upgrade intent")
 	}
 	return nil
@@ -257,7 +262,7 @@ func validateBillingUpgradeResult(result BillingUpgradeResult, dashboardBaseURL 
 
 func validBillingUpgradeState(state string) bool {
 	switch state {
-	case "awaiting_owner", "session_prepared", "session_open", "provider_unknown":
+	case "needs_owner", "awaiting_owner", "session_prepared", "session_open", "provider_unknown":
 		return true
 	default:
 		return false
