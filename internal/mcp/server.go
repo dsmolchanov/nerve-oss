@@ -50,6 +50,7 @@ type Server struct {
 	Onboarding     OnboardingProvisioner
 	Billing        BillingProvisioner
 	HostedBilling  HostedBillingProvisioner
+	Inbound        InboundProvisioner
 	Invoker        *Invoker
 	mu             sync.Mutex
 	sessions       map[string]time.Time
