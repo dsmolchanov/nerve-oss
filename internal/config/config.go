@@ -207,6 +207,7 @@ func applyPreferredEnvAliases() []string {
 		"NM_DEV_MODE",
 		"NM_CLOUD_MODE",
 		"NM_CLOUD_PUBLIC_BASE_URL",
+		"NM_CLOUD_DASHBOARD_BASE_URL",
 		"NM_AUTH_ISSUER",
 		"NM_AUTH_AUDIENCE",
 		"NM_AUTH_JWKS_URL",
