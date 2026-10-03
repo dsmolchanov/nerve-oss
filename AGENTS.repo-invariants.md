@@ -162,3 +162,9 @@ makes a review loop unable to terminate.
   Enforced by `test_restart_quiet_window_starts_only_after_a_new_poll` and
   `test_rejects_inbound_replay_during_post_poll_quiet_window` in
   `scripts/ci/test_hybrid_active_image_smoke.py`.
+
+- In-period paid recipient cap changes must return sql.Result.RowsAffected
+  failures as driver errors, never as deterministic ledger conflicts. Only a
+  successfully read non-one row count is a state refusal. PostgreSQL-backed
+  TestPaidRecipientUpgradeResultErrorsAreNotStateFences checks both tiers,
+  rollback, zero-row refusal and successful exact retry.
