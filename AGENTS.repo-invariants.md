@@ -162,3 +162,15 @@ makes a review loop unable to terminate.
   Enforced by `test_restart_quiet_window_starts_only_after_a_new_poll` and
   `test_rejects_inbound_replay_during_post_poll_quiet_window` in
   `scripts/ci/test_hybrid_active_image_smoke.py`.
+
+- After inbound recovery may have committed, does every semantically invalid
+  success at the native provisioner or signed delegation boundary return
+  retryable `inbound_outcome_unknown`, while read-only usage/receipts retain
+  retryable `inbound_retry_later`? No automatic recovery retry is permitted.
+  Enforced by `TestInboundNativeInvalidSuccessIsUnknownOnlyForRecovery` and
+  `TestClientInboundRecoveryInvalidPostCommitResponsesAreUnknown`.
+- Does optional `attachment_retry_state` accept only `evaluated` or
+  `retry_later` on a materialized recovery result, independently of the
+  attachment reopening count, and never on usage or receipt-list results?
+  Enforced by `TestInboundAttachmentRetryStateIsClosedAndMaterializedOnly`
+  and `TestClientInboundAttachmentRetryStateClosedResponse`.

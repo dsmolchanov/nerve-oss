@@ -30,7 +30,13 @@ func translateModernBusinessError(err error) modernBusinessError {
 	var inProgressErr *entitlements.IdempotencyInProgressError
 	var onboardingErr *OnboardingBusinessError
 	var billingErr *BillingBusinessError
+	var inboundErr *InboundBusinessError
 	switch {
+	case errors.As(err, &inboundErr):
+		if ValidInboundError(inboundErr) {
+			translated.Code = inboundErr.Code
+			translated.Retryable = inboundErr.Retryable
+		}
 	case errors.Is(err, llm.ErrUnavailable):
 		translated.Code = "ai_unavailable"
 		translated.Remediation = "docs/SELF_HOSTING.md#ai-configuration"

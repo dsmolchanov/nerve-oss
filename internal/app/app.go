@@ -130,6 +130,9 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	)
 	mcpServer.Billing = billingProvisioner
 	mcpServer.HostedBilling = hostedBillingProvisioner
+	if delegationClient != nil {
+		mcpServer.Inbound = delegationClient
+	}
 	mcpRouter := mcp.NewRouter(cfg, authSvc, mcp.NewLegacyHandler(mcpServer), mcp.NewSDKHandler(mcpServer, true))
 
 	return &App{
