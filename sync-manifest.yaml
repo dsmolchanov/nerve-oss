@@ -84,7 +84,8 @@
     "scripts/release/prove_candidate_version_unused.sh",
     "docs/MCP_Contract.md",
     "docs/INBOUND_RECOVERY.md",
-    "docs/FREE_APEX_SETUP.md"
+    "docs/FREE_APEX_SETUP.md",
+    "docs/HOSTED_BILLING_STATUS.md"
   ],
   "patch-synced": [],
   "cloud-only": [
