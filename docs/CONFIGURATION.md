@@ -38,6 +38,7 @@ Secrets have no documented sample value: supply your own key/password privately.
 | `NERVE_DEV_MODE` | `Dev.Mode` |
 | `NERVE_CLOUD_MODE` | `Cloud.Mode` |
 | `NERVE_CLOUD_PUBLIC_BASE_URL` | `Cloud.PublicBaseURL` |
+| `NERVE_CLOUD_DASHBOARD_BASE_URL` | `Cloud.DashboardBaseURL`; configured HTTPS dashboard origin for owner-assisted hosted billing. |
 | `NERVE_AUTH_ISSUER` | `Auth.Issuer` |
 | `NERVE_AUTH_AUDIENCE` | `Auth.Audience` |
 | `NERVE_AUTH_JWKS_URL` | `Auth.JWKSURL` |

@@ -24,8 +24,9 @@ type Config struct {
 		Mode bool `yaml:"mode"`
 	} `yaml:"dev"`
 	Cloud struct {
-		Mode          bool   `yaml:"mode"`
-		PublicBaseURL string `yaml:"public_base_url"`
+		Mode             bool   `yaml:"mode"`
+		PublicBaseURL    string `yaml:"public_base_url"`
+		DashboardBaseURL string `yaml:"dashboard_base_url"`
 	} `yaml:"cloud"`
 	Auth struct {
 		Issuer   string `yaml:"issuer"`
@@ -206,6 +207,7 @@ func applyPreferredEnvAliases() []string {
 		"NM_DEV_MODE",
 		"NM_CLOUD_MODE",
 		"NM_CLOUD_PUBLIC_BASE_URL",
+		"NM_CLOUD_DASHBOARD_BASE_URL",
 		"NM_AUTH_ISSUER",
 		"NM_AUTH_AUDIENCE",
 		"NM_AUTH_JWKS_URL",
@@ -310,6 +312,9 @@ func applyEnv(cfg *Config) {
 	}
 	if v := os.Getenv("NM_CLOUD_PUBLIC_BASE_URL"); v != "" {
 		cfg.Cloud.PublicBaseURL = v
+	}
+	if v := os.Getenv("NM_CLOUD_DASHBOARD_BASE_URL"); v != "" {
+		cfg.Cloud.DashboardBaseURL = v
 	}
 	if v := os.Getenv("NM_AUTH_ISSUER"); v != "" {
 		cfg.Auth.Issuer = v
