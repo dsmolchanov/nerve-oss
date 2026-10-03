@@ -308,7 +308,12 @@ func newSDKServer(requestContext context.Context, runtime *Server) *sdkmcp.Serve
 			}
 			var result any
 			var err error
-			if principal.Kind == auth.PrincipalM2MOnboarding {
+			if freeSetupToolOperation(request.Params.Name) != "" {
+				if _, restricted := localauth.FromContext(ctx); restricted {
+					return nil, nil, localauth.ErrForbidden
+				}
+				result, err = invokeFreeSetupTool(ctx, runtime.FreeSetup, OnboardingCaller{Principal: principal, Authorization: onboardingAuthorizationFromContext(requestContext)}, request.Params.Name, request.Params.Arguments)
+			} else if principal.Kind == auth.PrincipalM2MOnboarding {
 				result, err = invokeOnboardingTool(ctx, runtime.Onboarding, OnboardingCaller{
 					Principal: principal, Authorization: onboardingAuthorizationFromContext(requestContext),
 				}, request.Params.Name, request.Params.Arguments)

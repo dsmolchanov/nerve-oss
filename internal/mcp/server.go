@@ -48,6 +48,7 @@ type Server struct {
 	FeatureFlags   FeatureGate
 	OutboundPolicy OutboundPolicyGate
 	Onboarding     OnboardingProvisioner
+	FreeSetup      FreeSetupProvisioner
 	Billing        BillingProvisioner
 	HostedBilling  HostedBillingProvisioner
 	Inbound        InboundProvisioner

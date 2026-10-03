@@ -40,6 +40,9 @@ func TestNewOnboardingProvisionerBuildsBoundedFixedOriginClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("delegation client: %v", err)
 	}
+	if _, ok := any(delegated).(mcp.FreeSetupProvisioner); !ok {
+		t.Fatal("production delegation client does not implement Free setup")
+	}
 	if _, ok := any(delegated).(mcp.BillingProvisioner); !ok {
 		t.Fatal("production delegation client does not implement billing provisioner")
 	}
