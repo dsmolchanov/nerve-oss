@@ -277,3 +277,54 @@ func TestInboundNativeRecoveryErrorsAreMutationOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestInboundNativeCatalogErrorsMatchReadAndMutationContracts(t *testing.T) {
+	cfg := hostedRouterConfig()
+	runtime := NewServer(cfg, nil, authForInbound(cfg), nil)
+	runtime.Inbound = &inboundStub{}
+	caller := inboundCaller()
+	request := billingModernRequest(t, caller.Principal, "tools/list", map[string]any{"_meta": modernOAuthMeta()}, "")
+	request.Header.Set("Authorization", caller.Authorization)
+	recorder := httptest.NewRecorder()
+	NewSDKHandler(runtime, true).ServeHTTP(recorder, request)
+	var listed struct {
+		Result struct {
+			Tools []struct {
+				Name         string         `json:"name"`
+				OutputSchema map[string]any `json:"outputSchema"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &listed); err != nil || recorder.Code != http.StatusOK {
+		t.Fatalf("list=%s err=%v", recorder.Body.String(), err)
+	}
+	for _, name := range []string{InboundUsageTool, InboundReceiptsTool, InboundRecoverTool} {
+		t.Run(name, func(t *testing.T) {
+			var schema map[string]any
+			for _, tool := range listed.Result.Tools {
+				if tool.Name == name {
+					schema = tool.OutputSchema
+				}
+			}
+			if schema == nil {
+				t.Fatalf("missing scoped tool %s", name)
+			}
+			outcomes := schema["oneOf"].([]any)
+			errorShape := outcomes[1].(map[string]any)
+			properties := errorShape["properties"].(map[string]any)["error"].(map[string]any)["properties"].(map[string]any)
+			codes := properties["code"].(map[string]any)["enum"].([]any)
+			wanted := []string{"inbound_invalid_request", "inbound_unavailable", "inbound_retry_later"}
+			if name == InboundRecoverTool {
+				wanted = append(wanted, "inbound_outcome_unknown", "recovery_in_progress_or_changed", "recovery_provider_or_save_unavailable", "recovery_response_exceeds_limit")
+			}
+			if len(codes) != len(wanted) {
+				t.Fatalf("schema codes=%v want=%v", codes, wanted)
+			}
+			for i, code := range codes {
+				if code != wanted[i] {
+					t.Fatalf("schema codes=%v want=%v", codes, wanted)
+				}
+			}
+		})
+	}
+}

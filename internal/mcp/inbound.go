@@ -84,9 +84,9 @@ func inboundToolsAvailable(s *Server, p auth.Principal) bool {
 }
 func inboundToolDescriptors() []toolDescriptor {
 	return []toolDescriptor{
-		{Name: InboundUsageTool, Description: "Read admitted inbound usage, pending slots and receipt completeness", InputSchema: inputObject(map[string]any{}), OutputShape: inboundOutputSchema("usage"), ErrorCodes: inboundErrorCodes()},
-		{Name: InboundReceiptsTool, Description: "List bounded content-free inbound receipts; opaque IDs never grant access", InputSchema: inputObject(map[string]any{"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 100}, "cursor": map[string]any{"type": "string", "maxLength": 66}}), OutputShape: inboundOutputSchema("receipts"), ErrorCodes: inboundErrorCodes()},
-		{Name: InboundRecoverTool, Description: "Attempt recovery of one receipt and paused attachments; the provider deadline is an attempt window, not a guarantee", InputSchema: inputObject(map[string]any{"receipt_id": map[string]any{"type": "string", "minLength": 36, "maxLength": 66}}, "receipt_id"), OutputShape: inboundOutputSchema("recover"), ErrorCodes: inboundErrorCodes()},
+		{Name: InboundUsageTool, Description: "Read admitted inbound usage, pending slots and receipt completeness", InputSchema: inputObject(map[string]any{}), OutputShape: inboundOutputSchema("usage"), ErrorCodes: inboundErrorCodes("usage")},
+		{Name: InboundReceiptsTool, Description: "List bounded content-free inbound receipts; opaque IDs never grant access", InputSchema: inputObject(map[string]any{"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 100}, "cursor": map[string]any{"type": "string", "maxLength": 66}}), OutputShape: inboundOutputSchema("receipts"), ErrorCodes: inboundErrorCodes("receipts")},
+		{Name: InboundRecoverTool, Description: "Attempt recovery of one receipt and paused attachments; the provider deadline is an attempt window, not a guarantee", InputSchema: inputObject(map[string]any{"receipt_id": map[string]any{"type": "string", "minLength": 36, "maxLength": 66}}, "receipt_id"), OutputShape: inboundOutputSchema("recover"), ErrorCodes: inboundErrorCodes("recover")},
 	}
 }
 func inboundOutputSchema(op string) map[string]any {
@@ -444,6 +444,10 @@ func DecodeInboundInput(op string, raw json.RawMessage) (InboundInput, error) {
 	return i, nil
 }
 
-func inboundErrorCodes() []string {
-	return []string{"inbound_invalid_request", "inbound_unavailable", "inbound_retry_later", "inbound_outcome_unknown", "recovery_in_progress_or_changed", "recovery_provider_or_save_unavailable", "recovery_response_exceeds_limit"}
+func inboundErrorCodes(operation string) []string {
+	codes := []string{"inbound_invalid_request", "inbound_unavailable", "inbound_retry_later"}
+	if operation == "recover" {
+		codes = append(codes, "inbound_outcome_unknown", "recovery_in_progress_or_changed", "recovery_provider_or_save_unavailable", "recovery_response_exceeds_limit")
+	}
+	return codes
 }
