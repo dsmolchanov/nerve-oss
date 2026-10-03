@@ -288,7 +288,7 @@ func invokeFreeSetupTool(ctx context.Context, p FreeSetupProvisioner, c Onboardi
 		return FreeSetupResult{}, sanitizeOnboardingProvisionerError(err)
 	}
 	if ValidateFreeSetupOperationResult(op, normalized, result, c.Principal.Generation) != nil {
-		if op == "resume" {
+		if op != "status" {
 			return FreeSetupResult{}, ErrOnboardingOutcomeUnknown
 		}
 		return FreeSetupResult{}, onboardingTemporarilyUnavailable()

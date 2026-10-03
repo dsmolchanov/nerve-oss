@@ -10,6 +10,7 @@ import (
 	"neuralmail/internal/config"
 	"neuralmail/internal/entitlements"
 	"neuralmail/internal/localauth"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -155,5 +156,99 @@ func TestInboundEveryNativeToolUsesItsDeclaredSchemaAndOriginalBearer(t *testing
 				t.Fatalf("native %d %s calls=%d", rec.Code, rec.Body.String(), stub.calls)
 			}
 		})
+	}
+}
+
+func TestInboundNativeInvalidSuccessIsUnknownOnlyForRecovery(t *testing.T) {
+	for _, operation := range []struct{ name, input, result string }{
+		{InboundUsageTool, `{}`, inboundUsageFixture},
+		{InboundReceiptsTool, `{"limit":1}`, `{"items":[]}`},
+		{InboundRecoverTool, `{"receipt_id":"` + inboundTestID + `"}`, `{"receipt_id":"` + inboundTestID + `","state":"content_paused","reason":"storage_exhausted"}`},
+	} {
+		for _, defect := range []string{"invalid", "mismatched", "foreign"} {
+			t.Run(operation.name+"/"+defect, func(t *testing.T) {
+				bad := operation.result
+				switch defect {
+				case "invalid":
+					bad = `null`
+				case "foreign":
+					bad = strings.TrimSuffix(bad, "}") + `,"org_id":"private-foreign-org"}`
+				case "mismatched":
+					switch operation.name {
+					case InboundUsageTool:
+						bad = strings.Replace(bad, `"reserved":0`, `"reserved":1`, 1)
+					case InboundReceiptsTool:
+						bad = `{"items":[],"next_cursor":"` + inboundTestID + `"}`
+					case InboundRecoverTool:
+						bad = strings.Replace(bad, inboundTestID, "22222222-2222-4222-8222-222222222222", 1)
+					}
+				}
+				stub := &inboundStub{result: json.RawMessage(bad)}
+				got, err := invokeInboundTool(context.Background(), stub, inboundCaller(), operation.name, json.RawMessage(operation.input))
+				want := "inbound_retry_later"
+				if operation.name == InboundRecoverTool {
+					want = "inbound_outcome_unknown"
+				}
+				var business *InboundBusinessError
+				mapped, mapResult := got.(map[string]any)
+				if (got != nil && (!mapResult || mapped != nil)) || stub.calls != 1 || !errors.As(err, &business) || business.Code != want || !business.Retryable {
+					t.Fatalf("result=%v calls=%d err=%v", got, stub.calls, err)
+				}
+				cfg := hostedRouterConfig()
+				runtime := NewServer(cfg, nil, authForInbound(cfg), nil)
+				runtime.Inbound = stub
+				var args map[string]any
+				if err := json.Unmarshal([]byte(operation.input), &args); err != nil {
+					t.Fatal(err)
+				}
+				caller := inboundCaller()
+				request := billingModernRequest(t, caller.Principal, "tools/call", map[string]any{"_meta": modernOAuthMeta(), "name": operation.name, "arguments": args}, operation.name)
+				request.Header.Set("Authorization", caller.Authorization)
+				recorder := httptest.NewRecorder()
+				NewSDKHandler(runtime, true).ServeHTTP(recorder, request)
+				if stub.calls != 2 || !strings.Contains(recorder.Body.String(), `"code":"`+want+`"`) || !strings.Contains(recorder.Body.String(), `"retryable":true`) || strings.Contains(recorder.Body.String(), "private-foreign-org") {
+					t.Fatalf("native response calls=%d: %s", stub.calls, recorder.Body.String())
+				}
+			})
+		}
+	}
+}
+
+func TestInboundAttachmentRetryStateIsClosedAndMaterializedOnly(t *testing.T) {
+	for _, retryState := range []string{"evaluated", "retry_later"} {
+		for _, reopened := range []int{0, 2} {
+			body := `{"receipt_id":"` + inboundTestID + `","state":"materialized","message_id":"` + inboundTestID + `","attachment_retry_state":"` + retryState + `","attachments_reopened":` + strconv.Itoa(reopened) + `}`
+			if _, err := ValidateInboundResult("recover", InboundInput{ReceiptID: inboundTestID}, []byte(body)); err != nil {
+				t.Fatalf("valid independent state/count %s: %v", body, err)
+			}
+		}
+	}
+	for _, bad := range []string{
+		`{"receipt_id":"` + inboundTestID + `","state":"materialized","message_id":"` + inboundTestID + `","attachment_retry_state":"unexpected"}`,
+		`{"receipt_id":"` + inboundTestID + `","state":"materialized","message_id":"` + inboundTestID + `","attachment_retry_state":null}`,
+		`{"receipt_id":"` + inboundTestID + `","state":"materialized","message_id":"` + inboundTestID + `","attachment_retry_state":true}`,
+	} {
+		if _, err := ValidateInboundResult("recover", InboundInput{ReceiptID: inboundTestID}, []byte(bad)); err == nil {
+			t.Fatalf("accepted invalid retry state: %s", bad)
+		}
+	}
+	for _, state := range []string{"pending", "content_paused", "expired_unrecoverable"} {
+		body := `{"receipt_id":"` + inboundTestID + `","state":"` + state + `","reason":"provider_unavailable","attachment_retry_state":"retry_later"}`
+		if _, err := ValidateInboundResult("recover", InboundInput{ReceiptID: inboundTestID}, []byte(body)); err == nil {
+			t.Fatalf("accepted nonmaterialized retry state: %s", body)
+		}
+	}
+	for _, tc := range []struct {
+		op    string
+		input InboundInput
+		body  string
+	}{
+		{"usage", InboundInput{}, strings.TrimSuffix(inboundUsageFixture, "}") + `,"attachment_retry_state":"evaluated"}`},
+		{"receipts", InboundInput{Limit: 1}, `{"items":[],"attachment_retry_state":"evaluated"}`},
+		{"receipts", InboundInput{Limit: 1}, `{"items":[{"id":"` + inboundTestID + `","inbox_id":"","period_id":"","state":"materialized","message_id":"` + inboundTestID + `","created_at":"2026-10-01T00:00:00Z","expires_at":"2026-11-01T00:00:00Z","attachment_retry_state":"evaluated"}]}`},
+	} {
+		if _, err := ValidateInboundResult(tc.op, tc.input, []byte(tc.body)); err == nil {
+			t.Fatalf("accepted read-only retry state: %s", tc.body)
+		}
 	}
 }

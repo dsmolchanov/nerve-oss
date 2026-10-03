@@ -82,3 +82,46 @@ func TestClientInboundRecoveryInvalidPostCommitResponsesAreUnknown(t *testing.T)
 		}
 	}
 }
+
+func TestClientInboundAttachmentRetryStateClosedResponse(t *testing.T) {
+	const id = "11111111-1111-4111-8111-111111111111"
+	base := `{"receipt_id":"` + id + `","state":"materialized","message_id":"` + id + `","attachments_reopened":0}`
+	for _, tc := range []struct {
+		name, field string
+		valid       bool
+	}{
+		{"absent", "", true},
+		{"evaluated", `,"attachment_retry_state":"evaluated"`, true},
+		{"retry-later", `,"attachment_retry_state":"retry_later"`, true},
+		{"unknown", `,"attachment_retry_state":"unknown"`, false},
+		{"null", `,"attachment_retry_state":null`, false},
+		{"duplicate", `,"attachment_retry_state":"evaluated","attachment_retry_state":"retry_later"`, false},
+		{"foreign", `,"attachment_retry_state":"evaluated","org_id":"private"`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.TrimSuffix(base, "}") + tc.field + "}"
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "application/json")
+				io.WriteString(w, body)
+			}))
+			defer server.Close()
+			client := newTestClient(t, server.URL, server.Client(), time.Now())
+			result, err := client.Inbound(context.Background(), inboundTestCaller(), "recover", mcp.InboundInput{ReceiptID: id})
+			if calls != 1 {
+				t.Fatalf("automatic retry: %d", calls)
+			}
+			if tc.valid {
+				if err != nil || string(result) != body {
+					t.Fatalf("valid result=%s err=%v", result, err)
+				}
+				return
+			}
+			var business *mcp.InboundBusinessError
+			if result != nil || !errors.As(err, &business) || business.Code != "inbound_outcome_unknown" || !business.Retryable {
+				t.Fatalf("ambiguous invalid response=%s err=%v", result, err)
+			}
+		})
+	}
+}

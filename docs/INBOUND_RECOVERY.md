@@ -10,7 +10,7 @@ modern tools when the configured signed control plane is available:
 | --- | --- | --- |
 | `nerve_inbound_usage` | `{}` | Current admitted period, reserved/materialized slots, soft/hard limits, receipt overflow and completeness |
 | `nerve_inbound_receipts` | Optional `limit` 1–100 (default 50), optional opaque `cursor` | Bounded content-free `items` and an optional opaque continuation cursor |
-| `nerve_inbound_recover` | Exactly one `receipt_id` | The same receipt identity, durable state/reason, a saved message handle only after materialization, optional attachment reopening count and provider attempt deadline |
+| `nerve_inbound_recover` | Exactly one `receipt_id` | The same receipt identity, durable state/reason, a saved message handle only after materialization, optional attachment reopening count, attachment retry state and provider attempt deadline |
 
 Arguments never select an organization, generation, inbox, provider delivery,
 owner, payment, or allowance. Receipt IDs are canonical nonzero UUIDs or the
@@ -32,6 +32,14 @@ provider diagnostics. Native tools and typed SDK methods validate identity,
 state, timestamps, the 30-day attempt interval, page bounds and usage arithmetic.
 `provider_created_at + 30 days` is a deadline to attempt recovery, not a guarantee;
 an unknown origin omits both timestamp and deadline.
+
+A materialized recovery may include `attachment_retry_state`: `evaluated`
+means attachment retry eligibility was evaluated; `retry_later` means that
+independent attachment evaluation remains unavailable and needs an explicit
+later attempt. It does not change the durable body/message success. The
+optional `attachments_reopened` count remains independent, so a zero count
+alone never proves whether that evaluation completed. The retry-state field
+is rejected on pending/paused/expired recoveries, usage and receipt lists.
 
 Recovery has no automatic retry. A missing, interrupted or invalid successful
 response returns `inbound_outcome_unknown` with `retryable=true`; first read the

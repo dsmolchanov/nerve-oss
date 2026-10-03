@@ -204,3 +204,56 @@ func TestFreeReturnProvenanceIsClosedPairedAndActiveOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestFreeSetupNativeInvalidSuccessIsUnknownForEveryMutation(t *testing.T) {
+	for _, operation := range []struct{ name, input string }{
+		{"nerve_free_setup", `{"idempotency_key":"free","organization_name":"Free","apex_domain":"example.com","local_part":"agent"}`},
+		{"nerve_free_status", `{}`},
+		{"nerve_free_verify_domain", `{}`},
+		{"nerve_free_close", `{"idempotency_key":"close","expected_generation":7}`},
+		{"nerve_free_resume", `{"idempotency_key":"resume-one"}`},
+	} {
+		for _, defect := range []string{"wrong-generation", "invalid-entry"} {
+			t.Run(operation.name+"/"+defect, func(t *testing.T) {
+				result := freeTestResult()
+				if operation.name == "nerve_free_resume" {
+					result = freeResumeTestResult()
+				}
+				if defect == "wrong-generation" {
+					result.Generation++
+				} else {
+					result.SetupID = "private-invalid-identity"
+				}
+				p := &recordingFreeProvisioner{result: result}
+				got, err := invokeFreeSetupTool(context.Background(), p, freeTestCaller(), operation.name, json.RawMessage(operation.input))
+				mutation := operation.name != "nerve_free_status"
+				if p.calls != 1 || got.SetupID != "" || errors.Is(err, ErrOnboardingOutcomeUnknown) != mutation {
+					t.Fatalf("calls=%d result=%+v err=%v", p.calls, got, err)
+				}
+				if !mutation {
+					var business *OnboardingBusinessError
+					if !errors.As(err, &business) || business.Code != OnboardingErrorTemporarilyUnavailable || !business.Retryable {
+						t.Fatalf("read-only diagnostic: %v", err)
+					}
+				}
+				cfg := hostedRouterConfig()
+				runtime := NewServer(cfg, nil, auth.NewService(cfg, nil), nil)
+				runtime.FreeSetup = p
+				runtime.Onboarding = &recordingOnboardingProvisioner{}
+				var args map[string]any
+				if err := json.Unmarshal([]byte(operation.input), &args); err != nil {
+					t.Fatal(err)
+				}
+				recorder := httptest.NewRecorder()
+				NewSDKHandler(runtime, true).ServeHTTP(recorder, onboardingModernRequest(t, freeTestCaller().Principal, "tools/call", map[string]any{"_meta": modernOAuthMeta(), "name": operation.name, "arguments": args}, operation.name))
+				code := OnboardingErrorOutcomeUnknown
+				if !mutation {
+					code = OnboardingErrorTemporarilyUnavailable
+				}
+				if p.calls != 2 || !strings.Contains(recorder.Body.String(), `"code":"`+code+`"`) || !strings.Contains(recorder.Body.String(), `"retryable":true`) || strings.Contains(recorder.Body.String(), "private-invalid-identity") {
+					t.Fatalf("native response calls=%d: %s", p.calls, recorder.Body.String())
+				}
+			})
+		}
+	}
+}

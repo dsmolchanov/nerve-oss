@@ -110,6 +110,7 @@ func inboundOutputSchema(op string) map[string]any {
 		for _, k := range []string{"receipt_id", "state", "reason", "message_id", "provider_created_at", "recovery_attempt_deadline"} {
 			props[k] = boundedStringProperty(0, 66)
 		}
+		props["attachment_retry_state"] = map[string]any{"type": "string", "enum": []string{"evaluated", "retry_later"}}
 		props["attachments_reopened"] = map[string]any{"type": "integer", "minimum": 0, "maximum": 100}
 		return outputObject(props, "receipt_id", "state")
 	}
@@ -164,12 +165,21 @@ func invokeInboundTool(ctx context.Context, p InboundProvisioner, c InboundCalle
 	return ValidateInboundResult(op, i, result)
 }
 
+// An invalid success is not proof that a requested recovery did not commit.
+// Reads can be repeated; a recovery must first be reconciled from its receipt.
+func inboundInvalidResult(operation string) error {
+	if operation == "recover" {
+		return &InboundBusinessError{Code: "inbound_outcome_unknown", Retryable: true}
+	}
+	return inboundUnavailable()
+}
+
 // ValidateInboundResult prevents provider IDs, bodies, sender/recipient metadata,
 // impossible counters and wrong receipt identities crossing the MCP boundary.
 func ValidateInboundResult(op string, i InboundInput, raw []byte) (map[string]any, error) {
 	d, e := inboundObject(raw)
 	if e != nil || !ValidInboundInput(op, i) {
-		return nil, inboundUnavailable()
+		return nil, inboundInvalidResult(op)
 	}
 	bad := false
 	switch op {
@@ -224,7 +234,10 @@ func ValidateInboundResult(op string, i InboundInput, raw []byte) (map[string]an
 			bad = bad || !ok || !OpaqueInboundID(s) || len(items) == 0 || s == i.Cursor
 		}
 	case "recover":
-		bad = !inboundKeys(d, "receipt_id state reason message_id attachments_reopened provider_created_at recovery_attempt_deadline") || d["receipt_id"] != i.ReceiptID || !validInboundState(d, false) || !validInboundDeadline(d)
+		bad = !inboundKeys(d, "receipt_id state reason message_id attachments_reopened attachment_retry_state provider_created_at recovery_attempt_deadline") || d["receipt_id"] != i.ReceiptID || !validInboundState(d, false) || !validInboundDeadline(d)
+		if v, ok := d["attachment_retry_state"]; ok {
+			bad = bad || d["state"] != "materialized" || (v != "evaluated" && v != "retry_later")
+		}
 		if v, ok := d["attachments_reopened"]; ok {
 			n, valid := inboundInteger(v)
 			bad = bad || !valid || n > 100 || (d["state"] != "materialized" && n != 0)
@@ -233,7 +246,7 @@ func ValidateInboundResult(op string, i InboundInput, raw []byte) (map[string]an
 		bad = true
 	}
 	if bad {
-		return nil, inboundUnavailable()
+		return nil, inboundInvalidResult(op)
 	}
 	return d, nil
 }
