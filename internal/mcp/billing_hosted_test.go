@@ -241,3 +241,80 @@ func TestHostedStatusNativeAndDescriptorRequireConsistentPaidTier(t *testing.T) 
 		t.Fatalf("descriptor omitted paid tier %s", descriptor)
 	}
 }
+
+func TestHostedStatusTierChangePreservesCurrentPaidAuthority(t *testing.T) {
+	states := []string{"awaiting_owner", "attempt_prepared", "provider_unknown", "pending_payment", "operator_review", "applied", "terminal"}
+	for _, offer := range []struct{ id, tier string }{{"growth_2026_09_v2", "growth"}, {"scale_2026_09_v2", "scale"}} {
+		for _, state := range states {
+			for _, tier := range []string{"", "starter", "growth", "scale"} {
+				t.Run(offer.tier+"/"+state+"/"+tier, func(t *testing.T) {
+					result := BillingStatusResult{ResultType: "complete", HostedState: "active", ActiveTier: tier, StarterActive: tier == "starter", TierChangeState: state, TierChangeOfferID: offer.id}
+					valid := tier == "" || tier == "starter"
+					if state == "applied" {
+						valid = tier == "" || tier == offer.tier
+					}
+					if state == "terminal" {
+						valid = true
+					}
+					stub := &hostedStatusResultStub{statusResult: result}
+					got, err := invokeBillingStatusTool(context.Background(), stub, BillingCaller{Principal: activeBillingPrincipal("nerve:billing.subscribe")}, json.RawMessage(`{}`))
+					if (err == nil) != valid || stub.calls != 1 {
+						t.Fatalf("got=%+v err=%v expectedValid=%v", got, err, valid)
+					}
+					if valid && got != result {
+						t.Fatalf("status replaced paid authority: %+v", got)
+					}
+				})
+			}
+		}
+	}
+	for _, pair := range []struct{ state, offer string }{{"pending_payment", ""}, {"", "growth_2026_09_v2"}, {"unknown", "growth_2026_09_v2"}, {"pending_payment", "starter_2026_09_v2"}, {"pending_payment", "scale"}} {
+		result := BillingStatusResult{ResultType: "complete", HostedState: "active", ActiveTier: "starter", StarterActive: true, TierChangeState: pair.state, TierChangeOfferID: pair.offer}
+		if ValidHostedBillingStatus(result) {
+			t.Fatalf("accepted incomplete or unknown pair: %+v", result)
+		}
+	}
+	body, _ := json.Marshal(BillingStatusResult{ResultType: "complete", HostedState: "none"})
+	if strings.Contains(string(body), "tier_change_") {
+		t.Fatalf("missing decision emitted fields: %s", body)
+	}
+	descriptor, _ := json.Marshal(billingStatusToolDescriptor())
+	for _, field := range []string{"tier_change_state", "tier_change_offer_id", "dependentRequired"} {
+		if !strings.Contains(string(descriptor), field) {
+			t.Fatalf("schema missing field %s", field)
+		}
+	}
+}
+
+func TestHostedStatusTierChangeNativeOutputRemainsScopedRead(t *testing.T) {
+	for _, tc := range []struct {
+		state, offer, tier string
+		valid              bool
+	}{
+		{"pending_payment", "growth_2026_09_v2", "starter", true},
+		{"operator_review", "scale_2026_09_v2", "", true},
+		{"applied", "scale_2026_09_v2", "scale", true},
+		{"pending_payment", "growth_2026_09_v2", "growth", false},
+		{"applied", "scale_2026_09_v2", "growth", false},
+	} {
+		t.Run(tc.state+"/"+tc.tier, func(t *testing.T) {
+			cfg := hostedRouterConfig()
+			runtime := NewServer(cfg, nil, auth.NewService(cfg, nil), nil)
+			gate := &fakeEntitlementGate{preAuthErr: entitlements.ErrQuotaExceeded}
+			runtime.Entitlements = gate
+			stub := &hostedStatusResultStub{statusResult: BillingStatusResult{ResultType: "complete", HostedState: "active", StarterActive: tc.tier == "starter", ActiveTier: tc.tier, TierChangeState: tc.state, TierChangeOfferID: tc.offer}}
+			runtime.HostedBilling = stub
+			principal := activeBillingPrincipal("nerve:billing.subscribe")
+			request := billingModernRequest(t, principal, "tools/call", map[string]any{"_meta": modernOAuthMeta(), "name": billingStatusToolName, "arguments": map[string]any{}}, billingStatusToolName)
+			recorder := httptest.NewRecorder()
+			NewSDKHandler(runtime, true).ServeHTTP(recorder, request)
+			body := recorder.Body.String()
+			if stub.calls != 1 || gate.preAuthCalls != 0 || strings.Contains(body, `"isError":true`) == tc.valid {
+				t.Fatalf("calls=%d quota=%d response=%s", stub.calls, gate.preAuthCalls, body)
+			}
+			if tc.valid && (!strings.Contains(body, `"tier_change_state":"`+tc.state+`"`) || !strings.Contains(body, `"active_tier":"`+tc.tier+`"`)) {
+				t.Fatalf("scoped read lost status: %s", body)
+			}
+		})
+	}
+}

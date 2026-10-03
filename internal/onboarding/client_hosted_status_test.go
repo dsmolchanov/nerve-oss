@@ -100,3 +100,55 @@ func TestHostedStatusDecodesOnlyConsistentPaidTier(t *testing.T) {
 		}
 	}
 }
+
+func TestClientHostedStatusTierChangeOptionalPairIsClosed(t *testing.T) {
+	base := `"resultType":"complete","hosted_state":"active","starter_active":true,"active_tier":"starter"`
+	for _, tc := range []struct {
+		name, fields string
+		valid        bool
+	}{
+		{"absent", "", true},
+		{"pending-growth", `,"tier_change_state":"pending_payment","tier_change_offer_id":"growth_2026_09_v2"`, true},
+		{"review-scale", `,"tier_change_state":"operator_review","tier_change_offer_id":"scale_2026_09_v2"`, true},
+		{"state-only", `,"tier_change_state":"pending_payment"`, false},
+		{"offer-only", `,"tier_change_offer_id":"growth_2026_09_v2"`, false},
+		{"empty-pair", `,"tier_change_state":"","tier_change_offer_id":""`, false},
+		{"empty-state", `,"tier_change_state":"","tier_change_offer_id":"growth_2026_09_v2"`, false},
+		{"null-state", `,"tier_change_state":null,"tier_change_offer_id":"growth_2026_09_v2"`, false},
+		{"null-offer", `,"tier_change_state":"pending_payment","tier_change_offer_id":null`, false},
+		{"unknown-state", `,"tier_change_state":"unknown","tier_change_offer_id":"growth_2026_09_v2"`, false},
+		{"unknown-offer", `,"tier_change_state":"pending_payment","tier_change_offer_id":"starter_2026_09_v2"`, false},
+		{"mismatched-key", `,"tier_change_state":"pending_payment","tier_change_offer":"growth_2026_09_v2"`, false},
+		{"duplicate", `,"tier_change_state":"pending_payment","Tier_Change_State":"applied","tier_change_offer_id":"growth_2026_09_v2"`, false},
+		{"private-id", `,"tier_change_state":"pending_payment","tier_change_offer_id":"growth_2026_09_v2","change_intent_id":"private"`, false},
+		{"applied-starter", `,"tier_change_state":"applied","tier_change_offer_id":"growth_2026_09_v2"`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"result":{` + base + tc.fields + `}}`
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "application/json")
+				io.WriteString(w, body)
+			}))
+			defer server.Close()
+			client := newTestClient(t, server.URL, server.Client(), time.Now())
+			result, err := client.BillingStatus(context.Background(), testBillingCaller())
+			if (err == nil) != tc.valid || calls != 1 {
+				t.Fatalf("result=%+v err=%v calls=%d", result, err, calls)
+			}
+			if tc.valid && (result.ActiveTier != "starter" || !result.StarterActive) {
+				t.Fatalf("pending decision changed current tier: %+v", result)
+			}
+		})
+	}
+	for _, offer := range []struct{ id, tier string }{{"growth_2026_09_v2", "growth"}, {"scale_2026_09_v2", "scale"}} {
+		for _, tier := range []string{"", "starter", "growth", "scale"} {
+			body, _ := json.Marshal(map[string]any{"result": map[string]any{"resultType": "complete", "hosted_state": "active", "starter_active": tier == "starter", "active_tier": tier, "tier_change_state": "applied", "tier_change_offer_id": offer.id}})
+			result, _, err := decodeHostedStatusResponse(body)
+			if (err == nil) != (tier == "" || tier == offer.tier) {
+				t.Fatalf("applied offer=%s tier=%s result=%+v err=%v", offer.id, tier, result, err)
+			}
+		}
+	}
+}

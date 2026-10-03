@@ -27,14 +27,16 @@ type HostedBillingProvisioner interface {
 }
 
 type BillingStatusResult struct {
-	ResultType    string `json:"resultType"`
-	HostedState   string `json:"hosted_state"`
-	StarterActive bool   `json:"starter_active"`
-	ActiveTier    string `json:"active_tier"`
+	ResultType        string `json:"resultType"`
+	HostedState       string `json:"hosted_state"`
+	StarterActive     bool   `json:"starter_active"`
+	ActiveTier        string `json:"active_tier"`
+	TierChangeState   string `json:"tier_change_state,omitempty"`
+	TierChangeOfferID string `json:"tier_change_offer_id,omitempty"`
 }
 
 func billingStatusToolDescriptor() toolDescriptor {
-	return toolDescriptor{
+	descriptor := toolDescriptor{
 		Name:        billingStatusToolName,
 		Description: "Read the authenticated organization's durable hosted paid tier billing state",
 		InputSchema: inputObject(map[string]any{}),
@@ -44,11 +46,18 @@ func billingStatusToolDescriptor() toolDescriptor {
 				"none", "awaiting_owner", "session_prepared", "session_open", "provider_unknown",
 				"quarantined", "active", "cleanup_required", "terminal",
 			}},
-			"starter_active": map[string]any{"type": "boolean"},
-			"active_tier":    map[string]any{"type": "string", "enum": []string{"", "starter", "growth", "scale"}},
+			"starter_active":       map[string]any{"type": "boolean"},
+			"active_tier":          map[string]any{"type": "string", "enum": []string{"", "starter", "growth", "scale"}},
+			"tier_change_state":    map[string]any{"type": "string", "enum": []string{"awaiting_owner", "attempt_prepared", "provider_unknown", "pending_payment", "operator_review", "applied", "terminal"}},
+			"tier_change_offer_id": map[string]any{"type": "string", "enum": []string{"growth_2026_09_v2", "scale_2026_09_v2"}},
 		}, "resultType", "hosted_state", "starter_active", "active_tier"),
 		ErrorCodes: billingBusinessErrorCodes(),
 	}
+	descriptor.OutputShape["dependentRequired"] = map[string]any{
+		"tier_change_state":    []string{"tier_change_offer_id"},
+		"tier_change_offer_id": []string{"tier_change_state"},
+	}
+	return descriptor
 }
 
 func billingStatusToolAvailable(server *Server, principal auth.Principal) bool {
@@ -89,6 +98,30 @@ func ValidHostedBillingStatus(result BillingStatusResult) bool {
 	case "", "starter", "growth", "scale":
 	default:
 		return false
+	}
+	if result.TierChangeState != "" || result.TierChangeOfferID != "" {
+		targetTier := ""
+		switch result.TierChangeOfferID {
+		case "growth_2026_09_v2":
+			targetTier = "growth"
+		case "scale_2026_09_v2":
+			targetTier = "scale"
+		default:
+			return false
+		}
+		switch result.TierChangeState {
+		case "awaiting_owner", "attempt_prepared", "provider_unknown", "pending_payment", "operator_review":
+			if result.ActiveTier != "" && result.ActiveTier != "starter" {
+				return false
+			}
+		case "applied":
+			if result.ActiveTier != "" && result.ActiveTier != targetTier {
+				return false
+			}
+		case "terminal": // Failed change does not replace independently proven paid access.
+		default:
+			return false
+		}
 	}
 	return result.StarterActive == (result.ActiveTier == "starter") && (result.ActiveTier == "" || result.HostedState == "active")
 }

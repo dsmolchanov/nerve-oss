@@ -79,7 +79,8 @@
     "scripts/ci/test_mcp_conformance_paths.sh",
     "scripts/ci/test_mcp_conformance.sh",
     "scripts/release/prove_candidate_version_unused.sh",
-    "docs/MCP_Contract.md"
+    "docs/MCP_Contract.md",
+    "docs/HOSTED_BILLING_STATUS.md"
   ],
   "patch-synced": [],
   "cloud-only": [
