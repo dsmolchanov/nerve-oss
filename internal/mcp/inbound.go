@@ -158,6 +158,9 @@ func invokeInboundTool(ctx context.Context, p InboundProvisioner, c InboundCalle
 	if e != nil {
 		var public *InboundBusinessError
 		if errors.As(e, &public) && ValidInboundError(public) {
+			if op != "recover" && (strings.HasPrefix(public.Code, "recovery_") || public.Code == "inbound_outcome_unknown") {
+				return nil, inboundUnavailable()
+			}
 			return nil, public
 		}
 		return nil, inboundUnavailable()

@@ -93,13 +93,22 @@ func (client *Client) Inbound(ctx context.Context, caller mcp.InboundCaller, ope
 				case "inbound_unavailable":
 					return nil, &mcp.InboundBusinessError{Code: code}
 				case "recovery_in_progress_or_changed":
+					if operation != "recover" {
+						return unavailable()
+					}
 					return nil, &mcp.InboundBusinessError{Code: code, Retryable: true}
 				case "recovery_response_exceeds_limit":
+					if operation != "recover" {
+						return unavailable()
+					}
 					return nil, &mcp.InboundBusinessError{Code: code}
 				}
 			}
 		}
 	case http.StatusBadGateway:
+		if operation != "recover" {
+			return unavailable()
+		}
 		return nil, &mcp.InboundBusinessError{Code: "recovery_provider_or_save_unavailable", Retryable: true}
 	}
 	return unknown()
