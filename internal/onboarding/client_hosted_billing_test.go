@@ -84,3 +84,11 @@ func TestClientHostedUpgradeRejectsMalformedProviderEnvelope(t *testing.T) {
 		})
 	}
 }
+
+func TestHostedUpgradeDecoderPreservesOwnerlessState(t *testing.T) {
+	body := []byte(`{"result":{"resultType":"complete","state":"needs_owner","offer_id":"starter_2026_09_v2","upgrade_url":"https://nerve.example/billing/pairing?pairing_id=11111111-1111-4111-8111-111111111111"}}`)
+	result, err := decodeHostedUpgradeResponse(body)
+	if err != nil || result.Result == nil || result.Result.State != "needs_owner" {
+		t.Fatalf("ownerless result: %+v %v", result, err)
+	}
+}

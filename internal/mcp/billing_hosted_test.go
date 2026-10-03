@@ -248,3 +248,23 @@ func (stub *recordingHostedBilling) ConfirmBillingPairing(_ context.Context, cal
 	stub.calls++
 	return BillingPairingConfirmResult{ResultType: "complete", State: "completed", OfferID: starterOfferID, UpgradeURL: "https://nerve.example/billing/pairing?pairing_id=" + input.PairingID}, stub.err
 }
+
+func TestOwnerlessUpgradePinsOnlyOpaquePairingURL(t *testing.T) {
+	const origin = "https://nerve.example"
+	const id = "11111111-1111-4111-8111-111111111111"
+	good := BillingUpgradeResult{ResultType: "complete", State: "needs_owner", OfferID: starterOfferID, UpgradeURL: origin + "/billing/pairing?pairing_id=" + id}
+	if err := validateBillingUpgradeResult(good, origin); err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{origin + "/billing/upgrade?intent=" + id, origin + "/billing/pairing?pairing_id=" + id + "&org_id=" + id, origin + "/billing/pairing?pairing_id=" + id + "&pairing_id=" + id, "https://foreign.example/billing/pairing?pairing_id=" + id, origin + "/billing/pairing?pairing_id=00000000-0000-0000-0000-000000000000"} {
+		changed := good
+		changed.UpgradeURL = target
+		if err := validateBillingUpgradeResult(changed, origin); err == nil {
+			t.Fatalf("unsafe pairing URL accepted: %s", target)
+		}
+	}
+	good.State = "awaiting_owner"
+	if err := validateBillingUpgradeResult(good, origin); err == nil {
+		t.Fatal("owner-bound upgrade accepted a pairing URL")
+	}
+}

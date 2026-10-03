@@ -160,7 +160,7 @@ func hostedUpgradeUnavailable() error {
 
 func validHostedUpgradeState(state string) bool {
 	switch state {
-	case "awaiting_owner", "session_prepared", "session_open", "provider_unknown":
+	case "needs_owner", "awaiting_owner", "session_prepared", "session_open", "provider_unknown":
 		return true
 	default:
 		return false
