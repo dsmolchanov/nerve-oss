@@ -93,15 +93,17 @@ func decodeHostedStatusResponse(body []byte) (*mcp.BillingStatusResult, *mcp.Bil
 	}
 	var wire struct {
 		Result *struct {
-			ResultType    *string `json:"resultType"`
-			HostedState   *string `json:"hosted_state"`
-			StarterActive *bool   `json:"starter_active"`
-			ActiveTier    *string `json:"active_tier"`
+			ResultType        *string `json:"resultType"`
+			HostedState       *string `json:"hosted_state"`
+			StarterActive     *bool   `json:"starter_active"`
+			ActiveTier        *string `json:"active_tier"`
+			TierChangeState   *string `json:"tier_change_state"`
+			TierChangeOfferID *string `json:"tier_change_offer_id"`
 		} `json:"result"`
 		Error *billingErrorWire `json:"error"`
 	}
 	if raw, ok := top["result"]; ok {
-		if _, err := decodeExactJSONObject(raw, "hosted status result", "resultType", "hosted_state", "starter_active", "active_tier"); err != nil {
+		if _, err := decodeExactJSONObject(raw, "hosted status result", "resultType", "hosted_state", "starter_active", "active_tier", "tier_change_state", "tier_change_offer_id"); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -128,6 +130,12 @@ func decodeHostedStatusResponse(body []byte) (*mcp.BillingStatusResult, *mcp.Bil
 		}
 		result = &mcp.BillingStatusResult{ResultType: *wire.Result.ResultType,
 			HostedState: *wire.Result.HostedState, StarterActive: *wire.Result.StarterActive, ActiveTier: *wire.Result.ActiveTier}
+		if wire.Result.TierChangeState != nil || wire.Result.TierChangeOfferID != nil {
+			if wire.Result.TierChangeState == nil || wire.Result.TierChangeOfferID == nil || *wire.Result.TierChangeState == "" || *wire.Result.TierChangeOfferID == "" {
+				return nil, nil, errors.New("incomplete hosted tier change status")
+			}
+			result.TierChangeState, result.TierChangeOfferID = *wire.Result.TierChangeState, *wire.Result.TierChangeOfferID
+		}
 		if !mcp.ValidHostedBillingStatus(*result) {
 			return nil, nil, errors.New("contradictory hosted paid tier status")
 		}
