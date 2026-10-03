@@ -312,6 +312,11 @@ func newSDKServer(requestContext context.Context, runtime *Server) *sdkmcp.Serve
 				result, err = invokeOnboardingTool(ctx, runtime.Onboarding, OnboardingCaller{
 					Principal: principal, Authorization: onboardingAuthorizationFromContext(requestContext),
 				}, request.Params.Name, request.Params.Arguments)
+			} else if inboundToolOperation(request.Params.Name) != "" {
+				if _, restricted := localauth.FromContext(ctx); restricted {
+					return nil, nil, localauth.ErrForbidden
+				}
+				result, err = invokeInboundTool(ctx, runtime.Inbound, InboundCaller{Principal: principal, Authorization: billingAuthorizationFromContext(requestContext)}, request.Params.Name, request.Params.Arguments)
 			} else if request.Params.Name == billingSubscribeToolName {
 				if _, restricted := localauth.FromContext(ctx); restricted {
 					return nil, nil, localauth.ErrForbidden

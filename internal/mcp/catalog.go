@@ -88,6 +88,9 @@ func modernToolDescriptors(ctx context.Context, server *Server, principal auth.P
 	if billingStatusToolAvailable(server, principal) {
 		tools = append(tools, billingStatusToolDescriptor())
 	}
+	if inboundToolsAvailable(server, principal) {
+		tools = append(tools, inboundToolDescriptors()...)
+	}
 	return tools
 }
 
