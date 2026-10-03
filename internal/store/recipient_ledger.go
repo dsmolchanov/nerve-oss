@@ -169,7 +169,11 @@ func (s *Store) IncreaseRecipientPeriodLimit(ctx context.Context, orgID, periodI
 	if err != nil {
 		return err
 	}
-	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
 		return ErrRecipientLedgerConflict
 	}
 	return nil
