@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -378,6 +379,360 @@ func TestOutboundLimitConstantsMatchVersionedPolicy(t *testing.T) {
 		int64(document.Abuse.HardBounceSuspension.RateGTE*10_000) != limitHardBounceBasisPoints {
 		t.Fatalf("compiled limits drifted from autonomous-outbound-v1.yaml: compose=%#v abuse=%#v", document.ComposeProfiles, document.Abuse)
 	}
+}
+
+func TestOutboundV2TierAndWarmupCapsUseUTCDays(t *testing.T) {
+	first := time.Date(2026, time.March, 28, 23, 30, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name string
+		tier string
+		days int
+		want outboundDailyCaps
+	}{
+		{"starter first", "starter", 0, outboundDailyCaps{100, 25}},
+		{"starter after warmup", "starter", 7, outboundDailyCaps{100, 25}},
+		{"growth day three", "growth", 2, outboundDailyCaps{100, 25}},
+		{"growth day four across Madrid DST", "growth", 3, outboundDailyCaps{500, 125}},
+		{"scale day seven", "scale", 6, outboundDailyCaps{500, 125}},
+		{"scale day eight", "scale", 7, outboundDailyCaps{1500, 375}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := first.Truncate(24 * time.Hour).Add(time.Duration(test.days)*24*time.Hour + time.Minute)
+			got, err := effectiveOutboundV2Caps(test.tier, first, now)
+			if err != nil || got != test.want {
+				t.Fatalf("tier=%s day=%d caps=%+v err=%v, want %+v", test.tier, test.days, got, err, test.want)
+			}
+		})
+	}
+	for _, test := range []struct {
+		tier       string
+		first, now time.Time
+	}{
+		{"legacy", first, first},
+		{"growth", first.Add(24 * time.Hour), first},
+	} {
+		if _, err := effectiveOutboundV2Caps(test.tier, test.first, test.now); !errors.Is(err, ErrOutboundPolicyVersionUnavailable) {
+			t.Fatalf("unsafe policy tier=%s first=%s now=%s: %v", test.tier, test.first, test.now, err)
+		}
+	}
+}
+
+func TestOutboundV2CompiledCapsMatchVersionedPolicy(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "configs", "policy", "autonomous-outbound-v2.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Version    string `yaml:"version"`
+		Activation struct {
+			EntitlementFeature      string `yaml:"entitlement_feature"`
+			RequiresRecipientPeriod bool   `yaml:"requires_recipient_period"`
+			UnmarkedEntitlement     string `yaml:"unmarked_entitlement"`
+		} `yaml:"activation"`
+		ComposeProfiles struct {
+			ReplyOnly struct {
+				Replies      int64 `yaml:"accepted_replies_per_utc_day"`
+				PerRecipient int64 `yaml:"accepted_replies_per_recipient_hash_per_utc_day"`
+			} `yaml:"reply_only"`
+			Compose struct {
+				TierLimits map[string]struct {
+					Sends int64 `yaml:"accepted_sends_per_utc_day"`
+					First int64 `yaml:"first_time_recipients_per_utc_day"`
+				} `yaml:"tier_limits"`
+				Warmup struct {
+					FirstThree struct {
+						Sends int64 `yaml:"accepted_sends_per_utc_day"`
+						First int64 `yaml:"first_time_recipients_per_utc_day"`
+					} `yaml:"first_three_utc_days"`
+					FourThroughSeven struct {
+						Sends int64 `yaml:"accepted_sends_per_utc_day"`
+						First int64 `yaml:"first_time_recipients_per_utc_day"`
+					} `yaml:"utc_days_four_through_seven"`
+				} `yaml:"warmup"`
+			} `yaml:"compose"`
+		} `yaml:"compose_profiles"`
+	}
+	if err := yaml.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	if document.Version != outboundPolicyV2 {
+		t.Fatalf("policy version=%q", document.Version)
+	}
+	if document.Activation.EntitlementFeature != "outbound_policy_version" ||
+		!document.Activation.RequiresRecipientPeriod ||
+		document.Activation.UnmarkedEntitlement != "autonomous-outbound-v1" {
+		t.Fatalf("unsafe v2 activation contract: %+v", document.Activation)
+	}
+	if document.ComposeProfiles.ReplyOnly.Replies != limitReplyPerDay ||
+		document.ComposeProfiles.ReplyOnly.PerRecipient != limitReplyPerRecipientDay {
+		t.Fatalf("v2 reply-only limits changed: %+v", document.ComposeProfiles.ReplyOnly)
+	}
+	for tier, want := range map[string]outboundDailyCaps{
+		"starter": {100, 25}, "growth": {500, 125}, "scale": {1500, 375},
+	} {
+		configured, ok := document.ComposeProfiles.Compose.TierLimits[tier]
+		if !ok || (outboundDailyCaps{configured.Sends, configured.First}) != want {
+			t.Fatalf("tier %q configured=%+v, want %+v", tier, configured, want)
+		}
+	}
+	if len(document.ComposeProfiles.Compose.TierLimits) != 3 ||
+		(outboundDailyCaps{document.ComposeProfiles.Compose.Warmup.FirstThree.Sends,
+			document.ComposeProfiles.Compose.Warmup.FirstThree.First}) != (outboundDailyCaps{100, 25}) ||
+		(outboundDailyCaps{document.ComposeProfiles.Compose.Warmup.FourThroughSeven.Sends,
+			document.ComposeProfiles.Compose.Warmup.FourThroughSeven.First}) != (outboundDailyCaps{500, 125}) {
+		t.Fatalf("v2 warmup policy drifted from compiled caps: %+v", document.ComposeProfiles.Compose)
+	}
+}
+
+func TestOutboundV2RequiresExplicitEntitlementAndPreservesWarmupHistory(t *testing.T) {
+	withOutboundLimitStore(t, func(ctx context.Context, st *Store, orgID, inboxID string) {
+		now := time.Now().UTC()
+		if _, err := st.q.ExecContext(ctx, `INSERT INTO org_entitlements
+  (org_id,plan_code,subscription_status,mcp_rpm,monthly_units,max_inboxes,max_domains,
+   features,usage_period_start,usage_period_end)
+  VALUES ($1,'scale','active',500,0,0,250,'{}',$2,$3)`, orgID,
+			now.Add(-time.Hour), now.Add(30*24*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		readCaps := func() (outboundDailyCaps, error) {
+			var got outboundDailyCaps
+			err := st.RunInTx(ctx, func(tx *Store) error {
+				if err := tx.LockOrgPolicy(ctx, orgID); err != nil {
+					return err
+				}
+				clock, err := tx.readOutboundLimitClock(ctx)
+				if err != nil {
+					return err
+				}
+				got, _, err = tx.outboundComposeCaps(ctx, orgID, clock)
+				return err
+			})
+			return got, err
+		}
+		if got, err := readCaps(); err != nil || got != (outboundDailyCaps{100, 25}) {
+			t.Fatalf("legacy Scale acquired v2 caps: %+v, %v", got, err)
+		}
+		if _, err := st.q.ExecContext(ctx, `UPDATE org_entitlements SET
+  features='{"outbound_policy_version":"autonomous-outbound-v2"}'::jsonb WHERE org_id=$1`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readCaps(); !errors.Is(err, ErrOutboundPolicyVersionUnavailable) {
+			t.Fatalf("v2 marker without monthly recipient ledger did not fail closed: %v", err)
+		}
+		if err := st.RunInTx(ctx, func(tx *Store) error {
+			return tx.InstallRecipientPeriod(ctx, RecipientPeriod{
+				OrgID: orgID, PeriodID: uuid.NewString(),
+				StartsAt: now.Add(-time.Hour), EndsAt: now.Add(30 * 24 * time.Hour),
+				Limit: sql.NullInt64{Int64: 30000, Valid: true},
+			})
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := readCaps(); err != nil || got != (outboundDailyCaps{100, 25}) {
+			t.Fatalf("new Scale skipped warmup: %+v, %v", got, err)
+		}
+		var stored sql.NullTime
+		if err := st.q.QueryRowContext(ctx, `SELECT first_compose_accepted_at
+  FROM org_outbound_policy_state WHERE org_id=$1`, orgID).Scan(&stored); err != nil || stored.Valid {
+			t.Fatalf("policy read started warmup without admission: %+v, %v", stored, err)
+		}
+		if err := st.RunInTx(ctx, func(tx *Store) error {
+			clock, err := tx.readOutboundLimitClock(ctx)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.q.ExecContext(ctx, `INSERT INTO usage_events
+  (org_id,meter_name,quantity,tool_name,status,created_at)
+  VALUES($1,$2,100,'compose_email','success',$3)`, orgID, meterOutboundSendDay, clock.acceptedAt); err != nil {
+				return err
+			}
+			if err := tx.EnsureOrgUsageCounter(ctx, orgID, meterOutboundSendDay, clock.dayStart, clock.dayEnd); err != nil {
+				return err
+			}
+			_, err = tx.q.ExecContext(ctx, `UPDATE org_usage_counters SET used=100
+  WHERE org_id=$1 AND meter_name=$2 AND period_start=$3`, orgID, meterOutboundSendDay, clock.dayStart)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.EnqueueOutboxMessage(ctx, outboundLimitMessage(orgID, inboxID,
+			"warmup-denied", "new@example.test", true)); err == nil {
+			t.Fatal("first-day Scale send bypassed 100-send warmup")
+		} else {
+			var limit *OutboundLimitError
+			if !errors.As(err, &limit) || limit.MeterName != meterOutboundSendDay {
+				t.Fatalf("first-day Scale denial=%v", err)
+			}
+		}
+		if err := st.q.QueryRowContext(ctx, `SELECT first_compose_accepted_at
+  FROM org_outbound_policy_state WHERE org_id=$1`, orgID).Scan(&stored); err != nil || stored.Valid {
+			t.Fatalf("denied compose started warmup: %+v, %v", stored, err)
+		}
+		historical := now.Add(-8 * 24 * time.Hour).Truncate(time.Microsecond)
+		if _, err := st.q.ExecContext(ctx, `INSERT INTO usage_events
+  (org_id,meter_name,quantity,tool_name,status,created_at)
+  VALUES ($1,$2,1,'compose_email','success',$3)`, orgID, meterOutboundSendDay,
+			historical); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := readCaps(); err != nil || got != (outboundDailyCaps{1500, 375}) {
+			t.Fatalf("historical compose did not restore Scale caps: %+v, %v", got, err)
+		}
+		if _, err := st.EnqueueOutboxMessage(ctx, outboundLimitMessage(orgID, inboxID,
+			"post-warmup", "new@example.test", true)); err != nil {
+			t.Fatalf("post-warmup Scale send: %v", err)
+		}
+		if err := st.q.QueryRowContext(ctx, `SELECT first_compose_accepted_at
+  FROM org_outbound_policy_state WHERE org_id=$1`, orgID).Scan(&stored); err != nil ||
+			!stored.Valid || !stored.Time.Equal(historical) {
+			t.Fatalf("accepted compose did not preserve historical origin: %+v, %v", stored, err)
+		}
+		if _, err := st.q.ExecContext(ctx, `UPDATE org_entitlements SET plan_code='growth' WHERE org_id=$1`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := readCaps(); err != nil || got != (outboundDailyCaps{500, 125}) {
+			t.Fatalf("tier change reset durable warmup history: %+v, %v", got, err)
+		}
+		if _, err := st.q.ExecContext(ctx, `UPDATE org_entitlements SET plan_code='unknown' WHERE org_id=$1`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readCaps(); !errors.Is(err, ErrOutboundPolicyVersionUnavailable) {
+			t.Fatalf("unknown v2 tier did not fail closed: %v", err)
+		}
+	})
+}
+
+func TestOutboundPolicyUsageReadDoesNotStartWarmupOrCreateBuckets(t *testing.T) {
+	withOutboundLimitStore(t, func(ctx context.Context, st *Store, orgID, inboxID string) {
+		now := time.Now().UTC()
+		if _, err := st.q.ExecContext(ctx, `INSERT INTO org_entitlements
+ (org_id,plan_code,subscription_status,mcp_rpm,monthly_units,max_inboxes,max_domains,
+ features,usage_period_start,usage_period_end)
+ VALUES($1,'scale','active',500,0,0,250,'{"outbound_policy_version":"autonomous-outbound-v2"}',$2,$3)`,
+			orgID, now.Add(-time.Hour), now.Add(30*24*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.RunInTx(ctx, func(tx *Store) error {
+			return tx.InstallRecipientPeriod(ctx, RecipientPeriod{OrgID: orgID, PeriodID: uuid.NewString(),
+				StartsAt: now.Add(-time.Hour), EndsAt: now.Add(30 * 24 * time.Hour), Limit: sql.NullInt64{Int64: 30000, Valid: true}})
+		}); err != nil {
+			t.Fatal(err)
+		}
+		read := func() OutboundPolicyUsage {
+			var got OutboundPolicyUsage
+			if err := st.RunInTx(ctx, func(tx *Store) error { var err error; got, err = tx.ReadOutboundPolicyUsage(ctx, orgID); return err }); err != nil {
+				t.Fatal(err)
+			}
+			return got
+		}
+		for replay := 0; replay < 2; replay++ {
+			got := read()
+			if got.Version != outboundPolicyV2 || got.ComposeSendLimit != 100 || got.FirstRecipientLimit != 25 ||
+				got.ComposeSendUsed != 0 || got.ComposeSendRemaining != 100 || got.WarmupStartedAt != nil || got.NextCapChangeAt != nil {
+				t.Fatalf("prospective Scale status fabricated warmup or usage: %+v", got)
+			}
+		}
+		var buckets int
+		var origin sql.NullTime
+		if err := st.q.QueryRowContext(ctx, `SELECT count(*) FROM org_usage_counters WHERE org_id=$1`, orgID).Scan(&buckets); err != nil || buckets != 0 {
+			t.Fatalf("read created buckets: %d %v", buckets, err)
+		}
+		if err := st.q.QueryRowContext(ctx, `SELECT first_compose_accepted_at FROM org_outbound_policy_state WHERE org_id=$1`, orgID).Scan(&origin); err != nil || origin.Valid {
+			t.Fatalf("read persisted warmup: %v %v", origin, err)
+		}
+		historical := now.Add(-8 * 24 * time.Hour).Truncate(time.Microsecond)
+		if _, err := st.q.ExecContext(ctx, `INSERT INTO usage_events(org_id,meter_name,quantity,tool_name,status,created_at)
+ VALUES($1,$2,1,'compose_email','success',$3)`, orgID, meterOutboundSendDay, historical); err != nil {
+			t.Fatal(err)
+		}
+		got := read()
+		if got.ComposeSendLimit != 1500 || got.FirstRecipientLimit != 375 || got.WarmupStartedAt == nil ||
+			!got.WarmupStartedAt.Equal(historical) || got.NextCapChangeAt != nil {
+			t.Fatalf("historical warmup missing: %+v", got)
+		}
+		if _, err := st.EnqueueOutboxMessage(ctx, outboundLimitMessage(orgID, inboxID, "status-admission", "new@example.test", true)); err != nil {
+			t.Fatal(err)
+		}
+		got = read()
+		if got.ComposeSendUsed != 1 || got.ComposeSendRemaining != 1499 || got.FirstRecipientUsed != 1 || got.FirstRecipientRemaining != 374 {
+			t.Fatalf("status differs from admission: %+v", got)
+		}
+		if _, err := st.q.ExecContext(ctx, `UPDATE org_entitlements SET features='{}',plan_code='scale' WHERE org_id=$1`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		got = read()
+		if got.Version != "autonomous-outbound-v1" || got.ComposeSendLimit != 100 || got.WarmupStartedAt != nil {
+			t.Fatalf("legacy label inferred higher allowance: %+v", got)
+		}
+	})
+}
+
+func TestNextOutboundCapChangeUsesUTCDateAndTier(t *testing.T) {
+	first := time.Date(2026, 3, 28, 23, 45, 0, 0, time.FixedZone("east", 2*3600))
+	day := first.UTC().Truncate(24 * time.Hour)
+	for _, test := range []struct {
+		tier     string
+		days     int
+		nextDays int
+	}{
+		{"starter", 0, 0}, {"growth", 0, 3}, {"growth", 3, 0}, {"scale", 0, 3}, {"scale", 3, 7}, {"scale", 7, 0},
+	} {
+		got := nextOutboundCapChange(test.tier, first, day.Add(time.Duration(test.days)*24*time.Hour))
+		if test.nextDays == 0 {
+			if got != nil {
+				t.Fatalf("%+v: unexpected transition %v", test, got)
+			}
+			continue
+		}
+		want := day.Add(time.Duration(test.nextDays) * 24 * time.Hour)
+		if got == nil || !got.Equal(want) || got.Location() != time.UTC {
+			t.Fatalf("%+v: got %v want %v", test, got, want)
+		}
+	}
+}
+
+func TestCore32WarmupOriginMigrationAndRollbackGuard(t *testing.T) {
+	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
+		if err := MigrateUpToCore(ctx, db, 31); err != nil {
+			t.Fatal(err)
+		}
+		orgID := uuid.NewString()
+		historical := time.Now().UTC().Add(-8 * 24 * time.Hour).Truncate(time.Microsecond)
+		if _, err := db.ExecContext(ctx, `INSERT INTO orgs(id,name) VALUES($1,'warmup migration')`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO org_outbound_policy_state(org_id) VALUES($1)`, orgID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO usage_events
+  (org_id,meter_name,quantity,tool_name,status,created_at)
+  VALUES($1,$2,1,'compose_email','success',$3)`, orgID, meterOutboundSendDay, historical); err != nil {
+			t.Fatal(err)
+		}
+		if err := MigrateUpToCore(ctx, db, 32); err != nil {
+			t.Fatal(err)
+		}
+		var index sql.NullString
+		if err := db.QueryRowContext(ctx, `SELECT to_regclass('public.idx_usage_events_first_compose')::text`).Scan(&index); err != nil || !index.Valid {
+			t.Fatalf("bounded historical lookup index missing: %+v, %v", index, err)
+		}
+		st := &Store{db: db, q: db}
+		if err := st.RunInTx(ctx, func(tx *Store) error {
+			if err := tx.LockOrgPolicy(ctx, orgID); err != nil {
+				return err
+			}
+			origin, err := tx.outboundWarmupOrigin(ctx, orgID, time.Now().UTC())
+			if err != nil || !origin.Equal(historical) {
+				return fmt.Errorf("historical origin=%s, want %s: %v", origin, historical, err)
+			}
+			return tx.persistOutboundWarmupOrigin(ctx, orgID, origin)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := MigrateDownCore(ctx, db); err == nil || !strings.Contains(err.Error(), "warmup origin evidence exists") {
+			t.Fatalf("Core32 down discarded warmup history: %v", err)
+		}
+	})
 }
 
 func outboundLimitMessage(orgID, inboxID, key, recipient string, composeEnabled bool) OutboxMessage {
