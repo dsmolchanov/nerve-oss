@@ -24,19 +24,21 @@ type FreeSetupInput struct {
 }
 
 type FreeSetupResult struct {
-	ResultType     string                `json:"resultType"`
-	SetupID        string                `json:"setup_id"`
-	OnboardingID   string                `json:"onboarding_id"`
-	Generation     int64                 `json:"generation"`
-	ApexDomain     string                `json:"apex_domain"`
-	SetupState     string                `json:"setup_state"`
-	State          string                `json:"state"`
-	SetupExpiresAt time.Time             `json:"setup_expires_at"`
-	OwnershipTXT   OnboardingDNSRecord   `json:"ownership_txt"`
-	DNSRecords     []OnboardingDNSRecord `json:"dns_records,omitempty"`
-	NextAction     string                `json:"next_action"`
-	Reauthorize    bool                  `json:"reauthorize"`
-	Address        string                `json:"address,omitempty"`
+	ResultType           string                `json:"resultType"`
+	SetupID              string                `json:"setup_id"`
+	OnboardingID         string                `json:"onboarding_id"`
+	Generation           int64                 `json:"generation"`
+	ApexDomain           string                `json:"apex_domain"`
+	SetupState           string                `json:"setup_state"`
+	State                string                `json:"state"`
+	SetupExpiresAt       time.Time             `json:"setup_expires_at"`
+	OwnershipTXT         OnboardingDNSRecord   `json:"ownership_txt"`
+	DNSRecords           []OnboardingDNSRecord `json:"dns_records,omitempty"`
+	NextAction           string                `json:"next_action"`
+	Reauthorize          bool                  `json:"reauthorize"`
+	Address              string                `json:"address,omitempty"`
+	ReturnReceiptID      string                `json:"return_receipt_id,omitempty"`
+	ReturnIdempotencyKey string                `json:"return_idempotency_key,omitempty"`
 }
 
 func DecodeFreeSetupInput(operation string, generation int64, raw json.RawMessage) (json.RawMessage, error) {
@@ -71,6 +73,17 @@ func DecodeFreeSetupInput(operation string, generation int64, raw json.RawMessag
 			return nil, onboardingInvalidRequest()
 		}
 		return json.RawMessage(`{}`), nil
+	case "resume":
+		if len(doc) != 1 || !inboundKeys(doc, "idempotency_key") || generation < 1 {
+			return nil, onboardingInvalidRequest()
+		}
+		var input struct {
+			IdempotencyKey string `json:"idempotency_key"`
+		}
+		if json.Unmarshal(raw, &input) != nil || validateOnboardingIdempotencyKey(input.IdempotencyKey) != nil {
+			return nil, onboardingInvalidRequest()
+		}
+		return json.Marshal(input)
 	case "close":
 		if len(doc) != 2 || !inboundKeys(doc, "idempotency_key expected_generation") {
 			return nil, onboardingInvalidRequest()
@@ -89,7 +102,7 @@ func DecodeFreeSetupResult(raw []byte, generation int64) (FreeSetupResult, error
 		return FreeSetupResult{}, onboardingTemporarilyUnavailable()
 	}
 	doc, err := inboundObject(raw)
-	if err != nil || !inboundKeys(doc, "resultType setup_id onboarding_id generation apex_domain setup_state state setup_expires_at ownership_txt dns_records next_action reauthorize address") {
+	if err != nil || !inboundKeys(doc, "resultType setup_id onboarding_id generation apex_domain setup_state state setup_expires_at ownership_txt dns_records next_action reauthorize address return_receipt_id return_idempotency_key") {
 		return FreeSetupResult{}, onboardingTemporarilyUnavailable()
 	}
 	for _, key := range []string{"resultType", "setup_id", "onboarding_id", "generation", "apex_domain", "setup_state", "state", "setup_expires_at", "ownership_txt", "next_action", "reauthorize"} {
@@ -123,6 +136,14 @@ func DecodeFreeSetupResult(raw []byte, generation int64) (FreeSetupResult, error
 			}
 		}
 	}
+	for _, key := range []string{"return_receipt_id", "return_idempotency_key"} {
+		if value, present := doc[key]; present {
+			text, ok := value.(string)
+			if !ok || text == "" {
+				return FreeSetupResult{}, onboardingTemporarilyUnavailable()
+			}
+		}
+	}
 	var result FreeSetupResult
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
@@ -140,6 +161,12 @@ func ValidateFreeSetupResult(result FreeSetupResult, generation int64) error {
 		parsed, err := uuid.Parse(id)
 		if err != nil || parsed == uuid.Nil || parsed.String() != id {
 			return errors.New("invalid Free setup result identity")
+		}
+	}
+	if result.ReturnReceiptID != "" || result.ReturnIdempotencyKey != "" {
+		receipt, err := uuid.Parse(result.ReturnReceiptID)
+		if err != nil || receipt == uuid.Nil || receipt.String() != result.ReturnReceiptID || validateOnboardingIdempotencyKey(result.ReturnIdempotencyKey) != nil || result.State != "active" || result.SetupState != "proof_verified" {
+			return errors.New("invalid Free return provenance")
 		}
 	}
 	apex, err := domains.CanonicalizeFreeApex(result.ApexDomain)
@@ -227,6 +254,8 @@ func freeSetupToolOperation(name string) string {
 		return "verify-domain"
 	case "nerve_free_close":
 		return "close"
+	case "nerve_free_resume":
+		return "resume"
 	}
 	return ""
 }
@@ -235,10 +264,11 @@ func freeSetupToolsAvailable(s *Server, p auth.Principal) bool {
 }
 func freeSetupToolDescriptors() []toolDescriptor {
 	dns := outputObject(map[string]any{"type": map[string]any{"type": "string", "enum": []string{"TXT", "MX", "CNAME"}}, "name": boundedStringProperty(1, 253), "value": boundedStringProperty(1, 1024), "priority": map[string]any{"type": "integer", "minimum": 0, "maximum": 65535}}, "type", "name", "value")
-	props := map[string]any{"resultType": map[string]any{"type": "string", "const": "complete"}, "setup_id": uuidStringProperty(), "onboarding_id": uuidStringProperty(), "generation": map[string]any{"type": "integer", "minimum": 1}, "apex_domain": boundedStringProperty(1, 253), "setup_state": map[string]any{"type": "string", "enum": []string{"pending", "proof_verified", "terminal"}}, "state": map[string]any{"type": "string", "enum": []string{"provisioning", "dns_pending", "active", "deprovisioning", "closed"}}, "setup_expires_at": map[string]any{"type": "string", "format": "date-time"}, "ownership_txt": dns, "dns_records": map[string]any{"type": "array", "maxItems": 32, "items": dns}, "next_action": map[string]any{"type": "string", "enum": []string{"configure_ownership_dns_then_verify", "wait_for_domain_setup", "configure_mail_dns_then_verify", "reauthorize_org", "poll_close", "closed"}}, "reauthorize": map[string]any{"type": "boolean"}, "address": boundedStringProperty(1, 320)}
+	props := map[string]any{"resultType": map[string]any{"type": "string", "const": "complete"}, "setup_id": uuidStringProperty(), "onboarding_id": uuidStringProperty(), "generation": map[string]any{"type": "integer", "minimum": 1}, "apex_domain": boundedStringProperty(1, 253), "setup_state": map[string]any{"type": "string", "enum": []string{"pending", "proof_verified", "terminal"}}, "state": map[string]any{"type": "string", "enum": []string{"provisioning", "dns_pending", "active", "deprovisioning", "closed"}}, "setup_expires_at": map[string]any{"type": "string", "format": "date-time"}, "ownership_txt": dns, "dns_records": map[string]any{"type": "array", "maxItems": 32, "items": dns}, "next_action": map[string]any{"type": "string", "enum": []string{"configure_ownership_dns_then_verify", "wait_for_domain_setup", "configure_mail_dns_then_verify", "reauthorize_org", "poll_close", "closed"}}, "reauthorize": map[string]any{"type": "boolean"}, "address": boundedStringProperty(1, 320), "return_receipt_id": uuidStringProperty(), "return_idempotency_key": boundedStringProperty(1, 128)}
 	result := outputObject(props, "resultType", "setup_id", "onboarding_id", "generation", "apex_domain", "setup_state", "state", "setup_expires_at", "ownership_txt", "next_action", "reauthorize")
 	return []toolDescriptor{
 		{Name: "nerve_free_setup", Description: "Start or replay a gated setup-only Free generation for one owned registrable apex; no mail before fresh TXT and complete domain readiness", InputSchema: inputObject(map[string]any{"idempotency_key": boundedStringProperty(1, 128), "organization_name": boundedStringProperty(1, 160), "apex_domain": boundedStringProperty(1, 253), "local_part": boundedStringProperty(1, 64)}, "idempotency_key", "organization_name", "apex_domain", "local_part"), OutputShape: result, ErrorCodes: onboardingBusinessErrorCodes()},
+		{Name: "nerve_free_resume", Description: "Explicitly request Free after terminal paid cleanup on the same retained apex; fresh readiness and compatible resources required; replay the exact saved decision key", InputSchema: inputObject(map[string]any{"idempotency_key": boundedStringProperty(1, 128)}, "idempotency_key"), OutputShape: result, ErrorCodes: onboardingBusinessErrorCodes()},
 		{Name: "nerve_free_status", Description: "Read retained Free setup history for the caller's exact generation", InputSchema: inputObject(map[string]any{}), OutputShape: result, ErrorCodes: onboardingBusinessErrorCodes()},
 		{Name: "nerve_free_verify_domain", Description: "Verify exact apex ownership before provider provisioning, then poll mail DNS readiness", InputSchema: inputObject(map[string]any{}), OutputShape: result, ErrorCodes: onboardingBusinessErrorCodes()},
 		{Name: "nerve_free_close", Description: "Close the exact Free generation while retaining its history and uncertain provider outcomes", InputSchema: inputObject(map[string]any{"idempotency_key": boundedStringProperty(1, 128), "expected_generation": map[string]any{"type": "integer", "minimum": 1}}, "idempotency_key", "expected_generation"), OutputShape: result, ErrorCodes: onboardingBusinessErrorCodes()},
@@ -257,8 +287,29 @@ func invokeFreeSetupTool(ctx context.Context, p FreeSetupProvisioner, c Onboardi
 	if err != nil {
 		return FreeSetupResult{}, sanitizeOnboardingProvisionerError(err)
 	}
-	if ValidateFreeSetupResult(result, c.Principal.Generation) != nil {
+	if ValidateFreeSetupOperationResult(op, normalized, result, c.Principal.Generation) != nil {
+		if op == "resume" {
+			return FreeSetupResult{}, ErrOnboardingOutcomeUnknown
+		}
 		return FreeSetupResult{}, onboardingTemporarilyUnavailable()
 	}
 	return result, nil
+}
+
+// A retained active resource label is not proof of this mutation. Resume must
+// return the exact saved decision key and a durable canonical receipt.
+func ValidateFreeSetupOperationResult(operation string, input json.RawMessage, result FreeSetupResult, generation int64) error {
+	if err := ValidateFreeSetupResult(result, generation); err != nil {
+		return err
+	}
+	if operation != "resume" {
+		return nil
+	}
+	var request struct {
+		IdempotencyKey string `json:"idempotency_key"`
+	}
+	if json.Unmarshal(input, &request) != nil || validateOnboardingIdempotencyKey(request.IdempotencyKey) != nil || result.State != "active" || result.ReturnReceiptID == "" || result.ReturnIdempotencyKey != request.IdempotencyKey {
+		return errors.New("Free resume lacks exact durable decision")
+	}
+	return nil
 }

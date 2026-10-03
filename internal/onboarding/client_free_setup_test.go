@@ -28,7 +28,7 @@ func freeClientResponse() string {
 	return `{"result":{"resultType":"complete","setup_id":"11111111-1111-4111-8111-111111111111","onboarding_id":"22222222-2222-4222-8222-222222222222","generation":7,"apex_domain":"example.com","setup_state":"pending","state":"provisioning","setup_expires_at":"2026-10-04T00:00:00Z","ownership_txt":{"type":"TXT","name":"_nerve-verify.example.com","value":"nerve-free-verification=` + strings.Repeat("a", 64) + `"},"next_action":"configure_ownership_dns_then_verify","reauthorize":false}}`
 }
 func TestClientFreeSetupSignsEachExactOriginalCallerTuple(t *testing.T) {
-	for op, input := range map[string]string{"setup": `{"idempotency_key":"free","organization_name":"Free","apex_domain":"example.com","local_part":"agent"}`, "status": `{}`, "verify-domain": `{}`, "close": `{"idempotency_key":"close","expected_generation":7}`} {
+	for op, input := range map[string]string{"setup": `{"idempotency_key":"free","organization_name":"Free","apex_domain":"example.com","local_part":"agent"}`, "status": `{}`, "verify-domain": `{}`, "close": `{"idempotency_key":"close","expected_generation":7}`, "resume": `{"idempotency_key":"resume-one"}`} {
 		t.Run(op, func(t *testing.T) {
 			calls := 0
 			var client *Client
@@ -43,12 +43,16 @@ func TestClientFreeSetupSignsEachExactOriginalCallerTuple(t *testing.T) {
 					t.Error("wrong signature")
 				}
 				w.Header().Set("Content-Type", "application/json")
-				io.WriteString(w, freeClientResponse())
+				if op == "resume" {
+					io.WriteString(w, freeResumeClientResponse())
+				} else {
+					io.WriteString(w, freeClientResponse())
+				}
 			}))
 			defer server.Close()
 			client = newTestClient(t, server.URL, server.Client(), time.Now())
 			got, err := client.FreeSetup(context.Background(), freeClientCaller(), op, json.RawMessage(input))
-			if err != nil || got.Generation != 7 || got.Address != "" || calls != 1 {
+			if err != nil || got.Generation != 7 || got.Address != map[bool]string{true: "agent@example.com", false: ""}[op == "resume"] || calls != 1 {
 				t.Fatalf("result%+v err%v calls%d", got, err, calls)
 			}
 		})
@@ -56,7 +60,7 @@ func TestClientFreeSetupSignsEachExactOriginalCallerTuple(t *testing.T) {
 }
 func TestClientFreeSetupAmbiguousMutationResponsesRequireStatusWithoutRetry(t *testing.T) {
 	bad := []string{`{}`, freeClientResponse() + ` {}`, strings.Replace(freeClientResponse(), `"reauthorize":false`, `"reauthorize":false,"address":"agent@example.com"`, 1), strings.Replace(freeClientResponse(), `"generation":7`, `"generation":8`, 1), strings.Replace(freeClientResponse(), `"reauthorize":false`, `"reauthorize":false,"provider_id":"private"`, 1), strings.Replace(freeClientResponse(), `"reauthorize":false`, `"reauthorize":false,"Reauthorize":true`, 1), strings.Repeat("x", 65537), `{"error":{"code":"private-provider-error","retryable":true}}`}
-	for op, input := range map[string]string{"setup": `{"idempotency_key":"free","organization_name":"Free","apex_domain":"example.com","local_part":"agent"}`, "status": `{}`, "verify-domain": `{}`, "close": `{"idempotency_key":"close","expected_generation":7}`} {
+	for op, input := range map[string]string{"setup": `{"idempotency_key":"free","organization_name":"Free","apex_domain":"example.com","local_part":"agent"}`, "status": `{}`, "verify-domain": `{}`, "close": `{"idempotency_key":"close","expected_generation":7}`, "resume": `{"idempotency_key":"resume-one"}`} {
 		for _, body := range bad {
 			calls := 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -75,7 +79,7 @@ func TestClientFreeSetupAmbiguousMutationResponsesRequireStatusWithoutRetry(t *t
 }
 
 func TestClientFreeSetupTransportAmbiguityAndNoRedirect(t *testing.T) {
-	inputs := map[string]string{"setup": `{"idempotency_key":"free","organization_name":"Free","apex_domain":"example.com","local_part":"agent"}`, "status": `{}`, "verify-domain": `{}`, "close": `{"idempotency_key":"close","expected_generation":7}`}
+	inputs := map[string]string{"setup": `{"idempotency_key":"free","organization_name":"Free","apex_domain":"example.com","local_part":"agent"}`, "status": `{}`, "verify-domain": `{}`, "close": `{"idempotency_key":"close","expected_generation":7}`, "resume": `{"idempotency_key":"resume-one"}`}
 	for op, input := range inputs {
 		for _, mode := range []string{"disconnect", "body timeout", "redirect", "wrong content type", "wrong status"} {
 			t.Run(op+"/"+mode, func(t *testing.T) {
@@ -140,4 +144,67 @@ func TestClientFreeSetupReturnsOnlyValidatedDurableBusinessErrors(t *testing.T) 
 	if !errors.As(err, &business) || business.Code != mcp.OnboardingErrorTemporarilyUnavailable || !business.Retryable || calls != 1 || errors.Is(err, mcp.ErrOnboardingOutcomeUnknown) {
 		t.Fatalf("err%v calls%d", err, calls)
 	}
+}
+
+func TestClientFreeResumeCorrelatesReceiptAndNeverRetriesMutation(t *testing.T) {
+	var envelope struct {
+		Result mcp.FreeSetupResult `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(freeClientResponse()), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	active := envelope.Result
+	active.State, active.SetupState = "active", "proof_verified"
+	active.Address, active.NextAction, active.Reauthorize = "agent@example.com", "reauthorize_org", true
+	active.ReturnReceiptID, active.ReturnIdempotencyKey = "33333333-3333-4333-8333-333333333333", "resume-one"
+	for _, scenario := range []string{"exact", "wrong-key", "missing-receipt", "active-resource-only"} {
+		t.Run(scenario, func(t *testing.T) {
+			result := active
+			switch scenario {
+			case "wrong-key":
+				result.ReturnIdempotencyKey = "other"
+			case "missing-receipt":
+				result.ReturnReceiptID = ""
+			case "active-resource-only":
+				result.ReturnReceiptID = ""
+				result.ReturnIdempotencyKey = ""
+			}
+			response, _ := json.Marshal(map[string]any{"result": result})
+			calls := 0
+			var client *Client
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if r.URL.Path != mcp.FreeSetupDelegationPath+"resume" || r.Header.Get("Authorization") != freeClientCaller().Authorization || r.Header.Get(delegationSignatureHeader) != client.signature("POST", r.URL.EscapedPath(), r.Header.Get(delegationNonceHeader), r.Header.Get(delegationTimestampHeader), r.Header.Get(delegationBodyHashHeader)) {
+					t.Error("resume caller/signature changed")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.Write(response)
+			}))
+			defer server.Close()
+			client = newTestClient(t, server.URL, server.Client(), time.Now())
+			got, err := client.FreeSetup(context.Background(), freeClientCaller(), "resume", json.RawMessage(`{"idempotency_key":"resume-one"}`))
+			if calls != 1 {
+				t.Fatalf("resume was retried: %d", calls)
+			}
+			if scenario == "exact" {
+				if err != nil || got.ReturnReceiptID != active.ReturnReceiptID {
+					t.Fatalf("exact resume %+v %v", got, err)
+				}
+			} else if !errors.Is(err, mcp.ErrOnboardingOutcomeUnknown) {
+				t.Fatalf("uncorrelated resume treated as definitive: %v", err)
+			}
+		})
+	}
+}
+
+func freeResumeClientResponse() string {
+	var envelope struct {
+		Result mcp.FreeSetupResult `json:"result"`
+	}
+	_ = json.Unmarshal([]byte(freeClientResponse()), &envelope)
+	envelope.Result.State, envelope.Result.SetupState = "active", "proof_verified"
+	envelope.Result.Address, envelope.Result.NextAction, envelope.Result.Reauthorize = "agent@example.com", "reauthorize_org", true
+	envelope.Result.ReturnReceiptID, envelope.Result.ReturnIdempotencyKey = "33333333-3333-4333-8333-333333333333", "resume-one"
+	encoded, _ := json.Marshal(envelope)
+	return string(encoded)
 }

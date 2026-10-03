@@ -80,7 +80,7 @@ func (client *Client) FreeSetup(ctx context.Context, caller mcp.OnboardingCaller
 	}
 	if value, ok := top["result"]; ok {
 		result, err := mcp.DecodeFreeSetupResult(value, caller.Principal.Generation)
-		if err != nil || response.StatusCode != http.StatusOK {
+		if err != nil || response.StatusCode != http.StatusOK || mcp.ValidateFreeSetupOperationResult(operation, normalized, result, caller.Principal.Generation) != nil {
 			return empty, unknown()
 		}
 		return result, nil

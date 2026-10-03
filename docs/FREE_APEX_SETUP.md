@@ -10,6 +10,7 @@ admission and expense acceptance remain release prerequisites.
 | `nerve_free_setup` | `idempotency_key`, `organization_name`, `apex_domain`, `local_part` | Create or replay a zero-mail setup generation |
 | `nerve_free_status` | `{}` | Read the caller's retained setup history |
 | `nerve_free_verify_domain` | `{}` | Prove apex ownership before provider provisioning, then poll mail DNS readiness |
+| `nerve_free_resume` | `idempotency_key` | Explicitly request or replay Free after terminal paid cleanup on the same retained apex |
 | `nerve_free_close` | `idempotency_key`, `expected_generation` | Close this generation, preserving unknown outcomes and history |
 
 Inputs are closed objects. Caller identity, organization, owner, entitlement,
@@ -62,3 +63,26 @@ The Cloud admission path additionally requires the audited global
 `free_catalog_published` decision and existing bounded admission/inventory gates.
 Missing or withdrawn publication refuses new starts; retained status and cleanup
 remain available. This contract changes no deployed lock or publication decision.
+
+## Explicit return after paid cleanup
+
+`nerve_free_resume` uses the original onboarding bearer and one exact saved
+idempotency key. It is separate from setup/status/verify replay. Terminal paid
+cleanup, the retained physical lease, fresh exact provider GET and ownership TXT,
+three compatible active inboxes, one apex and at most one GB are required. Old
+used/unknown outcome history remains in the same monthly pool; cancel/resubscribe
+cannot grant a new 300-recipient pool. No domain/provider resource is created.
+
+A completed current return additionally reports both `return_receipt_id` (a
+canonical UUID) and `return_idempotency_key` (the exact saved key). Both are
+optional for ordinary setup history but must appear together only on an active,
+proof-verified result. A resume response requires both and exact input-key
+correlation. A retained root's active resource label alone is not proof that
+Free resumed: it can remain active while a paid subscription is read-only.
+
+After an ambiguous resume result, poll `nerve_free_status` and check the return
+receipt and exact saved key before reauthorizing. Never invent a new key to retry.
+Explicit replay of the same committed decision does not need another provider
+reading and grants no additional allowance. A newer paid period, revoked issuing
+key, changed generation or DNS loss fails closed. This prospective contract does
+not publish Free or accept its economic/manual release gates.
