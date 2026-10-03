@@ -170,3 +170,23 @@ func TestLoadWarnsOnLegacyEnvUsage(t *testing.T) {
 		t.Fatalf("expected deprecation warning to mention NM_SMTP_HOST, got: %s", logs.String())
 	}
 }
+
+func TestHostedBillingDashboardEnvUsesCanonicalPrecedence(t *testing.T) {
+	for _, scenario := range []struct{ name, canonical, legacy, want string }{
+		{"canonical only", "https://canonical.example", "", "https://canonical.example"},
+		{"canonical over legacy", "https://canonical.example", "https://legacy.example", "https://canonical.example"},
+		{"legacy only", "", "https://legacy.example", "https://legacy.example"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			t.Setenv("NERVE_CLOUD_DASHBOARD_BASE_URL", scenario.canonical)
+			t.Setenv("NM_CLOUD_DASHBOARD_BASE_URL", scenario.legacy)
+			cfg, err := Load("")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Cloud.DashboardBaseURL != scenario.want {
+				t.Fatalf("dashboard origin=%q want %q", cfg.Cloud.DashboardBaseURL, scenario.want)
+			}
+		})
+	}
+}
