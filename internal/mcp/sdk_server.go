@@ -308,7 +308,12 @@ func newSDKServer(requestContext context.Context, runtime *Server) *sdkmcp.Serve
 			}
 			var result any
 			var err error
-			if principal.Kind == auth.PrincipalM2MOnboarding {
+			if freeSetupToolOperation(request.Params.Name) != "" {
+				if _, restricted := localauth.FromContext(ctx); restricted {
+					return nil, nil, localauth.ErrForbidden
+				}
+				result, err = invokeFreeSetupTool(ctx, runtime.FreeSetup, OnboardingCaller{Principal: principal, Authorization: onboardingAuthorizationFromContext(requestContext)}, request.Params.Name, request.Params.Arguments)
+			} else if principal.Kind == auth.PrincipalM2MOnboarding {
 				result, err = invokeOnboardingTool(ctx, runtime.Onboarding, OnboardingCaller{
 					Principal: principal, Authorization: onboardingAuthorizationFromContext(requestContext),
 				}, request.Params.Name, request.Params.Arguments)
@@ -331,6 +336,11 @@ func newSDKServer(requestContext context.Context, runtime *Server) *sdkmcp.Serve
 				result, err = invokeBillingUpgradeTool(ctx, runtime.HostedBilling, BillingCaller{
 					Principal: principal, Authorization: billingAuthorizationFromContext(requestContext),
 				}, request.Params.Arguments, runtime.Config.Cloud.DashboardBaseURL)
+			} else if request.Params.Name == billingPairingConfirmToolName {
+				if _, restricted := localauth.FromContext(ctx); restricted {
+					return nil, nil, localauth.ErrForbidden
+				}
+				result, err = invokeBillingPairingConfirmTool(ctx, runtime.HostedBilling, BillingCaller{Principal: principal, Authorization: billingAuthorizationFromContext(requestContext)}, request.Params.Arguments, runtime.Config.Cloud.DashboardBaseURL)
 			} else if request.Params.Name == billingStatusToolName {
 				if _, restricted := localauth.FromContext(ctx); restricted {
 					return nil, nil, localauth.ErrForbidden

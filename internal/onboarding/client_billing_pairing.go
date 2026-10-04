@@ -9,15 +9,16 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
 	"neuralmail/internal/mcp"
 )
 
-const hostedUpgradeDelegationPath = "/internal/v1/agent-billing/upgrade"
+const pairingConfirmDelegationPath = "/internal/v1/agent-billing/pairing/confirm"
 
-type hostedUpgradeResponseWire struct {
+type pairingConfirmResponseWire struct {
 	Result *struct {
 		ResultType *string `json:"resultType"`
 		State      *string `json:"state"`
@@ -27,14 +28,13 @@ type hostedUpgradeResponseWire struct {
 	Error *billingErrorWire `json:"error,omitempty"`
 }
 
-func (client *Client) Upgrade(ctx context.Context, caller mcp.BillingCaller,
-	input mcp.BillingUpgradeInput) (mcp.BillingUpgradeResult, error) {
-	empty := mcp.BillingUpgradeResult{}
+func (client *Client) ConfirmBillingPairing(ctx context.Context, caller mcp.BillingCaller,
+	input mcp.BillingPairingConfirmInput) (mcp.BillingPairingConfirmResult, error) {
+	empty := mcp.BillingPairingConfirmResult{}
 	if err := validateBillingCaller(caller); err != nil {
 		return empty, err
 	}
-	if input.IdempotencyKey == "" || len(input.IdempotencyKey) > 128 ||
-		strings.TrimSpace(input.IdempotencyKey) != input.IdempotencyKey {
+	if !mcp.ValidBillingPairingConfirmInput(input) {
 		return empty, &mcp.BillingBusinessError{Code: mcp.BillingErrorInvalidRequest}
 	}
 	requestBody, err := json.Marshal(delegationRequest{
@@ -50,7 +50,7 @@ func (client *Client) Upgrade(ctx context.Context, caller mcp.BillingCaller,
 	requestContext, cancel := context.WithTimeout(ctx, client.timeout)
 	defer cancel()
 	endpoint := *client.baseURL
-	endpoint.Path = hostedUpgradeDelegationPath
+	endpoint.Path = pairingConfirmDelegationPath
 	request, err := http.NewRequestWithContext(requestContext, http.MethodPost,
 		endpoint.String(), bytes.NewReader(requestBody))
 	if err != nil {
@@ -82,7 +82,7 @@ func (client *Client) Upgrade(ctx context.Context, caller mcp.BillingCaller,
 		strings.ToLower(strings.TrimSpace(strings.Split(response.Header.Get("Content-Type"), ";")[0])) != "application/json" {
 		return empty, hostedUpgradeUnavailable()
 	}
-	decoded, err := decodeHostedUpgradeResponse(responseBody)
+	decoded, err := decodePairingConfirmResponse(responseBody)
 	if err != nil || (decoded.Result == nil) == (decoded.Error == nil) {
 		return empty, hostedUpgradeUnavailable()
 	}
@@ -95,15 +95,19 @@ func (client *Client) Upgrade(ctx context.Context, caller mcp.BillingCaller,
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return empty, hostedUpgradeUnavailable()
 	}
+	target, parseErr := url.Parse(decoded.Result.UpgradeURL)
+	if parseErr != nil || !mcp.ValidBillingPairingConfirmResult(*decoded.Result, target.Scheme+"://"+target.Host) || target.Query().Get("pairing_id") != input.PairingID {
+		return empty, hostedUpgradeUnavailable()
+	}
 	return *decoded.Result, nil
 }
 
-func decodeHostedUpgradeResponse(body []byte) (struct {
-	Result *mcp.BillingUpgradeResult
+func decodePairingConfirmResponse(body []byte) (struct {
+	Result *mcp.BillingPairingConfirmResult
 	Error  *mcp.BillingBusinessError
 }, error) {
 	var decoded struct {
-		Result *mcp.BillingUpgradeResult
+		Result *mcp.BillingPairingConfirmResult
 		Error  *mcp.BillingBusinessError
 	}
 	if err := rejectDuplicateJSONFields(body); err != nil {
@@ -123,7 +127,7 @@ func decodeHostedUpgradeResponse(body []byte) (struct {
 			return decoded, err
 		}
 	}
-	var wire hostedUpgradeResponseWire
+	var wire pairingConfirmResponseWire
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&wire); err != nil {
@@ -135,12 +139,12 @@ func decodeHostedUpgradeResponse(body []byte) (struct {
 	if wire.Result != nil {
 		if wire.Result.ResultType == nil || wire.Result.State == nil ||
 			wire.Result.OfferID == nil || wire.Result.UpgradeURL == nil ||
-			*wire.Result.ResultType != "complete" || !validHostedUpgradeState(*wire.Result.State) ||
+			*wire.Result.ResultType != "complete" || *wire.Result.State != "completed" ||
 			*wire.Result.OfferID != "starter_2026_09_v2" || *wire.Result.UpgradeURL == "" ||
 			len(*wire.Result.UpgradeURL) > 2048 {
 			return decoded, errors.New("invalid hosted upgrade result")
 		}
-		decoded.Result = &mcp.BillingUpgradeResult{ResultType: *wire.Result.ResultType,
+		decoded.Result = &mcp.BillingPairingConfirmResult{ResultType: *wire.Result.ResultType,
 			State: *wire.Result.State, OfferID: *wire.Result.OfferID,
 			UpgradeURL: *wire.Result.UpgradeURL}
 	}
@@ -152,17 +156,4 @@ func decodeHostedUpgradeResponse(body []byte) (struct {
 			Retryable: *wire.Error.Retryable, RetryAt: wire.Error.RetryAt}
 	}
 	return decoded, nil
-}
-
-func hostedUpgradeUnavailable() error {
-	return &mcp.BillingBusinessError{Code: mcp.BillingErrorTemporarilyUnavailable, Retryable: true}
-}
-
-func validHostedUpgradeState(state string) bool {
-	switch state {
-	case "needs_owner", "awaiting_owner", "session_prepared", "session_open", "provider_unknown":
-		return true
-	default:
-		return false
-	}
 }

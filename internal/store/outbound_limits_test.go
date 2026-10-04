@@ -832,3 +832,41 @@ func insertOutboundLimitTenant(t *testing.T, ctx context.Context, st *Store, lab
 	}
 	return orgID, inboxID
 }
+
+func TestOutboundUTCClockKeepsTwentyFourHoursAcrossSessionDST(t *testing.T) {
+	withOutboundLimitStore(t, func(ctx context.Context, st *Store, _, _ string) {
+		for _, zone := range []string{"UTC", "Europe/Prague", "America/New_York"} {
+			for _, instant := range []string{"2026-03-29T12:00:00Z", "2026-10-25T12:00:00Z", "2026-03-08T12:00:00Z", "2026-11-01T12:00:00Z", "2024-02-29T12:00:00Z", "2026-10-25T23:59:59.2Z"} {
+				t.Run(zone+"/"+instant, func(t *testing.T) {
+					accepted, err := time.Parse(time.RFC3339Nano, instant)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := st.RunInTx(ctx, func(tx *Store) error {
+						if _, err := tx.q.ExecContext(ctx, `SELECT set_config('TimeZone',$1,true)`, zone); err != nil {
+							return err
+						}
+						// Replace only the real-clock source in the exact production query.
+						// No test time override is added to the runtime or its public API.
+						query := strings.Replace(outboundLimitClockQuery, "SELECT clock_timestamp() AS accepted_at", "SELECT $1::timestamptz AS accepted_at", 1)
+						var got outboundLimitClock
+						if err := tx.q.QueryRowContext(ctx, query, accepted).Scan(&got.acceptedAt, &got.dayStart, &got.dayEnd, &got.retryAfterSeconds); err != nil {
+							return err
+						}
+						start := time.Date(accepted.Year(), accepted.Month(), accepted.Day(), 0, 0, 0, 0, time.UTC)
+						wantRetry := 43200
+						if accepted.Hour() == 23 {
+							wantRetry = 1
+						}
+						if !got.acceptedAt.Equal(accepted) || !got.dayStart.Equal(start) || !got.dayEnd.Equal(start.Add(24*time.Hour)) || got.retryAfterSeconds != wantRetry {
+							t.Fatalf("UTC clock zone=%s instant=%s got=%+v retry=%d", zone, instant, got, got.retryAfterSeconds)
+						}
+						return nil
+					}); err != nil {
+						t.Fatal(err)
+					}
+				})
+			}
+		}
+	})
+}

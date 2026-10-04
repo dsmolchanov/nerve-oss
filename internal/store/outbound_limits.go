@@ -73,6 +73,17 @@ func (s *Store) ReserveOutboundLimits(
 	if err := s.LockOrgPolicy(ctx, orgID); err != nil {
 		return err
 	}
+	// Enrolled sources closed for handover cannot mutate abuse counters
+	// through a direct Store caller after the monthly outbox fence closes.
+	ledgerAvailable, err := s.recipientLedgerAvailable(ctx)
+	if err != nil {
+		return err
+	}
+	if ledgerAvailable {
+		if _, _, err := s.RecipientAdmissionPeriod(ctx, orgID); err != nil {
+			return err
+		}
+	}
 	reservationClock, err := s.readOutboundLimitClock(ctx)
 	if err != nil {
 		return err
@@ -339,9 +350,10 @@ func nextOutboundCapChange(tier string, firstCompose, now time.Time) *time.Time 
 	return &next
 }
 
-func (s *Store) readOutboundLimitClock(ctx context.Context) (outboundLimitClock, error) {
-	var result outboundLimitClock
-	err := s.q.QueryRowContext(ctx, `
+// The bucket begins at UTC midnight. A calendar "1 day" added to timestamptz
+// follows the session zone and becomes 23/25 hours at a DST transition.
+// Duration arithmetic keeps the boundary and retry hint in the same UTC day.
+const outboundLimitClockQuery = `
 		WITH db_clock AS (
 			SELECT clock_timestamp() AS accepted_at
 		), bucket AS (
@@ -353,10 +365,14 @@ func (s *Store) readOutboundLimitClock(ctx context.Context) (outboundLimitClock,
 		SELECT
 			accepted_at,
 			day_start,
-			day_start + interval '1 day',
-			greatest(1, ceil(extract(epoch FROM (day_start + interval '1 day' - accepted_at))))::integer
+			day_start + interval '24 hours',
+			greatest(1, ceil(extract(epoch FROM (day_start + interval '24 hours' - accepted_at))))::integer
 		FROM bucket
-	`).Scan(&result.acceptedAt, &result.dayStart, &result.dayEnd, &result.retryAfterSeconds)
+	`
+
+func (s *Store) readOutboundLimitClock(ctx context.Context) (outboundLimitClock, error) {
+	var result outboundLimitClock
+	err := s.q.QueryRowContext(ctx, outboundLimitClockQuery).Scan(&result.acceptedAt, &result.dayStart, &result.dayEnd, &result.retryAfterSeconds)
 	return result, err
 }
 

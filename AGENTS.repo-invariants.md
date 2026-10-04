@@ -55,7 +55,12 @@ makes a review loop unable to terminate.
   `TestClientTransportDisconnectReturnsOutcomeUnknownForEveryOperation`,
   `TestClientInvalidPostCommitResponseReturnsOutcomeUnknownForEveryMutation`,
   and `TestClientRejectsSemanticallyInvalidEnvelopesForEveryOperation` tests in
-  `internal/onboarding/client_test.go`.
+  `internal/onboarding/client_test.go`. The same mutation/read distinction
+  applies to Free setup/verify/close/resume at the native MCP provisioner
+  boundary, enforced by
+  `TestFreeSetupNativeInvalidSuccessIsUnknownForEveryMutation` in
+  `internal/mcp/free_setup_test.go` and the Free delegated-response matrix in
+  `internal/onboarding/client_free_setup_test.go`.
 - Do all inbox address lookup, receiving resolution, create, ensure, and
   reactivate paths use the one canonical-equivalence rule, prefer a single
   active row before disabled history where replay is supported, fail closed on
