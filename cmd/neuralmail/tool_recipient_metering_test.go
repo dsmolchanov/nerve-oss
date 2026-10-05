@@ -33,6 +33,9 @@ func TestModernComposeAndReplyShareRecipientAllowanceWithAttachments(t *testing.
 		}
 		period := store.RecipientPeriod{OrgID: org, PeriodID: uuid.NewString(), StartsAt: time.Now().UTC().Add(-time.Hour), EndsAt: time.Now().UTC().Add(time.Hour), Limit: sql.NullInt64{Int64: 2, Valid: true}}
 		if err := st.RunAsOrg(ctx, org, func(tx *store.Store) error {
+			if _, err := tx.EnsureOutboundPolicyState(ctx, org); err != nil {
+				return err
+			}
 			for flag, value := range map[string]bool{"autonomous_outbound_policy": true, "email_outbound_suspended": false, "email_compose_org_enabled": true} {
 				if _, err := tx.SetFeatureFlag(ctx, &org, flag, value, "test"); err != nil {
 					return err
