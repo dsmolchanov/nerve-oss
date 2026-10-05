@@ -279,7 +279,11 @@ func validInboundState(d map[string]any, list bool) bool {
 	}
 	if reason, ok := d["reason"]; ok {
 		switch reason {
-		case "inbound_hard_cap", "storage_exhausted", "period_closed", "provider_unavailable", "provider_retention_elapsed", "ownership_changed", "ownership_unverified":
+		case "inbound_hard_cap", "storage_exhausted", "period_closed", "provider_unavailable", "provider_retention_elapsed":
+		case "ownership_changed", "ownership_unverified":
+			if d["state"] != "expired_unrecoverable" {
+				return false
+			}
 		case "inbox_daily_cap":
 			if !list {
 				return false

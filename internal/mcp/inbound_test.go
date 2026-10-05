@@ -350,3 +350,31 @@ func TestInboundOwnerBoundaryOutcomesRemainContentFreeAcrossNativeTools(t *testi
 		}
 	}
 }
+
+func TestInboundOwnershipReasonsAreTerminalForRecoveryAndReceiptList(t *testing.T) {
+	for _, reason := range []string{"ownership_changed", "ownership_unverified"} {
+		for _, state := range []string{"pending", "content_paused", "materialized"} {
+			for _, op := range []string{"recover", "receipts"} {
+				t.Run(op+"/"+reason+"/"+state, func(t *testing.T) {
+					extra := ""
+					if state == "materialized" {
+						extra = `,"message_id":"` + inboundTestID + `"`
+					}
+					body := `{"receipt_id":"` + inboundTestID + `","state":"` + state + `","reason":"` + reason + `"` + extra + `}`
+					input := InboundInput{ReceiptID: inboundTestID}
+					want := "inbound_outcome_unknown"
+					if op == "receipts" {
+						body = `{"items":[{"id":"` + inboundTestID + `","inbox_id":"","period_id":"","state":"` + state + `","reason":"` + reason + `","created_at":"2026-10-01T00:00:00Z","expires_at":"2026-11-01T00:00:00Z"` + extra + `}]}`
+						input = InboundInput{Limit: 1}
+						want = "inbound_retry_later"
+					}
+					_, err := ValidateInboundResult(op, input, []byte(body))
+					var outcome *InboundBusinessError
+					if !errors.As(err, &outcome) || outcome.Code != want || !outcome.Retryable {
+						t.Fatalf("impossible ownership outcome accepted: %s err=%v", body, err)
+					}
+				})
+			}
+		}
+	}
+}
