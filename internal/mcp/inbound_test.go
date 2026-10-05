@@ -328,3 +328,53 @@ func TestInboundNativeCatalogErrorsMatchReadAndMutationContracts(t *testing.T) {
 		})
 	}
 }
+
+func TestInboundOwnerBoundaryOutcomesRemainContentFreeAcrossNativeTools(t *testing.T) {
+	for _, reason := range []string{"ownership_changed", "ownership_unverified"} {
+		for _, id := range []string{inboundTestID, "q_" + strings.Repeat("a", 64)} {
+			body := `{"receipt_id":"` + id + `","state":"expired_unrecoverable","reason":"` + reason + `"}`
+			stub := &inboundStub{result: json.RawMessage(body)}
+			got, err := invokeInboundTool(context.Background(), stub, inboundCaller(), InboundRecoverTool, json.RawMessage(`{"receipt_id":"`+id+`"}`))
+			if err != nil || got == nil || stub.calls != 1 {
+				t.Fatalf("terminal %s: %v calls=%d", body, err, stub.calls)
+			}
+			page := `{"items":[{"id":"` + id + `","inbox_id":"","period_id":"","state":"expired_unrecoverable","reason":"` + reason + `","created_at":"2026-10-01T00:00:00Z","expires_at":"2026-11-01T00:00:00Z"}]}`
+			if _, err := ValidateInboundResult("receipts", InboundInput{Limit: 1}, []byte(page)); err != nil {
+				t.Fatal(err)
+			}
+			for _, extra := range []string{`,"message_id":"` + inboundTestID + `"`, `,"body":"prior owner private mail"`, `,"attachments_reopened":1`, `,"provider_email_id":"private"`} {
+				if _, err := ValidateInboundResult("recover", InboundInput{ReceiptID: id}, []byte(strings.TrimSuffix(body, "}")+extra+"}")); err == nil {
+					t.Fatalf("terminal outcome admitted prior content: %s", extra)
+				}
+			}
+		}
+	}
+}
+
+func TestInboundOwnershipReasonsAreTerminalForRecoveryAndReceiptList(t *testing.T) {
+	for _, reason := range []string{"ownership_changed", "ownership_unverified"} {
+		for _, state := range []string{"pending", "content_paused", "materialized"} {
+			for _, op := range []string{"recover", "receipts"} {
+				t.Run(op+"/"+reason+"/"+state, func(t *testing.T) {
+					extra := ""
+					if state == "materialized" {
+						extra = `,"message_id":"` + inboundTestID + `"`
+					}
+					body := `{"receipt_id":"` + inboundTestID + `","state":"` + state + `","reason":"` + reason + `"` + extra + `}`
+					input := InboundInput{ReceiptID: inboundTestID}
+					want := "inbound_outcome_unknown"
+					if op == "receipts" {
+						body = `{"items":[{"id":"` + inboundTestID + `","inbox_id":"","period_id":"","state":"` + state + `","reason":"` + reason + `","created_at":"2026-10-01T00:00:00Z","expires_at":"2026-11-01T00:00:00Z"` + extra + `}]}`
+						input = InboundInput{Limit: 1}
+						want = "inbound_retry_later"
+					}
+					_, err := ValidateInboundResult(op, input, []byte(body))
+					var outcome *InboundBusinessError
+					if !errors.As(err, &outcome) || outcome.Code != want || !outcome.Retryable {
+						t.Fatalf("impossible ownership outcome accepted: %s err=%v", body, err)
+					}
+				})
+			}
+		}
+	}
+}
