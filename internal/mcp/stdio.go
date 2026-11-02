@@ -27,6 +27,9 @@ func RunStdio(ctx context.Context, srv *Server) error {
 		if err := json.Unmarshal(line, &req); err != nil {
 			return err
 		}
+		if req.Method == "notifications/initialized" && req.ID == nil {
+			continue
+		}
 		result, err := srv.dispatch(ctx, req)
 		resp := Response{JSONRPC: "2.0", ID: req.ID}
 		if err != nil {

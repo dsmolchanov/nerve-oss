@@ -58,6 +58,7 @@ asyncio.run(main())
 
 const immutableSDK02GoldenPython = `
 import asyncio
+import json
 import sys
 
 import httpx
@@ -141,10 +142,13 @@ async def main():
             raise SystemExit(f"legacy tools/list={names}, want {expected_names}")
         resources = await sdk._rpc("resources/list", {})
         expected_resources = {
-            "resources": [{"description": "List inbox IDs", "uri": "email://inboxes"}],
+            "resources": [{"description": "List inbox IDs", "name": "inboxes", "uri": "email://inboxes"}],
         }
         if resources != expected_resources:
             raise SystemExit(f"legacy resources/list={resources}, want {expected_resources}")
+        success = await sdk._rpc("tools/call", {"name": "fixture_success", "arguments": {}})
+        if success.get("threads") != [] or json.loads(success["content"][0]["text"]).get("threads") != []:
+            raise SystemExit("standard tool content lost the immutable SDK business fields")
 
     await expect_error(base_url, "fixture_quota", NerveQuotaError, -32040)
     await expect_error(base_url, "fixture_subscription", NerveSubscriptionError, -32041)
@@ -301,6 +305,7 @@ func proveImmutableSDK02GoldenFixtures(t *testing.T, python string) {
 		"initialize":           5,
 		"tools/list":           1,
 		"resources/list":       1,
+		"fixture_success":      1,
 		"fixture_quota":        1,
 		"fixture_subscription": 1,
 		"fixture_rate":         1,
@@ -355,6 +360,24 @@ func (fixture *sdk02GoldenFixtureServer) ServeHTTP(w http.ResponseWriter, reques
 		}
 		response = legacyResourcesListWireGolden
 	case "tools/call":
+		if wire.Params.Name == "fixture_success" {
+			if wire.ID != 4 {
+				http.Error(w, "success fixture requires id 4", http.StatusBadRequest)
+				return
+			}
+			result, err := legacyResultForClient(Request{Method: "tools/call"}, map[string]any{"threads": []any{}})
+			if err != nil {
+				http.Error(w, "fixture result unavailable", http.StatusInternalServerError)
+				return
+			}
+			raw, err := json.Marshal(Response{JSONRPC: "2.0", ID: wire.ID, Result: result})
+			if err != nil {
+				http.Error(w, "fixture encoding failed", http.StatusInternalServerError)
+				return
+			}
+			key, response = "fixture_success", string(raw)+"\n"
+			break
+		}
 		if wire.ID != 2 {
 			http.Error(w, "error fixture requires id 2", http.StatusBadRequest)
 			return

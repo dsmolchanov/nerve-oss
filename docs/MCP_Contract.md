@@ -2,6 +2,35 @@
 
 This document defines the MCP interface for NeuralMail: resources, tools, and JSON schemas.
 
+### Strict client connection and request memory
+
+The sessionful `2025-11-25` HTTP adapter negotiates headerless `initialize` and
+returns object-valued `tools` and `resources` capabilities. Subsequent requests
+carry the negotiated protocol version and session ID. A valid
+`notifications/initialized` is acknowledged with HTTP202 and an empty body;
+stdio consumes this notification without emitting a response. `ping` returns
+an empty result object. Advertised tools all include their existing argument
+schema, and resources include their name as well as URI. Authentication,
+Origin, scope and session checks remain in effect. These wire corrections do
+not change tool execution, mailbox ownership, quotas or business-error formats.
+
+Successful sessionful tool calls include standard text `content`; resource reads
+include URI-bound JSON text `contents`. Original business fields remain present
+for the published0.2 SDK. These are transport copies: cached/audited business
+objects remain unchanged, and the modern adapter retains its existing SDK result
+format. Request-memory admission does not measure total process RSS or promise
+that all possible response sizes fit physical memory.
+
+Modern ingress retains the16 MiB request-body bound and shared process budget.
+It charges two wire copies against that budget as bounded bytes arrive, even
+with unknown or understated Content-Length, and reserves the existing10 MiB
+decoded attachment allowance before decoding/dispatching `tools/call`.
+Reservations remain held until the request finishes, including SSE responses,
+and are released on errors, cancellation and panics. Small parallel discovery
+requests do not each reserve the42 MiB maximum of an attachment-bearing call.
+HTTP503 `memory budget exhausted` remains a retryable admission refusal with
+`Retry-After: 1`; it is not by itself evidence of a physical-memory OOM.
+
 ## Conventions
 - JSON Schema draft: 2020-12
 - All IDs are opaque strings.

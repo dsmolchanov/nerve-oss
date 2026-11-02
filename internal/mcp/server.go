@@ -76,21 +76,26 @@ type budgetedReadCloser struct {
 	ctx              context.Context
 	reader           io.Reader
 	closer           io.Closer
-	budget           *memguard.Budget
 	prepaidRemaining int64
-	releases         []func()
+	memoryCopies     int64
+	reservation      *memguard.Reservation
 	closed           bool
 }
 
 func newBudgetedReadCloser(ctx context.Context, body io.ReadCloser, budget *memguard.Budget, prepaid int64) (*budgetedReadCloser, error) {
-	guarded := &budgetedReadCloser{ctx: ctx, reader: body, closer: body, budget: budget, prepaidRemaining: prepaid}
-	if prepaid > 0 {
-		release, err := budget.Acquire(ctx, prepaid)
-		if err != nil {
-			return nil, err
-		}
-		guarded.releases = append(guarded.releases, release)
+	return newBudgetedReadCloserCopies(ctx, body, budget, prepaid, 1)
+}
+
+func newBudgetedReadCloserCopies(ctx context.Context, body io.ReadCloser, budget *memguard.Budget, prepaid, copies int64) (*budgetedReadCloser, error) {
+	if prepaid < 0 || prepaid > maxMCPBodyBytes || copies < 1 || copies > 2 {
+		return nil, errors.New("invalid bounded request reservation")
 	}
+	guarded := &budgetedReadCloser{ctx: ctx, reader: body, closer: body, prepaidRemaining: prepaid, memoryCopies: copies}
+	reservation, err := budget.Reserve(ctx, copies*prepaid)
+	if err != nil {
+		return nil, err
+	}
+	guarded.reservation = reservation
 	return guarded, nil
 }
 
@@ -104,11 +109,10 @@ func (r *budgetedReadCloser) Read(buffer []byte) (int, error) {
 	charge -= r.prepaidRemaining
 	r.prepaidRemaining = 0
 	if charge > 0 {
-		release, err := r.budget.Acquire(r.ctx, charge)
+		err := r.reservation.Grow(r.ctx, r.memoryCopies*charge)
 		if err != nil {
 			return 0, err
 		}
-		r.releases = append(r.releases, release)
 	}
 	return read, readErr
 }
@@ -118,9 +122,7 @@ func (r *budgetedReadCloser) Close() error {
 		return nil
 	}
 	r.closed = true
-	for index := len(r.releases) - 1; index >= 0; index-- {
-		r.releases[index]()
-	}
+	r.reservation.Release()
 	return r.closer.Close()
 }
 
@@ -240,6 +242,10 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, routed bool)
 			return
 		}
 	}
+	if req.Method == "notifications/initialized" && req.ID == nil {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
 	result, err := s.dispatch(ctx, req)
 	if err != nil {
 		s.writeDispatchError(w, req.ID, err)
@@ -324,6 +330,8 @@ func (s *Server) HandleSSEStub(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) dispatch(ctx context.Context, req Request) (any, error) {
 	switch req.Method {
+	case "ping":
+		return map[string]any{}, nil
 	case "initialize":
 		return map[string]any{
 			"protocolVersion": responseProtocolVersion(ctx, s.Config.MCP.ProtocolVersion),
@@ -332,8 +340,8 @@ func (s *Server) dispatch(ctx context.Context, req Request) (any, error) {
 				"version": "0.1.0",
 			},
 			"capabilities": map[string]any{
-				"tools":     true,
-				"resources": true,
+				"tools":     map[string]any{},
+				"resources": map[string]any{},
 			},
 		}, nil
 	case "tools/list":
@@ -343,11 +351,19 @@ func (s *Server) dispatch(ctx context.Context, req Request) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return s.Invoker.Invoke(ctx, invocation)
+		result, err := s.Invoker.Invoke(ctx, invocation)
+		if err != nil {
+			return nil, err
+		}
+		return legacyResultForClient(req, result)
 	case "resources/list":
 		return ListResources(), nil
 	case "resources/read":
-		return s.readResource(ctx, req)
+		result, err := s.readResource(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		return legacyResultForClient(req, result)
 	default:
 		return nil, fmt.Errorf("unknown method: %s", req.Method)
 	}
