@@ -334,7 +334,7 @@ func TestModernContractJSONResponseModesEmitOneFinalResponse(t *testing.T) {
 }
 
 func TestExplicitProtocolProfilesReturnFrozenLegacyAndModernWire(t *testing.T) {
-	const frozenLegacyInitialize = `{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"resources":true,"tools":true},"protocolVersion":"2025-11-25","serverInfo":{"name":"nerve-runtime","version":"0.1.0"}}}` + "\n"
+	const frozenLegacyInitialize = `{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"resources":{},"tools":{}},"protocolVersion":"2025-11-25","serverInfo":{"name":"nerve-runtime","version":"0.1.0"}}}` + "\n"
 
 	for _, test := range []struct {
 		name         string

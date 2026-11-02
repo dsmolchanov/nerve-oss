@@ -15,6 +15,7 @@ import (
 
 	"neuralmail/internal/auth"
 	"neuralmail/internal/localauth"
+	"neuralmail/internal/memguard"
 	"neuralmail/internal/release"
 )
 
@@ -45,29 +46,53 @@ func NewSDKHandler(runtime *Server, jsonResponse bool) http.Handler {
 			writeMemoryBudgetError(w)
 			return
 		}
-		// The SDK may retain two wire copies while tool decoding materializes up
-		// to 10 MiB of attachment content. Reserve that worst case before
-		// dispatch so chunked and concurrent requests cannot evade the shared
-		// process budget by growing incrementally.
-		release, err := runtime.MemoryBudget.Acquire(request.Context(), maxModernRequestMemoryBytes)
+		// Charge both retained wire copies as bytes arrive, including unknown or
+		// understated Content-Length. Small discovery requests must not reserve
+		// the 42 MiB maximum of an attachment-bearing tool call.
+		prepaid := request.ContentLength
+		if prepaid < 0 {
+			prepaid = 0
+		}
+		guarded, err := newBudgetedReadCloserCopies(request.Context(), http.MaxBytesReader(w, request.Body, maxMCPBodyBytes), runtime.MemoryBudget, prepaid, 2)
 		if err != nil {
 			_ = request.Body.Close()
 			writeMemoryBudgetError(w)
 			return
 		}
-		defer release()
-		request.Body = http.MaxBytesReader(w, request.Body, maxMCPBodyBytes)
-		body, err := io.ReadAll(request.Body)
+		defer guarded.Close()
+		body, err := io.ReadAll(guarded)
 		if err != nil {
 			var maxBytesError *http.MaxBytesError
 			if errors.As(err, &maxBytesError) {
 				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 				return
 			}
+			if errors.Is(err, memguard.ErrExhausted) {
+				writeMemoryBudgetError(w)
+				return
+			}
 			http.Error(w, "failed to read request body", http.StatusBadRequest)
 			return
 		}
-		_ = request.Body.Close()
+		var envelope struct {
+			Method string `json:"method"`
+		}
+		if trimmed := bytes.TrimSpace(body); len(trimmed) > 0 && trimmed[0] == '[' {
+			// Both supported protocols require one message per POST. Do not let
+			// a batch bypass the per-call decoded reservation or header checks.
+			http.Error(w, "JSON-RPC batches are not supported", http.StatusBadRequest)
+			return
+		}
+		if json.Unmarshal(body, &envelope) == nil && envelope.Method == "tools/call" {
+			// Reserve decoded attachments before either contract validation or
+			// SDK/tool decoding. Wire reservations remain held through dispatch.
+			release, err := runtime.MemoryBudget.Acquire(request.Context(), maxModernDecodedAttachmentBytes)
+			if err != nil {
+				writeMemoryBudgetError(w)
+				return
+			}
+			defer release()
+		}
 		request.Body = io.NopCloser(bytes.NewReader(body))
 		if !validateModernRequestContract(w, request, body) {
 			return

@@ -27,6 +27,37 @@ makes a review loop unable to terminate.
 
 ## Invariants
 
+- Do supported client discovery responses use object capabilities, a valid
+  object inputSchema for every advertised tool and a nonempty resource name,
+  and consume initialized notifications without a JSON-RPC response while
+  preserving HTTP authentication and session checks? Enforced by
+  `TestStrictClientDiscoveryShapes`, `TestStrictClientInitializedAndPing` and
+  `TestStdioInitializedDoesNotEmitAResponse`, plus the complete discovery wire
+  goldens and immutable SDK shared-endpoint qualification.
+
+- Do successful sessionful tool/resource results contain standard MCP content
+  while retaining original published-SDK payload fields without mutating the
+  audited/cached object? Enforced by
+  `TestStrictLegacySuccessfulToolResultKeepsOriginalPayload`,
+  `TestLegacyResourceContentBindsURIAndPreservesStoredObject`,
+  `TestLegacyResultAdapterRefusesAmbiguousProtocolFields` and the immutable
+  SDK0.2 successful-call fixture. Authentication, tenant reads and business
+  error translation stay at their existing boundaries.
+
+- Does modern ingress charge two bounded wire copies for known, unknown and
+  understated Content-Length, hold them through dispatch and reserve the
+  decoded attachment allowance before tools/call decoding, while allowing two
+  small discovery responses to overlap under the default budget? Enforced by
+  `TestModernWireBudgetChargesBothCopiesForEveryLengthMode`,
+  `TestModernToolCallsReserveDecodedAllowanceBeforeDispatch`,
+  `TestModernDiscoveryOverlapsWithinDefaultMemoryBudget` and the exceptional
+  body-read, 413 and shared-budget release matrix. No physical VM enlargement
+  or removal of memory admission is a substitute for this accounting.
+  `TestBytewiseBodyBudgetBookkeepingDoesNotGrowPerRead` additionally prevents
+  wire fragmentation from allocating one retained callback per input byte;
+  growing reservations share the same atomic budget and cannot revive after
+  release (`TestGrowingReservationConcurrentCloseDoesNotLeakOrRevive`).
+
 - When nested `RunAsOrg` cannot set or restore either transaction-local tenant
   setting, does it abort the enclosing transaction even if its caller handles
   the returned error? Enforced by

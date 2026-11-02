@@ -39,12 +39,12 @@ func ListTools(attachmentsEnabled ...bool) map[string]any {
 	enabled := len(attachmentsEnabled) > 0 && attachmentsEnabled[0]
 	return map[string]any{
 		"tools": []map[string]any{
-			{"name": "list_threads", "description": "List threads in an inbox"},
-			{"name": "get_thread", "description": "Fetch a thread with messages"},
-			{"name": "search_inbox", "description": "Semantic search over an inbox"},
-			{"name": "triage_message", "description": "Classify intent, urgency, sentiment"},
-			{"name": "extract_to_schema", "description": "Extract structured data"},
-			{"name": "draft_reply_with_policy", "description": "Draft a reply constrained by policy"},
+			{"name": "list_threads", "description": "List threads in an inbox", "inputSchema": inputObject(map[string]any{"inbox_id": stringProperty(1), "status": stringProperty(0), "limit": map[string]any{"type": "integer"}}, "inbox_id")},
+			{"name": "get_thread", "description": "Fetch a thread with messages", "inputSchema": inputObject(map[string]any{"thread_id": stringProperty(1)}, "thread_id")},
+			{"name": "search_inbox", "description": "Semantic search over an inbox", "inputSchema": inputObject(map[string]any{"inbox_id": stringProperty(1), "query": stringProperty(1), "top_k": map[string]any{"type": "integer"}}, "inbox_id", "query")},
+			{"name": "triage_message", "description": "Classify intent, urgency, sentiment", "inputSchema": inputObject(map[string]any{"message_id": stringProperty(1)}, "message_id")},
+			{"name": "extract_to_schema", "description": "Extract structured data", "inputSchema": inputObject(map[string]any{"message_id": stringProperty(1), "schema_id": schemaIDProperty()}, "message_id", "schema_id")},
+			{"name": "draft_reply_with_policy", "description": "Draft a reply constrained by policy", "inputSchema": inputObject(map[string]any{"thread_id": stringProperty(1), "goal": stringProperty(0)}, "thread_id")},
 			{"name": "send_reply", "description": "Send a reply", "inputSchema": sendReplyInputSchema(enabled)},
 			{"name": "compose_email", "description": "Compose and send a new email (not a reply)", "inputSchema": composeEmailInputSchema(enabled)},
 		},
@@ -123,7 +123,7 @@ func composeEmailInputSchema(attachmentsEnabled bool) map[string]any {
 func ListResources() map[string]any {
 	return map[string]any{
 		"resources": []map[string]any{
-			{"uri": "email://inboxes", "description": "List inbox IDs"},
+			{"uri": "email://inboxes", "name": "inboxes", "description": "List inbox IDs"},
 		},
 	}
 }

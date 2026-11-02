@@ -247,7 +247,7 @@ func TestSDKServerListsConformantPrivateResources(t *testing.T) {
 
 func TestSDKHandlerEnforcesAndReleasesSharedMemoryBudget(t *testing.T) {
 	cfg := config.Default()
-	cfg.Memory.BudgetBytes = maxModernRequestMemoryBytes - 1
+	cfg.Memory.BudgetBytes = 2*int64(len(`{}`)) - 1
 	exhausted := NewServer(cfg, nil, nil, nil)
 	request := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewBufferString(`{}`))
 	recorder := httptest.NewRecorder()
@@ -280,7 +280,7 @@ func TestSDKHandlerEnforcesAndReleasesSharedMemoryBudget(t *testing.T) {
 	}
 }
 
-func TestSDKHandlerChunkedAndExceptionalReadsReleaseWorstCaseReservation(t *testing.T) {
+func TestSDKHandlerChunkedAndExceptionalReadsReleaseWireReservations(t *testing.T) {
 	newRuntime := func(t *testing.T) *Server {
 		t.Helper()
 		cfg := config.Default()
@@ -299,7 +299,7 @@ func TestSDKHandlerChunkedAndExceptionalReadsReleaseWorstCaseReservation(t *test
 		return recorder
 	}
 
-	t.Run("chunked request reserves worst case before read", func(t *testing.T) {
+	t.Run("chunked request charges bounded wire bytes", func(t *testing.T) {
 		runtime := newRuntime(t)
 		reader := &budgetProbeReadCloser{budget: runtime.MemoryBudget, reader: strings.NewReader(`{}`)}
 		recorder := serve(t, runtime, reader)
@@ -352,15 +352,19 @@ type budgetUsage interface {
 }
 
 type budgetProbeReadCloser struct {
-	budget     budgetUsage
-	reader     io.Reader
-	readErr    error
-	panicValue any
-	observed   int64
-	read       bool
+	budget          budgetUsage
+	reader          io.Reader
+	readErr         error
+	panicValue      any
+	observed        int64
+	maximumObserved int64
+	read            bool
 }
 
 func (reader *budgetProbeReadCloser) Read(buffer []byte) (int, error) {
+	if used := reader.budget.Used(); used > reader.maximumObserved {
+		reader.maximumObserved = used
+	}
 	if !reader.read {
 		reader.read = true
 		reader.observed = reader.budget.Used()
@@ -378,8 +382,8 @@ func (*budgetProbeReadCloser) Close() error { return nil }
 
 func assertModernBudgetProbeReleased(t *testing.T, runtime *Server, reader *budgetProbeReadCloser) {
 	t.Helper()
-	if !reader.read || reader.observed != maxModernRequestMemoryBytes {
-		t.Fatalf("body read observed reservation=%d read=%t want=%d", reader.observed, reader.read, maxModernRequestMemoryBytes)
+	if !reader.read || reader.observed != 0 || reader.maximumObserved > 2*maxMCPBodyBytes {
+		t.Fatalf("chunked read reservation initial=%d peak=%d read=%t", reader.observed, reader.maximumObserved, reader.read)
 	}
 	if runtime.MemoryBudget.Used() != 0 {
 		t.Fatalf("modern request leaked %d bytes", runtime.MemoryBudget.Used())
