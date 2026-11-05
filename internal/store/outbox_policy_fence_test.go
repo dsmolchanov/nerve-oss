@@ -125,7 +125,11 @@ func TestCoreMigration29DownRefusesPolicyAndProviderEvidence(t *testing.T) {
 
 func TestCoreMigration29EmptyDownSucceeds(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
-		migrateToLatest(t, ctx, db)
+		// This qualification owns only the Core schema. Cloud successors may
+		// depend on Core29 columns and must not become implicit rollback work.
+		if err := MigrateCore(ctx, db); err != nil {
+			t.Fatal(err)
+		}
 		goose.SetDialect("postgres")
 		goose.SetTableName(migrationTableCore)
 		if err := goose.DownToContext(ctx, db, coreMigrationDir(t), 28); err != nil {
