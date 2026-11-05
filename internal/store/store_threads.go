@@ -98,6 +98,31 @@ func (s *Store) GetThreadInboxID(ctx context.Context, threadID string) (string, 
 	return inboxID, nil
 }
 
+// InboundForwardSender returns the sender address of the inbound message a
+// forward was created from, or "" when no such message is recorded. The
+// forward is sent from the inbox address, so this is the only place the
+// original sender survives.
+func (s *Store) InboundForwardSender(ctx context.Context, orgID, inboxID, receivedEmailID string) (string, error) {
+	if orgID == "" || inboxID == "" || receivedEmailID == "" {
+		return "", errors.New("missing inbound forward sender identity")
+	}
+	var sender string
+	err := s.q.QueryRowContext(ctx, `
+		SELECT coalesce(from_json->>'email', '')
+		FROM messages
+		WHERE org_id = $1
+		  AND inbox_id = $2
+		  AND received_email_id = $3
+		  AND direction = 'inbound'
+		ORDER BY created_at, id
+		LIMIT 1
+	`, orgID, inboxID, receivedEmailID).Scan(&sender)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return strings.TrimSpace(sender), err
+}
+
 func (s *Store) GetMessage(ctx context.Context, messageID string) (Message, error) {
 	var m Message
 	var fromJSON, toJSON, ccJSON []byte
