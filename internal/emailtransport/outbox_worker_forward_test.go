@@ -84,19 +84,20 @@ func TestOutboxWorkerSetsForwardReplyToOriginalSender(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		forward := func(emailID, provider string) store.OutboxMessage {
+		// The forward key does not name the provider, so each case needs its
+		// own destination.
+		forward := func(emailID, provider, destination string) store.OutboxMessage {
 			return store.OutboxMessage{
 				OrgID: orgID, InboxID: inboxID, Provider: provider,
-				IdempotencyKey: "fwd:" + emailID + ":" + inboxID + ":dest@example.org",
-				To:             "dest@example.org", From: "forward@local.neuralmail",
+				IdempotencyKey: "fwd:" + emailID + ":" + inboxID + ":" + destination,
+				To:             destination, From: "forward@local.neuralmail",
 				Subject: "Fwd: original", TextBody: "body " + emailID + provider,
 			}
 		}
-		for _, msg := range []store.OutboxMessage{
-			forward(receivedEmailID, "resend"),
-			forward("never-recorded", "resend"),
-			forward(receivedEmailID, "capture"),
-		} {
+		recorded := forward(receivedEmailID, "resend", "dest@example.org")
+		unrecorded := forward("never-recorded", "resend", "dest@example.org")
+		otherProvider := forward(receivedEmailID, "capture", "other-dest@example.org")
+		for _, msg := range []store.OutboxMessage{recorded, unrecorded, otherProvider} {
 			if _, err := st.EnqueueOutboxMessage(ctx, msg); err != nil {
 				t.Fatal(err)
 			}
@@ -122,11 +123,10 @@ func TestOutboxWorkerSetsForwardReplyToOriginalSender(t *testing.T) {
 		for _, delivery := range resend.deliveries {
 			replyTo[delivery.idempotencyKey] = delivery.message.ReplyTo
 		}
-		recordedKey := forward(receivedEmailID, "resend").IdempotencyKey
-		if got := replyTo[recordedKey]; len(got) != 1 || got[0] != "original@sender.example" {
+		if got := replyTo[recorded.IdempotencyKey]; len(got) != 1 || got[0] != "original@sender.example" {
 			t.Fatalf("recorded forward Reply-To = %v, want the canonical original sender", got)
 		}
-		if got, sent := replyTo[forward("never-recorded", "resend").IdempotencyKey]; !sent || len(got) != 0 {
+		if got, sent := replyTo[unrecorded.IdempotencyKey]; !sent || len(got) != 0 {
 			t.Fatalf("unrecorded forward sent=%v Reply-To=%v, want sent without Reply-To", sent, got)
 		}
 		if len(other.deliveries) != 1 || len(other.deliveries[0].message.ReplyTo) != 0 {
