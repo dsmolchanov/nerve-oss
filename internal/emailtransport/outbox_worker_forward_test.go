@@ -3,6 +3,7 @@ package emailtransport
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -132,5 +133,143 @@ func TestOutboxWorkerSetsForwardReplyToOriginalSender(t *testing.T) {
 		if len(other.deliveries) != 1 || len(other.deliveries[0].message.ReplyTo) != 0 {
 			t.Fatalf("non-Resend deliveries=%d, want one without Reply-To", len(other.deliveries))
 		}
+	})
+}
+
+// idempotentResendAdapter enforces Resend's idempotency contract: a reused
+// key with the same payload returns the original id, a different payload is
+// refused as a mismatch.
+type idempotentResendAdapter struct {
+	payloads map[string]string
+	ids      map[string]string
+	sends    int
+}
+
+func (a *idempotentResendAdapter) Name() string                          { return "resend" }
+func (a *idempotentResendAdapter) SupportsIdempotentReplay() bool        { return true }
+func (a *idempotentResendAdapter) IdempotentReplayWindow() time.Duration { return 24 * time.Hour }
+func (a *idempotentResendAdapter) GetDeliveryStatus(context.Context, string) (DeliveryStatus, error) {
+	return DeliveryStatusUnknown, ErrNotSupported
+}
+
+func (a *idempotentResendAdapter) record(key string, msg OutboundMessage, id string) {
+	a.payloads[key] = resendPayloadIdentity(msg)
+	a.ids[key] = id
+}
+
+func (a *idempotentResendAdapter) SendMessage(_ context.Context, msg OutboundMessage, key string) (string, error) {
+	if stored, ok := a.payloads[key]; ok {
+		if stored != resendPayloadIdentity(msg) {
+			return "", &ProviderError{Permanent: true, StatusCode: 409, Reason: ReasonIdempotencyPayloadMismatch}
+		}
+		return a.ids[key], nil
+	}
+	a.sends++
+	a.record(key, msg, "new-"+key)
+	return a.ids[key], nil
+}
+
+func resendPayloadIdentity(msg OutboundMessage) string {
+	return strings.Join([]string{msg.From, strings.Join(msg.To, ","), msg.Subject, msg.TextBody, msg.HTMLBody,
+		strings.Join(msg.ReplyTo, ","), msg.Headers["X-Nerve-Loop"]}, "\x00")
+}
+
+func TestOutboxWorkerReplaysPreReplyToForwardPayload(t *testing.T) {
+	withOutboxWorkerDatabase(t, func(ctx context.Context, db *sql.DB, st *store.Store) {
+		orgID, inboxID := seedWorkerPolicyFence(t, ctx, db, st, "forward-replay")
+		inbox := "forward-replay@local.neuralmail"
+		receivedEmailID := "received-" + uuid.NewString()
+		if _, _, err := st.InsertMessageWithThread(ctx, inboxID, "", store.Message{
+			Direction: "inbound", Subject: "original", Text: "body",
+			ProviderMessageID: "provider-" + uuid.NewString(),
+			From:              store.Participant{Email: "original@sender.example"},
+			To:                []store.Participant{{Email: inbox}},
+			CreatedAt:         time.Now().UTC(), ReceivedEmailID: receivedEmailID,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		insertForward := func(destination string, epoch int64) (string, string) {
+			id := uuid.NewString()
+			key := "fwd:" + receivedEmailID + ":" + inboxID + ":" + destination
+			var epochArg any
+			if epoch > 0 {
+				epochArg = epoch
+			}
+			if _, err := db.ExecContext(ctx, `
+				INSERT INTO outbox_messages (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject, text_body, autonomous_policy_epoch)
+				VALUES ($1, $2, $3, 'resend', $4, $5, $6, 'Fwd: original', 'body', $7)
+			`, id, orgID, inboxID, key, destination, inbox, epochArg); err != nil {
+				t.Fatal(err)
+			}
+			return id, key
+		}
+		preUpgrade := func(destination string) OutboundMessage {
+			return OutboundMessage{From: inbox, To: []string{destination}, Subject: "Fwd: original", TextBody: "body",
+				Headers: map[string]string{"X-Nerve-Loop": inboxID}}
+		}
+		assertSent := func(id, wantProviderID string) {
+			t.Helper()
+			var status, providerID string
+			if err := db.QueryRowContext(ctx, `SELECT status, coalesce(provider_message_id,'') FROM outbox_messages WHERE id = $1`, id).Scan(&status, &providerID); err != nil {
+				t.Fatal(err)
+			}
+			if status != "sent" || providerID != wantProviderID {
+				t.Fatalf("outbox %s status=%q provider id=%q, want sent with %q", id, status, providerID, wantProviderID)
+			}
+		}
+
+		t.Run("legacy retry", func(t *testing.T) {
+			adapter := &idempotentResendAdapter{payloads: map[string]string{}, ids: map[string]string{}}
+			id, key := insertForward("legacy-dest@example.org", 0)
+			adapter.record(key, preUpgrade("legacy-dest@example.org"), "original-legacy")
+			msg := claimWorkerPolicyOutbox(t, ctx, st, id, "legacy-worker")
+			if err := policyFenceWorker(t, st, adapter, "legacy-worker").deliverOne(ctx, msg); err != nil {
+				t.Fatal(err)
+			}
+			if adapter.sends != 0 {
+				t.Fatalf("sends=%d, want the pre-upgrade send recovered without a second delivery", adapter.sends)
+			}
+			assertSent(id, "original-legacy")
+		})
+
+		t.Run("unresolved operation", func(t *testing.T) {
+			adapter := &idempotentResendAdapter{payloads: map[string]string{}, ids: map[string]string{}}
+			id, _ := insertForward("fenced-dest@example.org", 1)
+			first := claimWorkerPolicyOutbox(t, ctx, st, id, "crashed-worker")
+			operationID, err := st.BeginOutboxProviderOperation(ctx, first)
+			if err != nil {
+				t.Fatal(err)
+			}
+			adapter.record(operationID, preUpgrade("fenced-dest@example.org"), "original-fenced")
+			if _, err := db.ExecContext(ctx, `UPDATE outbox_messages SET locked_at = now() - interval '10 minutes' WHERE id = $1`, id); err != nil {
+				t.Fatal(err)
+			}
+			msg := claimWorkerPolicyOutbox(t, ctx, st, id, "recovery-worker")
+			if err := policyFenceWorker(t, st, adapter, "recovery-worker").deliverOne(ctx, msg); err != nil {
+				t.Fatal(err)
+			}
+			if adapter.sends != 0 {
+				t.Fatalf("sends=%d, want the unresolved send recovered without a second delivery", adapter.sends)
+			}
+			assertSent(id, "original-fenced")
+		})
+
+		t.Run("new forward", func(t *testing.T) {
+			adapter := &idempotentResendAdapter{payloads: map[string]string{}, ids: map[string]string{}}
+			id, _ := insertForward("new-dest@example.org", 0)
+			msg := claimWorkerPolicyOutbox(t, ctx, st, id, "new-worker")
+			if err := policyFenceWorker(t, st, adapter, "new-worker").deliverOne(ctx, msg); err != nil {
+				t.Fatal(err)
+			}
+			if adapter.sends != 1 {
+				t.Fatalf("sends=%d, want one", adapter.sends)
+			}
+			for sentKey, payload := range adapter.payloads {
+				if !strings.Contains(payload, "original@sender.example") {
+					t.Fatalf("payload=%q, want Reply-To to the original sender", payload)
+				}
+				assertSent(id, "new-"+sentKey)
+			}
+		})
 	})
 }

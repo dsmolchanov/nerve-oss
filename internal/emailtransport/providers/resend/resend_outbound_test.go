@@ -287,3 +287,34 @@ type outboundRoundTripFunc func(*http.Request) (*http.Response, error)
 func (fn outboundRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
 }
+
+func TestResendOutboundAdapterNamesIdempotencyPayloadMismatch(t *testing.T) {
+	cases := map[string]struct {
+		body   string
+		reason string
+	}{
+		"payload mismatch":    {body: `{"statusCode":409,"name":"invalid_idempotent_request","message":"secret detail"}`, reason: emailtransport.ReasonIdempotencyPayloadMismatch},
+		"concurrent requests": {body: `{"statusCode":409,"name":"concurrent_idempotent_requests"}`, reason: "bad_request"},
+		"unparseable body":    {body: `not json`, reason: "bad_request"},
+	}
+	for name, input := range cases {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = io.WriteString(w, input.body)
+			}))
+			defer srv.Close()
+			adapter := NewOutboundAdapter(Config{APIKey: "re_test", BaseURL: srv.URL})
+			_, err := adapter.SendMessage(context.Background(), emailtransport.OutboundMessage{
+				From: "from@example.com", To: []string{"to@example.com"}, Subject: "s", TextBody: "b",
+			}, "key-1")
+			pe := emailtransport.ClassifyProviderError(err)
+			if pe == nil || pe.Reason != input.reason || pe.StatusCode != http.StatusConflict || !pe.Permanent {
+				t.Fatalf("error = %#v, want permanent 409 with reason %q", pe, input.reason)
+			}
+			if strings.Contains(err.Error(), "secret detail") {
+				t.Fatalf("error %q leaks the provider body", err)
+			}
+		})
+	}
+}
