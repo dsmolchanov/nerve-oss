@@ -53,6 +53,10 @@ func (e *ProviderError) Unwrap() error {
 	return e.Cause
 }
 
+// ReasonIdempotencyPayloadMismatch marks a provider refusal of an
+// idempotency key that was first used with a different payload.
+const ReasonIdempotencyPayloadMismatch = "idempotency_payload_mismatch"
+
 // NewPermanentError builds a permanent ProviderError. Use this when the
 // provider has signalled that retrying will not help (invalid recipient,
 // bad auth, malformed request).

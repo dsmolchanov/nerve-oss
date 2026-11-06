@@ -372,6 +372,7 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 	// Set In-Reply-To and References headers for reply-chain threading.
 	out.Headers = threadingHeaders(msg.InReplyToMessageID, msg.References)
 
+	forwardReplyToAdded := false
 	// For forwarded messages (idempotency key starts with "fwd:"), add forwarding headers.
 	if strings.HasPrefix(msg.IdempotencyKey, "fwd:") {
 		if out.Headers == nil {
@@ -391,6 +392,7 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 			}
 			if replyTo := forwardReplyTo(sender, msg.From, msg.To); replyTo != "" {
 				out.ReplyTo = []string{replyTo}
+				forwardReplyToAdded = true
 			}
 		}
 	}
@@ -421,6 +423,13 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 
 	sendStart := time.Now()
 	providerMessageID, err := adapter.SendMessage(ctx, out, providerOperationKey)
+	if err != nil && forwardReplyToAdded && isIdempotencyPayloadMismatch(err) {
+		// Workers before forward Reply-To sent this key without it. Replay
+		// that exact payload so the original send is recovered, not failed
+		// or duplicated.
+		out.ReplyTo = nil
+		providerMessageID, err = adapter.SendMessage(ctx, out, providerOperationKey)
+	}
 	w.observeDelivery(msg.Provider, time.Since(sendStart).Seconds())
 	if err == nil {
 		w.incDeliver(msg.Provider, "ok")
@@ -657,6 +666,11 @@ func (w *OutboxWorker) backoffForAttempt(attempt int) time.Duration {
 // forwardedReceivedEmailID extracts the provider email id from an inbound
 // forward key, "fwd:<received email id>:<inbox id>:<destination>". A key for a
 // different inbox is not trusted.
+func isIdempotencyPayloadMismatch(err error) bool {
+	pe := ClassifyProviderError(err)
+	return pe != nil && pe.Reason == ReasonIdempotencyPayloadMismatch
+}
+
 func forwardedReceivedEmailID(idempotencyKey, inboxID string) (string, bool) {
 	parts := strings.SplitN(idempotencyKey, ":", 4)
 	if len(parts) != 4 || parts[0] != "fwd" || parts[1] == "" || parts[2] != inboxID {

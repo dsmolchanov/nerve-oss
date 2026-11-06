@@ -164,8 +164,19 @@ func (a *OutboundAdapter) SendMessage(ctx context.Context, msg emailtransport.Ou
 		// Provider error bodies are untrusted and may contain credentials,
 		// addresses, message content, or an attacker-sized payload. Drain only a
 		// bounded prefix for connection hygiene and never retain or surface it.
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResendErrorDrainBytes))
+		errorBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxResendErrorDrainBytes))
 		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusConflict && resendErrorName(errorBody) == "invalid_idempotent_request" {
+			// The key was used with a different payload, so the original send may
+			// already have been delivered. Only the error name is kept.
+			return "", &emailtransport.ProviderError{
+				Permanent:  true,
+				StatusCode: resp.StatusCode,
+				Reason:     emailtransport.ReasonIdempotencyPayloadMismatch,
+				Cause:      errors.New("resend send failed: idempotency key reused with a different payload"),
+			}
+		}
 
 		lastStatus = resp.StatusCode
 
@@ -182,6 +193,18 @@ func (a *OutboundAdapter) SendMessage(ctx context.Context, msg emailtransport.Ou
 	}
 
 	return "", newResendSendProviderError(lastStatus)
+}
+
+// resendErrorName returns only the stable error name from a Resend error
+// body; the rest of the body is untrusted and is discarded.
+func resendErrorName(body []byte) string {
+	var parsed struct {
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(body, &parsed) != nil {
+		return ""
+	}
+	return parsed.Name
 }
 
 func newResendSendProviderError(status int) *emailtransport.ProviderError {
