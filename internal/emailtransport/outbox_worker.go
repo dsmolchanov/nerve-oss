@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"neuralmail/internal/emailaddr"
 	"neuralmail/internal/memguard"
 	"neuralmail/internal/store"
 )
@@ -378,9 +379,20 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		}
 		// X-Nerve-Loop prevents infinite forwarding loops
 		out.Headers["X-Nerve-Loop"] = msg.InboxID
-		// Reply-To lets the external recipient reply directly to the original sender
-		// (the original sender info isn't stored separately, but the outbox "to" field
-		// is the forward target; the inbox address is the "from")
+		// Reply-To lets the forward recipient reply directly to the original
+		// sender. Only Resend carries it: hybrid refuses a Reply-To and SMTP
+		// does not emit one, so those keep sending without it.
+		if receivedEmailID, ok := forwardedReceivedEmailID(msg.IdempotencyKey, msg.InboxID); ok && msg.Provider == "resend" {
+			sender, err := w.Store.InboundForwardSender(ctx, msg.OrgID, msg.InboxID, receivedEmailID)
+			if err != nil {
+				next := time.Now().UTC().Add(w.BaseBackoff)
+				requeueErr := w.Store.RequeueClaimedOutboxMessage(outcomeContext(), msg.ID, claimLeaseID, next, fmt.Sprintf("load forward sender: %v", err))
+				return errors.Join(fmt.Errorf("load inbound forward sender: %w", err), requeueErr)
+			}
+			if replyTo := forwardReplyTo(sender, msg.From, msg.To); replyTo != "" {
+				out.ReplyTo = []string{replyTo}
+			}
+		}
 	}
 
 	operation, err := w.Store.BeginOutboxProviderOperationState(ctx, msg)
@@ -642,6 +654,33 @@ func (w *OutboxWorker) backoffForAttempt(attempt int) time.Duration {
 //
 // Nil when there is no reply target, so a first message in a conversation
 // carries no threading headers at all rather than empty ones.
+// forwardedReceivedEmailID extracts the provider email id from an inbound
+// forward key, "fwd:<received email id>:<inbox id>:<destination>". A key for a
+// different inbox is not trusted.
+func forwardedReceivedEmailID(idempotencyKey, inboxID string) (string, bool) {
+	parts := strings.SplitN(idempotencyKey, ":", 4)
+	if len(parts) != 4 || parts[0] != "fwd" || parts[1] == "" || parts[2] != inboxID {
+		return "", false
+	}
+	return parts[1], true
+}
+
+// forwardReplyTo returns the canonical original sender, or "" when it is
+// unusable or would point the reply back at our own inbox or the forward
+// destination.
+func forwardReplyTo(sender, inboxAddress, destination string) string {
+	canonical, _, _, err := emailaddr.Canonicalize(sender)
+	if err != nil {
+		return ""
+	}
+	for _, own := range []string{inboxAddress, destination} {
+		if ownCanonical, _, _, ownErr := emailaddr.Canonicalize(own); ownErr == nil && ownCanonical == canonical {
+			return ""
+		}
+	}
+	return canonical
+}
+
 func threadingHeaders(inReplyTo, references string) map[string]string {
 	inReplyTo = strings.TrimSpace(inReplyTo)
 	if inReplyTo == "" {
