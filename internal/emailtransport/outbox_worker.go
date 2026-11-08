@@ -429,6 +429,11 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		// or duplicated.
 		out.ReplyTo = nil
 		providerMessageID, err = adapter.SendMessage(ctx, out, providerOperationKey)
+		if err != nil {
+			// The mismatch proves the key already names an earlier send, so a
+			// failed recovery says nothing about that send's outcome.
+			err = &ProviderError{Reason: ReasonIdempotencyRecoveryUnresolved, Cause: err}
+		}
 	}
 	w.observeDelivery(msg.Provider, time.Since(sendStart).Seconds())
 	if err == nil {
@@ -488,6 +493,22 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 	}
 
 	if msg.AttemptCount >= store.MaxOutboxRetries {
+		if operationID == "" && classified != nil && classified.Reason == ReasonIdempotencyRecoveryUnresolved {
+			// A legacy row has no provider fence. Keep recovering the earlier
+			// send while its key is still retained; past that window a replay
+			// could deliver twice, so the row ends with the unresolved reason.
+			next := time.Now().UTC().Add(w.MaxBackoff)
+			createdAt, createdErr := w.Store.OutboxMessageCreatedAt(ctx, msg.OrgID, msg.ID)
+			if createdErr != nil {
+				requeueErr := w.Store.RequeueClaimedOutboxMessage(outcomeContext(), msg.ID, claimLeaseID, next, fmt.Sprintf("load outbox enqueue time: %v", createdErr))
+				return errors.Join(err, createdErr, requeueErr)
+			}
+			if replayDeadline, ok := adapterReplayDeadline(adapter, createdAt); ok && next.Before(replayDeadline) {
+				w.incDeliver(msg.Provider, "provider_unknown")
+				requeueErr := w.Store.RequeueClaimedOutboxMessage(outcomeContext(), msg.ID, claimLeaseID, next, err.Error())
+				return errors.Join(err, requeueErr)
+			}
+		}
 		if operationID != "" && !knownOutcome && adapterSupportsIdempotentReplay(adapter) {
 			// Unknown autonomous outcomes cannot be declared failed: retrying the
 			// same provider idempotency identity is the recovery/readback path.

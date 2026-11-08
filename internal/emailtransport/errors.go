@@ -57,6 +57,10 @@ func (e *ProviderError) Unwrap() error {
 // idempotency key that was first used with a different payload.
 const ReasonIdempotencyPayloadMismatch = "idempotency_payload_mismatch"
 
+// ReasonIdempotencyRecoveryUnresolved marks a failed replay of an earlier
+// payload after a mismatch. The earlier send's outcome stays unknown.
+const ReasonIdempotencyRecoveryUnresolved = "idempotency_recovery_unresolved"
+
 // NewPermanentError builds a permanent ProviderError. Use this when the
 // provider has signalled that retrying will not help (invalid recipient,
 // bad auth, malformed request).

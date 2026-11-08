@@ -143,6 +143,8 @@ type idempotentResendAdapter struct {
 	payloads map[string]string
 	ids      map[string]string
 	sends    int
+	// recoveryErr fails every request that reuses a recorded key.
+	recoveryErr error
 }
 
 func (a *idempotentResendAdapter) Name() string                          { return "resend" }
@@ -159,6 +161,9 @@ func (a *idempotentResendAdapter) record(key string, msg OutboundMessage, id str
 
 func (a *idempotentResendAdapter) SendMessage(_ context.Context, msg OutboundMessage, key string) (string, error) {
 	if stored, ok := a.payloads[key]; ok {
+		if stored == resendPayloadIdentity(msg) && a.recoveryErr != nil {
+			return "", a.recoveryErr
+		}
 		if stored != resendPayloadIdentity(msg) {
 			return "", &ProviderError{Permanent: true, StatusCode: 409, Reason: ReasonIdempotencyPayloadMismatch}
 		}
@@ -271,5 +276,112 @@ func TestOutboxWorkerReplaysPreReplyToForwardPayload(t *testing.T) {
 				assertSent(id, "new-"+sentKey)
 			}
 		})
+	})
+}
+
+func TestOutboxWorkerKeepsForwardOutcomeUnresolvedWhenRecoveryFails(t *testing.T) {
+	withOutboxWorkerDatabase(t, func(ctx context.Context, db *sql.DB, st *store.Store) {
+		recoveryErrors := map[string]error{
+			"unauthorized": &ProviderError{Permanent: true, StatusCode: 401, Reason: "unauthorized"},
+			"rate limited": &ProviderError{StatusCode: 429, Reason: "rate_limited"},
+		}
+		for _, fenced := range []bool{false, true} {
+			for name, recoveryErr := range recoveryErrors {
+				mode := "legacy"
+				if fenced {
+					mode = "fenced"
+				}
+				t.Run(mode+" "+name, func(t *testing.T) {
+					// Each case owns its org: a fenced case advances the policy epoch.
+					tenant := "forward-recovery-" + strings.ReplaceAll(mode+"-"+name, " ", "-")
+					orgID, inboxID := seedWorkerPolicyFence(t, ctx, db, st, tenant)
+					inbox := tenant + "@local.neuralmail"
+					receivedEmailID := "received-" + uuid.NewString()
+					if _, _, err := st.InsertMessageWithThread(ctx, inboxID, "", store.Message{
+						Direction: "inbound", Subject: "original", Text: "body",
+						ProviderMessageID: "provider-" + uuid.NewString(),
+						From:              store.Participant{Email: "original@sender.example"},
+						To:                []store.Participant{{Email: inbox}},
+						CreatedAt:         time.Now().UTC(), ReceivedEmailID: receivedEmailID,
+					}); err != nil {
+						t.Fatal(err)
+					}
+					destination := uuid.NewString() + "@example.org"
+					id := uuid.NewString()
+					key := "fwd:" + receivedEmailID + ":" + inboxID + ":" + destination
+					var epoch any
+					if fenced {
+						epoch = int64(1)
+					}
+					// Exhausted retries are where an unknown outcome used to be
+					// declared failed.
+					if _, err := db.ExecContext(ctx, `
+						INSERT INTO outbox_messages (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject, text_body, autonomous_policy_epoch, attempt_count)
+						VALUES ($1, $2, $3, 'resend', $4, $5, $6, 'Fwd: original', 'body', $7, $8)
+					`, id, orgID, inboxID, key, destination, inbox, epoch, store.MaxOutboxRetries-1); err != nil {
+						t.Fatal(err)
+					}
+					adapter := &idempotentResendAdapter{payloads: map[string]string{}, ids: map[string]string{}}
+					original := OutboundMessage{From: inbox, To: []string{destination}, Subject: "Fwd: original", TextBody: "body",
+						Headers: map[string]string{"X-Nerve-Loop": inboxID}}
+					var operationID string
+					if fenced {
+						first := claimWorkerPolicyOutbox(t, ctx, st, id, "crashed-worker")
+						var err error
+						if operationID, err = st.BeginOutboxProviderOperation(ctx, first); err != nil {
+							t.Fatal(err)
+						}
+						adapter.record(operationID, original, "original-"+id)
+						if _, err := db.ExecContext(ctx, `UPDATE outbox_messages SET locked_at = now() - interval '10 minutes' WHERE id = $1`, id); err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						adapter.record(key, original, "original-"+id)
+					}
+					adapter.recoveryErr = recoveryErr
+					msg := claimWorkerPolicyOutbox(t, ctx, st, id, "recovery-worker")
+					if err := policyFenceWorker(t, st, adapter, "recovery-worker").deliverOne(ctx, msg); err == nil {
+						t.Fatal("failed recovery reported success")
+					}
+					var status string
+					var storedOperationID sql.NullString
+					var startedAt, resolvedAt sql.NullTime
+					if err := db.QueryRowContext(ctx, `
+						SELECT status, provider_operation_id, provider_started_at, provider_resolved_at FROM outbox_messages WHERE id = $1
+					`, id).Scan(&status, &storedOperationID, &startedAt, &resolvedAt); err != nil {
+						t.Fatal(err)
+					}
+					if status != "queued" || resolvedAt.Valid || storedOperationID.String != operationID || startedAt.Valid != fenced {
+						t.Fatalf("status=%q operation=%q started=%v resolved=%v, want queued and unresolved", status, storedOperationID.String, startedAt.Valid, resolvedAt.Valid)
+					}
+
+					if fenced {
+						// A policy change after the failed recovery must not end
+						// the already started send.
+						if err := st.RunInTx(ctx, func(scoped *store.Store) error {
+							_, _, err := scoped.AdvanceOutboundPolicyEpoch(ctx, orgID)
+							return err
+						}); err != nil {
+							t.Fatal(err)
+						}
+					}
+					adapter.recoveryErr = nil
+					if _, err := db.ExecContext(ctx, `UPDATE outbox_messages SET next_attempt_at = now() - interval '1 second' WHERE id = $1`, id); err != nil {
+						t.Fatal(err)
+					}
+					msg = claimWorkerPolicyOutbox(t, ctx, st, id, "recovered-worker")
+					if err := policyFenceWorker(t, st, adapter, "recovered-worker").deliverOne(ctx, msg); err != nil {
+						t.Fatal(err)
+					}
+					var providerID string
+					if err := db.QueryRowContext(ctx, `SELECT status, coalesce(provider_message_id, '') FROM outbox_messages WHERE id = $1`, id).Scan(&status, &providerID); err != nil {
+						t.Fatal(err)
+					}
+					if status != "sent" || providerID != "original-"+id || adapter.sends != 0 {
+						t.Fatalf("status=%q provider id=%q sends=%d, want the original send recovered once", status, providerID, adapter.sends)
+					}
+				})
+			}
+		}
 	})
 }
