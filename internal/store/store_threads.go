@@ -517,3 +517,13 @@ func (s *Store) ListAudit(ctx context.Context, limit int) ([]map[string]any, err
 	}
 	return out, rows.Err()
 }
+
+// OutboxMessageCreatedAt returns when an outbox row was enqueued. A legacy row
+// has no provider fence, so its enqueue time bounds the provider key window.
+func (s *Store) OutboxMessageCreatedAt(ctx context.Context, orgID, id string) (time.Time, error) {
+	var createdAt time.Time
+	err := s.q.QueryRowContext(ctx, `
+		SELECT created_at FROM outbox_messages WHERE org_id = $1 AND id = $2
+	`, orgID, id).Scan(&createdAt)
+	return createdAt, err
+}
