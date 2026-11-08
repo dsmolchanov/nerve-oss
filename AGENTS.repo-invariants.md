@@ -223,3 +223,16 @@ makes a review loop unable to terminate.
   successfully read non-one row count is a state refusal. PostgreSQL-backed
   TestPaidRecipientUpgradeResultErrorsAreNotStateFences checks both tiers,
   rollback, zero-row refusal and successful exact retry.
+- Does every retry of an unfenced legacy forward (no `provider_started_at`)
+  on a replay-capable provider check the provider's idempotency-key retention
+  deadline before any provider call? The check must read only durable row
+  state (`attempt_count` above one and `created_at`), never `last_error` or
+  other diagnostic text that requeue paths overwrite. Past the deadline the row
+  fails as replay-window-expired without contacting the provider; a first
+  attempt and a retry inside the window still send. A failed replay after an
+  idempotency payload mismatch is an unresolved outcome, never a known send
+  failure.
+  Enforced by `TestOutboxWorkerStopsExpiredLegacyForwardRetryBeforeSending`
+  (unresolved-recovery and shutdown requeues stop; first-attempt and in-window
+  cases send) and `TestOutboxWorkerKeepsForwardOutcomeUnresolvedWhenRecoveryFails`
+  in `internal/emailtransport/outbox_worker_forward_test.go`.
