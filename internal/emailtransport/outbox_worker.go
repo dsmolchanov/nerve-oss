@@ -296,27 +296,6 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		}
 	}
 
-	if !msg.ProviderStartedAt.Valid && msg.AttemptCount > 1 && strings.HasPrefix(msg.IdempotencyKey, "fwd:") && adapterSupportsIdempotentReplay(adapter) {
-		// A legacy forward has no provider fence, and an earlier claim may
-		// have reached the provider, possibly with an outcome still unknown.
-		// Only the provider's key retention makes resending it safe, so check
-		// that window from the durable enqueue time before any provider call.
-		createdAt, err := w.Store.OutboxMessageCreatedAt(ctx, msg.OrgID, msg.ID)
-		if err != nil {
-			next := time.Now().UTC().Add(w.BaseBackoff)
-			requeueErr := w.Store.RequeueClaimedOutboxMessage(outcomeContext(), msg.ID, claimLeaseID, next, fmt.Sprintf("load outbox enqueue time: %v", err))
-			return errors.Join(fmt.Errorf("load outbox enqueue time: %w", err), requeueErr)
-		}
-		if replayDeadline, ok := adapterReplayDeadline(adapter, createdAt); !ok || !time.Now().UTC().Before(replayDeadline) {
-			w.incDeliver(msg.Provider, "provider_unknown_expired")
-			reason := "provider_unknown_replay_window_expired: an earlier forward attempt can no longer be replayed safely"
-			if finishErr := w.Store.MarkClaimedOutboxMessageFailed(outcomeContext(), msg.ID, claimLeaseID, reason); finishErr != nil {
-				return fmt.Errorf("record expired forward replay: %w", finishErr)
-			}
-			return errors.New(reason)
-		}
-	}
-
 	textBody := msg.TextBody
 	htmlBody := msg.HTMLBody
 
@@ -437,6 +416,33 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 	}
 	operationID := operation.ID
 	providerStartedAt := operation.StartedAt
+	// An unfenced legacy forward has no durable provider-start record, and an
+	// earlier claim may have reached the provider. Fenced rows are excluded:
+	// their provider start is recorded before any network I/O, so a claim
+	// alone never makes them uncertain.
+	legacyForwardRetry := operationID == "" && msg.AttemptCount > 1 &&
+		strings.HasPrefix(msg.IdempotencyKey, "fwd:") && adapterSupportsIdempotentReplay(adapter)
+	if legacyForwardRetry {
+		// Only the provider's key retention makes resending safe, so check
+		// that window from the durable enqueue time before any provider call.
+		createdAt, err := w.Store.OutboxMessageCreatedAt(ctx, msg.OrgID, msg.ID)
+		if err != nil {
+			next := time.Now().UTC().Add(w.BaseBackoff)
+			requeueErr := w.Store.RequeueClaimedOutboxMessage(outcomeContext(), msg.ID, claimLeaseID, next, fmt.Sprintf("load outbox enqueue time: %v", err))
+			return errors.Join(fmt.Errorf("load outbox enqueue time: %w", err), requeueErr)
+		}
+		if replayDeadline, ok := adapterReplayDeadline(adapter, createdAt); !ok || !time.Now().UTC().Before(replayDeadline) {
+			w.incDeliver(msg.Provider, "provider_unknown_expired")
+			reason := "provider_unknown_replay_window_expired: an earlier forward attempt can no longer be replayed safely"
+			if finishErr := w.Store.MarkClaimedOutboxMessageFailed(outcomeContext(), msg.ID, claimLeaseID, reason); finishErr != nil {
+				return fmt.Errorf("record expired forward replay: %w", finishErr)
+			}
+			return errors.New(reason)
+		}
+	}
+	// A replay of an operation that may already have been accepted reads its
+	// outcome back; a failed replay cannot establish that it failed.
+	replayingEarlierSend := (msg.ProviderStartedAt.Valid && !msg.ProviderResolvedAt.Valid) || legacyForwardRetry
 	providerOperationKey := msg.IdempotencyKey
 	if operationID != "" {
 		providerOperationKey = operationID
@@ -450,11 +456,14 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		// or duplicated.
 		out.ReplyTo = nil
 		providerMessageID, err = adapter.SendMessage(ctx, out, providerOperationKey)
-		if err != nil {
-			// The mismatch proves the key already names an earlier send, so a
-			// failed recovery says nothing about that send's outcome.
-			err = &ProviderError{Reason: ReasonIdempotencyRecoveryUnresolved, Cause: fmt.Errorf("%s: %w", ReasonIdempotencyRecoveryUnresolved, err)}
-		}
+		// The mismatch proves the key already names an earlier send.
+		replayingEarlierSend = true
+	}
+	if err != nil && replayingEarlierSend && !isPendingProviderError(err) {
+		// A failed replay says nothing about the earlier send's outcome: keep
+		// it unresolved (bounded replay, then quarantine or expiry) instead of
+		// resolving it as a send failure or releasing its reservation.
+		err = &ProviderError{Reason: ReasonIdempotencyRecoveryUnresolved, Cause: fmt.Errorf("%s: %w", ReasonIdempotencyRecoveryUnresolved, err)}
 	}
 	w.observeDelivery(msg.Provider, time.Since(sendStart).Seconds())
 	if err == nil {
@@ -708,6 +717,11 @@ func (w *OutboxWorker) backoffForAttempt(attempt int) time.Duration {
 // forwardedReceivedEmailID extracts the provider email id from an inbound
 // forward key, "fwd:<received email id>:<inbox id>:<destination>". A key for a
 // different inbox is not trusted.
+func isPendingProviderError(err error) bool {
+	pe := ClassifyProviderError(err)
+	return pe != nil && pe.Pending
+}
+
 func isIdempotencyPayloadMismatch(err error) bool {
 	pe := ClassifyProviderError(err)
 	return pe != nil && pe.Reason == ReasonIdempotencyPayloadMismatch

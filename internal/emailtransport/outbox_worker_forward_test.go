@@ -145,6 +145,8 @@ type idempotentResendAdapter struct {
 	sends    int
 	// recoveryErr fails every request that reuses a recorded key.
 	recoveryErr error
+	// failAll fails every request before any key check.
+	failAll error
 }
 
 func (a *idempotentResendAdapter) Name() string                          { return "resend" }
@@ -160,6 +162,9 @@ func (a *idempotentResendAdapter) record(key string, msg OutboundMessage, id str
 }
 
 func (a *idempotentResendAdapter) SendMessage(_ context.Context, msg OutboundMessage, key string) (string, error) {
+	if a.failAll != nil {
+		return "", a.failAll
+	}
 	if stored, ok := a.payloads[key]; ok {
 		if stored == resendPayloadIdentity(msg) && a.recoveryErr != nil {
 			return "", a.recoveryErr
@@ -446,5 +451,128 @@ func TestOutboxWorkerStopsExpiredLegacyForwardRetryBeforeSending(t *testing.T) {
 				t.Fatalf("sends=%d status=%q, want one send", adapter.sends, got)
 			}
 		})
+	})
+}
+
+func TestOutboxWorkerNeverResolvesEarlierForwardFromFailedReplay(t *testing.T) {
+	withOutboxWorkerDatabase(t, func(ctx context.Context, db *sql.DB, st *store.Store) {
+		replayErrors := map[string]error{
+			"unauthorized": &ProviderError{Permanent: true, StatusCode: 401, Reason: "unauthorized"},
+			"rate limited": &ProviderError{StatusCode: 429, Reason: "rate_limited"},
+		}
+		for _, fenced := range []bool{false, true} {
+			for name, replayErr := range replayErrors {
+				mode := "legacy"
+				if fenced {
+					mode = "fenced"
+				}
+				t.Run(mode+" "+name, func(t *testing.T) {
+					tenant := "forward-replay-fail-" + strings.ReplaceAll(mode+"-"+name, " ", "-")
+					orgID, inboxID := seedWorkerPolicyFence(t, ctx, db, st, tenant)
+					inbox := tenant + "@local.neuralmail"
+					destination := "dest@example.org"
+					id := uuid.NewString()
+					key := "fwd:received-" + id + ":" + inboxID + ":" + destination
+					var epoch any
+					if fenced {
+						epoch = int64(1)
+					}
+					// One earlier claim already happened; this is the last retry.
+					if _, err := db.ExecContext(ctx, `
+						INSERT INTO outbox_messages (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject, text_body, autonomous_policy_epoch, attempt_count)
+						VALUES ($1, $2, $3, 'resend', $4, $5, $6, 'Fwd: original', 'body', $7, $8)
+					`, id, orgID, inboxID, key, destination, inbox, epoch, store.MaxOutboxRetries-1); err != nil {
+						t.Fatal(err)
+					}
+					adapter := &idempotentResendAdapter{payloads: map[string]string{}, ids: map[string]string{}}
+					original := OutboundMessage{From: inbox, To: []string{destination}, Subject: "Fwd: original", TextBody: "body",
+						Headers: map[string]string{"X-Nerve-Loop": inboxID}}
+					var operationID string
+					if fenced {
+						first := claimWorkerPolicyOutbox(t, ctx, st, id, "crashed-worker")
+						var err error
+						if operationID, err = st.BeginOutboxProviderOperation(ctx, first); err != nil {
+							t.Fatal(err)
+						}
+						adapter.record(operationID, original, "original-"+id)
+						if _, err := db.ExecContext(ctx, `UPDATE outbox_messages SET locked_at = now() - interval '10 minutes' WHERE id = $1`, id); err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						adapter.record(key, original, "original-"+id)
+					}
+					// The replay itself fails before any payload comparison, as a
+					// revoked key or rate limit would on a later claim.
+					adapter.failAll = replayErr
+					msg := claimWorkerPolicyOutbox(t, ctx, st, id, "replay-worker")
+					if err := policyFenceWorker(t, st, adapter, "replay-worker").deliverOne(ctx, msg); err == nil {
+						t.Fatal("failed replay reported success")
+					}
+					var status string
+					var storedOperationID sql.NullString
+					var startedAt, resolvedAt sql.NullTime
+					if err := db.QueryRowContext(ctx, `
+						SELECT status, provider_operation_id, provider_started_at, provider_resolved_at FROM outbox_messages WHERE id = $1
+					`, id).Scan(&status, &storedOperationID, &startedAt, &resolvedAt); err != nil {
+						t.Fatal(err)
+					}
+					if status != "queued" || resolvedAt.Valid || storedOperationID.String != operationID || startedAt.Valid != fenced {
+						t.Fatalf("status=%q operation=%q started=%v resolved=%v, want queued and unresolved", status, storedOperationID.String, startedAt.Valid, resolvedAt.Valid)
+					}
+					if fenced {
+						if err := st.RunInTx(ctx, func(scoped *store.Store) error {
+							_, _, err := scoped.AdvanceOutboundPolicyEpoch(ctx, orgID)
+							return err
+						}); err != nil {
+							t.Fatal(err)
+						}
+					}
+					adapter.failAll = nil
+					if _, err := db.ExecContext(ctx, `UPDATE outbox_messages SET next_attempt_at = now() - interval '1 second' WHERE id = $1`, id); err != nil {
+						t.Fatal(err)
+					}
+					msg = claimWorkerPolicyOutbox(t, ctx, st, id, "recovered-worker")
+					if err := policyFenceWorker(t, st, adapter, "recovered-worker").deliverOne(ctx, msg); err != nil {
+						t.Fatal(err)
+					}
+					var providerID string
+					if err := db.QueryRowContext(ctx, `SELECT status, coalesce(provider_message_id, '') FROM outbox_messages WHERE id = $1`, id).Scan(&status, &providerID); err != nil {
+						t.Fatal(err)
+					}
+					if status != "sent" || providerID != "original-"+id || adapter.sends != 0 {
+						t.Fatalf("status=%q provider id=%q sends=%d, want the original send recovered once", status, providerID, adapter.sends)
+					}
+				})
+			}
+		}
+	})
+}
+
+func TestOutboxWorkerSendsOldFencedForwardThatNeverStarted(t *testing.T) {
+	withOutboxWorkerDatabase(t, func(ctx context.Context, db *sql.DB, st *store.Store) {
+		orgID, inboxID := seedWorkerPolicyFence(t, ctx, db, st, "forward-fenced-old")
+		destination := "fenced-old@example.org"
+		id := uuid.NewString()
+		// Claimed and requeued before delivery (for example at shutdown) and
+		// resumed after the provider key window: a fence proves it never started.
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO outbox_messages (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject, text_body, autonomous_policy_epoch, attempt_count, last_error, created_at)
+			VALUES ($1, $2, $3, 'resend', $4, $5, 'forward-fenced-old@local.neuralmail', 'Fwd: original', 'body', 1, 1, 'worker stopping before delivery', now() - interval '25 hours')
+		`, id, orgID, inboxID, "fwd:received-old:"+inboxID+":"+destination, destination); err != nil {
+			t.Fatal(err)
+		}
+		adapter := &idempotentResendAdapter{payloads: map[string]string{}, ids: map[string]string{}}
+		msg := claimWorkerPolicyOutbox(t, ctx, st, id, "resumed-worker")
+		if err := policyFenceWorker(t, st, adapter, "resumed-worker").deliverOne(ctx, msg); err != nil {
+			t.Fatal(err)
+		}
+		var status string
+		var resolvedAt sql.NullTime
+		if err := db.QueryRowContext(ctx, `SELECT status, provider_resolved_at FROM outbox_messages WHERE id = $1`, id).Scan(&status, &resolvedAt); err != nil {
+			t.Fatal(err)
+		}
+		if adapter.sends != 1 || status != "sent" || !resolvedAt.Valid {
+			t.Fatalf("sends=%d status=%q resolved=%v, want one committed send", adapter.sends, status, resolvedAt.Valid)
+		}
 	})
 }
