@@ -296,6 +296,26 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		}
 	}
 
+	if !msg.ProviderStartedAt.Valid && msg.LastError.Valid && strings.HasPrefix(msg.LastError.String, ReasonIdempotencyRecoveryUnresolved+":") {
+		// A legacy row whose earlier send is still unresolved. It has no
+		// provider fence, so check the key window from its enqueue time before
+		// contacting the provider: a send after expiry could deliver twice.
+		createdAt, err := w.Store.OutboxMessageCreatedAt(ctx, msg.OrgID, msg.ID)
+		if err != nil {
+			next := time.Now().UTC().Add(w.BaseBackoff)
+			requeueErr := w.Store.RequeueClaimedOutboxMessage(outcomeContext(), msg.ID, claimLeaseID, next, msg.LastError.String)
+			return errors.Join(fmt.Errorf("load outbox enqueue time: %w", err), requeueErr)
+		}
+		if replayDeadline, ok := adapterReplayDeadline(adapter, createdAt); !ok || !time.Now().UTC().Before(replayDeadline) {
+			w.incDeliver(msg.Provider, "provider_unknown_expired")
+			reason := "provider_unknown_replay_window_expired: earlier send unresolved and no longer replayable"
+			if finishErr := w.Store.MarkClaimedOutboxMessageFailed(outcomeContext(), msg.ID, claimLeaseID, reason); finishErr != nil {
+				return fmt.Errorf("record expired unresolved send: %w", finishErr)
+			}
+			return errors.New(reason)
+		}
+	}
+
 	textBody := msg.TextBody
 	htmlBody := msg.HTMLBody
 
@@ -432,7 +452,7 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		if err != nil {
 			// The mismatch proves the key already names an earlier send, so a
 			// failed recovery says nothing about that send's outcome.
-			err = &ProviderError{Reason: ReasonIdempotencyRecoveryUnresolved, Cause: err}
+			err = &ProviderError{Reason: ReasonIdempotencyRecoveryUnresolved, Cause: fmt.Errorf("%s: %w", ReasonIdempotencyRecoveryUnresolved, err)}
 		}
 	}
 	w.observeDelivery(msg.Provider, time.Since(sendStart).Seconds())

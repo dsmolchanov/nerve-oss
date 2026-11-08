@@ -385,3 +385,32 @@ func TestOutboxWorkerKeepsForwardOutcomeUnresolvedWhenRecoveryFails(t *testing.T
 		}
 	})
 }
+
+func TestOutboxWorkerStopsExpiredUnresolvedLegacyForwardBeforeSending(t *testing.T) {
+	withOutboxWorkerDatabase(t, func(ctx context.Context, db *sql.DB, st *store.Store) {
+		orgID, inboxID := seedWorkerPolicyFence(t, ctx, db, st, "forward-expired")
+		destination := "expired-dest@example.org"
+		id := uuid.NewString()
+		// Requeued after a failed recovery, then resumed only after the
+		// provider's key retention expired.
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO outbox_messages (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject, text_body, last_error, created_at)
+			VALUES ($1, $2, $3, 'resend', $4, $5, 'forward-expired@local.neuralmail', 'Fwd: original', 'body', $6, now() - interval '25 hours')
+		`, id, orgID, inboxID, "fwd:received-expired:"+inboxID+":"+destination, destination,
+			ReasonIdempotencyRecoveryUnresolved+": rate limited"); err != nil {
+			t.Fatal(err)
+		}
+		adapter := &idempotentResendAdapter{payloads: map[string]string{}, ids: map[string]string{}}
+		msg := claimWorkerPolicyOutbox(t, ctx, st, id, "late-worker")
+		if err := policyFenceWorker(t, st, adapter, "late-worker").deliverOne(ctx, msg); err == nil {
+			t.Fatal("expired unresolved forward reported success")
+		}
+		var status, lastError string
+		if err := db.QueryRowContext(ctx, `SELECT status, coalesce(last_error, '') FROM outbox_messages WHERE id = $1`, id).Scan(&status, &lastError); err != nil {
+			t.Fatal(err)
+		}
+		if adapter.sends != 0 || len(adapter.payloads) != 0 || status != "failed" || !strings.Contains(lastError, "replay_window_expired") {
+			t.Fatalf("sends=%d status=%q last_error=%q, want no provider call and an expired failure", adapter.sends, status, lastError)
+		}
+	})
+}
