@@ -296,21 +296,22 @@ func (w *OutboxWorker) deliverOne(ctx context.Context, msg store.OutboxMessage) 
 		}
 	}
 
-	if !msg.ProviderStartedAt.Valid && msg.LastError.Valid && strings.HasPrefix(msg.LastError.String, ReasonIdempotencyRecoveryUnresolved+":") {
-		// A legacy row whose earlier send is still unresolved. It has no
-		// provider fence, so check the key window from its enqueue time before
-		// contacting the provider: a send after expiry could deliver twice.
+	if !msg.ProviderStartedAt.Valid && msg.AttemptCount > 1 && strings.HasPrefix(msg.IdempotencyKey, "fwd:") && adapterSupportsIdempotentReplay(adapter) {
+		// A legacy forward has no provider fence, and an earlier claim may
+		// have reached the provider, possibly with an outcome still unknown.
+		// Only the provider's key retention makes resending it safe, so check
+		// that window from the durable enqueue time before any provider call.
 		createdAt, err := w.Store.OutboxMessageCreatedAt(ctx, msg.OrgID, msg.ID)
 		if err != nil {
 			next := time.Now().UTC().Add(w.BaseBackoff)
-			requeueErr := w.Store.RequeueClaimedOutboxMessage(outcomeContext(), msg.ID, claimLeaseID, next, msg.LastError.String)
+			requeueErr := w.Store.RequeueClaimedOutboxMessage(outcomeContext(), msg.ID, claimLeaseID, next, fmt.Sprintf("load outbox enqueue time: %v", err))
 			return errors.Join(fmt.Errorf("load outbox enqueue time: %w", err), requeueErr)
 		}
 		if replayDeadline, ok := adapterReplayDeadline(adapter, createdAt); !ok || !time.Now().UTC().Before(replayDeadline) {
 			w.incDeliver(msg.Provider, "provider_unknown_expired")
-			reason := "provider_unknown_replay_window_expired: earlier send unresolved and no longer replayable"
+			reason := "provider_unknown_replay_window_expired: an earlier forward attempt can no longer be replayed safely"
 			if finishErr := w.Store.MarkClaimedOutboxMessageFailed(outcomeContext(), msg.ID, claimLeaseID, reason); finishErr != nil {
-				return fmt.Errorf("record expired unresolved send: %w", finishErr)
+				return fmt.Errorf("record expired forward replay: %w", finishErr)
 			}
 			return errors.New(reason)
 		}

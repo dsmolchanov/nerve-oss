@@ -386,31 +386,65 @@ func TestOutboxWorkerKeepsForwardOutcomeUnresolvedWhenRecoveryFails(t *testing.T
 	})
 }
 
-func TestOutboxWorkerStopsExpiredUnresolvedLegacyForwardBeforeSending(t *testing.T) {
+func TestOutboxWorkerStopsExpiredLegacyForwardRetryBeforeSending(t *testing.T) {
 	withOutboxWorkerDatabase(t, func(ctx context.Context, db *sql.DB, st *store.Store) {
 		orgID, inboxID := seedWorkerPolicyFence(t, ctx, db, st, "forward-expired")
-		destination := "expired-dest@example.org"
-		id := uuid.NewString()
-		// Requeued after a failed recovery, then resumed only after the
-		// provider's key retention expired.
-		if _, err := db.ExecContext(ctx, `
-			INSERT INTO outbox_messages (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject, text_body, last_error, created_at)
-			VALUES ($1, $2, $3, 'resend', $4, $5, 'forward-expired@local.neuralmail', 'Fwd: original', 'body', $6, now() - interval '25 hours')
-		`, id, orgID, inboxID, "fwd:received-expired:"+inboxID+":"+destination, destination,
-			ReasonIdempotencyRecoveryUnresolved+": rate limited"); err != nil {
-			t.Fatal(err)
+		insert := func(destination string, attempts int, age string, lastError string) string {
+			id := uuid.NewString()
+			if _, err := db.ExecContext(ctx, `
+				INSERT INTO outbox_messages (id, org_id, inbox_id, provider, idempotency_key, "to", "from", subject, text_body, attempt_count, last_error, created_at)
+				VALUES ($1, $2, $3, 'resend', $4, $5, 'forward-expired@local.neuralmail', 'Fwd: original', 'body', $6, nullif($7, ''), now() - $8::interval)
+			`, id, orgID, inboxID, "fwd:received-expired:"+inboxID+":"+destination, destination, attempts, lastError, age); err != nil {
+				t.Fatal(err)
+			}
+			return id
 		}
-		adapter := &idempotentResendAdapter{payloads: map[string]string{}, ids: map[string]string{}}
-		msg := claimWorkerPolicyOutbox(t, ctx, st, id, "late-worker")
-		if err := policyFenceWorker(t, st, adapter, "late-worker").deliverOne(ctx, msg); err == nil {
-			t.Fatal("expired unresolved forward reported success")
+		status := func(id string) (string, string) {
+			var status, lastError string
+			if err := db.QueryRowContext(ctx, `SELECT status, coalesce(last_error, '') FROM outbox_messages WHERE id = $1`, id).Scan(&status, &lastError); err != nil {
+				t.Fatal(err)
+			}
+			return status, lastError
 		}
-		var status, lastError string
-		if err := db.QueryRowContext(ctx, `SELECT status, coalesce(last_error, '') FROM outbox_messages WHERE id = $1`, id).Scan(&status, &lastError); err != nil {
-			t.Fatal(err)
+		// The guard reads only durable row state, so an unrelated requeue
+		// message (here a worker shutdown) cannot hide an earlier attempt.
+		for name, lastError := range map[string]string{
+			"after unresolved recovery": ReasonIdempotencyRecoveryUnresolved + ": rate limited",
+			"after worker shutdown":     "worker stopping before delivery",
+		} {
+			t.Run(name, func(t *testing.T) {
+				adapter := &idempotentResendAdapter{payloads: map[string]string{}, ids: map[string]string{}}
+				id := insert(uuid.NewString()+"@example.org", 1, "25 hours", lastError)
+				msg := claimWorkerPolicyOutbox(t, ctx, st, id, "late-worker")
+				if err := policyFenceWorker(t, st, adapter, "late-worker").deliverOne(ctx, msg); err == nil {
+					t.Fatal("expired forward retry reported success")
+				}
+				if got, reason := status(id); adapter.sends != 0 || len(adapter.payloads) != 0 || got != "failed" || !strings.Contains(reason, "replay_window_expired") {
+					t.Fatalf("sends=%d status=%q last_error=%q, want no provider call and an expired failure", adapter.sends, got, reason)
+				}
+			})
 		}
-		if adapter.sends != 0 || len(adapter.payloads) != 0 || status != "failed" || !strings.Contains(lastError, "replay_window_expired") {
-			t.Fatalf("sends=%d status=%q last_error=%q, want no provider call and an expired failure", adapter.sends, status, lastError)
-		}
+		t.Run("first attempt of an old forward still sends", func(t *testing.T) {
+			adapter := &idempotentResendAdapter{payloads: map[string]string{}, ids: map[string]string{}}
+			id := insert("first-attempt@example.org", 0, "25 hours", "")
+			msg := claimWorkerPolicyOutbox(t, ctx, st, id, "first-worker")
+			if err := policyFenceWorker(t, st, adapter, "first-worker").deliverOne(ctx, msg); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := status(id); adapter.sends != 1 || got != "sent" {
+				t.Fatalf("sends=%d status=%q, want one send", adapter.sends, got)
+			}
+		})
+		t.Run("retry inside the window still sends", func(t *testing.T) {
+			adapter := &idempotentResendAdapter{payloads: map[string]string{}, ids: map[string]string{}}
+			id := insert("in-window@example.org", 1, "1 hour", "worker stopping before delivery")
+			msg := claimWorkerPolicyOutbox(t, ctx, st, id, "window-worker")
+			if err := policyFenceWorker(t, st, adapter, "window-worker").deliverOne(ctx, msg); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := status(id); adapter.sends != 1 || got != "sent" {
+				t.Fatalf("sends=%d status=%q, want one send", adapter.sends, got)
+			}
+		})
 	})
 }
