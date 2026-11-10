@@ -7,6 +7,21 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: neuralmail
+          POSTGRES_PASSWORD: neuralmail
+          POSTGRES_DB: neuralmail
+        ports:
+          - 5432
+        options: >-
+          --health-cmd "pg_isready -U neuralmail"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Checkout nerve-oss
         uses: actions/checkout@v4
@@ -24,11 +39,13 @@ jobs:
       - name: Apply manifest-owned changes
         id: changes
         env:
-          BASE_REF: ${{ github.event.before }}
           HEAD_REF: ${{ github.sha }}
         run: |
+          # A prior push may have failed before publishing its Cloud PR.
+          # Compare against adopted authority, not only the immediately prior push.
+          base_ref="$(oss/scripts/sync/resolve_cloud_base.sh "$PWD/oss" "$PWD/cloud" "$HEAD_REF")"
           oss/scripts/sync/apply_to_cloud.sh \
-            "$PWD/oss" "$PWD/cloud" "$BASE_REF" "$HEAD_REF" \
+            "$PWD/oss" "$PWD/cloud" "$base_ref" "$HEAD_REF" \
             /tmp/changed_files.txt
           if [ ! -s /tmp/changed_files.txt ]; then
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
@@ -61,9 +78,13 @@ jobs:
       - name: Build and test cloud
         if: steps.changes.outputs.has_changes == 'true'
         working-directory: cloud
+        env:
+          NM_REQUIRE_DB: "1"
+          NM_TEST_DB_DSN: postgres://neuralmail:neuralmail@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/neuralmail?sslmode=disable
+          TZ: UTC
         run: |
           go build ./...
-          go test ./...
+          go test ./... -count=1 -timeout=30m
 
       - name: Create Pull Request
         if: steps.changes.outputs.has_changes == 'true'

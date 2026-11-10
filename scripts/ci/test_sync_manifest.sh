@@ -53,6 +53,9 @@ for path in internal/cloudapi/owned.go internal/billing/owned.go internal/reconc
   printf 'cloud preserved\n' > "$cloud_fixture/$path"
 done
 git -C "$cloud_fixture" add .
+mkdir -p "$cloud_fixture/deploy/cloud"
+printf 'OSS_SOURCE_REVISION=%s\n' "$base_ref" > "$cloud_fixture/deploy/cloud/oss-source.lock"
+git -C "$cloud_fixture" add deploy/cloud/oss-source.lock
 git -C "$cloud_fixture" commit -qm cloud-divergence
 
 printf 'contract head\n' >"$oss_fixture/docs/MCP_Contract.md"
@@ -72,7 +75,34 @@ for name in billing tokens usage; do
 done
 git -C "$oss_fixture" add -A
 git -C "$oss_fixture" commit -qm head
+failed_push_ref="$(git -C "$oss_fixture" rev-parse HEAD)"
+# A workflow-only repair must still deliver the preceding failed shared push.
+mkdir -p "$oss_fixture/.github/workflows"
+printf 'workflow-only repair\n' > "$oss_fixture/.github/workflows/repair.yml"
+git -C "$oss_fixture" add .github/workflows/repair.yml
+git -C "$oss_fixture" commit -qm repair-only
 head_ref="$(git -C "$oss_fixture" rev-parse HEAD)"
+"$repository_root/scripts/sync/apply_to_cloud.sh" \
+  "$oss_fixture" "$cloud_fixture" "$failed_push_ref" "$head_ref" "$fixture_root/lost-delta.txt"
+test ! -s "$fixture_root/lost-delta.txt"
+resolved_base="$("$repository_root/scripts/sync/resolve_cloud_base.sh" "$oss_fixture" "$cloud_fixture" "$head_ref")"
+test "$resolved_base" = "$base_ref"
+# Neither an invented/missing pin, duplicate authority nor a descendant can
+# silently reset the source or turn an older workflow into a downgrade.
+unrelated_ref="$(printf 'unrelated source\n' | git -C "$oss_fixture" commit-tree "${base_ref}^{tree}")"
+for pin in '' 'not-a-sha'  '0000000000000000000000000000000000000000' "$base_ref
+OSS_SOURCE_REVISION=$base_ref" "$base_ref=extra" "$head_ref" "$unrelated_ref"; do
+  printf 'OSS_SOURCE_REVISION=%s\n' "$pin" > "$cloud_fixture/deploy/cloud/oss-source.lock"
+  if "$repository_root/scripts/sync/resolve_cloud_base.sh" "$oss_fixture" "$cloud_fixture" "$failed_push_ref"; then
+    echo "invalid Cloud source base unexpectedly accepted" >&2; exit 1
+  fi
+done
+rm "$cloud_fixture/deploy/cloud/oss-source.lock"
+if "$repository_root/scripts/sync/resolve_cloud_base.sh" "$oss_fixture" "$cloud_fixture" "$head_ref"; then
+  echo "missing Cloud source authority unexpectedly accepted" >&2; exit 1
+fi
+printf 'OSS_SOURCE_REVISION=%s\n' "$base_ref" > "$cloud_fixture/deploy/cloud/oss-source.lock"
+base_ref="$resolved_base"
 
 changed_file="$fixture_root/changed.txt"
 "$repository_root/scripts/sync/apply_to_cloud.sh" \
