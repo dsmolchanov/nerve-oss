@@ -133,5 +133,13 @@ class IsolationTest(unittest.TestCase):
         self.assertNotIn(smoke, candidate_job)
 
 
+def load_tests(loader, tests, _pattern):
+    # This entry point is already required by OSS CI. Keep active-image wire
+    # and restart observation contracts in the same deterministic gate.
+    import test_hybrid_active_image_smoke
+    tests.addTests(loader.loadTestsFromModule(test_hybrid_active_image_smoke))
+    return tests
+
+
 if __name__ == '__main__':
     unittest.main()
