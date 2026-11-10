@@ -98,11 +98,10 @@ func (a *InboundAdapter) store(ctx context.Context, st *store.Store, inboxID str
 		Subject:   delivery.Subject,
 		Text:      delivery.Body,
 		CreatedAt: a.now(),
-		// The local key is ours and stable; the provider's own identifier is
-		// kept separately so an operator can still trace a message back to
-		// Cloud and the mail provider.
+		// The local key stays stable across redelivery. Only the original mail
+		// header may become a reply target; the provider API ID is not one.
 		ProviderMessageID: LocalDeliveryID(a.AuthorityID, delivery),
-		InternetMessageID: delivery.ProviderMessageID,
+		InternetMessageID: delivery.InternetMessageID,
 		From:              store.Participant{Email: delivery.Sender},
 		To:                []store.Participant{{Email: delivery.Recipient}},
 	})
