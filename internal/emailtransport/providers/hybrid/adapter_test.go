@@ -555,3 +555,48 @@ func TestHybridSendableCoversEveryHeaderTheWorkerEmits(t *testing.T) {
 		}
 	}
 }
+
+// Provider API IDs and mail headers are different namespaces. Exercise storage
+// and native reply selection, including a legacy peer that omits the header.
+func TestHybridIngestPreservesOriginalMessageIDForReplyAndReplay(t *testing.T) {
+	for _, header := range []string{"<actual-provider-token@mail.resend.test>", ""} {
+		t.Run(fmt.Sprint(header != ""), func(t *testing.T) {
+			st, inbox := hybridRuntimeStore(t)
+			ctx := context.Background()
+			first := delivery(uuid.NewString(), uuid.NewString())
+			first.InternetMessageID = header
+			a, _ := inboundFixture(t, []Delivery{first})
+			_, ids, err := a.Ingest(ctx, st, inbox, "")
+			if err != nil || len(ids) != 1 {
+				t.Fatal(ids, err)
+			}
+			var stored, org, thread string
+			if err := st.DB().QueryRowContext(ctx, `SELECT coalesce(internet_message_id,''),org_id::text,thread_id::text FROM messages WHERE id=$1`, ids[0]).Scan(&stored, &org, &thread); err != nil {
+				t.Fatal(err)
+			}
+			if stored != header {
+				t.Fatal("provider API ID replaced original mail header")
+			}
+			target, err := st.GetThreadReplyTarget(ctx, org, inbox, thread)
+			if err != nil || target.InReplyTo != header {
+				t.Fatal("reply target did not preserve original header", err)
+			}
+			if target.References != "" {
+				t.Fatal("reply target duplicated in ancestors")
+			}
+			// A redelivery cannot rewrite either the stable local key or original header.
+			replay := first
+			replay.LeaseToken = uuid.NewString()
+			replay.InternetMessageID = "<changed@mail.resend.test>"
+			again, _ := inboundFixture(t, []Delivery{replay})
+			again.AuthorityID = a.AuthorityID
+			_, next, err := again.Ingest(ctx, st, inbox, "")
+			if err != nil || len(next) != 1 || next[0] != ids[0] {
+				t.Fatal("redelivery changed local identity", err)
+			}
+			if err := st.DB().QueryRowContext(ctx, `SELECT coalesce(internet_message_id,'') FROM messages WHERE id=$1`, ids[0]).Scan(&stored); err != nil || stored != header {
+				t.Fatal("redelivery rewrote original header", err)
+			}
+		})
+	}
+}

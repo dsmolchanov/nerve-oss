@@ -5,8 +5,12 @@ from pathlib import Path
 import json
 import tempfile
 import unittest
+import threading
+import urllib.request
+import urllib.error
+from http.server import ThreadingHTTPServer
 
-from hybrid_active_image_smoke import complete_sends, fixture_key_state, observe_single_send, write_admission
+from hybrid_active_image_smoke import complete_sends, fixture_key_state, fixture_handler, observe_single_send, write_admission
 
 
 class FixtureKeyStateTest(unittest.TestCase):
@@ -32,6 +36,56 @@ class FixtureKeyStateTest(unittest.TestCase):
             self.assertEqual(json.loads((root / 'admission.json').read_text()),
                              {'kid': 'old', 'admitted_kids': ['old', 'new']})
             self.assertFalse((root / 'admission.next.json').exists())
+
+
+class FixtureMessageIdentityTest(unittest.TestCase):
+    def test_actual_poll_and_reply_keep_provider_and_internet_identifiers_distinct(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            admission = {key: key + '-fixture' for key in
+                         ('installation_id', 'org_id', 'inbox_id', 'delivery_id', 'lease_token')}
+            admission['kid'] = 'active-fixture-key'
+            write_admission(root, admission)
+            server = ThreadingHTTPServer(('127.0.0.1', 0), fixture_handler(root))
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                def post(action, fields):
+                    body = {key: admission[key] for key in ('installation_id', 'inbox_id')}
+                    body.update(fields)
+                    request = urllib.request.Request(
+                        f'http://127.0.0.1:{server.server_port}/v1/hybrid/{action}',
+                        data=json.dumps(body).encode(),
+                        headers={'Authorization': 'Bearer fixture-token.' + admission['kid']})
+                    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=2) as response:
+                        return json.load(response)
+
+                delivery = post('poll', {})['delivery']
+                self.assertEqual(delivery['internet_message_id'], '<fixture-inbound@example.invalid>')
+                self.assertNotEqual(delivery['provider_message_id'], delivery['internet_message_id'])
+                self.assertNotEqual(delivery['provider_message_id'], delivery['id'])
+                request = {'kind': 'reply', 'to': ['sender@example.invalid'],
+                           'operation_key': 'fixture-reply', 'body': 'Synthetic hybrid reply',
+                           'in_reply_to': delivery['internet_message_id'],
+                           'references': delivery['internet_message_id']}
+                for field in ('in_reply_to', 'references'):
+                    wrong = request.copy()
+                    wrong[field] = delivery['provider_message_id']
+                    with self.assertRaises(urllib.error.HTTPError) as refused:
+                        post('send', wrong)
+                    self.assertEqual(refused.exception.code, 400)
+                    self.assertFalse((root / 'sends.jsonl').exists())
+                receipt = post('send', request)
+                self.assertEqual(receipt['status'], 'sent')
+                self.assertEqual(complete_sends(root / 'sends.jsonl')[0]['in_reply_to'],
+                                 delivery['internet_message_id'])
+                post('ack', {'delivery_id': delivery['id'], 'lease_token': delivery['lease_token']})
+                self.assertIsNone(post('poll', {})['delivery'])
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+                self.assertFalse(worker.is_alive())
 
 
 class CompleteSendsTest(unittest.TestCase):

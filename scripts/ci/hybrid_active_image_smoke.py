@@ -82,7 +82,7 @@ def observe_single_send(read_events, terminal, quiet_seconds=6, timeout=120,
     raise RuntimeError('synthetic reply never reached one complete, settled send')
 
 
-def fixture(state_dir):
+def fixture_handler(state_dir):
     """A loopback-only synthetic Cloud with an explicit admission/approval file."""
     state_dir = Path(state_dir)
 
@@ -157,7 +157,8 @@ def fixture(state_dir):
                 return self.answer(200, {'delivery': {
                     'id': admission['delivery_id'], 'org_id': admission['org_id'],
                     'installation_id': admission['installation_id'], 'inbox_id': admission['inbox_id'],
-                    'provider_message_id': '<fixture-inbound@example.invalid>',
+                    'provider_message_id': 'aaaaaaaa-1111-4111-8111-111111111111',
+                    'internet_message_id': '<fixture-inbound@example.invalid>',
                     'sender': 'sender@example.invalid', 'recipient': 'dev@local.nerve.email',
                     'subject': 'Synthetic hybrid inbound', 'body': 'Local fixture body',
                     'state': 'leased', 'lease_token': admission['lease_token']}})
@@ -167,19 +168,25 @@ def fixture(state_dir):
                 (state_dir / 'acked').write_text('yes')
                 return self.answer(200, {})
             if action == 'send':
-                if request.get('kind') != 'reply' or request.get('to') != ['sender@example.invalid']:
+                if (request.get('kind') != 'reply' or request.get('to') != ['sender@example.invalid']
+                        or request.get('in_reply_to') != '<fixture-inbound@example.invalid>'
+                        or request.get('references') != '<fixture-inbound@example.invalid>'):
                     return self.answer(400, {})
                 with (state_dir / 'sends.jsonl').open('a') as events:
                     events.write(json.dumps(request) + '\n')
                 return self.answer(200, {
                     'org_id': admission['org_id'], 'installation_id': admission['installation_id'],
                     'operation_key': request['operation_key'], 'status': 'sent',
-                    'provider_message_id': '<fixture-reply@example.invalid>', 'technical_units': 1})
+                    'provider_message_id': 'aaaaaaaa-2222-4222-8222-222222222222', 'technical_units': 1})
             if action == 'receipt':
                 return self.answer(404, {})
             return self.answer(404, {})
 
-    ThreadingHTTPServer(('127.0.0.1', FIXTURE_PORT), Handler).serve_forever()
+    return Handler
+
+
+def fixture(state_dir):
+    ThreadingHTTPServer(('127.0.0.1', FIXTURE_PORT), fixture_handler(state_dir)).serve_forever()
 
 
 def smoke(image, successor_core_head, predecessor_migration_image):

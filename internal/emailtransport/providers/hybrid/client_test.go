@@ -476,3 +476,21 @@ func TestHybridUnverifiableSendOutcomesStayRetryable(t *testing.T) {
 		t.Fatalf("a foreign delivery was treated as retryable: %+v", classified)
 	}
 }
+
+func TestHybridDeliveryPreservesOnlyBoundedOriginalThreadingMetadata(t *testing.T) {
+	client, _ := newTestClient(t, "")
+	for _, value := range []string{"", "<actual-provider-token@mail.resend.test>", "<" + strings.Repeat("a", 981) + "@b>"} {
+		d := validDelivery(client)
+		d.InternetMessageID = value
+		if err := client.checkDelivery(d); err != nil {
+			t.Fatalf("valid original header refused: %v", err)
+		}
+	}
+	for _, value := range []string{"provider-api-id", "<missing-at>", "<@b>", "<a@>", "<a@@b>", "<a@b> <c@d>", "<a@b>\r\nBcc:private@example.test", "<a b@c>", "<<a@b>>", "<é@b>", "<" + strings.Repeat("a", 982) + "@b>"} {
+		d := validDelivery(client)
+		d.InternetMessageID = value
+		if err := client.checkDelivery(d); err == nil {
+			t.Fatal("invalid original header admitted")
+		}
+	}
+}

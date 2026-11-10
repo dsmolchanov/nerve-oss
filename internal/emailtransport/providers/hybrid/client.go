@@ -58,6 +58,9 @@ type Delivery struct {
 	InstallationID    string `json:"installation_id"`
 	InboxID           string `json:"inbox_id"`
 	ProviderMessageID string `json:"provider_message_id"`
+	// InternetMessageID is the original RFC 5322 header, not the provider API ID.
+	// Older Cloud peers omit it; omission never fabricates a threading target.
+	InternetMessageID string `json:"internet_message_id,omitempty"`
 	Subject           string `json:"subject"`
 	Body              string `json:"body"`
 	Sender            string `json:"sender"`
@@ -163,7 +166,32 @@ func (c *Client) checkDelivery(d Delivery) error {
 		return emailtransport.NewTransientError(0, "server_error",
 			fmt.Errorf("%w: poll returned an incomplete delivery %s", ErrUnavailable, d.ID))
 	}
+	if !validInternetMessageID(d.InternetMessageID) {
+		return emailtransport.NewTransientError(0, "server_error",
+			fmt.Errorf("%w: poll returned an invalid threading identifier", ErrUnavailable))
+	}
 	return nil
+}
+
+// An optional single ASCII identifier must fit the longest threading header.
+// Do not trim or repair it: that would change the original reply target.
+func validInternetMessageID(value string) bool {
+	if value == "" {
+		return true
+	}
+	if len(value) < 5 || len(value) > 998-len("In-Reply-To: ") || value[0] != '<' || value[len(value)-1] != '>' || strings.Count(value, "@") != 1 {
+		return false
+	}
+	inner := value[1 : len(value)-1]
+	if strings.HasPrefix(inner, "@") || strings.HasSuffix(inner, "@") {
+		return false
+	}
+	for _, c := range inner {
+		if c < 0x21 || c > 0x7e || c == '<' || c == '>' {
+			return false
+		}
+	}
+	return true
 }
 
 // checkBinding requires a response to name this tenant and installation.
