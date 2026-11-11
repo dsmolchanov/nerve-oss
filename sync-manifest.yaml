@@ -36,6 +36,7 @@
     "internal/store/tool_idempotency_test.go",
     "internal/store/migrate.go",
     "internal/store/migration_test.go",
+    "internal/store/fixture_role_cleanup_test.go",
     "internal/store/legacy_domain_lifecycle.go",
     "internal/store/legacy_domain_lifecycle_test.go",
     "internal/store/org_domains.go",

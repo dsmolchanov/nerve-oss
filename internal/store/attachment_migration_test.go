@@ -405,8 +405,9 @@ func TestAttachmentTablesEnforceTenantRLSAndLegacyDenyAll(t *testing.T) {
 		}
 		t.Cleanup(func() {
 			_ = appDB.Close()
-			_, _ = db.ExecContext(context.Background(), fmt.Sprintf(`DROP OWNED BY %s`, roleName))
-			_, _ = db.ExecContext(context.Background(), fmt.Sprintf(`DROP ROLE IF EXISTS %s`, roleName))
+			if err := fixtureRoleCleanup(context.Background(), db, fmt.Sprintf(`DROP OWNED BY %s; DROP ROLE IF EXISTS %s`, roleName, roleName)); err != nil {
+				t.Error(err)
+			}
 		})
 
 		st := &Store{db: appDB, q: appDB}
