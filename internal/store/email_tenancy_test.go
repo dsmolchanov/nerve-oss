@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -1029,10 +1028,7 @@ func openDomainGrantAppStore(t *testing.T, ctx context.Context, db *sql.DB) *Sto
 	if err := db.QueryRowContext(ctx, `SELECT current_database()`).Scan(&databaseName); err != nil {
 		t.Fatal(err)
 	}
-	baseDSN := os.Getenv("NM_TEST_DB_DSN")
-	if baseDSN == "" {
-		baseDSN = "postgres://neuralmail@127.0.0.1:54320/neuralmail?sslmode=disable"
-	}
+	baseDSN := tempDatabaseDSN(t, db)
 	appDSN, err := dsnWithDatabase(baseDSN, databaseName)
 	if err != nil {
 		t.Fatal(err)
