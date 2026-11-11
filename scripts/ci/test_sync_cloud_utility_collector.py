@@ -99,7 +99,7 @@ printf '%s\\n' "$*" >> "$CAPTURE_ROOT/go.calls"
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.root / 'go.calls').read_text().splitlines(),
-                         ['build ./...', 'test ./... -count=1 -timeout=30m'])
+                         ['build ./...', 'test ./... -count=1 -timeout=120m'])
         calls = (self.root / 'docker.calls').read_text().splitlines()
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0], 'restart --time 5 ' + self.cid)
@@ -122,7 +122,7 @@ printf '%s\\n' "$*" >> "$CAPTURE_ROOT/go.calls"
         for name in ('Qualify Cloud credential utility collector', 'Build and test cloud', 'Create Pull Request'):
             self.assertIn("if: steps.changes.outputs.has_changes == 'true'", step(self.source, name))
         self.assertIn('timeout-minutes: 3', self.body)
-        self.assertIn('timeout-minutes: 45', self.source)
+        self.assertIn('    timeout-minutes: 210', self.source)
         self.assertIn('${{ job.services.postgres.id }}', self.body)
         self.assertIn("${{ job.services.postgres.ports['5432'] }}", self.body)
         self.assertLess(self.source.index('name: Qualify Cloud credential utility collector'), self.source.index('name: Build and test cloud'))
