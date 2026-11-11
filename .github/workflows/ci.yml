@@ -64,6 +64,7 @@ jobs:
           ./scripts/sync/verify_exact_mirror.sh sync-manifest.yaml . .
           ./scripts/ci/test_sync_manifest.sh
           python3 -S scripts/ci/test_sync_cloud_utility_collector.py
+          python3 -S scripts/ci/test_sync_cloud_owned_fixtures.py
       - name: Verify pinned MCP conformance tooling
         env:
           MCP_CONFORMANCE_DIR: ${{ github.workspace }}/_mcp_conformance

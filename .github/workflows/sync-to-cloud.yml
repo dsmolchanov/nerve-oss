@@ -41,16 +41,19 @@ jobs:
         env:
           HEAD_REF: ${{ github.sha }}
         run: |
+          set -euo pipefail
+          changed_file="${RUNNER_TEMP:?required}/nerve-oss-cloud-changed-files.txt"
           # A prior push may have failed before publishing its Cloud PR.
           # Compare against adopted authority, not only the immediately prior push.
           base_ref="$(oss/scripts/sync/resolve_cloud_base.sh "$PWD/oss" "$PWD/cloud" "$HEAD_REF")"
           oss/scripts/sync/apply_to_cloud.sh \
             "$PWD/oss" "$PWD/cloud" "$base_ref" "$HEAD_REF" \
-            /tmp/changed_files.txt
-          if [ ! -s /tmp/changed_files.txt ]; then
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
-          else
+            "$changed_file"
+          # Exact-head release evidence also needs qualified source-only advances.
+          if [[ -s "$changed_file" || "$base_ref" != "$HEAD_REF" ]]; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Verify exact mirror
@@ -117,8 +120,23 @@ jobs:
           NM_REQUIRE_DB: "1"
           TZ: UTC
         run: |
+          set -euo pipefail
           go build ./...
           go test ./... -count=1 -timeout=30m
+
+      - name: Verify owned Cloud PostgreSQL fixture cleanup
+        if: always()
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          sweeper="$PWD/cloud/scripts/ci/cleanup_test_postgres.py"
+          ledger="${RUNNER_TEMP:?required}/nerve-test-postgres.jsonl"
+          if [[ -f "$sweeper" ]]; then
+            python3 -S "$sweeper" --ledger "$ledger"
+          elif [[ -e "$ledger" || -L "$ledger" ]]; then
+            echo "::error::owned Cloud fixture ledger exists without its reviewed sweeper"
+            exit 1
+          fi
 
       - name: Create Pull Request
         if: steps.changes.outputs.has_changes == 'true'
@@ -134,12 +152,12 @@ jobs:
 
             **Commit message:** ${{ github.event.head_commit.message }}
 
-            **Changed shared files:**
-            ```
-            ${{ steps.changes.outputs.has_changes == 'true' && '(see below)' || 'none' }}
-            ```
+            Manifest-owned file changes, if any, are listed in this PR diff.
+            A source-only advance still qualifies the exact OSS head and updates
+            the authority lock through this reviewed PR.
 
-            Exact-mirror paths were copied from OSS and byte-compared. Patch-synced
+            Exact-mirror paths were byte-compared against OSS. Changed patch-synced
             paths were applied with `git apply --3way`; conflicts fail the workflow
-            before a PR is opened. Cloud-only paths were excluded.
+            before a PR is opened. Owned fixture cleanup passed before publication.
+            Cloud-only paths were excluded.
           labels: sync,automated
