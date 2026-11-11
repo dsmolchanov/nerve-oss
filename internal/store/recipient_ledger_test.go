@@ -475,8 +475,9 @@ func TestRecipientLedgerRLS(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() {
-			_, _ = db.ExecContext(context.Background(), `DROP OWNED BY `+role)
-			_, _ = db.ExecContext(context.Background(), `DROP ROLE `+role)
+			if err := fixtureRoleCleanup(context.Background(), db, `DROP OWNED BY `+role+`; DROP ROLE `+role); err != nil {
+				t.Error(err)
+			}
 		})
 		if _, err := db.ExecContext(ctx, `GRANT SELECT,INSERT,UPDATE,DELETE ON org_recipient_periods,recipient_reservations TO `+role); err != nil {
 			t.Fatal(err)
