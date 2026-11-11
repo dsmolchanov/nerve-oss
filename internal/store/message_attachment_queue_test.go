@@ -62,8 +62,8 @@ func TestClaimMessageAttachmentsHonorsScheduleAndLeaseExpiry(t *testing.T) {
 
 func TestRequeueMessageAttachmentBacksOffAndFailsSixthAttempt(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
-		st, _, _ := seedMessageAttachmentQueue(t, ctx, db, []string{"retry"})
-		now := time.Now().UTC()
+		st, orgID, messageID := seedMessageAttachmentQueue(t, ctx, db, []string{"retry"})
+		now := attachmentFixtureDueAt(t, ctx, db, orgID, messageID)
 		claimed, err := st.ClaimMessageAttachments(ctx, 1, "worker-a", now, 5*time.Minute)
 		if err != nil || len(claimed) != 1 {
 			t.Fatalf("first claim=%v err=%v", claimed, err)
@@ -108,8 +108,8 @@ func TestRequeueMessageAttachmentBacksOffAndFailsSixthAttempt(t *testing.T) {
 
 func TestClaimMessageAttachmentsTerminalizesExpiredSixthLease(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
-		st, _, _ := seedMessageAttachmentQueue(t, ctx, db, []string{"crashed-sixth"})
-		now := time.Now().UTC()
+		st, orgID, messageID := seedMessageAttachmentQueue(t, ctx, db, []string{"crashed-sixth"})
+		now := attachmentFixtureDueAt(t, ctx, db, orgID, messageID)
 		var attachmentID string
 		if err := db.QueryRowContext(ctx, `
 			UPDATE message_attachments
@@ -147,7 +147,7 @@ func TestClaimMessageAttachmentsTerminalizesExpiredSixthLease(t *testing.T) {
 func TestCompleteMessageAttachmentMirrorUpdatesAvailabilityAndRefCount(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
 		st, orgID, messageID := seedMessageAttachmentQueue(t, ctx, db, []string{"available", "expired"})
-		now := time.Now().UTC()
+		now := attachmentFixtureDueAt(t, ctx, db, orgID, messageID)
 		claimed, err := st.ClaimMessageAttachments(ctx, 10, "worker", now, 5*time.Minute)
 		if err != nil || len(claimed) != 2 {
 			t.Fatalf("claim=%v err=%v", claimed, err)
@@ -186,8 +186,8 @@ func TestCompleteMessageAttachmentMirrorUpdatesAvailabilityAndRefCount(t *testin
 
 func TestMessageAttachmentCompletionRejectsStaleLeaseFromSameWorker(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
-		st, _, _ := seedMessageAttachmentQueue(t, ctx, db, []string{"lease"})
-		now := time.Now().UTC()
+		st, orgID, messageID := seedMessageAttachmentQueue(t, ctx, db, []string{"lease"})
+		now := attachmentFixtureDueAt(t, ctx, db, orgID, messageID)
 		first, err := st.ClaimMessageAttachments(ctx, 1, "worker", now, 5*time.Minute)
 		if err != nil || len(first) != 1 {
 			t.Fatalf("first claim=%v err=%v", first, err)
@@ -217,8 +217,8 @@ func TestMarkMessageAttachmentTerminalRejectsInvalidStateBeforeSQL(t *testing.T)
 
 func TestStoreMirroredMessageAttachmentCommitsBlobAndReferenceAtomically(t *testing.T) {
 	withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
-		st, orgID, _ := seedMessageAttachmentQueue(t, ctx, db, []string{"success", "lost-lease"})
-		now := time.Now().UTC()
+		st, orgID, messageID := seedMessageAttachmentQueue(t, ctx, db, []string{"success", "lost-lease"})
+		now := attachmentFixtureDueAt(t, ctx, db, orgID, messageID)
 		claimed, err := st.ClaimMessageAttachments(ctx, 2, "worker-a", now, 5*time.Minute)
 		if err != nil || len(claimed) != 2 {
 			t.Fatalf("claimed=%v err=%v", claimed, err)
@@ -323,4 +323,16 @@ func assertClaimedProviderIDs(t *testing.T, attachments []MessageAttachment, wan
 			t.Fatalf("claimed provider ids=%v, missing %q", got, providerID)
 		}
 	}
+}
+
+// Initial positive claims use the due timestamp of their exact seeded rows.
+// An unrelated process clock cannot establish ordering with a DB now() default.
+// Scheduling/negative tests still arrange and test their explicit time values.
+func attachmentFixtureDueAt(t *testing.T, ctx context.Context, db *sql.DB, orgID, messageID string) time.Time {
+	t.Helper()
+	var due sql.NullTime
+	if err := db.QueryRowContext(ctx, `SELECT max(next_attempt_at) FROM message_attachments WHERE org_id=$1 AND message_id=$2`, orgID, messageID).Scan(&due); err != nil || !due.Valid {
+		t.Fatal("seeded attachment due timestamp unavailable", err)
+	}
+	return due.Time.UTC()
 }

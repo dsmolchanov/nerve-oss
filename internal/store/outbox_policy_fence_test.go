@@ -106,7 +106,11 @@ func TestCoreMigration29DownRefusesPolicyAndProviderEvidence(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			withTempDatabase(t, func(ctx context.Context, db *sql.DB) {
-				migrateToLatest(t, ctx, db)
+				// This test owns Core29 evidence. Cloud successors may depend on
+				// later Core relations and are outside this rollback fixture.
+				if err := MigrateCore(ctx, db); err != nil {
+					t.Fatal(err)
+				}
 				orgID, inboxID := insertPolicyFenceTenant(t, ctx, db, "down-29")
 				outboxID := insertPolicyFenceOutbox(t, ctx, db, orgID, inboxID, 0)
 				if err := test.seed(ctx, db, orgID, inboxID, outboxID); err != nil {
