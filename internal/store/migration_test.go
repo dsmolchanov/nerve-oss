@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -566,10 +567,7 @@ func TestTenantRLSBlocksCrossOrgReadsAndWritesWithScopedSession(t *testing.T) {
 		if err := db.QueryRowContext(ctx, `SELECT current_database()`).Scan(&dbName); err != nil {
 			t.Fatalf("resolve current database: %v", err)
 		}
-		baseDSN := os.Getenv("NM_TEST_DB_DSN")
-		if baseDSN == "" {
-			baseDSN = "postgres://neuralmail@127.0.0.1:54320/neuralmail?sslmode=disable"
-		}
+		baseDSN := tempDatabaseDSN(t, db)
 		appDSN, err := dsnWithDatabase(baseDSN, dbName)
 		if err != nil {
 			t.Fatalf("build app dsn: %v", err)
@@ -1056,12 +1054,32 @@ func assertIndexUnique(t *testing.T, db *sql.DB, index string, unique bool) {
 	}
 }
 
+// Cloud may supply a physically isolated cluster in its own _test.go initializer.
+// Nil retains the ordinary OSS PostgreSQL fixture and adds no runtime callback.
+var tempDatabaseSource func(*testing.T) string
+var tempDatabaseDSNs sync.Map // *sql.DB -> the actual fixture connection URL
+
+func tempDatabaseDSN(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	value, ok := tempDatabaseDSNs.Load(db)
+	if !ok {
+		t.Fatal("database handle has no owned fixture connection source")
+	}
+	return value.(string)
+}
+
 func withTempDatabase(t *testing.T, run func(ctx context.Context, db *sql.DB)) {
 	t.Helper()
 
 	baseDSN := os.Getenv("NM_TEST_DB_DSN")
 	if baseDSN == "" {
 		baseDSN = "postgres://neuralmail:neuralmail@127.0.0.1:54320/neuralmail?sslmode=disable"
+	}
+	if tempDatabaseSource != nil {
+		baseDSN = tempDatabaseSource(t)
+		if baseDSN == "" {
+			t.Fatal("fixture database source returned an empty connection URL")
+		}
 	}
 	adminDSN, err := dsnWithDatabase(baseDSN, "postgres")
 	if err != nil {
@@ -1106,6 +1124,8 @@ func withTempDatabase(t *testing.T, run func(ctx context.Context, db *sql.DB)) {
 		_ = db.Close()
 	})
 
+	tempDatabaseDSNs.Store(db, testDSN)
+	t.Cleanup(func() { tempDatabaseDSNs.Delete(db) })
 	run(context.Background(), db)
 }
 
@@ -1684,5 +1704,79 @@ func TestMigrateOnStartRejectsInvalidPolicy(t *testing.T) {
 	invalidWindow.CoreMinRequired = 19
 	if err := MigrateOnStart(context.Background(), nil, StartupMigrationOff, invalidWindow); err == nil {
 		t.Fatal("invalid migration window succeeded")
+	}
+}
+
+// Keep the same lifecycle when a Cloud test-only initializer supplies an isolated
+// cluster: callback return does not close fixtures, and reconnects never borrow
+// an enclosing or process-wide endpoint. The wrapper retains that provider.
+func TestTempDatabaseSourcePreservesNestedConnectionsAndCleanup(t *testing.T) {
+	original := tempDatabaseSource
+	allocations := 0
+	tempDatabaseSource = func(t *testing.T) string {
+		allocations++
+		if original != nil {
+			return original(t)
+		}
+		if dsn := os.Getenv("NM_TEST_DB_DSN"); dsn != "" {
+			return dsn
+		}
+		return "postgres://neuralmail:neuralmail@127.0.0.1:54320/neuralmail?sslmode=disable"
+	}
+	t.Cleanup(func() { tempDatabaseSource = original })
+	var handles []*sql.DB
+	var names []string
+	if !t.Run("retained", func(t *testing.T) {
+		check := func(ctx context.Context, db *sql.DB) {
+			t.Helper()
+			var name string
+			if err := db.QueryRowContext(ctx, `SELECT current_database()`).Scan(&name); err != nil {
+				t.Fatal(err)
+			}
+			dsn := tempDatabaseDSN(t, db)
+			parsed, err := url.Parse(dsn)
+			if err != nil || parsed.Path != "/"+name {
+				t.Fatal("fixture reconnect source lost its actual database")
+			}
+			reopened, err := OpenDB(dsn)
+			if err != nil {
+				t.Fatal("reopen owned fixture")
+			}
+			defer reopened.Close()
+			var actual string
+			if err := reopened.QueryRowContext(ctx, `SELECT current_database()`).Scan(&actual); err != nil || actual != name {
+				t.Fatal("fixture reconnected to another database", err)
+			}
+		}
+		withTempDatabase(t, func(ctx context.Context, outer *sql.DB) {
+			handles = append(handles, outer)
+			check(ctx, outer)
+			withTempDatabase(t, func(ctx context.Context, inner *sql.DB) {
+				handles = append(handles, inner)
+				check(ctx, outer)
+				check(ctx, inner)
+			})
+		})
+		for _, db := range handles {
+			check(context.Background(), db)
+			var name string
+			if err := db.QueryRow(`SELECT current_database()`).Scan(&name); err != nil {
+				t.Fatal("fixture did not survive callback return", err)
+			}
+			names = append(names, name)
+		}
+		if len(names) != 2 || names[0] == names[1] || allocations != 2 {
+			t.Fatal("nested fixture identity/allocation changed")
+		}
+	}) {
+		t.Fatal("nested fixture failed")
+	}
+	for _, db := range handles {
+		if _, exists := tempDatabaseDSNs.Load(db); exists {
+			t.Fatal("fixture connection source survived cleanup")
+		}
+		if err := db.Ping(); !errors.Is(err, sql.ErrConnDone) && (err == nil || err.Error() != "sql: database is closed") {
+			t.Fatal("fixture database handle survived cleanup", err)
+		}
 	}
 }
