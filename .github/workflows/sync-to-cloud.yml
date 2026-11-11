@@ -7,7 +7,7 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 210
     services:
       postgres:
         image: postgres:16
@@ -113,7 +113,10 @@ jobs:
           echo "::error::required Cloud credential utility collector unavailable"
           exit 1
 
+      # Physical per-test PG16 clusters need a complete-suite budget; keep
+      # setup/cleanup outside the 180min step and inside the 210min job.
       - name: Build and test cloud
+        timeout-minutes: 180
         if: steps.changes.outputs.has_changes == 'true'
         working-directory: cloud
         env:
@@ -122,7 +125,7 @@ jobs:
         run: |
           set -euo pipefail
           go build ./...
-          go test ./... -count=1 -timeout=30m
+          go test ./... -count=1 -timeout=120m
 
       - name: Verify owned Cloud PostgreSQL fixture cleanup
         if: always()

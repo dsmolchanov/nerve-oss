@@ -1,12 +1,27 @@
 #!/usr/bin/env python3
 """Execute actual producer shell with explicit filesystem/command doubles."""
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
 
 from test_sync_cloud_utility_collector import ROOT, WORKFLOW, shell, step
+
+
+def require_suite_budgets(source):
+    # Check actual enclosing YAML metadata, not occurrences inside shell/comments.
+    job = re.search(r'^  sync:\n(.*?)(?=^    steps:)', source, re.M | re.S)
+    if not job:
+        raise ValueError('missing sync job metadata')
+    body = step(source, 'Build and test cloud').split('        run:', 1)[0]
+    job_values = re.findall(r'^    timeout-minutes: (.+)$', job[1], re.M)
+    step_values = re.findall(r'^        timeout-minutes: (.+)$', body, re.M)
+    if job_values != ['210'] or step_values != ['180']:
+        raise ValueError('finite 210min job and 180min complete-suite step required')
+    if int(job_values[0]) - int(step_values[0]) < 30:
+        raise ValueError('setup and unconditional cleanup reserve required')
 
 
 class CloudOwnedFixtures(unittest.TestCase):
@@ -75,14 +90,46 @@ printf '%s\n' "$*" >> "$CAPTURE_ROOT/python.calls"
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(Path(self.env['GITHUB_OUTPUT']).exists())
 
+    def test_actual_nested_budgets_and_each_missing_or_shortened_boundary(self):
+        require_suite_budgets(self.source)
+        for old, new in [('    timeout-minutes: 210', '    timeout-minutes: 0'),
+                         ('    timeout-minutes: 210', '    timeout-minutes: 45'),
+                         ('    timeout-minutes: 210', '    timeout-minutes: 180'),
+                         ('    timeout-minutes: 210\n', ''),
+                         ('        timeout-minutes: 180', '        timeout-minutes: 0'),
+                         ('        timeout-minutes: 180', '        timeout-minutes: 120'),
+                         ('        timeout-minutes: 180', '        timeout-minutes: 210'),
+                         ('        timeout-minutes: 180\n', '')]:
+            with self.subTest(mutation=(old, new)):
+                self.assertIn(old, self.source)
+                with self.assertRaises(ValueError):
+                    require_suite_budgets(self.source.replace(old, new))
+
+    def test_cached_filtered_unbounded_or_shortened_actual_commands_refuse(self):
+        original = self.source
+        for old, new in [('-timeout=120m', '-timeout=0'),
+                         ('-timeout=120m', '-timeout=30m'),
+                         ('-timeout=120m', '-timeout=45m'),
+                         ('-timeout=120m', '-timeout=90m'),
+                         ('-timeout=120m', ''), ('-count=1', ''),
+                         ('go test ./...', 'go test ./internal/store'),
+                         ('go test ./...', 'go test ./... -run TestOnly')]:
+            with self.subTest(mutation=(old, new)):
+                self.assertIn(old, original)
+                self.source = original.replace(old, new)
+                (self.root / 'go.calls').unlink(missing_ok=True)
+                with self.assertRaises(AssertionError):
+                    self.test_actual_complete_build_and_suite_commands_and_failure_boundaries()
+        self.source = original
+
     def test_actual_complete_build_and_suite_commands_and_failure_boundaries(self):
         result = self.run_step('Build and test cloud')
         self.assertEqual(result.returncode, 0, result.stderr)
         log = self.root / 'go.calls'
         self.assertEqual(log.read_text().splitlines(),
-                         ['build ./...', 'test ./... -count=1 -timeout=30m'])
+                         ['build ./...', 'test ./... -count=1 -timeout=120m'])
         for failure, expected in [('build', ['build ./...']),
-                                  ('test', ['build ./...', 'test ./... -count=1 -timeout=30m'])]:
+                                  ('test', ['build ./...', 'test ./... -count=1 -timeout=120m'])]:
             with self.subTest(failure=failure):
                 log.unlink()
                 self.assertNotEqual(self.run_step('Build and test cloud', FAILURE=failure).returncode, 0)

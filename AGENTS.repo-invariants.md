@@ -244,3 +244,11 @@ makes a review loop unable to terminate.
   Enforced by `TestOutboxWorkerNeverResolvesEarlierForwardFromFailedReplay`
   and `TestOutboxWorkerKeepsForwardOutcomeUnresolvedWhenRecoveryFails` in
   `internal/emailtransport/outbox_worker_forward_test.go`.
+
+- Does the OSS-to-Cloud producer run the complete uncached Cloud build/suite
+  with a finite 120min package alarm inside an explicit 180min test step and
+  210min job, retaining 30min outside the test step and the unconditional 3min
+  owned-fixture cleanup before guarded publication? No filtering, cached or
+  unbounded invocation substitutes for complete qualification. Enforced by
+  `scripts/ci/test_sync_cloud_owned_fixtures.py` (actual shell, failure and
+  deadline mutations) and `scripts/ci/test_sync_cloud_utility_collector.py`.
