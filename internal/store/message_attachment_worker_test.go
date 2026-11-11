@@ -31,7 +31,7 @@ func TestMessageAttachmentWorkerLeaseMirrorAndLoad(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		claimed, err := st.ClaimMessageAttachments(ctx, 1, "worker-test", time.Now().UTC(), time.Minute)
+		claimed, err := st.ClaimMessageAttachments(ctx, 1, "worker-test", attachmentFixtureDueAt(t, ctx, db, orgID, messageID), time.Minute)
 		if err != nil || len(claimed) != 1 {
 			t.Fatalf("claimed=%v err=%v", claimed, err)
 		}
