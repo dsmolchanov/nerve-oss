@@ -75,12 +75,46 @@ jobs:
         with:
           go-version: "1.25.13"
 
+      - name: Qualify Cloud credential utility collector
+        if: steps.changes.outputs.has_changes == 'true'
+        timeout-minutes: 3
+        env:
+          COLLECTOR_CONTAINER_ID: ${{ job.services.postgres.id }}
+          COLLECTOR_INITIAL_PORT: ${{ job.services.postgres.ports['5432'] }}
+        run: |
+          set -euo pipefail
+          [[ "$COLLECTOR_CONTAINER_ID" =~ ^[0-9a-f]{64}$ ]] || exit 1
+          [[ "$COLLECTOR_INITIAL_PORT" =~ ^[0-9]+$ ]] || exit 1
+          (( COLLECTOR_INITIAL_PORT >= 1 && COLLECTOR_INITIAL_PORT <= 65535 )) || exit 1
+          export PGCONNECT_TIMEOUT=3
+          initial_dsn="postgres://neuralmail:neuralmail@127.0.0.1:${COLLECTOR_INITIAL_PORT}/neuralmail?sslmode=disable"
+          initial_ready=false
+          for attempt in {1..30}; do
+            if [[ "$(psql "$initial_dsn" -XAt -v ON_ERROR_STOP=1 -c 'SELECT 1' 2>/dev/null)" == 1 ]]; then initial_ready=true; break; fi
+            sleep 1
+          done
+          [[ "$initial_ready" == true ]] || exit 1
+          psql "$initial_dsn" -Xq -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET shared_preload_libraries='pg_stat_statements'"
+          docker restart --time 5 "$COLLECTOR_CONTAINER_ID" >/dev/null
+          actual_port="$(docker inspect --format '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "$COLLECTOR_CONTAINER_ID")"
+          [[ "$actual_port" =~ ^[0-9]+$ ]] || exit 1
+          (( actual_port >= 1 && actual_port <= 65535 )) || exit 1
+          actual_dsn="postgres://neuralmail:neuralmail@127.0.0.1:${actual_port}/neuralmail?sslmode=disable"
+          for attempt in {1..30}; do
+            if [[ "$(psql "$actual_dsn" -XAt -v ON_ERROR_STOP=1 -c "SELECT current_setting('shared_preload_libraries')='pg_stat_statements' AND current_setting('pg_stat_statements.track') IN('top','all') AND current_setting('pg_stat_statements.track_utility')='on'" 2>/dev/null)" == t ]]; then
+              echo "NM_TEST_DB_DSN=$actual_dsn" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::required Cloud credential utility collector unavailable"
+          exit 1
+
       - name: Build and test cloud
         if: steps.changes.outputs.has_changes == 'true'
         working-directory: cloud
         env:
           NM_REQUIRE_DB: "1"
-          NM_TEST_DB_DSN: postgres://neuralmail:neuralmail@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/neuralmail?sslmode=disable
           TZ: UTC
         run: |
           go build ./...
