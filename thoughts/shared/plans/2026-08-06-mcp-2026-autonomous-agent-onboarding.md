@@ -1,6 +1,8 @@
 ---
 title: MCP 2026 and Autonomous Agent Onboarding
-status: draft
+status: closed
+closed_at: 2026-11-26
+closed_scope: Phases 0-9
 revision: 21
 created_at: 2026-08-06 12:49:07 CEST
 enhanced_at: 2026-08-23
@@ -16,6 +18,19 @@ cloud_schema_target: 0010
 ---
 
 # MCP 2026 and Autonomous Agent Onboarding Implementation Plan
+
+## Closure — 2026-11-26
+
+This plan was closed on 2026-11-26 at the scope of Phases 0–9 by owner decision.
+The authoritative copy lives in the `nerve-cloud` repository, where it reached
+revision 24; this file is the revision 21 snapshot and is kept as history. It
+creates no open obligation for this repository.
+
+The runtime work this repository owned under the plan — the dual-protocol MCP
+server, the Core 0029 outbox policy fence and the v0.1.0 runtime candidate — is
+merged. Phase 10 (lifecycle drills, soak, publication of the tested bytes and
+the first external activation) continues under a separate plan in `nerve-cloud`.
+The publication step will tag and release from this repository when it runs.
 
 ## Overview
 
